@@ -55,15 +55,16 @@ type Runtime struct {
 	natsServer     *natsserver.Server
 	natsClient     *natsclient.Client
 	configManager  *config.Manager
-	serviceManager *service.Manager
+	serviceManager atomic.Pointer[service.Manager]
 	serviceNames   []string
 	mutations      *projection.MutationClient
 
-	started      atomic.Bool
-	initialReady atomic.Bool
-	stopping     atomic.Bool
-	stopMu       sync.Mutex
-	closed       bool
+	onReadinessCheck atomic.Pointer[func()]
+	started          atomic.Bool
+	initialReady     atomic.Bool
+	stopping         atomic.Bool
+	stopMu           sync.Mutex
+	closed           bool
 }
 
 // Start boots embedded NATS + JetStream (unless opts.NATSURL is set), ensures
@@ -80,19 +81,20 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		baseLogger = slog.Default()
 	}
 
-	// Preflight offline validation fails fast before starting NATS or touching disk.
+	// Validate both the un-overridden flow config persisted to KV and the
+	// overridden runtime flow offline before starting NATS or touching disk.
+	baseCfg, err := LoadConfig(opts.ConfigPath, PortOverrides{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ValidateOffline(baseCfg); err != nil {
+		return nil, err
+	}
 	preflightCfg, err := LoadConfig(opts.ConfigPath, opts.Overrides)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := ValidateOffline(preflightCfg); err != nil {
-		return nil, err
-	}
-
-	// Load un-overridden flow config for ConfigManager KV persistence so ephemeral
-	// CLI listener overrides do not clobber stored config on first boot.
-	baseCfg, err := LoadConfig(opts.ConfigPath, PortOverrides{})
-	if err != nil {
 		return nil, err
 	}
 
@@ -232,7 +234,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	if err := svcMgr.ConfigureFromServices(effectiveCfg.Services, svcDeps); err != nil {
 		return cleanup(fmt.Errorf("configure services: %w", err))
 	}
-	rt.serviceManager = svcMgr
+	rt.serviceManager.Store(svcMgr)
 
 	if err := svcMgr.StartAll(ctx); err != nil {
 		return cleanup(fmt.Errorf("start services: %w", err))
@@ -363,14 +365,14 @@ func (rt *Runtime) checkLiveReadiness() bool {
 	if !rt.started.Load() || rt.stopping.Load() {
 		return false
 	}
-	rt.stopMu.Lock()
-	svcMgr := rt.serviceManager
-	names := rt.serviceNames
-	rt.stopMu.Unlock()
+	if hookPtr := rt.onReadinessCheck.Load(); hookPtr != nil && *hookPtr != nil {
+		(*hookPtr)()
+	}
+	svcMgr := rt.serviceManager.Load()
 	if svcMgr == nil {
 		return false
 	}
-	for _, name := range names {
+	for _, name := range rt.serviceNames {
 		svc, ok := svcMgr.GetService(name)
 		if !ok || svc.Status() != service.StatusRunning || !svc.IsHealthy() {
 			return false
@@ -412,11 +414,11 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 
 	var errs []error
-	if rt.serviceManager != nil {
-		if err := rt.serviceManager.StopAll(ctx); err != nil {
+	if svcMgr := rt.serviceManager.Load(); svcMgr != nil {
+		if err := svcMgr.StopAll(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("stop service manager: %w", err))
 		} else {
-			rt.serviceManager = nil
+			rt.serviceManager.Store(nil)
 		}
 	}
 	if rt.configManager != nil {
@@ -609,20 +611,35 @@ func (h *redactingSlogHandler) scrubAttr(a slog.Attr) slog.Attr {
 }
 
 func setServerVersion(cfg *config.Config, ver string) error {
-	svc, ok := cfg.Services["service-manager"]
-	if !ok || len(svc.Config) == 0 {
-		return nil
+	if cfg == nil {
+		return errors.New("host: nil configuration")
 	}
-	var parsed map[string]any
-	if err := json.Unmarshal(svc.Config, &parsed); err != nil {
-		return err
+	if cfg.Services == nil {
+		cfg.Services = make(types.ServiceConfigs)
 	}
-	info, _ := parsed["server_info"].(map[string]any)
-	if info == nil {
-		info = map[string]any{}
+	svc, exists := cfg.Services["service-manager"]
+	parsed := map[string]any{}
+	if exists && !isEmptyOrNullJSON(svc.Config) {
+		if err := json.Unmarshal(svc.Config, &parsed); err != nil {
+			return fmt.Errorf("decode service-manager config: %w", err)
+		}
+		if parsed == nil {
+			parsed = map[string]any{}
+		}
 	}
-	info["version"] = ver
-	parsed["server_info"] = info
+	if rawInfo, hasInfo := parsed["server_info"]; hasInfo && rawInfo != nil {
+		infoMap, ok := rawInfo.(map[string]any)
+		if !ok {
+			return errors.New("service-manager.server_info must be a JSON object")
+		}
+		infoMap["version"] = ver
+		parsed["server_info"] = infoMap
+	} else {
+		parsed["server_info"] = map[string]any{"version": ver}
+	}
+	if !exists {
+		svc.Enabled = true
+	}
 	encoded, err := json.Marshal(parsed)
 	if err != nil {
 		return err

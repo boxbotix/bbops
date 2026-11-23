@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boxbotix/bbops/configs"
 	"github.com/boxbotix/bbops/internal/host"
 	"github.com/c360studio/semengine/graph"
 	"github.com/c360studio/semengine/message"
@@ -628,5 +629,83 @@ func assertMetricsReachable(t *testing.T, port int) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET %s status = %d, want 200", url, resp.StatusCode)
+	}
+}
+
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+func TestRuntimeInvalidServiceConfigDoesNotPoisonDataDir(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	dataDir := t.TempDir()
+
+	// Boot 1: disabled mandatory component-manager must fail before persisting to KV.
+	var brokenDoc map[string]any
+	if err := json.Unmarshal(configs.DefaultFlowJSON, &brokenDoc); err != nil {
+		t.Fatalf("unmarshal default flow: %v", err)
+	}
+	brokenDoc["services"].(map[string]any)["component-manager"] = map[string]any{
+		"enabled": false,
+		"config":  map[string]any{},
+	}
+	brokenRaw, err := json.Marshal(brokenDoc)
+	if err != nil {
+		t.Fatalf("marshal broken flow: %v", err)
+	}
+	brokenPath := filepath.Join(t.TempDir(), "broken-component-manager.json")
+	if err := os.WriteFile(brokenPath, brokenRaw, 0o600); err != nil {
+		t.Fatalf("write broken flow: %v", err)
+	}
+
+	if rtBroken, err := host.StartEphemeral(ctx, host.Options{
+		ConfigPath: brokenPath,
+		DataDir:    dataDir,
+	}, 2); err == nil {
+		_ = rtBroken.Stop(context.Background())
+		t.Fatal("expected Boot 1 with disabled component-manager to fail")
+	} else if !strings.Contains(err.Error(), "mandatory service component-manager cannot be disabled") {
+		t.Fatalf("Boot 1 error = %v, want mandatory service diagnostic", err)
+	}
+
+	// Boot 2: corrected stock config on the SAME dataDir must succeed cleanly without poisoned KV state.
+	rtValid, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: dataDir,
+		UIDir:   t.TempDir(),
+		Version: "v0.2.0-recovered",
+	}, 4)
+	if err != nil {
+		t.Fatalf("Boot 2 with valid config on shared dataDir failed (KV poisoned): %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rtValid.Stop(stopCtx); stopErr != nil {
+			t.Errorf("Boot 2 Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rtValid.WaitReady(readyCtx); err != nil {
+		t.Fatalf("Boot 2 WaitReady: %v", err)
+	}
+
+	assertHTTPGet(t, rtValid.Endpoints().HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+
+	gqlReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		rtValid.Endpoints().HTTPBaseURL+"/graph-gateway/graphql",
+		bytes.NewBufferString(`{"query":"{ entitiesByPrefix(prefix: \"boxbotix.\", limit: 10) { total entities { id } } }"}`))
+	if err != nil {
+		t.Fatalf("build GraphQL request: %v", err)
+	}
+	gqlReq.Header.Set("Content-Type", "application/json")
+	gqlResp, err := http.DefaultClient.Do(gqlReq)
+	if err != nil {
+		t.Fatalf("POST /graph-gateway/graphql: %v", err)
+	}
+	_ = gqlResp.Body.Close()
+	if gqlResp.StatusCode != http.StatusOK {
+		t.Fatalf("Boot 2 GraphQL status = %d, want 200", gqlResp.StatusCode)
 	}
 }

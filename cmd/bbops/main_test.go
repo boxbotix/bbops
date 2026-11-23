@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boxbotix/bbops/configs"
 	"github.com/boxbotix/bbops/internal/host"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 )
@@ -77,6 +79,63 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		}
 		if !strings.Contains(stderr.String(), "http-port") {
 			t.Fatalf("stderr = %q, want diagnostic naming http-port", stderr.String())
+		}
+	})
+
+	t.Run("validate flag rejects disabled mandatory component-manager or missing graph-gateway", func(t *testing.T) {
+		disabledCompMgr := writeMutatedFlowFile(t, func(doc map[string]any) {
+			services := doc["services"].(map[string]any)
+			services["component-manager"] = map[string]any{"enabled": false, "config": map[string]any{}}
+		})
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-validate", "-config", disabledCompMgr}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1 (stdout=%q stderr=%q)", code, stdout.String(), stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "mandatory service component-manager cannot be disabled") {
+			t.Fatalf("stderr = %q, want mandatory service diagnostic", stderr.String())
+		}
+
+		disabledGateway := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			gw := components["graph-gateway"].(map[string]any)
+			gw["enabled"] = false
+		})
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-validate", "-config", disabledGateway}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1 (stdout=%q stderr=%q)", code, stdout.String(), stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "graph-gateway") {
+			t.Fatalf("stderr = %q, want graph-gateway diagnostic", stderr.String())
+		}
+	})
+
+	t.Run("validate flag accepts null service configs with CLI port overrides without panicking", func(t *testing.T) {
+		nullSvcPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			services := doc["services"].(map[string]any)
+			services["service-manager"] = map[string]any{"enabled": true, "config": nil}
+			services["metrics"] = map[string]any{"enabled": true, "config": nil}
+		})
+		var stdout, stderr bytes.Buffer
+		code := run([]string{
+			"-validate",
+			"-config", nullSvcPath,
+			"-http-port", "18080",
+			"-metrics-port", "19090",
+		}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stderr=%q)", code, stderr.String())
+		}
+		if got, want := stdout.String(), "bbops configuration valid\n"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 	})
 
@@ -339,4 +398,22 @@ func TestRunCLIEntrypoint(t *testing.T) {
 			})
 		}
 	})
+}
+
+func writeMutatedFlowFile(t *testing.T, mutate func(map[string]any)) string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(configs.DefaultFlowJSON, &doc); err != nil {
+		t.Fatalf("unmarshal default flow: %v", err)
+	}
+	mutate(doc)
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal mutated flow: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "flow.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
 }

@@ -1,18 +1,26 @@
 package host
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/boxbotix/bbops/configs"
 )
 
 // spec: host-runtime / Host CLI version and flag entrypoint
 // spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
 func TestValidateOfflineAndPortOverrides(t *testing.T) {
 	t.Run("embedded default flow validates all seven components and endpoints", func(t *testing.T) {
 		cfg, err := LoadConfig("", PortOverrides{})
@@ -74,6 +82,57 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		delete(cfg3.Streams, EntityStreamName)
 		if _, err := ValidateOffline(cfg3); err == nil {
 			t.Fatal("expected ValidateOffline error when ENTITY stream is missing")
+		}
+	})
+
+	t.Run("mandatory SemEngine services cannot be disabled offline", func(t *testing.T) {
+		cfgCompMgr, err := LoadConfig("", PortOverrides{})
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		svc := cfgCompMgr.Services["component-manager"]
+		svc.Enabled = false
+		cfgCompMgr.Services["component-manager"] = svc
+		if _, err := ValidateOffline(cfgCompMgr); err == nil || !strings.Contains(err.Error(), "mandatory service component-manager cannot be disabled") {
+			t.Fatalf("expected mandatory component-manager error, got %v", err)
+		}
+
+		cfgSvcMgr, err := LoadConfig("", PortOverrides{})
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		sm := cfgSvcMgr.Services["service-manager"]
+		sm.Enabled = false
+		cfgSvcMgr.Services["service-manager"] = sm
+		// Even with an explicit HTTPPort override, service-manager.enabled=false must stay disabled and fail.
+		if err := ApplyPortOverrides(cfgSvcMgr, PortOverrides{HTTPPort: 18080}); err != nil {
+			t.Fatalf("ApplyPortOverrides: %v", err)
+		}
+		if _, err := ValidateOffline(cfgSvcMgr); err == nil || !strings.Contains(err.Error(), "mandatory service service-manager cannot be disabled") {
+			t.Fatalf("expected mandatory service-manager error, got %v", err)
+		}
+	})
+
+	t.Run("required M0.2 SKG pipeline and GraphQL front door cannot be disabled", func(t *testing.T) {
+		for _, required := range []string{
+			"graph-ingest",
+			"graph-index",
+			"graph-lexical",
+			"graph-query",
+			"graph-gateway",
+			TelemetryWSComponent,
+			GraphWSComponent,
+		} {
+			cfg, err := LoadConfig("", PortOverrides{})
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			comp := cfg.Components[required]
+			comp.Enabled = false
+			cfg.Components[required] = comp
+			if _, err := ValidateOffline(cfg); err == nil || !strings.Contains(err.Error(), required) {
+				t.Fatalf("expected ValidateOffline error naming disabled required component %q, got %v", required, err)
+			}
 		}
 	})
 
@@ -393,5 +452,190 @@ func referenceReservedBackendRoute(reqPath string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// spec: host-runtime / Host CLI version and flag entrypoint
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+func TestNullServiceConfigsDoNotPanicOnOverridesOrVersion(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal(configs.DefaultFlowJSON, &doc); err != nil {
+		t.Fatalf("unmarshal default flow: %v", err)
+	}
+	servicesMap := doc["services"].(map[string]any)
+	servicesMap["service-manager"] = map[string]any{
+		"enabled": true,
+		"config":  nil,
+	}
+	servicesMap["metrics"] = map[string]any{
+		"enabled": true,
+		"config":  nil,
+	}
+	rawJSON, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal null-service flow: %v", err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "null-services.json")
+	if err := os.WriteFile(cfgPath, rawJSON, 0o600); err != nil {
+		t.Fatalf("write null-services.json: %v", err)
+	}
+
+	// 1. Port overrides on null service configs normalize cleanly without nil-map panic.
+	overridden, err := LoadConfig(cfgPath, PortOverrides{
+		HTTPPort:    18088,
+		MetricsPort: 19098,
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with overrides on null service configs: %v", err)
+	}
+	if _, err := ValidateOffline(overridden); err != nil {
+		t.Fatalf("ValidateOffline overridden null service configs: %v", err)
+	}
+	ep, err := ResolveEndpoints(overridden)
+	if err != nil {
+		t.Fatalf("ResolveEndpoints overridden null service configs: %v", err)
+	}
+	if ep.HTTPPort != 18088 || ep.MetricsPort != 19098 {
+		t.Fatalf("endpoints = %+v, want HTTPPort=18088 MetricsPort=19098", ep)
+	}
+
+	// 2. Disabling metrics on a null metrics config normalizes cleanly.
+	disabledMetrics, err := LoadConfig(cfgPath, PortOverrides{MetricsPort: -1})
+	if err != nil {
+		t.Fatalf("LoadConfig MetricsPort=-1 on null service configs: %v", err)
+	}
+	if _, err := ValidateOffline(disabledMetrics); err != nil {
+		t.Fatalf("ValidateOffline disabled metrics: %v", err)
+	}
+
+	// 3. Stamping server version onto a null service-manager config or null server_info does not panic.
+	unoverridden, err := LoadConfig(cfgPath, PortOverrides{})
+	if err != nil {
+		t.Fatalf("LoadConfig unoverridden null service configs: %v", err)
+	}
+	if err := setServerVersion(unoverridden, "v0.2.9-nulltest"); err != nil {
+		t.Fatalf("setServerVersion on null service-manager config: %v", err)
+	}
+	if _, err := ValidateOffline(unoverridden); err != nil {
+		t.Fatalf("ValidateOffline after setServerVersion: %v", err)
+	}
+	var smCfg struct {
+		ServerInfo struct {
+			Version string `json:"version"`
+		} `json:"server_info"`
+	}
+	if err := json.Unmarshal(unoverridden.Services["service-manager"].Config, &smCfg); err != nil {
+		t.Fatalf("unmarshal stamped service-manager config: %v", err)
+	}
+	if smCfg.ServerInfo.Version != "v0.2.9-nulltest" {
+		t.Fatalf("stamped version = %q, want v0.2.9-nulltest", smCfg.ServerInfo.Version)
+	}
+
+	smEntry := unoverridden.Services["service-manager"]
+	smEntry.Config = json.RawMessage(`{"server_info":null}`)
+	unoverridden.Services["service-manager"] = smEntry
+	if err := setServerVersion(unoverridden, "v0.2.10-nullinfo"); err != nil {
+		t.Fatalf("setServerVersion on null server_info: %v", err)
+	}
+	if err := json.Unmarshal(unoverridden.Services["service-manager"].Config, &smCfg); err != nil {
+		t.Fatalf("unmarshal stamped null-info config: %v", err)
+	}
+	if smCfg.ServerInfo.Version != "v0.2.10-nullinfo" {
+		t.Fatalf("stamped version = %q, want v0.2.10-nullinfo", smCfg.ServerInfo.Version)
+	}
+}
+
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+func TestRuntimeStopDoesNotDeadlockInFlightPreReadyUIRequest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>cop</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+
+	rt, err := StartEphemeral(ctx, Options{
+		DataDir: t.TempDir(),
+		UIDir:   uiDir,
+		Version: "v0.2.0-stop-race",
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	t.Cleanup(func() {
+		rt.onReadinessCheck.Store(nil)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = rt.Stop(cleanupCtx)
+	})
+
+	entered := make(chan struct{})
+	releaseHook := make(chan struct{})
+	defer close(releaseHook)
+	var once sync.Once
+	hook := func() {
+		once.Do(func() {
+			close(entered)
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for !rt.stopping.Load() && time.Now().Before(deadline) {
+				select {
+				case <-releaseHook:
+					return
+				default:
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+			// Give Stop() time to acquire stopMu and enter ServiceManager.StopAll HTTP drain.
+			time.Sleep(30 * time.Millisecond)
+		})
+	}
+	rt.onReadinessCheck.Store(&hook)
+
+	type httpResult struct {
+		code int
+		body string
+		err  error
+	}
+	reqDone := make(chan httpResult, 1)
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, reqErr := client.Get(rt.Endpoints().HTTPBaseURL + "/") //nolint:noctx
+		if reqErr != nil {
+			reqDone <- httpResult{err: reqErr}
+			return
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		reqDone <- httpResult{code: resp.StatusCode, body: string(raw)}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pre-ready GET / to enter checkLiveReadiness")
+	}
+
+	const stopBudget = 1500 * time.Millisecond
+	stopStart := time.Now()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopBudget)
+	defer stopCancel()
+	stopErr := rt.Stop(stopCtx)
+	elapsed := time.Since(stopStart)
+	if stopErr != nil || elapsed >= 1300*time.Millisecond {
+		t.Fatalf("Stop blocked on in-flight pre-ready UI request (elapsed=%v, budget=%v, err=%v)", elapsed, stopBudget, stopErr)
+	}
+
+	select {
+	case res := <-reqDone:
+		if res.err != nil {
+			t.Fatalf("in-flight pre-ready GET / failed: %v", res.err)
+		}
+		if res.code != http.StatusServiceUnavailable || res.body != "NOT READY" {
+			t.Fatalf("in-flight pre-ready GET / = %d %q, want 503 NOT READY", res.code, res.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight pre-ready GET / did not complete after Stop")
 	}
 }

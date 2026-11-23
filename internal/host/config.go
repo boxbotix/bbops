@@ -1,26 +1,33 @@
 package host
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/boxbotix/bbops/configs"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/composition"
 	"github.com/c360studio/semengine/config"
 	graphgateway "github.com/c360studio/semengine/gateway/graph-gateway"
+	"github.com/c360studio/semengine/metric"
+	"github.com/c360studio/semengine/natsclient"
 	"github.com/c360studio/semengine/output/websocket"
+	"github.com/c360studio/semengine/payloadregistry"
 	graphindex "github.com/c360studio/semengine/processor/graph-index"
 	graphingest "github.com/c360studio/semengine/processor/graph-ingest"
 	graphlexical "github.com/c360studio/semengine/processor/graph-lexical"
 	graphquery "github.com/c360studio/semengine/processor/graph-query"
+	"github.com/c360studio/semengine/service"
 	"github.com/c360studio/semengine/types"
 )
 
@@ -35,6 +42,19 @@ const (
 	minUserPort = 1024
 	maxUserPort = 65535
 )
+
+var requiredM02Components = []struct {
+	instance string
+	factory  string
+}{
+	{instance: "graph-ingest", factory: "graph-ingest"},
+	{instance: "graph-index", factory: "graph-index"},
+	{instance: "graph-lexical", factory: "graph-lexical"},
+	{instance: "graph-query", factory: "graph-query"},
+	{instance: "graph-gateway", factory: "graph-gateway"},
+	{instance: TelemetryWSComponent, factory: "websocket"},
+	{instance: GraphWSComponent, factory: "websocket"},
+}
 
 // PortOverrides carries optional CLI or test listener overrides applied atop the
 // loaded SemEngine flow configuration.
@@ -119,7 +139,7 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 		if err := validateUserPort("http-port", overrides.HTTPPort); err != nil {
 			return err
 		}
-		if err := patchJSONField(cfg.Services, "service-manager", "http_port", overrides.HTTPPort); err != nil {
+		if err := patchJSONField(cfg.Services, "service-manager", "http_port", overrides.HTTPPort, false); err != nil {
 			return err
 		}
 	}
@@ -127,7 +147,7 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 	if overrides.MetricsPort < 0 {
 		entry := cfg.Services["metrics"]
 		entry.Enabled = false
-		if len(entry.Config) == 0 {
+		if isEmptyOrNullJSON(entry.Config) {
 			entry.Config = json.RawMessage(`{"port":9090,"path":"/metrics"}`)
 		}
 		cfg.Services["metrics"] = entry
@@ -135,7 +155,7 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 		if err := validateUserPort("metrics-port", overrides.MetricsPort); err != nil {
 			return err
 		}
-		if err := patchJSONField(cfg.Services, "metrics", "port", overrides.MetricsPort); err != nil {
+		if err := patchJSONField(cfg.Services, "metrics", "port", overrides.MetricsPort, true); err != nil {
 			return err
 		}
 	}
@@ -166,7 +186,8 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 }
 
 // ValidateOffline validates the SemEngine config document, ENTITY stream retention
-// invariants, listener port uniqueness, and offline component composition graph.
+// invariants, mandatory SemEngine services, required bbops SKG/GraphQL/WebSocket
+// components, listener port uniqueness, and offline component composition graph.
 func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	if cfg == nil {
 		return nil, errors.New("host: nil configuration")
@@ -178,11 +199,26 @@ func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	if !slices.Contains(entityStream.Subjects, "entity.>") {
 		return nil, fmt.Errorf("%s stream subjects %v must include entity.>", EntityStreamName, entityStream.Subjects)
 	}
-	if entityStream.MaxAge == "" || entityStream.MaxBytes <= 0 || entityStream.Discard != "old" {
+	maxAge, ageErr := time.ParseDuration(entityStream.MaxAge)
+	if entityStream.MaxAge == "" || ageErr != nil || maxAge <= 0 || entityStream.MaxBytes <= 0 || entityStream.Discard != "old" {
 		return nil, fmt.Errorf("%s stream requires explicit finite max_age, max_bytes > 0, and discard \"old\"", EntityStreamName)
 	}
 
+	for _, req := range requiredM02Components {
+		comp, exists := cfg.Components[req.instance]
+		if !exists || !comp.Enabled {
+			return nil, fmt.Errorf("required component %q is missing or disabled", req.instance)
+		}
+		if comp.Name != req.factory {
+			return nil, fmt.Errorf("required component %q must use factory %q, got %q", req.instance, req.factory, comp.Name)
+		}
+	}
+
 	if _, err := ResolveEndpoints(cfg); err != nil {
+		return nil, err
+	}
+
+	if err := validateServiceCompositionOffline(cfg); err != nil {
 		return nil, err
 	}
 
@@ -217,14 +253,53 @@ func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	return result, nil
 }
 
+func validateServiceCompositionOffline(cfg *config.Config) error {
+	discardLogger := slog.New(slog.DiscardHandler)
+	offlineClient, err := natsclient.NewClient("nats://127.0.0.1:4222", natsclient.WithLogger(discardLogger))
+	if err != nil {
+		return fmt.Errorf("create offline NATS client: %w", err)
+	}
+	cfgMgr, err := config.NewConfigManager(cfg, offlineClient, discardLogger)
+	if err != nil {
+		return fmt.Errorf("validate platform config: %w", err)
+	}
+	compReg := component.NewRegistry()
+	if err := RegisterComponents(compReg); err != nil {
+		return err
+	}
+	svcReg := service.NewServiceRegistry()
+	if err := service.RegisterAll(svcReg); err != nil {
+		return fmt.Errorf("register framework services: %w", err)
+	}
+	svcMgr := service.NewServiceManager(svcReg)
+	svcDeps := &service.Dependencies{
+		NATSClient:        offlineClient,
+		MetricsRegistry:   metric.NewMetricsRegistry(),
+		Logger:            discardLogger,
+		Platform:          types.PlatformMeta{Org: cfg.Platform.Org, Platform: cfg.Platform.ID},
+		Manager:           cfgMgr,
+		ComponentRegistry: compReg,
+		PayloadRegistry:   payloadregistry.New(),
+	}
+	if err := svcMgr.ConfigureFromServices(cfg.Services, svcDeps); err != nil {
+		return fmt.Errorf("configure services: %w", err)
+	}
+	return nil
+}
+
 // ResolveEndpoints extracts the effective HTTP and WebSocket URLs from cfg and
 // verifies that no two active listeners claim the same TCP port.
 func ResolveEndpoints(cfg *config.Config) (ResolvedEndpoints, error) {
 	if cfg == nil {
 		return ResolvedEndpoints{}, errors.New("host: nil configuration")
 	}
+	resolvedServices, err := service.ResolveServiceConfigs(cfg.Services)
+	if err != nil {
+		return ResolvedEndpoints{}, fmt.Errorf("resolve service configs: %w", err)
+	}
+
 	httpPort := 8080
-	if svc, ok := cfg.Services["service-manager"]; ok && len(svc.Config) > 0 {
+	if svc, ok := resolvedServices["service-manager"]; ok && !isEmptyOrNullJSON(svc.Config) {
 		var parsed struct {
 			HTTPPort int `json:"http_port"`
 		}
@@ -242,19 +317,17 @@ func ResolveEndpoints(cfg *config.Config) (ResolvedEndpoints, error) {
 	portsUsed := map[int]string{httpPort: "service-manager"}
 
 	metricsPort := 9090
-	metricsEnabled := true
-	if svc, ok := cfg.Services["metrics"]; ok {
-		metricsEnabled = svc.Enabled
-		if len(svc.Config) > 0 {
-			var parsed struct {
-				Port int `json:"port"`
-			}
-			if err := json.Unmarshal(svc.Config, &parsed); err != nil {
-				return ResolvedEndpoints{}, fmt.Errorf("decode metrics config: %w", err)
-			}
-			if parsed.Port != 0 {
-				metricsPort = parsed.Port
-			}
+	metricsSvc := resolvedServices["metrics"]
+	metricsEnabled := metricsSvc.Enabled
+	if !isEmptyOrNullJSON(metricsSvc.Config) {
+		var parsed struct {
+			Port int `json:"port"`
+		}
+		if err := json.Unmarshal(metricsSvc.Config, &parsed); err != nil {
+			return ResolvedEndpoints{}, fmt.Errorf("decode metrics config: %w", err)
+		}
+		if parsed.Port != 0 {
+			metricsPort = parsed.Port
 		}
 	}
 	if metricsEnabled {
@@ -302,12 +375,20 @@ func validateUserPort(name string, port int) error {
 	return nil
 }
 
-func patchJSONField(services types.ServiceConfigs, serviceName, key string, value any) error {
+func isEmptyOrNullJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
+func patchJSONField(services types.ServiceConfigs, serviceName, key string, value any, forceEnable bool) error {
 	entry, exists := services[serviceName]
 	raw := map[string]any{}
-	if exists && len(entry.Config) > 0 {
+	if exists && !isEmptyOrNullJSON(entry.Config) {
 		if err := json.Unmarshal(entry.Config, &raw); err != nil {
 			return fmt.Errorf("decode %s config: %w", serviceName, err)
+		}
+		if raw == nil {
+			raw = map[string]any{}
 		}
 	}
 	raw[key] = value
@@ -315,7 +396,9 @@ func patchJSONField(services types.ServiceConfigs, serviceName, key string, valu
 	if err != nil {
 		return fmt.Errorf("encode %s config: %w", serviceName, err)
 	}
-	entry.Enabled = true
+	if !exists || forceEnable {
+		entry.Enabled = true
+	}
 	entry.Config = encoded
 	services[serviceName] = entry
 	return nil
@@ -325,6 +408,9 @@ func patchWebSocketEndpoint(cfg *config.Config, componentName, host string, port
 	comp, ok := cfg.Components[componentName]
 	if !ok {
 		return fmt.Errorf("missing required component %q", componentName)
+	}
+	if isEmptyOrNullJSON(comp.Config) {
+		return fmt.Errorf("%s config missing ports block", componentName)
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(comp.Config, &doc); err != nil {
