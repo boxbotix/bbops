@@ -1,6 +1,13 @@
-# T3 Code host manifest for ateam review request and notify (adapted from
-# C360Studio/ateam v0.4.4). Changes here alter review_launch: agent behavior
-# and require owner review before merging to main.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 boxbotix
+# Copyright (c) 2026 C360Studio
+#
+# Provenance: Adapted from boxbotix/bbstack .agents/hosts/t3code.toml
+# @ 894ab3e94aee0cd0705bb8e46675bfeebcc57f3c (Apache-2.0 OR MIT, elected under MIT),
+# which adapted C360Studio/ateam .agents/hosts/t3code.toml
+# @ 797759e5d44f84af3d4913ffa99c52c3ae8639bf (MIT; unchanged in v0.4.4
+# @ 031e68563bf278ea197368929d2e24cfde767eec).
+# Changes here alter review_launch: agent behavior and require owner review before merging to main.
 #
 # T3 Code gives agents inside a thread the t3-code MCP tool t3_thread_launch,
 # whose modelSelection carries the effort option, so the first review turn runs

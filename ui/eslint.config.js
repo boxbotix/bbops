@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Complete 360 Studio
+// Copyright (c) 2026 boxbotix
+//
+// Provenance: Adapted from C360Studio/semboids ui/eslint.config.js
+// @ 37dbdb088438a2601c8556d012ab2c33bec85da2 (MIT).
+
 import js from "@eslint/js";
 import tseslint from "@typescript-eslint/eslint-plugin";
 import tsparser from "@typescript-eslint/parser";
