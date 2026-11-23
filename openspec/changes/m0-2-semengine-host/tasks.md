@@ -2,7 +2,7 @@
 
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval (`proposal.md` + `design.md` `OQ1`–`OQ4` rulings and `Approved-by:` digest from `ateam state spec-queue`).
+- [x] 1.1 Owner approved `proposal.md` and `design.md` together (`Approved-by: Coby Leuschke (2026-11-23) sha256:45e8ca3a6a61`; `OQ1`–`OQ4` ruled Option A).
 
 ## 2. Implementation
 

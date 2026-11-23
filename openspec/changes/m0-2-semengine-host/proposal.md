@@ -1,5 +1,5 @@
 # Proposal: m0-2-semengine-host
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-23) sha256:45e8ca3a6a61
 Architect: gemini (gemini-4-carbon, medium)
 
 ## Track

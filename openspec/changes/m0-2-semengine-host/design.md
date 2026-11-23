@@ -32,7 +32,7 @@ Architect: `gemini (gemini-4-carbon, medium)`
 | **A. Daemon default + `-validate` flag**: zero-arg `bbops` boots embedded NATS (`JetStream: true`, `-data-dir`, `-nats-url` override) + SemEngine until signal/ctx cancel; `-validate` runs offline `config` + `composition.Validate` and exits `0` | Update 1 `M0.1` test/scenario (`main_test.go:25-34`, `spec.md:8`) | `cmd/bbops`, `openspec/specs/host-runtime/spec.md` | Treating bare `bbops` as a side-effect-free no-op in scripts |
 | **B. Explicit `bbops serve` subcommand**: bare `bbops` keeps `M0.1` no-op exit `0`; `bbops serve` boots runtime | Subcommand routing in `cmd/bbops` | Every operator, container, and `Taskfile` run command | Single-command appliance UX matching `semboids/cmd/semboids/main.go:89` |
 
-Adopter seam: With A, running `./bin/bbops` immediately starts the GCS on default ports and `-validate` checks config offline; doing nothing in tests that call `run(nil, ...)` without a canceled `ctx` or `-validate` blocks waiting for shutdown. With B, operators running `./bin/bbops` get silent exit `0` instead of a running server.
+Adopter seam: With A, running `./bin/bbops` immediately starts the GCS on default ports and `-validate` checks config offline; doing nothing in tests that call `run(nil, ...)` without a canceled `ctx` or `-validate` blocks waiting for shutdown. With B, operators running `./bin/bbops` get silent exit `0` instead of a running server. **Ruled Option A (owner, 2026-11-23).**
 
 ### D2. Readiness Probe Contract (`/readyz` vs `/healthz`) & Ephemeral Test Ports
 
@@ -41,7 +41,7 @@ Adopter seam: With A, running `./bin/bbops` immediately starts the GCS on defaul
 | **A. Native SemEngine ADR-109 probes**: `/readyz` (`200 READY` only after `graph-ingest` + all components finish `Start` and `fullMux` commits) is the readiness gate; `/healthz` (`200 OK`) stays liveness; `/health` reports JSON component+NATS health | Zero custom probe middleware | Aligns `#3`'s readiness wording with SemEngine `service_manager_http.go:447-460` | Using `/healthz` alone as a cold-start readiness gate |
 | **B. Gate `/healthz` via `UseHTTPMiddleware`**: intercept `/healthz` (`service_manager_http.go:44`) to return `503 NOT READY` until `currentStartupSnapshot` / `readyz` is `200` | ~20 LOC middleware + test | Main listener `/healthz` diverges from dedicated health listener (`:156`) | Container liveness probes on `/healthz` surviving slow JetStream startup replay |
 
-Adopter seam: Callers and integration tests waiting for `graph-ingest` responders and `/graph-gateway/graphql` must poll `/readyz` under A (or either `/readyz`/`/healthz` under B); polling `/healthz` under A without checking `/readyz` hits `503 NOT READY` on `/graph-gateway/graphql` during cold start. Because `HTTPPort: 0` defaults to `8080` and `output/websocket` refuses `port < 1024`, test harnesses must allocate free loopback ports in `1024..65535`.
+Adopter seam: Callers and integration tests waiting for `graph-ingest` responders and `/graph-gateway/graphql` must poll `/readyz` under A (or either `/readyz`/`/healthz` under B); polling `/healthz` under A without checking `/readyz` hits `503 NOT READY` on `/graph-gateway/graphql` during cold start. Because `HTTPPort: 0` defaults to `8080` and `output/websocket` refuses `port < 1024`, test harnesses must allocate free loopback ports in `1024..65535`. **Ruled Option A (owner, 2026-11-23).**
 
 ### D3. UI Serving (`ui/build`) & Dual `output/websocket` Topology
 
@@ -50,7 +50,7 @@ Adopter seam: Callers and integration tests waiting for `graph-ingest` responder
 | **A. Go static SPA fallback on `:8080` + native WS ports (`:8081`, `:8082`) + dev proxy**: `UseHTTPMiddleware` serves `-ui-dir` (`ui/build` when present) on unmatched `GET`/`HEAD` paths after readiness; WS #1 (`:8081`) and WS #2 (`:8082`) stay on native `output/websocket` listeners; `ui/Caddyfile` + `ui/vite.config.ts` proxy all three in dev/container | ~55 LOC static/SPA middleware + `ui/Caddyfile` + Vite proxy | `internal/host`, `ui/Caddyfile`, `ui/vite.config.ts` | Mounting arbitrary catch-all API routes outside reserved prefixes (`/health*`, `/readyz`, `/services`, `/components/`, `/graph/`, `/graph-gateway/`, `/openapi.json`, `/docs`) |
 | **B. Caddy/Vite reverse-proxy only**: Go serves only SemEngine `:8080` + WS `:8081`/`:8082`; Caddy/Vite serves `ui/build` and proxies API/WS | `ui/Caddyfile` + Vite proxy only (0 Go static code) | Requires `caddy` or Node alongside `bbops` to view UI | Standalone single-binary `./bin/bbops` serving compiled `ui/build` in the field |
 
-Adopter seam: Browser UI code connects WS #1/WS #2 via configurable URLs (defaulting to same-host `:8081/ws` & `:8082/ws` when unproxied, or `/ws/telemetry` & `/ws/graph` behind Caddy/Vite); reverse-proxying WS inside `ServiceManager` middleware is avoided because `WriteTimeout` and `httpadmission.Requests` (`service_manager_http.go:92,211-225`) cut or block shutdown. If `-ui-dir` is absent under A, unmatched routes return `404` cleanly.
+Adopter seam: Browser UI code connects WS #1/WS #2 via configurable URLs (defaulting to same-host `:8081/ws` & `:8082/ws` when unproxied, or `/ws/telemetry` & `/ws/graph` behind Caddy/Vite); reverse-proxying WS inside `ServiceManager` middleware is avoided because `WriteTimeout` and `httpadmission.Requests` (`service_manager_http.go:92,211-225`) cut or block shutdown. If `-ui-dir` is absent under A, unmatched routes return `404` cleanly. **Ruled Option A (owner, 2026-11-23).**
 
 ### D4. Flow Configuration Source & `ENTITY` Stream Retention Bounds
 
@@ -59,7 +59,7 @@ Adopter seam: Browser UI code connects WS #1/WS #2 via configurable URLs (defaul
 | **A. Versioned `configs/bbops.json` + `go:embed` fallback**: canonical JSON flow (`ENTITY`: `entity.>`, `file`, `max_age: "24h"`, `max_bytes: 268435456` [256 MiB], `discard: "old"`, `replicas: 1`) embedded as default when `-config` is unset, with CLI port overrides | 1 JSON file + `embed` loader + `THIRD_PARTY_NOTICES` entry | `configs/bbops.json`, `internal/host` | Drift only if Go overrides mutate component names |
 | **B. Pure Go struct builder + optional `-config` file**: construct default `*config.Config` in Go code with no `configs/bbops.json` in repo | Go builder only | `internal/host` | Inspecting/diffing default port wiring directly in a static JSON file like `semboids/configs/flock.json` |
 
-Adopter seam: Any custom `-config` file must specify finite `max_age`, `max_bytes > 0`, and `discard` on every stream (`semengine/config/streams.go:18-47`) and omit removed WS keys; doing nothing uses the embedded default seamlessly.
+Adopter seam: Any custom `-config` file must specify finite `max_age`, `max_bytes > 0`, and `discard` on every stream (`semengine/config/streams.go:18-47`) and omit removed WS keys; doing nothing uses the embedded default seamlessly. **Ruled Option A (owner, 2026-11-23).**
 
 ## Risks / Trade-offs
 
@@ -72,7 +72,4 @@ Replaces the `M0.1` bootstrap stub in `cmd/bbops/main.go:35-36` and updates `ope
 
 ## Open Questions
 
-1. **OQ1 (Needs owner ruling — D1):** Should bare `bbops` boot the embedded NATS + SemEngine daemon with `-validate` for offline validation (**D1 Option A**), or require `bbops serve` (**D1 Option B**)?
-2. **OQ2 (Needs owner ruling — D2):** Keep SemEngine ADR-109 probe semantics (`/readyz` gates on `graph-ingest`/boot commit, `/healthz` stays liveness — **D2 Option A**), or also gate `/healthz` (`503` until ready) via middleware (**D2 Option B**)?
-3. **OQ3 (Needs owner ruling — D3):** Serve compiled `ui/build` from `bbops` `:8080` alongside `ui/Caddyfile` + Vite dev proxy while keeping WS #1/`:8081` & WS #2/`:8082` on native listeners (**D3 Option A**), or serve `ui/build` via Caddy/Vite only (**D3 Option B**)?
-4. **OQ4 (Needs owner ruling — D4):** Ship `configs/bbops.json` with `go:embed` default fallback and `256 MiB / 24h / old` `ENTITY` bounds (**D4 Option A**), or build defaults purely in Go structs (**D4 Option B**)?
+1. **Resolved (`OQ1`–`OQ4`, owner 2026-11-23):** D1 Option A (`bbops` daemon default + `-validate`), D2 Option A (native ADR-109 `/readyz` readiness + `/healthz` liveness), D3 Option A (`-ui-dir` SPA fallback on `:8080` + native WS `:8081`/`:8082` + `ui/Caddyfile` & Vite proxy), and D4 Option A (versioned `configs/bbops.json` with `go:embed` fallback and `256 MiB / 24h / old` `ENTITY` stream bounds).
