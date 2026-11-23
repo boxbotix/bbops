@@ -16,12 +16,17 @@
 
 3. **SemBoids (`C360Studio/semboids`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
-   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, and sentinel `ui/go.mod` boundary:
-     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
+   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, Caddy reverse-proxy rules, flow configuration patterns, and sentinel `ui/go.mod` boundary:
+     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/Caddyfile`, `configs/flock.json` (adapted in `configs/bbops.json`), `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
+
+4. **SemEngine (`C360Studio/semengine`) — MIT License**
+   Copyright (c) 2026 Complete 360 Studio
+   - Embedded Semantic Knowledge Graph (SKG) runtime dependency (`github.com/c360studio/semengine v0.1.0-alpha.7`) and component port configuration schema (`configs/bbops.json` adapted from `config/example_config.json`):
+     `C360Studio/semengine` `config/example_config.json` @ `3d89a31775219e7f7aaa44ab10892bbc804ae08e` (`v0.1.0-alpha.7`)
 
 ---
 
-### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, and `C360Studio/semboids`)
+### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, and `C360Studio/semengine`)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
