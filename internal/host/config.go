@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -103,6 +104,15 @@ func RegisterComponents(registry *component.Registry) error {
 	return nil
 }
 
+// PreparedConfig holds the validated persisted base flow configuration, the
+// validated runtime flow configuration after ephemeral overrides and version
+// stamping, and its offline composition result.
+type PreparedConfig struct {
+	Base        *config.Config
+	Effective   *config.Config
+	Composition *composition.Result
+}
+
 // LoadConfig reads path (or the embedded configs/bbops.json default when path is
 // empty), parses it via SemEngine's loader, and applies any PortOverrides.
 func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
@@ -124,6 +134,38 @@ func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// PrepareConfig reads path once, validates the un-overridden base flow that
+// ConfigManager persists to KV, applies listener overrides and optional server
+// version onto a deep clone, and validates the resulting effective flow offline.
+func PrepareConfig(path string, overrides PortOverrides, version string) (*PreparedConfig, error) {
+	baseCfg, err := LoadConfig(path, PortOverrides{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ValidateOffline(baseCfg); err != nil {
+		return nil, err
+	}
+
+	effectiveCfg := baseCfg.Clone()
+	if err := ApplyPortOverrides(effectiveCfg, overrides); err != nil {
+		return nil, err
+	}
+	if version != "" {
+		if err := setServerVersion(effectiveCfg, version); err != nil {
+			return nil, err
+		}
+	}
+	compRes, err := ValidateOffline(effectiveCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &PreparedConfig{
+		Base:        baseCfg,
+		Effective:   effectiveCfg,
+		Composition: compRes,
+	}, nil
 }
 
 // ApplyPortOverrides mutates cfg with validated listener overrides.
@@ -196,12 +238,17 @@ func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing required %s stream declaration", EntityStreamName)
 	}
+	if _, archival := cfg.ArchivalStreams[EntityStreamName]; archival {
+		return nil, fmt.Errorf("%s stream cannot be archival; finite retention is required", EntityStreamName)
+	}
 	if !slices.Contains(entityStream.Subjects, "entity.>") {
 		return nil, fmt.Errorf("%s stream subjects %v must include entity.>", EntityStreamName, entityStream.Subjects)
 	}
-	maxAge, ageErr := time.ParseDuration(entityStream.MaxAge)
-	if entityStream.MaxAge == "" || ageErr != nil || maxAge <= 0 || entityStream.MaxBytes <= 0 || entityStream.Discard != "old" {
+	if !hasValidSemEngineMaxAge(entityStream.MaxAge) || entityStream.MaxBytes <= 0 || entityStream.Discard != config.StreamDiscardOld {
 		return nil, fmt.Errorf("%s stream requires explicit finite max_age, max_bytes > 0, and discard \"old\"", EntityStreamName)
+	}
+	if _, err := config.ValidateStreamDeclarations(cfg); err != nil {
+		return nil, fmt.Errorf("validate stream declarations: %w", err)
 	}
 
 	for _, req := range requiredM02Components {
@@ -373,6 +420,19 @@ func validateUserPort(name string, port int) error {
 		return fmt.Errorf("%s %d out of range %d..%d", name, port, minUserPort, maxUserPort)
 	}
 	return nil
+}
+
+func hasValidSemEngineMaxAge(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.HasSuffix(raw, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(raw, "d"))
+		maxDays := int(math.MaxInt64 / int64(24*time.Hour))
+		return err == nil && n > 0 && n <= maxDays
+	}
+	d, err := time.ParseDuration(raw)
+	return err == nil && d > 0
 }
 
 func isEmptyOrNullJSON(raw json.RawMessage) bool {

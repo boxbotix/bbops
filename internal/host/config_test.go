@@ -52,7 +52,44 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		}
 	})
 
-	t.Run("ENTITY stream missing finite retention or discard old fails offline check", func(t *testing.T) {
+	t.Run("ENTITY stream accepts SemEngine day durations and rejects missing or non-finite retention", func(t *testing.T) {
+		for _, validMaxAge := range []string{"24h", "1d", "14d"} {
+			cfg, err := LoadConfig("", PortOverrides{})
+			if err != nil {
+				t.Fatalf("LoadConfig(%q): %v", validMaxAge, err)
+			}
+			stream := cfg.Streams[EntityStreamName]
+			stream.MaxAge = validMaxAge
+			cfg.Streams[EntityStreamName] = stream
+			if _, err := ValidateOffline(cfg); err != nil {
+				t.Fatalf("ValidateOffline(max_age=%q) unexpected error: %v", validMaxAge, err)
+			}
+		}
+
+		for _, invalidMaxAge := range []string{"", "0s", "0h", "0d", "-1h", "-1d", "1.5d", "bogus", "999999d"} {
+			cfg, err := LoadConfig("", PortOverrides{})
+			if err != nil {
+				t.Fatalf("LoadConfig(%q): %v", invalidMaxAge, err)
+			}
+			stream := cfg.Streams[EntityStreamName]
+			stream.MaxAge = invalidMaxAge
+			cfg.Streams[EntityStreamName] = stream
+			if _, err := ValidateOffline(cfg); err == nil {
+				t.Fatalf("expected ValidateOffline error for ENTITY max_age=%q", invalidMaxAge)
+			}
+		}
+
+		cfgArchival, err := LoadConfig("", PortOverrides{})
+		if err != nil {
+			t.Fatalf("LoadConfig archival: %v", err)
+		}
+		if err := json.Unmarshal([]byte(`{"ENTITY":{"reason":"test"}}`), &cfgArchival.ArchivalStreams); err != nil {
+			t.Fatalf("unmarshal archival_streams: %v", err)
+		}
+		if _, err := ValidateOffline(cfgArchival); err == nil || !strings.Contains(err.Error(), "cannot be archival") {
+			t.Fatalf("expected archival ENTITY stream rejection, got %v", err)
+		}
+
 		cfg, err := LoadConfig("", PortOverrides{})
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
@@ -82,6 +119,49 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		delete(cfg3.Streams, EntityStreamName)
 		if _, err := ValidateOffline(cfg3); err == nil {
 			t.Fatal("expected ValidateOffline error when ENTITY stream is missing")
+		}
+	})
+
+	t.Run("PrepareConfig rejects invalid base config even when port override masks collision", func(t *testing.T) {
+		var doc map[string]any
+		if err := json.Unmarshal(configs.DefaultFlowJSON, &doc); err != nil {
+			t.Fatalf("unmarshal default flow: %v", err)
+		}
+		services := doc["services"].(map[string]any)
+		metrics := services["metrics"].(map[string]any)
+		metricsCfg := metrics["config"].(map[string]any)
+		metricsCfg["port"] = 8080
+		encoded, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal colliding flow: %v", err)
+		}
+		cfgPath := filepath.Join(t.TempDir(), "masked-collision.json")
+		if err := os.WriteFile(cfgPath, encoded, 0o600); err != nil {
+			t.Fatalf("write colliding flow: %v", err)
+		}
+
+		if _, err := PrepareConfig(cfgPath, PortOverrides{MetricsPort: 19090}, "v0.2.0"); err == nil ||
+			!strings.Contains(err.Error(), "port 8080 claimed by both service-manager and metrics") {
+			t.Fatalf("expected PrepareConfig to reject colliding base config despite override, got %v", err)
+		}
+
+		prepared, err := PrepareConfig("", PortOverrides{HTTPPort: 18080, MetricsPort: 19090}, "v0.2.0-prep")
+		if err != nil {
+			t.Fatalf("PrepareConfig default with overrides: %v", err)
+		}
+		baseEP, err := ResolveEndpoints(prepared.Base)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints(Base): %v", err)
+		}
+		effEP, err := ResolveEndpoints(prepared.Effective)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints(Effective): %v", err)
+		}
+		if baseEP.HTTPPort != 8080 || baseEP.MetricsPort != 9090 {
+			t.Fatalf("Base endpoints mutated by overrides: %+v", baseEP)
+		}
+		if effEP.HTTPPort != 18080 || effEP.MetricsPort != 19090 {
+			t.Fatalf("Effective endpoints = %+v, want HTTPPort=18080 MetricsPort=19090", effEP)
 		}
 	})
 

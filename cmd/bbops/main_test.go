@@ -139,6 +139,78 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		}
 	})
 
+	t.Run("validate and startup share identical decision and diagnostic when override masks base-config error", func(t *testing.T) {
+		maskedCollisionPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			services := doc["services"].(map[string]any)
+			metrics := services["metrics"].(map[string]any)
+			metricsCfg := metrics["config"].(map[string]any)
+			metricsCfg["port"] = 8080
+		})
+		dataDir := filepath.Join(t.TempDir(), "data")
+
+		var valStdout, valStderr bytes.Buffer
+		valCode := run([]string{
+			"-validate",
+			"-config", maskedCollisionPath,
+			"-metrics-port", "19090",
+		}, &valStdout, &valStderr, "v0.1.0-dev", "abc1234")
+
+		startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer startCancel()
+		var startStdout, startStderr bytes.Buffer
+		startCode := runContext(startCtx, []string{
+			"-config", maskedCollisionPath,
+			"-data-dir", dataDir,
+			"-metrics-port", "19090",
+		}, &startStdout, &startStderr, "v0.1.0-dev", "abc1234")
+
+		if valCode != 1 || startCode != 1 {
+			t.Fatalf("codes = (validate=%d, startup=%d), want (1, 1) (valStderr=%q startStderr=%q)",
+				valCode, startCode, valStderr.String(), startStderr.String())
+		}
+		if valStdout.Len() != 0 || startStdout.Len() != 0 {
+			t.Fatalf("stdout = (validate=%q, startup=%q), want both empty", valStdout.String(), startStdout.String())
+		}
+		valDiag := strings.TrimPrefix(valStderr.String(), "validation error: ")
+		startDiag := strings.TrimPrefix(startStderr.String(), "startup failed: ")
+		if valDiag != startDiag {
+			t.Fatalf("underlying diagnostics diverged: validate=%q vs startup=%q", valDiag, startDiag)
+		}
+		if !strings.Contains(valDiag, "port 8080 claimed by both service-manager and metrics") {
+			t.Fatalf("diagnostic = %q, want base-config port collision message", valDiag)
+		}
+		if _, statErr := os.Stat(dataDir); !os.IsNotExist(statErr) {
+			t.Fatalf("startup touched dataDir %q despite offline base-config rejection (statErr=%v)", dataDir, statErr)
+		}
+	})
+
+	t.Run("validate accepts SemEngine day-duration ENTITY max_age and rejects zero or negative durations", func(t *testing.T) {
+		oneDayPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			streams := doc["streams"].(map[string]any)
+			entity := streams["ENTITY"].(map[string]any)
+			entity["max_age"] = "1d"
+		})
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-validate", "-config", oneDayPath}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 0 || stdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("1d max_age: code=%d stdout=%q stderr=%q, want 0 valid", code, stdout.String(), stderr.String())
+		}
+
+		for _, badMaxAge := range []string{"0d", "-1d", "bogus"} {
+			badPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+				streams := doc["streams"].(map[string]any)
+				entity := streams["ENTITY"].(map[string]any)
+				entity["max_age"] = badMaxAge
+			})
+			stdout.Reset()
+			stderr.Reset()
+			code = run([]string{"-validate", "-config", badPath}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+			if code != 1 || stdout.Len() != 0 {
+				t.Fatalf("max_age=%q: code=%d stdout=%q stderr=%q, want exit 1", badMaxAge, code, stdout.String(), stderr.String())
+			}
+		}
+	})
+
 	t.Run("unknown flag writes diagnostic to stderr and exits two", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"-bogus"}, &stdout, &stderr, "v0.1.0-dev", "abc1234")

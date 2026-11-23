@@ -69,12 +69,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer, ve
 	}
 
 	if *validateOnly {
-		cfg, err := host.LoadConfig(*configPath, overrides)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "config error: %v\n", err)
-			return 1
-		}
-		if _, err := host.ValidateOffline(cfg); err != nil {
+		if _, err := host.PrepareConfig(*configPath, overrides, ver); err != nil {
 			_, _ = fmt.Fprintf(stderr, "validation error: %v\n", err)
 			return 1
 		}

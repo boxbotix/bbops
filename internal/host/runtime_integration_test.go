@@ -668,14 +668,30 @@ func TestRuntimeInvalidServiceConfigDoesNotPoisonDataDir(t *testing.T) {
 		t.Fatalf("Boot 1 error = %v, want mandatory service diagnostic", err)
 	}
 
-	// Boot 2: corrected stock config on the SAME dataDir must succeed cleanly without poisoned KV state.
+	// Boot 2: corrected config with SemEngine day-duration ENTITY max_age ("1d") on the SAME
+	// dataDir must succeed cleanly without poisoned KV state and provision MaxAge=24h.
+	var validDoc map[string]any
+	if err := json.Unmarshal(configs.DefaultFlowJSON, &validDoc); err != nil {
+		t.Fatalf("unmarshal default flow for Boot 2: %v", err)
+	}
+	validDoc["streams"].(map[string]any)["ENTITY"].(map[string]any)["max_age"] = "1d"
+	validRaw, err := json.Marshal(validDoc)
+	if err != nil {
+		t.Fatalf("marshal 1d flow: %v", err)
+	}
+	validPath := filepath.Join(t.TempDir(), "one-day-entity.json")
+	if err := os.WriteFile(validPath, validRaw, 0o600); err != nil {
+		t.Fatalf("write 1d flow: %v", err)
+	}
+
 	rtValid, err := host.StartEphemeral(ctx, host.Options{
-		DataDir: dataDir,
-		UIDir:   t.TempDir(),
-		Version: "v0.2.0-recovered",
+		ConfigPath: validPath,
+		DataDir:    dataDir,
+		UIDir:      t.TempDir(),
+		Version:    "v0.2.0-recovered",
 	}, 4)
 	if err != nil {
-		t.Fatalf("Boot 2 with valid config on shared dataDir failed (KV poisoned): %v", err)
+		t.Fatalf("Boot 2 with valid 1d config on shared dataDir failed (KV poisoned or 1d rejected): %v", err)
 	}
 	t.Cleanup(func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -692,6 +708,22 @@ func TestRuntimeInvalidServiceConfigDoesNotPoisonDataDir(t *testing.T) {
 	}
 
 	assertHTTPGet(t, rtValid.Endpoints().HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+
+	js, err := rtValid.NATSClient().JetStream()
+	if err != nil {
+		t.Fatalf("Boot 2 JetStream handle: %v", err)
+	}
+	stream, err := js.Stream(ctx, host.EntityStreamName)
+	if err != nil {
+		t.Fatalf("Boot 2 lookup ENTITY stream: %v", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("Boot 2 ENTITY stream info: %v", err)
+	}
+	if info.Config.MaxAge != 24*time.Hour {
+		t.Fatalf("Boot 2 ENTITY stream MaxAge = %v, want 24h from \"1d\"", info.Config.MaxAge)
+	}
 
 	gqlReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		rtValid.Endpoints().HTTPBaseURL+"/graph-gateway/graphql",

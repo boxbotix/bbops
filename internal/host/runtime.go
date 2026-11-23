@@ -81,22 +81,13 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		baseLogger = slog.Default()
 	}
 
-	// Validate both the un-overridden flow config persisted to KV and the
-	// overridden runtime flow offline before starting NATS or touching disk.
-	baseCfg, err := LoadConfig(opts.ConfigPath, PortOverrides{})
+	// Validate both the persisted base flow and overridden runtime flow through
+	// the single shared offline preparation path before starting NATS or touching disk.
+	prepared, err := PrepareConfig(opts.ConfigPath, opts.Overrides, opts.Version)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := ValidateOffline(baseCfg); err != nil {
-		return nil, err
-	}
-	preflightCfg, err := LoadConfig(opts.ConfigPath, opts.Overrides)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := ValidateOffline(preflightCfg); err != nil {
-		return nil, err
-	}
+	baseCfg := prepared.Base
 
 	rt := &Runtime{}
 	cleanup := func(cause error) (*Runtime, error) {
