@@ -56,42 +56,47 @@ type Runtime struct {
 	natsClient     *natsclient.Client
 	configManager  *config.Manager
 	serviceManager *service.Manager
+	serviceNames   []string
 	mutations      *projection.MutationClient
 
-	ready  atomic.Bool
-	stopMu sync.Mutex
-	closed bool
+	started      atomic.Bool
+	initialReady atomic.Bool
+	stopping     atomic.Bool
+	stopMu       sync.Mutex
+	closed       bool
 }
 
 // Start boots embedded NATS + JetStream (unless opts.NATSURL is set), ensures
 // the ENTITY stream and kvcatalog retention invariants, starts ConfigManager and
 // ServiceManager (including graph-ingest, graph-index, graph-lexical, graph-query,
-// graph-gateway, and dual output/websocket planes), and returns once ready.
+// graph-gateway, and dual output/websocket planes), and returns once listeners
+// are bound. Callers awaiting full ADR-109 component readiness should call WaitReady.
 func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	if ctx == nil {
 		return nil, errors.New("host: nil context")
 	}
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
+	baseLogger := opts.Logger
+	if baseLogger == nil {
+		baseLogger = slog.Default()
 	}
 
-	cfg, err := LoadConfig(opts.ConfigPath, opts.Overrides)
+	// Preflight offline validation fails fast before starting NATS or touching disk.
+	preflightCfg, err := LoadConfig(opts.ConfigPath, opts.Overrides)
 	if err != nil {
 		return nil, err
 	}
-	if opts.Version != "" {
-		_ = setServerVersion(cfg, opts.Version)
-	}
-	if _, err := ValidateOffline(cfg); err != nil {
+	if _, err := ValidateOffline(preflightCfg); err != nil {
 		return nil, err
 	}
-	endpoints, err := ResolveEndpoints(cfg)
+
+	// Load un-overridden flow config for ConfigManager KV persistence so ephemeral
+	// CLI listener overrides do not clobber stored config on first boot.
+	baseCfg, err := LoadConfig(opts.ConfigPath, PortOverrides{})
 	if err != nil {
 		return nil, err
 	}
 
-	rt := &Runtime{endpoints: endpoints}
+	rt := &Runtime{}
 	cleanup := func(cause error) (*Runtime, error) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -103,30 +108,34 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	if dataDir == "" {
 		dataDir = defaultDataDir
 	}
-	natsURL := strings.TrimSpace(opts.NATSURL)
-	if natsURL == "" {
+	rawNATSURL := strings.TrimSpace(opts.NATSURL)
+	if rawNATSURL == "" {
 		srv, err := startEmbeddedNATS(ctx, filepath.Join(dataDir, "jetstream"))
 		if err != nil {
 			return nil, err
 		}
 		rt.natsServer = srv
-		natsURL = srv.ClientURL()
+		rawNATSURL = srv.ClientURL()
 	}
-	rt.natsURL = natsURL
-	cfg.NATS.URLs = []string{natsURL}
+	redactedNATSURL := RedactNATSURL(rawNATSURL)
+	secrets := extractNATSURLSecrets(rawNATSURL)
+	logger := newRedactingLogger(baseLogger, secrets)
+
+	rt.natsURL = redactedNATSURL
+	baseCfg.NATS.URLs = []string{redactedNATSURL}
 
 	metricsRegistry := metric.NewMetricsRegistry()
-	client, err := openNATSClient(ctx, natsURL, metricsRegistry)
+	client, err := openNATSClient(ctx, rawNATSURL, logger, secrets, metricsRegistry)
 	if err != nil {
 		return cleanup(err)
 	}
 	rt.natsClient = client
 
-	if err := config.NewStreamsManager(client, logger).EnsureStreams(ctx, cfg); err != nil {
+	if err := config.NewStreamsManager(client, logger).EnsureStreams(ctx, baseCfg); err != nil {
 		return cleanup(fmt.Errorf("ensure JetStream streams: %w", err))
 	}
 
-	cfgMgr, err := config.NewConfigManager(cfg, client, logger)
+	cfgMgr, err := config.NewConfigManager(baseCfg, client, logger)
 	if err != nil {
 		return cleanup(fmt.Errorf("create config manager: %w", err))
 	}
@@ -135,10 +144,45 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.configManager = cfgMgr
 
+	// Apply explicit process listener overrides and server version AFTER KV
+	// arbitration so warm restarts honor CLI/ephemeral overrides instead of
+	// silently binding stale KV ports.
+	if err := cfgMgr.GetConfig().Mutate(func(c *config.Config) error {
+		if err := ApplyPortOverrides(c, opts.Overrides); err != nil {
+			return err
+		}
+		if opts.Version != "" {
+			if err := setServerVersion(c, opts.Version); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return cleanup(fmt.Errorf("apply process overrides after config arbitration: %w", err))
+	}
+
 	effectiveCfg := cfgMgr.GetConfig().Get()
+	if _, err := ValidateOffline(effectiveCfg); err != nil {
+		return cleanup(fmt.Errorf("validate effective configuration: %w", err))
+	}
+	endpoints, err := ResolveEndpoints(effectiveCfg)
+	if err != nil {
+		return cleanup(fmt.Errorf("resolve effective endpoints: %w", err))
+	}
+	rt.endpoints = endpoints
 	rt.platform = types.PlatformMeta{
 		Org:      effectiveCfg.Platform.Org,
 		Platform: effectiveCfg.Platform.ID,
+	}
+
+	resolvedServices, err := service.ResolveServiceConfigs(effectiveCfg.Services)
+	if err != nil {
+		return cleanup(fmt.Errorf("resolve service configs: %w", err))
+	}
+	for name, svcCfg := range resolvedServices {
+		if name != "service-manager" && svcCfg.Enabled {
+			rt.serviceNames = append(rt.serviceNames, name)
+		}
 	}
 
 	if len(opts.Contracts) > 0 {
@@ -174,7 +218,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	svcMgr := service.NewServiceManager(svcReg)
-	svcMgr.UseHTTPMiddleware(NewStaticUIMiddleware(uiDir, rt.ready.Load))
+	svcMgr.UseHTTPMiddleware(NewStaticUIMiddleware(uiDir, rt.isUIAdmitted))
 
 	svcDeps := &service.Dependencies{
 		NATSClient:        client,
@@ -193,7 +237,8 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	if err := svcMgr.StartAll(ctx); err != nil {
 		return cleanup(fmt.Errorf("start services: %w", err))
 	}
-	rt.ready.Store(true)
+	rt.started.Store(true)
+	_ = rt.checkLiveReadiness()
 	return rt, nil
 }
 
@@ -261,7 +306,7 @@ func AllocateLoopbackPorts(count int) ([]int, error) {
 // Endpoints returns the resolved HTTP and WebSocket URLs of the started runtime.
 func (rt *Runtime) Endpoints() ResolvedEndpoints { return rt.endpoints }
 
-// NATSURL returns the active NATS client URL (embedded or external).
+// NATSURL returns the active NATS client URL with any credentials redacted.
 func (rt *Runtime) NATSURL() string { return rt.natsURL }
 
 // NATSClient returns the connected SemEngine NATS client.
@@ -270,13 +315,95 @@ func (rt *Runtime) NATSClient() *natsclient.Client { return rt.natsClient }
 // Platform returns the effective authority identity minted by ConfigManager.
 func (rt *Runtime) Platform() types.PlatformMeta { return rt.platform }
 
+// IsReady reports whether all composed SemEngine services and SKG/WebSocket
+// components currently satisfy ADR-109 readiness and shutdown has not begun.
+func (rt *Runtime) IsReady() bool {
+	return rt.checkLiveReadiness()
+}
+
+// WaitReady blocks until IsReady reports true, Stop begins, or ctx ends.
+func (rt *Runtime) WaitReady(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("host: nil context")
+	}
+	if rt.IsReady() {
+		return nil
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if rt.stopping.Load() {
+			return errors.New("host: runtime stopped before becoming ready")
+		}
+		if rt.IsReady() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (rt *Runtime) isUIAdmitted() bool {
+	if rt.stopping.Load() {
+		return false
+	}
+	if rt.initialReady.Load() {
+		return true
+	}
+	return rt.checkLiveReadiness()
+}
+
+func (rt *Runtime) checkLiveReadiness() bool {
+	if !rt.started.Load() || rt.stopping.Load() {
+		return false
+	}
+	rt.stopMu.Lock()
+	svcMgr := rt.serviceManager
+	names := rt.serviceNames
+	rt.stopMu.Unlock()
+	if svcMgr == nil {
+		return false
+	}
+	for _, name := range names {
+		svc, ok := svcMgr.GetService(name)
+		if !ok || svc.Status() != service.StatusRunning || !svc.IsHealthy() {
+			return false
+		}
+	}
+	cmSvc, ok := svcMgr.GetService("component-manager")
+	if !ok {
+		return false
+	}
+	cm, ok := cmSvc.(*service.ComponentManager)
+	if !ok {
+		return false
+	}
+	for _, status := range cm.GetComponentHealth() {
+		if !status.Healthy {
+			return false
+		}
+	}
+	if rt.stopping.Load() {
+		return false
+	}
+	rt.initialReady.Store(true)
+	return true
+}
+
 // Stop shuts down ServiceManager, ConfigManager, the NATS client, and any
 // embedded NATS server in reverse boot order. It is idempotent once nil is returned.
 func (rt *Runtime) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rt.ready.Store(false)
+	rt.stopping.Store(true)
+	rt.initialReady.Store(false)
 
 	rt.stopMu.Lock()
 	defer rt.stopMu.Unlock()
@@ -359,26 +486,126 @@ func startEmbeddedNATS(ctx context.Context, storeDir string) (*natsserver.Server
 	return srv, nil
 }
 
-func openNATSClient(ctx context.Context, url string, metrics *metric.MetricsRegistry) (*natsclient.Client, error) {
-	var opts []natsclient.ClientOption
+func openNATSClient(ctx context.Context, rawURL string, logger *slog.Logger, secrets []string, metrics *metric.MetricsRegistry) (*natsclient.Client, error) {
+	opts := []natsclient.ClientOption{
+		natsclient.WithLogger(logger),
+	}
 	if metrics != nil {
 		opts = append(opts, natsclient.WithMetrics(metrics))
 	}
-	client, err := natsclient.NewClient(url, opts...)
+	client, err := natsclient.NewClient(rawURL, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("create NATS client: %w", err)
+		return nil, fmt.Errorf("create NATS client: %w", scrubSecretsError(err, secrets))
 	}
 	if err := client.Connect(ctx); err != nil {
 		_ = client.Close(ctx)
-		return nil, fmt.Errorf("connect NATS client: %w", err)
+		return nil, fmt.Errorf("connect NATS client: %w", scrubSecretsError(err, secrets))
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, natsConnectBound)
 	defer cancel()
 	if err := client.WaitForConnection(waitCtx); err != nil {
 		_ = client.Close(ctx)
-		return nil, fmt.Errorf("wait for NATS connection: %w", err)
+		return nil, fmt.Errorf("wait for NATS connection: %w", scrubSecretsError(err, secrets))
 	}
 	return client, nil
+}
+
+func scrubSecretsError(err error, secrets []string) error {
+	if err == nil || len(secrets) == 0 {
+		return err
+	}
+	msg := err.Error()
+	scrubbed := scrubStringSecrets(msg, secrets)
+	if scrubbed == msg {
+		return err
+	}
+	return errors.New(scrubbed)
+}
+
+func scrubStringSecrets(s string, secrets []string) string {
+	out := s
+	for _, secret := range secrets {
+		if secret == "" || !strings.Contains(out, secret) {
+			continue
+		}
+		if strings.Contains(secret, "://") || strings.Contains(secret, "@") {
+			out = strings.ReplaceAll(out, secret, RedactNATSURL(secret))
+		} else {
+			out = strings.ReplaceAll(out, secret, "<redacted>")
+		}
+	}
+	return out
+}
+
+type redactingSlogHandler struct {
+	inner   slog.Handler
+	secrets []string
+}
+
+func newRedactingLogger(base *slog.Logger, secrets []string) *slog.Logger {
+	if base == nil {
+		base = slog.Default()
+	}
+	return slog.New(&redactingSlogHandler{
+		inner:   base.Handler(),
+		secrets: secrets,
+	})
+}
+
+func (h *redactingSlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *redactingSlogHandler) Handle(ctx context.Context, rec slog.Record) error {
+	clean := slog.NewRecord(rec.Time, rec.Level, scrubStringSecrets(rec.Message, h.secrets), rec.PC)
+	rec.Attrs(func(a slog.Attr) bool {
+		clean.AddAttrs(h.scrubAttr(a))
+		return true
+	})
+	return h.inner.Handle(ctx, clean)
+}
+
+func (h *redactingSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	cleaned := make([]slog.Attr, len(attrs))
+	for i, a := range attrs {
+		cleaned[i] = h.scrubAttr(a)
+	}
+	return &redactingSlogHandler{
+		inner:   h.inner.WithAttrs(cleaned),
+		secrets: h.secrets,
+	}
+}
+
+func (h *redactingSlogHandler) WithGroup(name string) slog.Handler {
+	return &redactingSlogHandler{
+		inner:   h.inner.WithGroup(name),
+		secrets: h.secrets,
+	}
+}
+
+func (h *redactingSlogHandler) scrubAttr(a slog.Attr) slog.Attr {
+	val := a.Value.Resolve()
+	switch val.Kind() {
+	case slog.KindString:
+		s := val.String()
+		switch strings.ToLower(a.Key) {
+		case "urls", "url", "nats":
+			s = RedactNATSURL(s)
+		}
+		return slog.String(a.Key, scrubStringSecrets(s, h.secrets))
+	case slog.KindGroup:
+		group := val.Group()
+		cleaned := make([]any, len(group))
+		for i, ga := range group {
+			cleaned[i] = h.scrubAttr(ga)
+		}
+		return slog.Group(a.Key, cleaned...)
+	case slog.KindAny:
+		if errVal, ok := val.Any().(error); ok && errVal != nil {
+			return slog.Any(a.Key, scrubSecretsError(errVal, h.secrets))
+		}
+	}
+	return a
 }
 
 func setServerVersion(cfg *config.Config, ver string) error {

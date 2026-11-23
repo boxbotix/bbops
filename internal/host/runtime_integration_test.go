@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,18 +133,38 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 
 	endpoints := rt.Endpoints()
 
-	// 1. Verify /healthz (liveness) immediately, wait for /readyz (ADR-109 readiness across all components), and verify static UI fallback.
+	// 1. Verify /healthz liveness immediately, verify cold-start pre-ready gating on both /readyz and /,
+	// then wait with a bounded deadline for ADR-109 readiness and verify static UI + /services/health diagnostic JSON.
 	assertHTTPGet(t, endpoints.HTTPBaseURL+"/healthz", http.StatusOK, "OK")
-	waitForCondition(t, 15*time.Second, "/readyz returns 200 READY", func() bool {
-		resp, getErr := http.Get(endpoints.HTTPBaseURL + "/readyz") //nolint:noctx
-		if getErr != nil {
-			return false
-		}
-		defer func() { _ = resp.Body.Close() }()
-		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode == http.StatusOK && string(body) == "READY"
-	})
+	if rt.IsReady() {
+		t.Fatal("expected cold-start runtime to report IsReady=false before graph-websocket ENTITY_STATES catch-up")
+	}
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusServiceUnavailable, "NOT READY")
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/", http.StatusServiceUnavailable, "NOT READY")
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
 	assertHTTPGet(t, endpoints.HTTPBaseURL+"/", http.StatusOK, wantIndex)
+
+	svcHealthResp, err := http.Get(endpoints.HTTPBaseURL + "/services/health") //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET /services/health: %v", err)
+	}
+	svcHealthBody, err := io.ReadAll(svcHealthResp.Body)
+	_ = svcHealthResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read /services/health: %v", err)
+	}
+	if svcHealthResp.StatusCode != http.StatusOK || strings.Contains(string(svcHealthBody), wantIndex) {
+		t.Fatalf("GET /services/health = %d %q, want 200 JSON (not SPA)", svcHealthResp.StatusCode, string(svcHealthBody))
+	}
+	var svcHealthJSON map[string]any
+	if err := json.Unmarshal(svcHealthBody, &svcHealthJSON); err != nil {
+		t.Fatalf("unmarshal /services/health JSON %q: %v", string(svcHealthBody), err)
+	}
 
 	// 2. Independently verify JetStream ENTITY stream bounds and ENTITY_STATES KV History: 1 compaction.
 	js, err := rt.NATSClient().JetStream()
@@ -460,4 +483,150 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, check fu
 		time.Sleep(40 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", desc)
+}
+
+// spec: host-runtime / Host CLI version and flag entrypoint
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	dataDir := t.TempDir()
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>warm-cop</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+
+	portsA, err := host.AllocateLoopbackPorts(4)
+	if err != nil {
+		t.Fatalf("allocate boot-1 ports: %v", err)
+	}
+
+	// Boot 1: cold start on dataDir with explicit listener overrides portsA.
+	rt1, err := host.Start(ctx, host.Options{
+		DataDir: dataDir,
+		UIDir:   uiDir,
+		Version: "v0.2.0-boot1",
+		Overrides: host.PortOverrides{
+			BindHost:        "127.0.0.1",
+			HTTPPort:        portsA[0],
+			TelemetryWSPort: portsA[1],
+			GraphWSPort:     portsA[2],
+			MetricsPort:     portsA[3],
+		},
+	})
+	if err != nil {
+		t.Fatalf("Boot 1 Start: %v", err)
+	}
+	readyCtx1, readyCancel1 := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel1()
+	if err := rt1.WaitReady(readyCtx1); err != nil {
+		_ = rt1.Stop(context.Background())
+		t.Fatalf("Boot 1 WaitReady: %v", err)
+	}
+	assertHTTPGet(t, fmt.Sprintf("http://127.0.0.1:%d/readyz", portsA[0]), http.StatusOK, "READY")
+	assertMetricsReachable(t, portsA[3])
+	wsTel1 := dialWebSocketWithRetry(ctx, t, fmt.Sprintf("ws://127.0.0.1:%d/ws", portsA[1]))
+	_ = wsTel1.Close()
+	wsGraph1 := dialWebSocketWithRetry(ctx, t, fmt.Sprintf("ws://127.0.0.1:%d/ws", portsA[2]))
+	_ = wsGraph1.Close()
+
+	stopCtx1, stopCancel1 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stopCancel1()
+	if err := rt1.Stop(stopCtx1); err != nil {
+		t.Fatalf("Boot 1 Stop: %v", err)
+	}
+
+	// Allocate distinct port set B for Boot 2 on the same persisted JetStream KV store.
+	var portsB []int
+	for range 10 {
+		cand, allocErr := host.AllocateLoopbackPorts(4)
+		if allocErr != nil {
+			t.Fatalf("allocate boot-2 ports: %v", allocErr)
+		}
+		distinct := true
+		for _, pb := range cand {
+			for _, pa := range portsA {
+				if pb == pa {
+					distinct = false
+				}
+			}
+		}
+		if distinct {
+			portsB = cand
+			break
+		}
+	}
+	if len(portsB) != 4 {
+		t.Fatalf("failed to allocate 4 ports distinct from %v", portsA)
+	}
+
+	// Boot 2: warm restart against same dataDir (equal config version triggers syncFromKV).
+	rt2, err := host.Start(ctx, host.Options{
+		DataDir: dataDir,
+		UIDir:   uiDir,
+		Version: "v0.2.0-boot2",
+		Overrides: host.PortOverrides{
+			BindHost:        "127.0.0.1",
+			HTTPPort:        portsB[0],
+			TelemetryWSPort: portsB[1],
+			GraphWSPort:     portsB[2],
+			MetricsPort:     portsB[3],
+		},
+	})
+	if err != nil {
+		t.Fatalf("Boot 2 Start: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx2, stopCancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel2()
+		if stopErr := rt2.Stop(stopCtx2); stopErr != nil {
+			t.Errorf("Boot 2 Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx2, readyCancel2 := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel2()
+	if err := rt2.WaitReady(readyCtx2); err != nil {
+		t.Fatalf("Boot 2 WaitReady: %v", err)
+	}
+
+	ep2 := rt2.Endpoints()
+	if ep2.HTTPPort != portsB[0] || ep2.MetricsPort != portsB[3] ||
+		ep2.TelemetryWS != fmt.Sprintf("ws://127.0.0.1:%d/ws", portsB[1]) ||
+		ep2.GraphWS != fmt.Sprintf("ws://127.0.0.1:%d/ws", portsB[2]) {
+		t.Fatalf("Boot 2 advertised endpoints = %+v, want portsB %v", ep2, portsB)
+	}
+
+	// Verify every requested Boot 2 listener answers on portsB.
+	assertHTTPGet(t, fmt.Sprintf("http://127.0.0.1:%d/readyz", portsB[0]), http.StatusOK, "READY")
+	assertHTTPGet(t, fmt.Sprintf("http://127.0.0.1:%d/", portsB[0]), http.StatusOK, "<html>warm-cop</html>")
+	assertMetricsReachable(t, portsB[3])
+	wsTel2 := dialWebSocketWithRetry(ctx, t, ep2.TelemetryWS)
+	_ = wsTel2.Close()
+	wsGraph2 := dialWebSocketWithRetry(ctx, t, ep2.GraphWS)
+	_ = wsGraph2.Close()
+
+	// Verify every Boot 1 listener on portsA is gone.
+	for _, oldPort := range portsA {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(oldPort))
+		conn, dialErr := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			t.Fatalf("stale Boot 1 listener still accepting connections on %s", addr)
+		}
+	}
+}
+
+func assertMetricsReachable(t *testing.T, port int) {
+	t.Helper()
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s status = %d, want 200", url, resp.StatusCode)
+	}
 }

@@ -97,17 +97,24 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer, ve
 		return 1
 	}
 
-	endpoints := rt.Endpoints()
-	logger.Info("bbops host ready",
-		"version", ver,
-		"commit", sha,
-		"http", endpoints.HTTPBaseURL,
-		"telemetry_ws", endpoints.TelemetryWS,
-		"graph_ws", endpoints.GraphWS,
-		"nats", rt.NATSURL(),
-	)
-
-	<-ctx.Done()
+	if err := rt.WaitReady(ctx); err == nil {
+		endpoints := rt.Endpoints()
+		logger.Info("bbops host ready",
+			"version", ver,
+			"commit", sha,
+			"http", endpoints.HTTPBaseURL,
+			"telemetry_ws", endpoints.TelemetryWS,
+			"graph_ws", endpoints.GraphWS,
+			"nats", rt.NATSURL(),
+		)
+		<-ctx.Done()
+	} else if ctx.Err() == nil {
+		_, _ = fmt.Fprintf(stderr, "readiness failed: %v\n", err)
+		stopCtx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+		defer cancel()
+		_ = rt.Stop(stopCtx)
+		return 1
+	}
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
 	defer cancel()

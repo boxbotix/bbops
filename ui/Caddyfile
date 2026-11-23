@@ -49,7 +49,15 @@
 		reverse_proxy {$BACKEND_HOST:backend:8080}
 	}
 
+	handle /services/* {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
 	handle /components/* {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /storage-observability/* {
 		reverse_proxy {$BACKEND_HOST:backend:8080}
 	}
 
@@ -58,6 +66,10 @@
 	}
 
 	handle /docs {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /docs/* {
 		reverse_proxy {$BACKEND_HOST:backend:8080}
 	}
 

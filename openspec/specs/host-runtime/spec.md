@@ -39,4 +39,3 @@ The `bbops` host runtime SHALL mount `gateway/graph-gateway` at `POST /graph-gat
 #### Scenario: Entity ingest flows to SKG WebSocket snapshot/sync and GraphQL query while telemetry streams uncoalesced
 - **WHEN** a running `bbops` instance ingests a test entity on `entity.>` and receives a JSON frame on `bbops.telemetry.test`
 - **THEN** WebSocket #2 (`ENTITY_STATES`) delivers `put` and `synced` frames for the entity, `POST /graph-gateway/graphql` returns the entity state, and WebSocket #1 (`bbops.telemetry.>`) delivers the uncoalesced `data` frame for `bbops.telemetry.test`
-

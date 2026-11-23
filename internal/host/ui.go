@@ -26,7 +26,8 @@ func NewStaticUIMiddleware(uiDir string, isReady func() bool) service.HTTPMiddle
 				return
 			}
 			if isReady != nil && !isReady() {
-				next.ServeHTTP(w, r)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("NOT READY"))
 				return
 			}
 			if uiDir == "" {
@@ -95,6 +96,8 @@ func isReservedBackendPath(urlPath string) bool {
 		return true
 	}
 	for _, prefix := range []string{
+		"/services/",
+		"/docs/",
 		"/components/",
 		"/graph/",
 		"/graph-gateway/",

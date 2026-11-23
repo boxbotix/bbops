@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -392,4 +393,72 @@ func extractWebSocketURL(cfg *config.Config, componentName string) (string, int,
 		dialHost = "127.0.0.1"
 	}
 	return "ws://" + net.JoinHostPort(dialHost, strconv.Itoa(port)) + wsPath, port, nil
+}
+
+// RedactNATSURL strips userinfo, query parameters, fragments, and paths from one
+// or more comma-separated NATS server URLs, preserving only scheme, hostname,
+// and port (defaulting schemeless addresses to "nats"). Unparseable segments
+// return "<redacted>" so credentials never leak through malformed URLs.
+func RedactNATSURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, ",")
+	redacted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		seg := strings.TrimSpace(part)
+		if seg == "" {
+			continue
+		}
+		candidate := seg
+		if !strings.Contains(candidate, "://") {
+			candidate = "nats://" + candidate
+		}
+		u, err := url.Parse(candidate)
+		if err != nil || u.Scheme == "" || u.Hostname() == "" {
+			redacted = append(redacted, "<redacted>")
+			continue
+		}
+		host := u.Hostname()
+		if port := u.Port(); port != "" {
+			host = net.JoinHostPort(host, port)
+		} else if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		redacted = append(redacted, strings.ToLower(u.Scheme)+"://"+host)
+	}
+	return strings.Join(redacted, ",")
+}
+
+func extractNATSURLSecrets(raw string) []string {
+	var secrets []string
+	addSecret := func(s string) {
+		if s != "" && !slices.Contains(secrets, s) {
+			secrets = append(secrets, s)
+		}
+	}
+	for _, part := range strings.Split(strings.TrimSpace(raw), ",") {
+		seg := strings.TrimSpace(part)
+		if seg == "" {
+			continue
+		}
+		candidate := seg
+		if !strings.Contains(candidate, "://") {
+			candidate = "nats://" + candidate
+		}
+		if u, err := url.Parse(candidate); err == nil && u.User != nil {
+			addSecret(u.User.String())
+			addSecret(u.User.Username())
+			if pass, ok := u.User.Password(); ok {
+				addSecret(pass)
+			}
+			addSecret(seg)
+			continue
+		}
+		if strings.Contains(seg, "@") {
+			addSecret(seg)
+		}
+	}
+	return secrets
 }

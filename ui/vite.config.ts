@@ -21,7 +21,9 @@ export default defineConfig({
       "/readyz": "http://127.0.0.1:8080",
       "/services": "http://127.0.0.1:8080",
       "/components": "http://127.0.0.1:8080",
+      "/storage-observability": "http://127.0.0.1:8080",
       "/openapi.json": "http://127.0.0.1:8080",
+      "/docs": "http://127.0.0.1:8080",
       "/ws/telemetry": {
         target: "ws://127.0.0.1:8081",
         ws: true,
