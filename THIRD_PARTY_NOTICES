@@ -1,0 +1,42 @@
+# Third-Party Notices (`bbops`)
+
+`bbops` incorporates harness templates and clean-room configuration adaptations from the following permissively licensed Tier-1 upstream repositories:
+
+1. **ATeam (`C360Studio/ateam`) — MIT License**
+   Copyright (c) 2026 C360Studio
+   - Bootstrap harness templates (`ateam init` output under `.agents/`, `.claude/`, `.codex/`, `.gemini/`, `.mcp.json`, `CLAUDE.md`, `openspec/config.yaml`) and static SvelteKit adapter config (`ui/svelte.config.js` adapted from `ui/svelte.config.js`):
+     `C360Studio/ateam` @ `031e68563bf278ea197368929d2e24cfde767eec` (`v0.4.4`)
+   - Upstream host review manifests (`.agents/hosts/{enjoy,herdr,t3code}.toml`, adapted via `boxbotix/bbstack` below):
+     `C360Studio/ateam` `.agents/hosts/{enjoy,herdr,t3code}.toml` @ `797759e5d44f84af3d4913ffa99c52c3ae8639bf` (`v0.4.3`; unchanged in `v0.4.4` @ `031e68563bf278ea197368929d2e24cfde767eec`)
+
+2. **BoxBotix Stack (`boxbotix/bbstack`) — Apache-2.0 OR MIT (elected under MIT)**
+   Copyright (c) 2026 boxbotix
+   - Cross-provider model review policy (`.agents/review-policy.json`) and host review manifests (`.agents/hosts/{enjoy,herdr,t3code}.toml`):
+     `boxbotix/bbstack` `.agents/review-policy.json`, `.agents/hosts/enjoy.toml`, `.agents/hosts/herdr.toml`, `.agents/hosts/t3code.toml` @ `894ab3e94aee0cd0705bb8e46675bfeebcc57f3c`
+
+3. **SemBoids (`C360Studio/semboids`) — MIT License**
+   Copyright (c) 2026 Complete 360 Studio
+   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, and sentinel `ui/go.mod` boundary:
+     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
+
+---
+
+### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, and `C360Studio/semboids`)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

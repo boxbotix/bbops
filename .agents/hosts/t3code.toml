@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 boxbotix
+# Copyright (c) 2026 C360Studio
+#
+# Provenance: Adapted from boxbotix/bbstack .agents/hosts/t3code.toml
+# @ 894ab3e94aee0cd0705bb8e46675bfeebcc57f3c (Apache-2.0 OR MIT, elected under MIT),
+# which adapted C360Studio/ateam .agents/hosts/t3code.toml
+# @ 797759e5d44f84af3d4913ffa99c52c3ae8639bf (MIT; unchanged in v0.4.4
+# @ 031e68563bf278ea197368929d2e24cfde767eec).
+# Changes here alter review_launch: agent behavior and require owner review before merging to main.
+#
+# T3 Code gives agents inside a thread the t3-code MCP tool t3_thread_launch,
+# whose modelSelection carries the effort option, so the first review turn runs
+# at the eligible effort. Launch is tool text: T3's provider instance ids are not
+# ateam's agent names (claude is claudeAgent with option effort, codex is codex
+# with option reasoningEffort; there is no gemini driver). `t3 thread send`
+# queues a message into a thread without interrupting it. The reviewer thread
+# starts in the detached review checkout, not the project root (T3's default),
+# so its hooks write their lease there and never in main (#314).
+# Effort floor: use 'high' whenever {effort} is none, minimal, low, medium, or default.
+# Gemini guard: T3 Code has no Gemini provider driver, so when {agent} is gemini,
+# stop before creating a detached worktree and request the Gemini review on a
+# supported host (such as Enjoy Antigravity).
+
+[launch]
+tool = "if '{agent}' is 'gemini', stop before creating any worktree: T3 Code has no Gemini provider driver, so run the '{agent}:{model}' review at high effort on a supported host (such as Enjoy Antigravity); otherwise in the main checkout (the parent of git rev-parse --path-format=absolute --git-common-dir), run git worktree add --detach .worktrees/{agent}-review-pr-{pr} {sha}; then call the T3 Code MCP tool t3_thread_launch with workspaceStrategy {type: existing_worktree, worktreePath: <that checkout's absolute path>}, title 'review PR {pr}', message '{prompt} at {sha}; launch settings reported by the T3 Code host for this thread: provider {agent}, model {model}, reasoning effort <'high' when {effort} is none, minimal, low, medium, or default, else '{effort}'> (you cannot read these from inside the session; use them in your reviewed-by: line unless you have evidence they are wrong, and if you do, say so in the record); when your record is posted, run ateam review notify --record <record file> --return-to {return_to} {pr}', and modelSelection {instanceId: <claudeAgent for claude, codex for codex>, model: {model}, options: [{id: <effort for claude, reasoningEffort for codex>, value: <'high' when {effort} is none, minimal, low, medium, or default, else '{effort}'>}]}; omit projectId to use this thread's project"
+
+# The fixed message is appended as the last argument, never substituted.
+[notify]
+command = ["t3", "thread", "send", "{return_to}"]

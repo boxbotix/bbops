@@ -1,0 +1,99 @@
+version: "3"
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo "unknown"
+
+tasks:
+  default:
+    desc: List all available tasks
+    cmds:
+      - task --list
+
+  fmt:
+    desc: Format Go and Svelte/TypeScript sources
+    cmds:
+      - gofmt -w ./cmd
+      - npm --prefix ui run format
+
+  fmt:check:
+    desc: Fail on Go or UI formatting drift or untidy go.mod
+    cmds:
+      - |
+        drift=$(gofmt -l ./cmd)
+        if [ -n "$drift" ]; then
+          echo "gofmt drift:"
+          echo "$drift"
+          exit 1
+        fi
+      - GOTOOLCHAIN=auto go mod tidy -diff
+      - npm --prefix ui run format:check
+
+  lint:
+    desc: Run Go vet, golangci-lint, svelte-check, and ESLint
+    cmds:
+      - GOTOOLCHAIN=auto go vet ./...
+      - GOTOOLCHAIN=auto golangci-lint run ./...
+      - npm --prefix ui run check
+      - npm --prefix ui run lint
+
+  test:
+    desc: Run Go unit tests (-race) and Vitest UI tests
+    cmds:
+      - GOTOOLCHAIN=auto go test -race -count=1 ./...
+      - npm --prefix ui run test
+
+  build:
+    desc: Build static Svelte 5 UI and standalone ./bin/bbops binary
+    cmds:
+      - npm --prefix ui run build
+      - mkdir -p bin
+      - GOTOOLCHAIN=auto go build -ldflags "-X main.version={{.VERSION}} -X main.commit={{.COMMIT}}" -o bin/bbops ./cmd/bbops
+
+  mutate:
+    aliases: [mutate:check]
+    desc: "Run non-destructive Go -overlay mutation check (-- -pkg -test -file -mutant -expect or -expect-text)"
+    cmds:
+      - "GOTOOLCHAIN=auto ateam mutate {{.CLI_ARGS}}"
+
+  spec:check:
+    desc: "Validate OpenSpec changes/specs strictly and fail on a Hold: written outside every task"
+    cmds:
+      - openspec validate --all --strict --no-interactive
+      - ateam state spec-check
+
+  spec:queue:
+    desc: Show each in-flight OpenSpec change with its holds and blocking conditions
+    cmds:
+      - ateam state spec-queue
+
+  test:spec:
+    desc: Check deterministic Go and Vitest test-to-spec citations
+    cmds:
+      - ateam test-spec
+
+  doctor:
+    desc: Check ateam version pin, multi-agent parity, MCP schema budget, and hook latency
+    cmds:
+      - ateam doctor --check
+
+  verify:
+    desc: Run every Definition of Done gate and fail if verify mutates the working tree
+    cmds:
+      - |
+        before=$(git status --porcelain)
+        task fmt:check
+        task lint
+        task test
+        task spec:check
+        task test:spec
+        task doctor
+        after=$(git status --porcelain)
+        if [ "$before" != "$after" ]; then
+          echo "verify check: working tree changed during verify:"
+          echo "$after"
+          exit 1
+        fi
+

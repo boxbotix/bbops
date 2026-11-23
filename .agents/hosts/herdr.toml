@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 boxbotix
+# Copyright (c) 2026 C360Studio
+#
+# Provenance: Adapted from boxbotix/bbstack .agents/hosts/herdr.toml
+# @ 894ab3e94aee0cd0705bb8e46675bfeebcc57f3c (Apache-2.0 OR MIT, elected under MIT),
+# which adapted C360Studio/ateam .agents/hosts/herdr.toml
+# @ 797759e5d44f84af3d4913ffa99c52c3ae8639bf (MIT; unchanged in v0.4.4
+# @ 031e68563bf278ea197368929d2e24cfde767eec).
+# Changes here alter review_launch: agent behavior and require owner review before merging to main.
+#
+# herdr 0.9.5 starts an agent only in an existing pane at a shell prompt and
+# takes the prompt once the agent is ready (herdr agent start --help), so a
+# launch is three calls passing the new pane's id: there is no one-command form
+# to run, and the launch is tool text the agent follows. Arguments after -- go to
+# the selected agent's own CLI, whose model and effort flags differ by agent.
+# The new pane opens in the requester's checkout, so --env ATEAM_ROLE=review
+# keeps the reviewer's hooks off that checkout's writer lease (#315).
+# Effort floor: use 'high' whenever {effort} is none, minimal, low, medium, or default.
+# Gemini guard: the standalone gemini CLI exposes no reasoning-effort flag, so
+# when {agent} is gemini, stop before splitting a pane and request the Gemini
+# review on a host that pins reasoning effort (such as Enjoy Antigravity).
+
+[launch]
+tool = "if '{agent}' is 'gemini', stop before splitting any pane: the standalone gemini CLI exposes no reasoning-effort flag to enforce the 'high' review floor, so run the '{agent}:{model}' review at high effort on a host that pins Gemini reasoning effort (such as Enjoy Antigravity); otherwise run herdr pane split --pane {return_to} --direction right --no-focus --env ATEAM_ROLE=review and read the new pane id; then herdr agent start review-pr-{pr} --kind {agent} --pane <new pane id> -- <{agent}'s own flags for model {model} and effort <high when {effort} is none, minimal, low, medium, or default, else {effort}>: claude takes --model {model} --effort <resolved effort>, codex takes -m {model} -c model_reasoning_effort=<resolved effort>>; then herdr agent prompt <new pane id> '{prompt} at {sha}; launch settings reported by the herdr host for this pane: provider {agent}, model {model}, reasoning effort <high when {effort} is none, minimal, low, medium, or default, else {effort}> (you cannot read these from inside the session; use the actual settings in your reviewed-by: line unless you have evidence they are wrong, and if you do, say so in the record); finish with ateam review notify --record <record file> --return-to {return_to} {pr}' (substitute every <...> placeholder before running, except leave literal '<record file>' for the reviewer to fill)"
+
+# The fixed message is appended as the last argument, never substituted.
+[notify]
+command = ["herdr", "agent", "prompt", "{return_to}"]
