@@ -1,0 +1,22 @@
+# Enjoy host manifest for ateam review request and notify (adapted from
+# C360Studio/ateam v0.4.4). Changes here alter review_launch: agent behavior
+# and require owner review before merging to main.
+#
+# Enjoy is MCP-only: it starts and messages conversations through its MCP
+# tools, never a command, so both actions are tool text the agent follows.
+# Enjoy puts no conversation id in the environment: pass your conversation id
+# as --return-to to ateam review request, and the reviewer passes its own
+# conversation id as --from and the launch spec's return_to to ateam review notify.
+#
+# Permission inheritance: omit permissionMode on start_conversation so the
+# reviewer inherits within the parent session's permission ceiling and never
+# requests broader permissions than a restricted parent allows.
+# Effort floor: enforce at least 'high' reasoning on every review launch
+# (both default codex:gpt-6.2-astra and cross-provider fallbacks) whenever
+# {effort} resolves to a low/mid band value (none, minimal, low, medium, default).
+
+[launch]
+tool = "call the Enjoy MCP tool start_conversation with title 'Review PR #{pr}', agent {provider: <'antigravity' when {agent} is gemini, else '{agent}'>, model: '{model}', reasoning: <'high' when {effort} is none, minimal, low, medium, or default, else '{effort}'>} (all three; omit permissionMode to inherit within this conversation's permissions; if start_conversation rejects that reasoning value, rerun ateam review request with --reviewer {agent}:{model}:<a high-band effort list_agents offers> rather than launching without one), and text set to '{prompt} at {sha}' then a blank line and 'Launch settings reported by the Enjoy host for this conversation: provider {agent}, model {model}, reasoning effort <'high' when {effort} is none, minimal, low, medium, or default, else '{effort}'>. You cannot read these from inside the session. Use them in your reviewed-by: line unless you have evidence they are wrong; if you do, say so in the record. Finish with ATEAM_HOST=enjoy ateam review notify --record <record file> --from <your Enjoy conversation id> --return-to {return_to} {pr}, then call the queue_message it prints.'"
+
+[notify]
+tool = "call the Enjoy MCP tool queue_message with conversationId '{return_to}' and text set to the message below (message_project_conversation only when that conversation is in another project)"

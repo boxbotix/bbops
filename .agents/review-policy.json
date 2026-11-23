@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "model_tiers": {
+    "frontier": [
+      "codex:gpt-6.2-astra",
+      "codex:gpt-6-astra",
+      "claude:opus",
+      "claude:claude-opus-5-5",
+      "claude:claude-opus-5",
+      "claude:claude-opus-4-8",
+      "claude:claude-opus-4-7",
+      "claude:claude-opus-4-6",
+      "claude:fable",
+      "claude:claude-fable-5-1",
+      "claude:claude-fable-5",
+      "gemini:gemini-4-hydrogen",
+      "gemini:gemini-4-neon",
+      "gemini:gemini-4-argon",
+      "gemini:gemini-4-carbon"
+    ],
+    "workhorse": [
+      "codex:gpt-6.2-sol",
+      "codex:gpt-6.1-terra",
+      "codex:gpt-6.1-sol",
+      "codex:gpt-6-sol",
+      "claude:sonnet",
+      "claude:claude-sonnet-5-5",
+      "claude:claude-sonnet-5",
+      "claude:claude-sonnet-4-6",
+      "gemini:gemini-3.1-pro"
+    ],
+    "light": [
+      "codex:gpt-6-luna",
+      "codex:gpt-5.6-sol",
+      "codex:gpt-5.6-terra",
+      "codex:gpt-5.6-luna",
+      "codex:gpt-5.4",
+      "claude:haiku",
+      "claude:claude-haiku-4-5",
+      "claude:claude-haiku-4-5-20251001",
+      "gemini:gemini-3.8-flash"
+    ]
+  },
+  "effort_bands": {
+    "claude": {
+      "low": ["low"],
+      "mid": ["medium"],
+      "high": ["high", "xhigh", "max", "ultracode"]
+    },
+    "codex": {
+      "low": ["low", "minimal", "none"],
+      "mid": ["medium"],
+      "high": ["high", "xhigh", "max", "ultra"]
+    },
+    "gemini": {
+      "low": ["low", "minimal"],
+      "mid": ["medium", "default"],
+      "high": ["high", "xhigh"]
+    }
+  },
+  "cross_provider": true,
+  "review_launch": "agent"
+}
