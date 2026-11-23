@@ -1,6 +1,7 @@
 package uxsvocab
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -208,10 +209,41 @@ func (s *VehicleSnapshot) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*alias)(s))
 }
 
-// UnmarshalJSON implements json.Unmarshaler for message.Payload.
+// UnmarshalJSON implements json.Unmarshaler for message.Payload, validating
+// exact vector lengths for quaternion (4), body_rates (3), and ned (3) before
+// copying into fixed arrays so encoding/json never zero-pads or truncates.
 func (s *VehicleSnapshot) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("uxsvocab: null vehicle snapshot")
+	}
 	type alias VehicleSnapshot
-	return json.Unmarshal(data, (*alias)(s))
+	var base alias
+	aux := struct {
+		*alias
+		Quaternion []float64 `json:"quaternion"`
+		BodyRates  []float64 `json:"body_rates"`
+		NED        []float64 `json:"ned"`
+	}{
+		alias: &base,
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(aux.Quaternion) != len(s.Quaternion) {
+		return fmt.Errorf("uxsvocab: quaternion array length %d, want %d", len(aux.Quaternion), len(s.Quaternion))
+	}
+	if len(aux.BodyRates) != len(s.BodyRates) {
+		return fmt.Errorf("uxsvocab: body_rates array length %d, want %d", len(aux.BodyRates), len(s.BodyRates))
+	}
+	if len(aux.NED) != len(s.NED) {
+		return fmt.Errorf("uxsvocab: ned array length %d, want %d", len(aux.NED), len(s.NED))
+	}
+	next := VehicleSnapshot(base)
+	copy(next.Quaternion[:], aux.Quaternion)
+	copy(next.BodyRates[:], aux.BodyRates)
+	copy(next.NED[:], aux.NED)
+	*s = next
+	return nil
 }
 
 // EntityID implements graph.Graphable, returning `<org>.<platform>.robotics.uxs.vehicle.<sysid>`

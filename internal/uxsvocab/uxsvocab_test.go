@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/c360studio/semengine/graph"
+	"github.com/c360studio/semengine/message"
 	"github.com/c360studio/semengine/payloadregistry"
 	semtypes "github.com/c360studio/semengine/pkg/types"
 	"github.com/c360studio/semengine/vocabulary"
@@ -376,5 +377,116 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 	}
 	if err := RegisterPayloads(reg); err == nil {
 		t.Fatal("duplicate RegisterPayloads succeeded, want error")
+	}
+}
+
+// spec: mavlink-ingest / Constant-predicate Graphable vehicle snapshot payload
+func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
+	reg := payloadregistry.New()
+	if err := RegisterPayloads(reg); err != nil {
+		t.Fatalf("RegisterPayloads: %v", err)
+	}
+	dec := message.NewDecoder(reg)
+
+	valid := &VehicleSnapshot{
+		Org:           "boxbotix",
+		Platform:      "gcs01",
+		SysID:         7,
+		Title:         "ROVER-7",
+		Domain:        DomainRover,
+		Authority:     AuthorityCompanionTeleop,
+		CompanionMode: ModeTeleopVelocity,
+		LinkTier:      LinkTierMeshHighRate,
+		Armed:         true,
+		Quaternion:    [4]float64{1, 0, 0, 0},
+		BodyRates:     [3]float64{0.1, -0.2, 0.3},
+		NED:           [3]float64{10.5, -4.25, 0.0},
+		HeadingDeg:    90.0,
+		Latitude:      37.7749,
+		Longitude:     -122.4194,
+		Altitude:      12.5,
+		ObservedAt:    time.Date(2026, 11, 23, 18, 0, 0, 0, time.UTC),
+	}
+
+	validEnvelope, err := json.Marshal(message.NewBaseMessage(valid.Schema(), valid, "decoder-test"))
+	if err != nil {
+		t.Fatalf("marshal valid BaseMessage: %v", err)
+	}
+	decodedMsg, err := dec.Decode(validEnvelope)
+	if err != nil {
+		t.Fatalf("dec.Decode(validEnvelope): %v", err)
+	}
+	gotSnap, ok := decodedMsg.Payload().(*VehicleSnapshot)
+	if !ok {
+		t.Fatalf("decoded payload = %T, want *VehicleSnapshot", decodedMsg.Payload())
+	}
+	if gotSnap.Quaternion != valid.Quaternion || gotSnap.BodyRates != valid.BodyRates || gotSnap.NED != valid.NED {
+		t.Fatalf("decoded vectors = (%v, %v, %v), want (%v, %v, %v)",
+			gotSnap.Quaternion, gotSnap.BodyRates, gotSnap.NED,
+			valid.Quaternion, valid.BodyRates, valid.NED)
+	}
+
+	invalidCases := []struct {
+		name   string
+		field  string
+		rawVal any
+		omit   bool
+	}{
+		{name: "quaternion empty", field: "quaternion", rawVal: []float64{}},
+		{name: "quaternion short len 2", field: "quaternion", rawVal: []float64{0.5, 0.5}},
+		{name: "quaternion short len 3", field: "quaternion", rawVal: []float64{1, 0, 0}},
+		{name: "quaternion oversized len 5", field: "quaternion", rawVal: []float64{1, 0, 0, 0, 0}},
+		{name: "quaternion null", field: "quaternion", rawVal: nil},
+		{name: "quaternion omitted", field: "quaternion", omit: true},
+		{name: "body_rates empty", field: "body_rates", rawVal: []float64{}},
+		{name: "body_rates short len 2", field: "body_rates", rawVal: []float64{0.1, 0.2}},
+		{name: "body_rates oversized len 4", field: "body_rates", rawVal: []float64{0.1, 0.2, 0.3, 0.4}},
+		{name: "body_rates null", field: "body_rates", rawVal: nil},
+		{name: "body_rates omitted", field: "body_rates", omit: true},
+		{name: "ned empty", field: "ned", rawVal: []float64{}},
+		{name: "ned short len 2", field: "ned", rawVal: []float64{1.0, 2.0}},
+		{name: "ned oversized len 4", field: "ned", rawVal: []float64{1.0, 2.0, 3.0, 4.0}},
+		{name: "ned null", field: "ned", rawVal: nil},
+		{name: "ned omitted", field: "ned", omit: true},
+	}
+
+	for _, tc := range invalidCases {
+		var envelope map[string]any
+		if err := json.Unmarshal(validEnvelope, &envelope); err != nil {
+			t.Fatalf("unmarshal validEnvelope map: %v", err)
+		}
+		payloadMap, ok := envelope["payload"].(map[string]any)
+		if !ok {
+			t.Fatalf("envelope[payload] = %T, want map[string]any", envelope["payload"])
+		}
+		if tc.omit {
+			delete(payloadMap, tc.field)
+		} else {
+			payloadMap[tc.field] = tc.rawVal
+		}
+		tamperedEnvelope, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatalf("marshal tampered envelope (%s): %v", tc.name, err)
+		}
+		if _, err := dec.Decode(tamperedEnvelope); err == nil {
+			t.Fatalf("dec.Decode(%s) succeeded, want error", tc.name)
+		}
+
+		// Also verify direct UnmarshalJSON leaves a pre-populated struct untouched on failure.
+		tamperedPayload, err := json.Marshal(payloadMap)
+		if err != nil {
+			t.Fatalf("marshal tampered payload (%s): %v", tc.name, err)
+		}
+		preserved := *valid
+		if err := json.Unmarshal(tamperedPayload, &preserved); err == nil {
+			t.Fatalf("json.Unmarshal(%s) succeeded, want error", tc.name)
+		}
+		if !reflect.DeepEqual(&preserved, valid) {
+			t.Fatalf("failed json.Unmarshal(%s) mutated target struct: got %+v, want %+v", tc.name, preserved, *valid)
+		}
+	}
+
+	if err := json.Unmarshal([]byte("null"), &VehicleSnapshot{}); err == nil {
+		t.Fatal("json.Unmarshal(null) succeeded, want error")
 	}
 }

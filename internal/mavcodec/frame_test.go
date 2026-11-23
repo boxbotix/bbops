@@ -334,11 +334,14 @@ func TestFrameCodecErrorPaths(t *testing.T) {
 		t.Fatalf("DecodeFrame(signed flag 0x01) err = %v, want ErrInvalidFrame", err)
 	}
 
-	// 7. Zero sysid or compid in V2 header.
-	zeroSysID := bytes.Clone(validWire)
-	zeroSysID[5] = 0
-	if _, err := DecodeFrame(zeroSysID); err == nil {
-		t.Fatal("DecodeFrame(sysid=0) succeeded, want error")
+	// 7. Zero sysid or compid in V2 header with independently computed valid X.25 CRCs.
+	zeroSysID := buildRawV2Packet(5, 0, CompIDAutopilot1, MsgIDHeartbeat, []byte{0x00}, 50)
+	if _, err := DecodeFrame(zeroSysID); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("DecodeFrame(valid-CRC sysid=0) err = %v, want ErrInvalidFrame", err)
+	}
+	zeroCompID := buildRawV2Packet(5, 1, 0, MsgIDHeartbeat, []byte{0x00}, 50)
+	if _, err := DecodeFrame(zeroCompID); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("DecodeFrame(valid-CRC compid=0) err = %v, want ErrInvalidFrame", err)
 	}
 
 	// 8. Unsupported message IDs (#24 GPS_RAW_INT, #30 ATTITUDE, #75 COMMAND_INT, #9999).
@@ -362,17 +365,172 @@ func TestFrameCodecErrorPaths(t *testing.T) {
 		}
 	}
 
-	// 9. EncodeFrame validation errors.
+	// 9. EncodeFrame validation errors (including typed nil pointers for all 9 contract types).
 	encodeRejects := []Frame{
 		{SystemID: 0, ComponentID: 1, Message: Heartbeat{}},
 		{SystemID: 1, ComponentID: 0, Message: Heartbeat{}},
 		{SystemID: 1, ComponentID: 1, Message: nil},
+		{SystemID: 1, ComponentID: 1, Message: (*Heartbeat)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*SysStatus)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*AttitudeQuaternion)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*LocalPositionNED)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*GlobalPositionInt)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*CommandLong)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*CommandAck)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*SetPositionTargetLocalNED)(nil)},
+		{SystemID: 1, ComponentID: 1, Message: (*StatusText)(nil)},
 		{SystemID: 1, ComponentID: 1, Message: StatusText{Severity: 3, Text: strings.Repeat("A", MaxStatusTextBytes+1)}},
 		{SystemID: 1, ComponentID: 1, Message: StatusText{Severity: 3, Text: "bad\x00nul"}},
 	}
 	for i, bad := range encodeRejects {
 		if _, err := EncodeFrame(bad); !errors.Is(err, ErrInvalidFrame) {
 			t.Fatalf("EncodeFrame(invalid[%d]) err = %v, want ErrInvalidFrame", i, err)
+		}
+	}
+}
+
+func buildRawV2Packet(seq, sysid, compid uint8, msgID uint32, payload []byte, crcExtra byte) []byte {
+	pkt := make([]byte, 0, 12+len(payload))
+	pkt = append(pkt,
+		V2MagicByte,
+		byte(len(payload)),
+		0, 0, // incompat_flags, compat_flags
+		seq,
+		sysid,
+		compid,
+		byte(msgID), byte(msgID>>8), byte(msgID>>16),
+	)
+	pkt = append(pkt, payload...)
+	crc := crc16MCRF4XX(pkt[1:], crcExtra)
+	return binary.LittleEndian.AppendUint16(pkt, crc)
+}
+
+// spec: mavlink-ingest / Clean-room common.xml MAVLink v2 frame codec and zero-GPLv3 dependency guard
+func TestFrameCodecPayloadTruncationBoundaryAndPointerMessages(t *testing.T) {
+	specs := []struct {
+		msgID    uint32
+		crcExtra byte
+		zeroVal  Message
+		zeroPtr  Message
+		sampleV  Message
+		sampleP  Message
+	}{
+		{
+			msgID: MsgIDHeartbeat, crcExtra: 50,
+			zeroVal: Heartbeat{}, zeroPtr: &Heartbeat{},
+			sampleV: Heartbeat{Type: MAVTypeGroundRover, BaseMode: ModeFlagCustomModeEnabled, CustomMode: 0xB1001001, MAVLinkVersion: 3},
+			sampleP: &Heartbeat{Type: MAVTypeGroundRover, BaseMode: ModeFlagCustomModeEnabled, CustomMode: 0xB1001001, MAVLinkVersion: 3},
+		},
+		{
+			msgID: MsgIDSysStatus, crcExtra: 124,
+			zeroVal: SysStatus{}, zeroPtr: &SysStatus{},
+			sampleV: SysStatus{Load: 450, VoltageBattery: 16200, ErrorsComm: 2},
+			sampleP: &SysStatus{Load: 450, VoltageBattery: 16200, ErrorsComm: 2},
+		},
+		{
+			msgID: MsgIDAttitudeQuaternion, crcExtra: 246,
+			zeroVal: AttitudeQuaternion{}, zeroPtr: &AttitudeQuaternion{},
+			sampleV: AttitudeQuaternion{TimeBootMs: 42, Q1: 1, Rollspeed: 0.25},
+			sampleP: &AttitudeQuaternion{TimeBootMs: 42, Q1: 1, Rollspeed: 0.25},
+		},
+		{
+			msgID: MsgIDLocalPositionNED, crcExtra: 185,
+			zeroVal: LocalPositionNED{}, zeroPtr: &LocalPositionNED{},
+			sampleV: LocalPositionNED{TimeBootMs: 99, X: 3.5, Y: -1.25, Z: -10.0, Vx: 1.5},
+			sampleP: &LocalPositionNED{TimeBootMs: 99, X: 3.5, Y: -1.25, Z: -10.0, Vx: 1.5},
+		},
+		{
+			msgID: MsgIDGlobalPositionInt, crcExtra: 104,
+			zeroVal: GlobalPositionInt{}, zeroPtr: &GlobalPositionInt{},
+			sampleV: GlobalPositionInt{TimeBootMs: 120, Lat: 377749000, Lon: -1224194000, Alt: 15000, Hdg: 18000},
+			sampleP: &GlobalPositionInt{TimeBootMs: 120, Lat: 377749000, Lon: -1224194000, Alt: 15000, Hdg: 18000},
+		},
+		{
+			msgID: MsgIDCommandLong, crcExtra: 152,
+			zeroVal: CommandLong{}, zeroPtr: &CommandLong{},
+			sampleV: CommandLong{TargetSystem: 1, TargetComponent: 1, Command: 400, Param1: 1},
+			sampleP: &CommandLong{TargetSystem: 1, TargetComponent: 1, Command: 400, Param1: 1},
+		},
+		{
+			msgID: MsgIDCommandAck, crcExtra: 143,
+			zeroVal: CommandAck{}, zeroPtr: &CommandAck{},
+			sampleV: CommandAck{Command: 400, Result: 0, Progress: 100, TargetSystem: 255, TargetComponent: 190},
+			sampleP: &CommandAck{Command: 400, Result: 0, Progress: 100, TargetSystem: 255, TargetComponent: 190},
+		},
+		{
+			msgID: MsgIDSetPositionTargetLocalNED, crcExtra: 143,
+			zeroVal: SetPositionTargetLocalNED{}, zeroPtr: &SetPositionTargetLocalNED{},
+			sampleV: SetPositionTargetLocalNED{TargetSystem: 2, TargetComponent: 1, CoordinateFrame: 1, TypeMask: 0x07C7, Vx: 2.0, YawRate: 0.1},
+			sampleP: &SetPositionTargetLocalNED{TargetSystem: 2, TargetComponent: 1, CoordinateFrame: 1, TypeMask: 0x07C7, Vx: 2.0, YawRate: 0.1},
+		},
+		{
+			msgID: MsgIDStatusText, crcExtra: 83,
+			zeroVal: StatusText{}, zeroPtr: &StatusText{},
+			sampleV: StatusText{Severity: 4, Text: "deadman clamped"},
+			sampleP: &StatusText{Severity: 4, Text: "deadman clamped"},
+		},
+	}
+
+	for _, tc := range specs {
+		// 1. 0-byte empty wire payload with valid X.25 CRC MUST be rejected with ErrInvalidFrame.
+		emptyWire := buildRawV2Packet(9, 1, CompIDAutopilot1, tc.msgID, nil, tc.crcExtra)
+		if len(emptyWire) != 12 {
+			t.Fatalf("msg #%d emptyWire len = %d, want 12", tc.msgID, len(emptyWire))
+		}
+		_, err := DecodeFrame(emptyWire)
+		if !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("msg #%d DecodeFrame(0-byte payload) err = %v, want ErrInvalidFrame", tc.msgID, err)
+		}
+		var decErr *DecodeError
+		if !errors.As(err, &decErr) || decErr.MessageID != tc.msgID {
+			t.Fatalf("msg #%d DecodeError = %+v, want MessageID=%d", tc.msgID, decErr, tc.msgID)
+		}
+
+		// 2. 1-byte all-zero wire payload ([0x00], 13 bytes total) with valid X.25 CRC MUST succeed
+		// and match EncodeFrame on both value and pointer zero structs.
+		oneZeroWire := buildRawV2Packet(9, 1, CompIDAutopilot1, tc.msgID, []byte{0x00}, tc.crcExtra)
+		if len(oneZeroWire) != 13 {
+			t.Fatalf("msg #%d oneZeroWire len = %d, want 13", tc.msgID, len(oneZeroWire))
+		}
+		decodedZero, err := DecodeFrame(oneZeroWire)
+		if err != nil {
+			t.Fatalf("msg #%d DecodeFrame(1-byte zero payload): %v", tc.msgID, err)
+		}
+		wantZeroFrame := Frame{Sequence: 9, SystemID: 1, ComponentID: CompIDAutopilot1, Message: tc.zeroVal}
+		if !framesEqualBitwise(decodedZero, wantZeroFrame) {
+			t.Fatalf("msg #%d decoded 1-byte zero = %+v, want %+v", tc.msgID, decodedZero, wantZeroFrame)
+		}
+
+		encZeroVal, err := EncodeFrame(wantZeroFrame)
+		if err != nil {
+			t.Fatalf("msg #%d EncodeFrame(zeroVal): %v", tc.msgID, err)
+		}
+		encZeroPtr, err := EncodeFrame(Frame{Sequence: 9, SystemID: 1, ComponentID: CompIDAutopilot1, Message: tc.zeroPtr})
+		if err != nil {
+			t.Fatalf("msg #%d EncodeFrame(zeroPtr): %v", tc.msgID, err)
+		}
+		if !bytes.Equal(encZeroVal, oneZeroWire) || !bytes.Equal(encZeroPtr, oneZeroWire) {
+			t.Fatalf("msg #%d zero wire mismatch: val=%x ptr=%x oracle=%x", tc.msgID, encZeroVal, encZeroPtr, oneZeroWire)
+		}
+
+		// 3. Populated value and pointer Message forms produce byte-identical wire packets and decode identically.
+		encSampleVal, err := EncodeFrame(Frame{Sequence: 21, SystemID: 3, ComponentID: CompIDAutopilot1, Message: tc.sampleV})
+		if err != nil {
+			t.Fatalf("msg #%d EncodeFrame(sampleV): %v", tc.msgID, err)
+		}
+		encSamplePtr, err := EncodeFrame(Frame{Sequence: 21, SystemID: 3, ComponentID: CompIDAutopilot1, Message: tc.sampleP})
+		if err != nil {
+			t.Fatalf("msg #%d EncodeFrame(sampleP): %v", tc.msgID, err)
+		}
+		if !bytes.Equal(encSampleVal, encSamplePtr) {
+			t.Fatalf("msg #%d value vs pointer wire bytes differ: val=%x ptr=%x", tc.msgID, encSampleVal, encSamplePtr)
+		}
+		decSample, err := DecodeFrame(encSamplePtr)
+		if err != nil {
+			t.Fatalf("msg #%d DecodeFrame(encSamplePtr): %v", tc.msgID, err)
+		}
+		if !framesEqualBitwise(decSample, Frame{Sequence: 21, SystemID: 3, ComponentID: CompIDAutopilot1, Message: tc.sampleV}) {
+			t.Fatalf("msg #%d pointer round-trip mismatch: got %+v", tc.msgID, decSample)
 		}
 	}
 }

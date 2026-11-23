@@ -310,9 +310,6 @@ func DecodeFrame(data []byte) (Frame, error) {
 	if !ok {
 		return Frame{}, newDecodeError(ErrNonV2Frame, fmt.Sprintf("decoded %T, expected *frame.V2Frame", fr))
 	}
-	if v2.IncompatibilityFlag != 0 {
-		return Frame{}, newDecodeError(ErrInvalidFrame, fmt.Sprintf("unsupported v2 incompatibility flag 0x%02X", v2.IncompatibilityFlag))
-	}
 	if v2.SystemID == 0 || v2.ComponentID == 0 {
 		return Frame{}, newDecodeError(ErrInvalidFrame, fmt.Sprintf("invalid sender header sysid=%d compid=%d", v2.SystemID, v2.ComponentID))
 	}
@@ -320,6 +317,13 @@ func DecodeFrame(data []byte) (Frame, error) {
 	domainMsg, err := fromWireMessage(v2.Message)
 	if err != nil {
 		return Frame{}, err
+	}
+	if data[1] == 0 {
+		return Frame{}, &DecodeError{
+			Kind:      ErrInvalidFrame,
+			MessageID: domainMsg.MessageID(),
+			Detail:    fmt.Sprintf("empty v2 payload for non-empty message #%d", domainMsg.MessageID()),
+		}
 	}
 	return Frame{
 		Sequence:    v2.SequenceNumber,
@@ -329,8 +333,64 @@ func DecodeFrame(data []byte) (Frame, error) {
 	}, nil
 }
 
-func toWireMessage(msg Message) (message.Message, error) {
+func derefMessage(msg Message) (Message, error) {
 	switch m := msg.(type) {
+	case *Heartbeat:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *Heartbeat message")
+		}
+		return *m, nil
+	case *SysStatus:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *SysStatus message")
+		}
+		return *m, nil
+	case *AttitudeQuaternion:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *AttitudeQuaternion message")
+		}
+		return *m, nil
+	case *LocalPositionNED:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *LocalPositionNED message")
+		}
+		return *m, nil
+	case *GlobalPositionInt:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *GlobalPositionInt message")
+		}
+		return *m, nil
+	case *CommandLong:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *CommandLong message")
+		}
+		return *m, nil
+	case *CommandAck:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *CommandAck message")
+		}
+		return *m, nil
+	case *SetPositionTargetLocalNED:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *SetPositionTargetLocalNED message")
+		}
+		return *m, nil
+	case *StatusText:
+		if m == nil {
+			return nil, newDecodeError(ErrInvalidFrame, "typed nil *StatusText message")
+		}
+		return *m, nil
+	default:
+		return msg, nil
+	}
+}
+
+func toWireMessage(msg Message) (message.Message, error) {
+	valMsg, err := derefMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	switch m := valMsg.(type) {
 	case Heartbeat:
 		return &common.MessageHeartbeat{
 			Type:           common.MAV_TYPE(m.Type),
