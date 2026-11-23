@@ -24,9 +24,14 @@
    - Embedded Semantic Knowledge Graph (SKG) runtime dependency (`github.com/c360studio/semengine v0.1.0-alpha.7`) and component port configuration schema (`configs/bbops.json` adapted from `config/example_config.json`):
      `C360Studio/semengine` `config/example_config.json` @ `3d89a31775219e7f7aaa44ab10892bbc804ae08e` (`v0.1.0-alpha.7`)
 
+5. **gomavlib (`bluenviron/gomavlib`) — MIT License**
+   Copyright (c) 2019 aler9
+   - MAVLink v2 (`0xFD`) packet framing, X.25 CRC, and MIT `minimal.xml` / `standard.xml` / `common.xml` generated dialect structs (`github.com/bluenviron/gomavlib/v3 v3.3.5`, restricted strictly to `pkg/dialect`, `pkg/dialects/{common,minimal,standard}`, `pkg/frame`, `pkg/message`, and `pkg/x25` with zero vendor dialect imports):
+     `bluenviron/gomavlib` @ `33ff3fce8d7f2e832e08e08cf02b946de821208e` (`v3.3.5`)
+
 ---
 
-### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, and `C360Studio/semengine`)
+### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, `C360Studio/semengine`, and `bluenviron/gomavlib`)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/config"
 	"github.com/c360studio/semengine/graph/kvcatalog"
@@ -194,6 +195,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	payloadReg := payloadregistry.New()
+	if err := uxsvocab.RegisterPayloads(payloadReg); err != nil {
+		return cleanup(fmt.Errorf("register uxs payloads: %w", err))
+	}
 	if opts.RegisterPayloads != nil {
 		if err := opts.RegisterPayloads(payloadReg); err != nil {
 			return cleanup(fmt.Errorf("register payloads: %w", err))
