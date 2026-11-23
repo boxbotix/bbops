@@ -210,8 +210,9 @@ func (s *VehicleSnapshot) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON implements json.Unmarshaler for message.Payload, validating
-// exact vector lengths for quaternion (4), body_rates (3), and ned (3) before
-// copying into fixed arrays so encoding/json never zero-pads or truncates.
+// exact vector lengths and non-null numeric elements for quaternion (4),
+// body_rates (3), and ned (3) before copying into fixed arrays so encoding/json
+// never zero-pads, truncates, or coerces null elements to 0.
 func (s *VehicleSnapshot) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return errors.New("uxsvocab: null vehicle snapshot")
@@ -220,29 +221,39 @@ func (s *VehicleSnapshot) UnmarshalJSON(data []byte) error {
 	var base alias
 	aux := struct {
 		*alias
-		Quaternion []float64 `json:"quaternion"`
-		BodyRates  []float64 `json:"body_rates"`
-		NED        []float64 `json:"ned"`
+		Quaternion []*float64 `json:"quaternion"`
+		BodyRates  []*float64 `json:"body_rates"`
+		NED        []*float64 `json:"ned"`
 	}{
 		alias: &base,
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	if len(aux.Quaternion) != len(s.Quaternion) {
-		return fmt.Errorf("uxsvocab: quaternion array length %d, want %d", len(aux.Quaternion), len(s.Quaternion))
-	}
-	if len(aux.BodyRates) != len(s.BodyRates) {
-		return fmt.Errorf("uxsvocab: body_rates array length %d, want %d", len(aux.BodyRates), len(s.BodyRates))
-	}
-	if len(aux.NED) != len(s.NED) {
-		return fmt.Errorf("uxsvocab: ned array length %d, want %d", len(aux.NED), len(s.NED))
-	}
 	next := VehicleSnapshot(base)
-	copy(next.Quaternion[:], aux.Quaternion)
-	copy(next.BodyRates[:], aux.BodyRates)
-	copy(next.NED[:], aux.NED)
+	if err := copyStrictFloat64Vector("quaternion", aux.Quaternion, next.Quaternion[:]); err != nil {
+		return err
+	}
+	if err := copyStrictFloat64Vector("body_rates", aux.BodyRates, next.BodyRates[:]); err != nil {
+		return err
+	}
+	if err := copyStrictFloat64Vector("ned", aux.NED, next.NED[:]); err != nil {
+		return err
+	}
 	*s = next
+	return nil
+}
+
+func copyStrictFloat64Vector(name string, elems []*float64, dst []float64) error {
+	if len(elems) != len(dst) {
+		return fmt.Errorf("uxsvocab: %s array length %d, want %d", name, len(elems), len(dst))
+	}
+	for i, elem := range elems {
+		if elem == nil {
+			return fmt.Errorf("uxsvocab: %s[%d] is null", name, i)
+		}
+		dst[i] = *elem
+	}
 	return nil
 }
 

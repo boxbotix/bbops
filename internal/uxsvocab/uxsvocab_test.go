@@ -426,6 +426,27 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 			valid.Quaternion, valid.BodyRates, valid.NED)
 	}
 
+	// Numeric-zero control: explicit 0 components across all 3 tuples must succeed.
+	zeroVecSnap := *valid
+	zeroVecSnap.Quaternion = [4]float64{0, 0, 0, 0}
+	zeroVecSnap.BodyRates = [3]float64{0, 0, 0}
+	zeroVecSnap.NED = [3]float64{0, 0, 0}
+	zeroEnvelope, err := json.Marshal(message.NewBaseMessage(zeroVecSnap.Schema(), &zeroVecSnap, "decoder-zero-control"))
+	if err != nil {
+		t.Fatalf("marshal zero-vector BaseMessage: %v", err)
+	}
+	zeroDecodedMsg, err := dec.Decode(zeroEnvelope)
+	if err != nil {
+		t.Fatalf("dec.Decode(zeroEnvelope): %v", err)
+	}
+	if err := zeroDecodedMsg.Validate(); err != nil {
+		t.Fatalf("zeroDecodedMsg.Validate(): %v", err)
+	}
+	gotZero, ok := zeroDecodedMsg.Payload().(*VehicleSnapshot)
+	if !ok || gotZero.Quaternion != [4]float64{} || gotZero.BodyRates != [3]float64{} || gotZero.NED != [3]float64{} {
+		t.Fatalf("decoded zero-vector control = %+v, want all-zero vectors", gotZero)
+	}
+
 	invalidCases := []struct {
 		name   string
 		field  string
@@ -436,16 +457,19 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		{name: "quaternion short len 2", field: "quaternion", rawVal: []float64{0.5, 0.5}},
 		{name: "quaternion short len 3", field: "quaternion", rawVal: []float64{1, 0, 0}},
 		{name: "quaternion oversized len 5", field: "quaternion", rawVal: []float64{1, 0, 0, 0, 0}},
+		{name: "quaternion null element", field: "quaternion", rawVal: []any{nil, 0.0, 0.0, 0.0}},
 		{name: "quaternion null", field: "quaternion", rawVal: nil},
 		{name: "quaternion omitted", field: "quaternion", omit: true},
 		{name: "body_rates empty", field: "body_rates", rawVal: []float64{}},
 		{name: "body_rates short len 2", field: "body_rates", rawVal: []float64{0.1, 0.2}},
 		{name: "body_rates oversized len 4", field: "body_rates", rawVal: []float64{0.1, 0.2, 0.3, 0.4}},
+		{name: "body_rates null element", field: "body_rates", rawVal: []any{0.0, nil, 0.0}},
 		{name: "body_rates null", field: "body_rates", rawVal: nil},
 		{name: "body_rates omitted", field: "body_rates", omit: true},
 		{name: "ned empty", field: "ned", rawVal: []float64{}},
 		{name: "ned short len 2", field: "ned", rawVal: []float64{1.0, 2.0}},
 		{name: "ned oversized len 4", field: "ned", rawVal: []float64{1.0, 2.0, 3.0, 4.0}},
+		{name: "ned null element", field: "ned", rawVal: []any{0.0, 0.0, nil}},
 		{name: "ned null", field: "ned", rawVal: nil},
 		{name: "ned omitted", field: "ned", omit: true},
 	}
