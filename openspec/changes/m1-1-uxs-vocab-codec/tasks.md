@@ -2,7 +2,7 @@
 
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval — record owner rulings on `OQ1`–`OQ4` (`D1`–`D4`) in `design.md`, fill `Approved-by: <name> (<YYYY-MM-DD>) sha256:<12 hex>` in `proposal.md`, and remove this Hold in one edit (premise: `.agents/protocol.md:14-18`, `.agents/contracts/architect.md:5`). Check: `task spec:check` exits `0` and `task spec:queue` reports `0` holds.
+- [x] 1.1 Owner approved `proposal.md` and `design.md` together (`Approved-by: Coby Leuschke (2026-11-23) sha256:c89f9e748652`; `OQ1`–`OQ4` ruled Option A).
 
 ## 2. Implementation
 

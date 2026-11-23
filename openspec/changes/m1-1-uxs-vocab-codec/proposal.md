@@ -1,5 +1,5 @@
 # Proposal: m1-1-uxs-vocab-codec
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-23) sha256:c89f9e748652
 Architect: gemini (gemini-4-carbon, medium)
 
 ## Track
