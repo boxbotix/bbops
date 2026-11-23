@@ -1,0 +1,395 @@
+package host
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/boxbotix/bbops/configs"
+	"github.com/c360studio/semengine/component"
+	"github.com/c360studio/semengine/composition"
+	"github.com/c360studio/semengine/config"
+	graphgateway "github.com/c360studio/semengine/gateway/graph-gateway"
+	"github.com/c360studio/semengine/output/websocket"
+	graphindex "github.com/c360studio/semengine/processor/graph-index"
+	graphingest "github.com/c360studio/semengine/processor/graph-ingest"
+	graphlexical "github.com/c360studio/semengine/processor/graph-lexical"
+	graphquery "github.com/c360studio/semengine/processor/graph-query"
+	"github.com/c360studio/semengine/types"
+)
+
+const (
+	// TelemetryWSComponent is output/websocket instance #1 (core NATS bbops.telemetry.>).
+	TelemetryWSComponent = "telemetry-websocket"
+	// GraphWSComponent is output/websocket instance #2 (kv-watch ENTITY_STATES).
+	GraphWSComponent = "graph-websocket"
+	// EntityStreamName is the durable JetStream stream backing entity.> ingest.
+	EntityStreamName = "ENTITY"
+
+	minUserPort = 1024
+	maxUserPort = 65535
+)
+
+// PortOverrides carries optional CLI or test listener overrides applied atop the
+// loaded SemEngine flow configuration.
+type PortOverrides struct {
+	HTTPPort        int
+	TelemetryWSPort int
+	GraphWSPort     int
+	// MetricsPort overrides the Prometheus metrics listener when > 0, keeps the
+	// flow config value when 0, and disables the metrics service when < 0.
+	MetricsPort int
+	// BindHost overrides output/websocket bind hosts when non-empty (e.g. "127.0.0.1").
+	BindHost string
+}
+
+// ResolvedEndpoints holds the effective local URLs for a configured bbops runtime.
+type ResolvedEndpoints struct {
+	HTTPPort    int
+	MetricsPort int
+	HTTPBaseURL string
+	TelemetryWS string
+	GraphWS     string
+}
+
+// RegisterComponents registers the SemEngine v0.1.0-alpha.7 SKG, GraphQL gateway,
+// and dual-WebSocket component factories used by bbops.
+func RegisterComponents(registry *component.Registry) error {
+	if registry == nil {
+		return errors.New("host: nil component registry")
+	}
+	registrars := []struct {
+		name string
+		fn   func(*component.Registry) error
+	}{
+		{name: "graph-ingest", fn: graphingest.Register},
+		{name: "graph-index", fn: graphindex.Register},
+		{name: "graph-lexical", fn: graphlexical.Register},
+		{name: "graph-query", fn: graphquery.Register},
+		{name: "graph-gateway", fn: graphgateway.Register},
+		{name: "websocket", fn: websocket.Register},
+	}
+	for _, r := range registrars {
+		if err := r.fn(registry); err != nil {
+			return fmt.Errorf("register %s: %w", r.name, err)
+		}
+	}
+	return nil
+}
+
+// LoadConfig reads path (or the embedded configs/bbops.json default when path is
+// empty), parses it via SemEngine's loader, and applies any PortOverrides.
+func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
+	var data []byte
+	var err error
+	if path == "" {
+		data = configs.DefaultFlowJSON
+	} else {
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config %q: %w", path, err)
+		}
+	}
+	cfg, err := config.NewLoader().LoadFromBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := ApplyPortOverrides(cfg, overrides); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// ApplyPortOverrides mutates cfg with validated listener overrides.
+func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
+	if cfg == nil {
+		return errors.New("host: nil configuration")
+	}
+	if cfg.Services == nil {
+		cfg.Services = make(types.ServiceConfigs)
+	}
+
+	if overrides.HTTPPort != 0 {
+		if err := validateUserPort("http-port", overrides.HTTPPort); err != nil {
+			return err
+		}
+		if err := patchJSONField(cfg.Services, "service-manager", "http_port", overrides.HTTPPort); err != nil {
+			return err
+		}
+	}
+
+	if overrides.MetricsPort < 0 {
+		entry := cfg.Services["metrics"]
+		entry.Enabled = false
+		if len(entry.Config) == 0 {
+			entry.Config = json.RawMessage(`{"port":9090,"path":"/metrics"}`)
+		}
+		cfg.Services["metrics"] = entry
+	} else if overrides.MetricsPort > 0 {
+		if err := validateUserPort("metrics-port", overrides.MetricsPort); err != nil {
+			return err
+		}
+		if err := patchJSONField(cfg.Services, "metrics", "port", overrides.MetricsPort); err != nil {
+			return err
+		}
+	}
+
+	if overrides.TelemetryWSPort != 0 || overrides.BindHost != "" {
+		if overrides.TelemetryWSPort != 0 {
+			if err := validateUserPort("telemetry-ws-port", overrides.TelemetryWSPort); err != nil {
+				return err
+			}
+		}
+		if err := patchWebSocketEndpoint(cfg, TelemetryWSComponent, overrides.BindHost, overrides.TelemetryWSPort); err != nil {
+			return err
+		}
+	}
+
+	if overrides.GraphWSPort != 0 || overrides.BindHost != "" {
+		if overrides.GraphWSPort != 0 {
+			if err := validateUserPort("graph-ws-port", overrides.GraphWSPort); err != nil {
+				return err
+			}
+		}
+		if err := patchWebSocketEndpoint(cfg, GraphWSComponent, overrides.BindHost, overrides.GraphWSPort); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateOffline validates the SemEngine config document, ENTITY stream retention
+// invariants, listener port uniqueness, and offline component composition graph.
+func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
+	if cfg == nil {
+		return nil, errors.New("host: nil configuration")
+	}
+	entityStream, ok := cfg.Streams[EntityStreamName]
+	if !ok {
+		return nil, fmt.Errorf("missing required %s stream declaration", EntityStreamName)
+	}
+	if !slices.Contains(entityStream.Subjects, "entity.>") {
+		return nil, fmt.Errorf("%s stream subjects %v must include entity.>", EntityStreamName, entityStream.Subjects)
+	}
+	if entityStream.MaxAge == "" || entityStream.MaxBytes <= 0 || entityStream.Discard != "old" {
+		return nil, fmt.Errorf("%s stream requires explicit finite max_age, max_bytes > 0, and discard \"old\"", EntityStreamName)
+	}
+
+	if _, err := ResolveEndpoints(cfg); err != nil {
+		return nil, err
+	}
+
+	catalog := component.NewRegistry()
+	if err := RegisterComponents(catalog); err != nil {
+		return nil, err
+	}
+	result, err := composition.Validate(catalog, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("validate composition: %w", err)
+	}
+	if result.Status == composition.StatusErrors || len(result.Errors) > 0 {
+		msgs := make([]string, 0, len(result.Errors))
+		for _, f := range result.Errors {
+			msgs = append(msgs, fmt.Sprintf("%s (%s): %s", f.Component, f.Type, f.Message))
+		}
+		return result, fmt.Errorf("composition validation failed: %s", strings.Join(msgs, "; "))
+	}
+
+	enabledCount := 0
+	for _, entry := range cfg.Components {
+		if entry.Enabled {
+			enabledCount++
+		}
+	}
+	if enabledCount == 0 {
+		return result, errors.New("composition enables zero components")
+	}
+	if len(result.Graph.Nodes) != enabledCount {
+		return result, fmt.Errorf("composition admitted %d/%d enabled components", len(result.Graph.Nodes), enabledCount)
+	}
+	return result, nil
+}
+
+// ResolveEndpoints extracts the effective HTTP and WebSocket URLs from cfg and
+// verifies that no two active listeners claim the same TCP port.
+func ResolveEndpoints(cfg *config.Config) (ResolvedEndpoints, error) {
+	if cfg == nil {
+		return ResolvedEndpoints{}, errors.New("host: nil configuration")
+	}
+	httpPort := 8080
+	if svc, ok := cfg.Services["service-manager"]; ok && len(svc.Config) > 0 {
+		var parsed struct {
+			HTTPPort int `json:"http_port"`
+		}
+		if err := json.Unmarshal(svc.Config, &parsed); err != nil {
+			return ResolvedEndpoints{}, fmt.Errorf("decode service-manager config: %w", err)
+		}
+		if parsed.HTTPPort != 0 {
+			httpPort = parsed.HTTPPort
+		}
+	}
+	if err := validateUserPort("service-manager.http_port", httpPort); err != nil {
+		return ResolvedEndpoints{}, err
+	}
+
+	portsUsed := map[int]string{httpPort: "service-manager"}
+
+	metricsPort := 9090
+	metricsEnabled := true
+	if svc, ok := cfg.Services["metrics"]; ok {
+		metricsEnabled = svc.Enabled
+		if len(svc.Config) > 0 {
+			var parsed struct {
+				Port int `json:"port"`
+			}
+			if err := json.Unmarshal(svc.Config, &parsed); err != nil {
+				return ResolvedEndpoints{}, fmt.Errorf("decode metrics config: %w", err)
+			}
+			if parsed.Port != 0 {
+				metricsPort = parsed.Port
+			}
+		}
+	}
+	if metricsEnabled {
+		if err := validateUserPort("metrics.port", metricsPort); err != nil {
+			return ResolvedEndpoints{}, err
+		}
+		if holder, clash := portsUsed[metricsPort]; clash {
+			return ResolvedEndpoints{}, fmt.Errorf("port %d claimed by both %s and metrics", metricsPort, holder)
+		}
+		portsUsed[metricsPort] = "metrics"
+	} else {
+		metricsPort = 0
+	}
+
+	telemetryURL, telemetryPort, err := extractWebSocketURL(cfg, TelemetryWSComponent)
+	if err != nil {
+		return ResolvedEndpoints{}, err
+	}
+	if holder, clash := portsUsed[telemetryPort]; clash {
+		return ResolvedEndpoints{}, fmt.Errorf("port %d claimed by both %s and %s", telemetryPort, holder, TelemetryWSComponent)
+	}
+	portsUsed[telemetryPort] = TelemetryWSComponent
+
+	graphURL, graphPort, err := extractWebSocketURL(cfg, GraphWSComponent)
+	if err != nil {
+		return ResolvedEndpoints{}, err
+	}
+	if holder, clash := portsUsed[graphPort]; clash {
+		return ResolvedEndpoints{}, fmt.Errorf("port %d claimed by both %s and %s", graphPort, holder, GraphWSComponent)
+	}
+
+	return ResolvedEndpoints{
+		HTTPPort:    httpPort,
+		MetricsPort: metricsPort,
+		HTTPBaseURL: fmt.Sprintf("http://127.0.0.1:%d", httpPort),
+		TelemetryWS: telemetryURL,
+		GraphWS:     graphURL,
+	}, nil
+}
+
+func validateUserPort(name string, port int) error {
+	if port < minUserPort || port > maxUserPort {
+		return fmt.Errorf("%s %d out of range %d..%d", name, port, minUserPort, maxUserPort)
+	}
+	return nil
+}
+
+func patchJSONField(services types.ServiceConfigs, serviceName, key string, value any) error {
+	entry, exists := services[serviceName]
+	raw := map[string]any{}
+	if exists && len(entry.Config) > 0 {
+		if err := json.Unmarshal(entry.Config, &raw); err != nil {
+			return fmt.Errorf("decode %s config: %w", serviceName, err)
+		}
+	}
+	raw[key] = value
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("encode %s config: %w", serviceName, err)
+	}
+	entry.Enabled = true
+	entry.Config = encoded
+	services[serviceName] = entry
+	return nil
+}
+
+func patchWebSocketEndpoint(cfg *config.Config, componentName, host string, port int) error {
+	comp, ok := cfg.Components[componentName]
+	if !ok {
+		return fmt.Errorf("missing required component %q", componentName)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(comp.Config, &doc); err != nil {
+		return fmt.Errorf("decode %s config: %w", componentName, err)
+	}
+	portsMap, _ := doc["ports"].(map[string]any)
+	if portsMap == nil {
+		return fmt.Errorf("%s config missing ports block", componentName)
+	}
+	outputs, _ := portsMap["outputs"].([]any)
+	if len(outputs) != 1 {
+		return fmt.Errorf("%s expected 1 output port, got %d", componentName, len(outputs))
+	}
+	outDef, _ := outputs[0].(map[string]any)
+	outCfg, _ := outDef["config"].(map[string]any)
+	if outCfg == nil {
+		return fmt.Errorf("%s output port missing config object", componentName)
+	}
+	if host != "" {
+		outCfg["host"] = host
+	}
+	if port != 0 {
+		outCfg["port"] = port
+	}
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("encode %s config: %w", componentName, err)
+	}
+	comp.Config = encoded
+	cfg.Components[componentName] = comp
+	return nil
+}
+
+func extractWebSocketURL(cfg *config.Config, componentName string) (string, int, error) {
+	comp, ok := cfg.Components[componentName]
+	if !ok || !comp.Enabled {
+		return "", 0, fmt.Errorf("required component %q is missing or disabled", componentName)
+	}
+	var parsed struct {
+		Path  string `json:"path"`
+		Ports struct {
+			Outputs []struct {
+				Config struct {
+					Host string `json:"host"`
+					Port int    `json:"port"`
+				} `json:"config"`
+			} `json:"outputs"`
+		} `json:"ports"`
+	}
+	if err := json.Unmarshal(comp.Config, &parsed); err != nil {
+		return "", 0, fmt.Errorf("decode %s config: %w", componentName, err)
+	}
+	if len(parsed.Ports.Outputs) != 1 {
+		return "", 0, fmt.Errorf("%s must declare exactly 1 output port", componentName)
+	}
+	wsPath := parsed.Path
+	if wsPath == "" {
+		wsPath = "/ws"
+	}
+	port := parsed.Ports.Outputs[0].Config.Port
+	if err := validateUserPort(componentName+".port", port); err != nil {
+		return "", 0, err
+	}
+	dialHost := parsed.Ports.Outputs[0].Config.Host
+	if dialHost == "" || dialHost == "0.0.0.0" || dialHost == "::" {
+		dialHost = "127.0.0.1"
+	}
+	return "ws://" + net.JoinHostPort(dialHost, strconv.Itoa(port)) + wsPath, port, nil
+}

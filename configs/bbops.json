@@ -1,0 +1,278 @@
+{
+  "version": "1.0.0",
+  "platform": {
+    "org": "boxbotix",
+    "id": "bbops",
+    "type": "gcs",
+    "region": "local",
+    "environment": "development"
+  },
+  "nats": {
+    "urls": [
+      "nats://127.0.0.1:4222"
+    ],
+    "jetstream": {
+      "enabled": true
+    }
+  },
+  "streams": {
+    "ENTITY": {
+      "subjects": [
+        "entity.>"
+      ],
+      "storage": "file",
+      "max_age": "24h",
+      "max_bytes": 268435456,
+      "discard": "old",
+      "replicas": 1
+    }
+  },
+  "services": {
+    "service-manager": {
+      "enabled": true,
+      "config": {
+        "http_port": 8080,
+        "swagger_ui": true,
+        "server_info": {
+          "title": "BoxBotix Ops API",
+          "description": "BoxBotix Multi-Domain GCS & COP SKG Host",
+          "version": "0.1.0"
+        }
+      }
+    },
+    "component-manager": {
+      "enabled": true,
+      "config": {}
+    },
+    "metrics": {
+      "enabled": true,
+      "config": {
+        "port": 9090,
+        "path": "/metrics"
+      }
+    }
+  },
+  "components": {
+    "graph-ingest": {
+      "type": "processor",
+      "name": "graph-ingest",
+      "enabled": true,
+      "config": {
+        "ports": {
+          "inputs": [
+            {
+              "name": "entity_stream",
+              "config": {
+                "kind": "jetstream",
+                "stream_name": "ENTITY",
+                "subjects": [
+                  "entity.>"
+                ],
+                "deliver_policy": "all"
+              }
+            },
+            {
+              "name": "mutations",
+              "required": true,
+              "config": {
+                "kind": "nats-request",
+                "subject": "graph.mutation.>",
+                "interface": {
+                  "type": "semengine.graph.mutation",
+                  "version": "v1"
+                }
+              }
+            }
+          ],
+          "outputs": [
+            {
+              "name": "entity_states",
+              "config": {
+                "kind": "kv-write",
+                "bucket": "ENTITY_STATES"
+              }
+            }
+          ]
+        },
+        "enable_hierarchy": false,
+        "ingest_lanes": 8
+      }
+    },
+    "graph-index": {
+      "type": "processor",
+      "name": "graph-index",
+      "enabled": true,
+      "config": {
+        "coalesce_ms": 500,
+        "ports": {
+          "inputs": [
+            {
+              "name": "entity_watch",
+              "config": {
+                "kind": "kv-watch",
+                "bucket": "ENTITY_STATES"
+              }
+            }
+          ],
+          "outputs": [
+            {
+              "name": "outgoing_index",
+              "config": {
+                "kind": "kv-write",
+                "bucket": "OUTGOING_INDEX"
+              }
+            },
+            {
+              "name": "incoming_index",
+              "config": {
+                "kind": "kv-write",
+                "bucket": "INCOMING_INDEX"
+              }
+            },
+            {
+              "name": "alias_index",
+              "config": {
+                "kind": "kv-write",
+                "bucket": "ALIAS_INDEX"
+              }
+            },
+            {
+              "name": "predicate_index",
+              "config": {
+                "kind": "kv-write",
+                "bucket": "PREDICATE_INDEX"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "graph-lexical": {
+      "type": "processor",
+      "name": "graph-lexical",
+      "enabled": true,
+      "config": {
+        "ports": {
+          "inputs": [
+            {
+              "name": "entity_watch",
+              "config": {
+                "kind": "kv-watch",
+                "bucket": "ENTITY_STATES"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "graph-query": {
+      "type": "processor",
+      "name": "graph-query",
+      "enabled": true,
+      "config": {
+        "embedding_enabled": false,
+        "ports": {
+          "inputs": [
+            {
+              "name": "graph_queries",
+              "required": true,
+              "config": {
+                "kind": "nats-request",
+                "subject": "graph.query.*",
+                "interface": {
+                  "type": "graph.query",
+                  "version": "v1"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "graph-gateway": {
+      "type": "gateway",
+      "name": "graph-gateway",
+      "enabled": true,
+      "config": {
+        "ports": {
+          "outputs": [
+            {
+              "name": "graph_queries",
+              "required": true,
+              "config": {
+                "kind": "nats-request",
+                "subject": "graph.query.*",
+                "interface": {
+                  "type": "graph.query",
+                  "version": "v1"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "telemetry-websocket": {
+      "type": "output",
+      "name": "websocket",
+      "enabled": true,
+      "config": {
+        "path": "/ws",
+        "ping_interval": "30s",
+        "ports": {
+          "inputs": [
+            {
+              "name": "telemetry",
+              "config": {
+                "kind": "nats",
+                "subject": "bbops.telemetry.>"
+              }
+            }
+          ],
+          "outputs": [
+            {
+              "name": "websocket_server",
+              "config": {
+                "kind": "network",
+                "protocol": "http",
+                "host": "0.0.0.0",
+                "port": 8081
+              }
+            }
+          ]
+        }
+      }
+    },
+    "graph-websocket": {
+      "type": "output",
+      "name": "websocket",
+      "enabled": true,
+      "config": {
+        "path": "/ws",
+        "ping_interval": "30s",
+        "ports": {
+          "inputs": [
+            {
+              "name": "entity_watch",
+              "config": {
+                "kind": "kv-watch",
+                "bucket": "ENTITY_STATES"
+              }
+            }
+          ],
+          "outputs": [
+            {
+              "name": "websocket_server",
+              "config": {
+                "kind": "network",
+                "protocol": "http",
+                "host": "0.0.0.0",
+                "port": 8082
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -41,5 +41,6 @@ ui/build/
 ui/.svelte-kit/
 coverage/
 bin/
+.bbops/
 skills/system/
 

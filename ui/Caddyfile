@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Complete 360 Studio
+# Copyright (c) 2026 boxbotix
+#
+# Provenance: Adapted from C360Studio/semboids ui/Caddyfile
+# @ 37dbdb088438a2601c8556d012ab2c33bec85da2 (MIT).
+# Reverse proxy: SemEngine ADR-115 front door + dual output/websocket planes + SvelteKit UI.
+
+{
+	auto_https off
+	admin off
+}
+
+:3000 {
+	# High-rate kinematic telemetry plane (output/websocket #1 on :8081, bbops.telemetry.>)
+	handle /ws/telemetry {
+		uri replace /ws/telemetry /ws
+		reverse_proxy {$TELEMETRY_WS_HOST:backend:8081}
+	}
+
+	# SKG applied-state plane (output/websocket #2 on :8082, ENTITY_STATES kv-watch)
+	handle /ws/graph {
+		uri replace /ws/graph /ws
+		reverse_proxy {$GRAPH_WS_HOST:backend:8082}
+	}
+
+	# ADR-115 GraphQL front door & SemEngine diagnostics
+	handle /graph-gateway/* {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /graph/* {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /health {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /healthz {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /readyz {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /services {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /components/* {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /openapi.json {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	handle /docs {
+		reverse_proxy {$BACKEND_HOST:backend:8080}
+	}
+
+	# Prometheus metrics
+	handle /metrics {
+		reverse_proxy {$METRICS_HOST:backend:9090}
+	}
+
+	# SvelteKit UI handles everything else
+	handle {
+		reverse_proxy {$UI_HOST:ui:3000}
+	}
+
+	header {
+		X-Frame-Options "SAMEORIGIN"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	encode gzip
+
+	log {
+		output stdout
+		format json
+		level {$LOG_LEVEL:INFO}
+	}
+}

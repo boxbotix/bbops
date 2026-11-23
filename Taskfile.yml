@@ -15,14 +15,14 @@ tasks:
   fmt:
     desc: Format Go and Svelte/TypeScript sources
     cmds:
-      - gofmt -w ./cmd
+      - gofmt -w ./cmd ./internal ./configs
       - npm --prefix ui run format
 
   fmt:check:
     desc: Fail on Go or UI formatting drift or untidy go.mod
     cmds:
       - |
-        drift=$(gofmt -l ./cmd)
+        drift=$(gofmt -l ./cmd ./internal ./configs)
         if [ -n "$drift" ]; then
           echo "gofmt drift:"
           echo "$drift"

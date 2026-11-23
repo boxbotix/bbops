@@ -13,6 +13,26 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    proxy: {
+      "/graph-gateway": "http://127.0.0.1:8080",
+      "/graph": "http://127.0.0.1:8080",
+      "/health": "http://127.0.0.1:8080",
+      "/healthz": "http://127.0.0.1:8080",
+      "/readyz": "http://127.0.0.1:8080",
+      "/services": "http://127.0.0.1:8080",
+      "/components": "http://127.0.0.1:8080",
+      "/openapi.json": "http://127.0.0.1:8080",
+      "/ws/telemetry": {
+        target: "ws://127.0.0.1:8081",
+        ws: true,
+        rewrite: (path) => path.replace(/^\/ws\/telemetry$/, "/ws"),
+      },
+      "/ws/graph": {
+        target: "ws://127.0.0.1:8082",
+        ws: true,
+        rewrite: (path) => path.replace(/^\/ws\/graph$/, "/ws"),
+      },
+    },
   },
   test: {
     include: ["src/**/*.{test,spec}.{js,ts}"],
