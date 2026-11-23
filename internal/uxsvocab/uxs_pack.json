@@ -1,0 +1,112 @@
+{
+  "name": "bbops-uxs",
+  "version": "0.1.0",
+  "predicates": [
+    {
+      "name": "uxs.domain.kind",
+      "description": "Canonical UXS vehicle operating domain (quadcopter, rover, surface-boat)",
+      "data_type": "string"
+    },
+    {
+      "name": "uxs.authority.state",
+      "description": "Active CommandMux control authority owner (direct-crsf-override, companion-teleop, companion-autonomous, mcu-failsafe)",
+      "data_type": "string"
+    },
+    {
+      "name": "uxs.mode.companion",
+      "description": "Requested companion operating mode (disarmed, teleop-velocity, autonomous-velocity, hold-position)",
+      "data_type": "string"
+    },
+    {
+      "name": "uxs.link.tier",
+      "description": "Active transport link tier (sitl-local, direct-bench, mesh-high-rate, mesh-supervisory)",
+      "data_type": "string"
+    },
+    {
+      "name": "uxs.health.armed",
+      "description": "Whether vehicle propulsion actuators are armed",
+      "data_type": "bool"
+    },
+    {
+      "name": "uxs.health.flags",
+      "description": "Structured bbstack 0xB1 link and trunk health flags",
+      "data_type": "json"
+    },
+    {
+      "name": "uxs.health.failsafes",
+      "description": "Cumulative MCU failsafe transition count",
+      "data_type": "int"
+    },
+    {
+      "name": "uxs.health.crcerrors",
+      "description": "Cumulative companion-MCU trunk CRC error count",
+      "data_type": "int"
+    },
+    {
+      "name": "uxs.health.loopdtus",
+      "description": "Latest MCU control loop period in microseconds",
+      "data_type": "int",
+      "units": "us"
+    },
+    {
+      "name": "uxs.health.maxloopdtus",
+      "description": "Maximum observed MCU control loop period in microseconds",
+      "data_type": "int",
+      "units": "us"
+    },
+    {
+      "name": "uxs.health.rttus",
+      "description": "Latest companion-MCU ping round-trip time in microseconds",
+      "data_type": "int",
+      "units": "us"
+    },
+    {
+      "name": "uxs.attitude.quaternion",
+      "description": "Body-to-NED attitude quaternion [qw, qx, qy, qz]",
+      "data_type": "json"
+    },
+    {
+      "name": "uxs.attitude.rates",
+      "description": "Body angular rates [p, q, r] in radians per second",
+      "data_type": "json",
+      "units": "rad/s"
+    },
+    {
+      "name": "uxs.kinematics.ned",
+      "description": "Local North-East-Down position [x, y, z] in meters",
+      "data_type": "json",
+      "units": "m"
+    },
+    {
+      "name": "uxs.kinematics.vx",
+      "description": "Local North velocity component in meters per second",
+      "data_type": "float",
+      "units": "m/s"
+    },
+    {
+      "name": "uxs.kinematics.vy",
+      "description": "Local East velocity component in meters per second",
+      "data_type": "float",
+      "units": "m/s"
+    },
+    {
+      "name": "uxs.kinematics.vz",
+      "description": "Local Down velocity component in meters per second",
+      "data_type": "float",
+      "units": "m/s"
+    },
+    {
+      "name": "uxs.kinematics.headingdeg",
+      "description": "Vehicle true heading in degrees [0, 360]",
+      "data_type": "float",
+      "units": "deg",
+      "range": "0-360"
+    }
+  ],
+  "entity_types": [
+    {
+      "domain_type": "uxs.vehicle",
+      "description": "Controllable uncrewed air, ground, or surface vehicle tracked by bbops"
+    }
+  ]
+}

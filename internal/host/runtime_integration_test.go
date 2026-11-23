@@ -18,9 +18,11 @@ import (
 
 	"github.com/boxbotix/bbops/configs"
 	"github.com/boxbotix/bbops/internal/host"
+	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/graph"
 	"github.com/c360studio/semengine/message"
 	"github.com/c360studio/semengine/payloadregistry"
+	"github.com/c360studio/semengine/vocabulary"
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -739,5 +741,188 @@ func TestRuntimeInvalidServiceConfigDoesNotPoisonDataDir(t *testing.T) {
 	_ = gqlResp.Body.Close()
 	if gqlResp.StatusCode != http.StatusOK {
 		t.Fatalf("Boot 2 GraphQL status = %d, want 200", gqlResp.StatusCode)
+	}
+}
+
+// spec: mavlink-ingest / Constant-predicate Graphable vehicle snapshot payload
+// spec: mavlink-ingest / UXS consumer vocabulary pack and ADR-102 vehicle entity identity
+func TestHostIngestsUXSVehicleSnapshotWithSignalIndexingProfile(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// Boot with zero custom RegisterPayloads to prove D3 Option A registers
+	// uxsvocab + uxs.vehicle.v1 automatically on host.Start.
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: t.TempDir(),
+		UIDir:   t.TempDir(),
+		Version: "v0.1.0-m11-test",
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	platform := rt.Platform()
+	snap1, err := uxsvocab.NewVehicleSnapshot(platform.Org, platform.Platform, 7, uxsvocab.DomainSurfaceBoat)
+	if err != nil {
+		t.Fatalf("NewVehicleSnapshot: %v", err)
+	}
+	snap1.Flags = uxsvocab.HealthFlags{ClockSyncLocked: true, CompanionTrunkHealthy: true}
+	snap1.Quaternion = [4]float64{0.70710678, 0, 0, 0.70710678}
+	snap1.ObservedAt = time.Date(2026, 11, 23, 21, 10, 0, 0, time.UTC)
+
+	entityID := snap1.EntityID()
+	msg1, err := json.Marshal(message.NewBaseMessage(snap1.Schema(), snap1, "m11-host-test"))
+	if err != nil {
+		t.Fatalf("Marshal BaseMessage 1: %v", err)
+	}
+	if err := rt.NATSClient().PublishToStream(ctx, "entity.uxs.upsert", msg1); err != nil {
+		t.Fatalf("PublishToStream 1: %v", err)
+	}
+
+	predBucket, err := rt.NATSClient().GetKeyValueBucket(ctx, graph.BucketPredicateIndex)
+	if err != nil {
+		t.Fatalf("lookup PREDICATE_INDEX: %v", err)
+	}
+	expectedIndexPreds := append(uxsvocab.SnapshotPredicates(), vocabulary.EntityIndexingProfile)
+	initialRevs := make(map[string]uint64, len(expectedIndexPreds))
+	waitForCondition(t, 10*time.Second, "PREDICATE_INDEX populated for all 23 vehicle predicates", func() bool {
+		for _, pred := range expectedIndexPreds {
+			entry, getErr := predBucket.Get(ctx, pred+"."+entityID)
+			if getErr != nil || entry.Revision() == 0 {
+				return false
+			}
+			initialRevs[pred] = entry.Revision()
+		}
+		return true
+	})
+
+	// Publish a second snapshot with updated values (armed + altitude + authority) and
+	// verify ENTITY_STATES advances to kvRevision >= 2 while PREDICATE_INDEX per-key
+	// revisions remain unchanged (zero predicate-index rewrite amplification).
+	snap2 := *snap1
+	snap2.Armed = true
+	snap2.Authority = uxsvocab.AuthorityCompanionTeleop
+	snap2.CompanionMode = uxsvocab.ModeTeleopVelocity
+	snap2.Altitude = 88.5
+	snap2.ObservedAt = snap1.ObservedAt.Add(time.Second)
+
+	msg2, err := json.Marshal(message.NewBaseMessage(snap2.Schema(), &snap2, "m11-host-test"))
+	if err != nil {
+		t.Fatalf("Marshal BaseMessage 2: %v", err)
+	}
+	if err := rt.NATSClient().PublishToStream(ctx, "entity.uxs.upsert", msg2); err != nil {
+		t.Fatalf("PublishToStream 2: %v", err)
+	}
+
+	gqlURL := rt.Endpoints().HTTPBaseURL + "/graph-gateway/graphql"
+	waitForCondition(t, 10*time.Second, "GraphQL entity reflects updated VehicleSnapshot + signal profile", func() bool {
+		reqBody, _ := json.Marshal(map[string]any{
+			"query":     `query($id: String!) { entity(id: $id) { kvRevision entity { id triples { predicate object } } } }`,
+			"variables": map[string]any{"id": entityID},
+		})
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, gqlURL, bytes.NewReader(reqBody))
+		if reqErr != nil {
+			return false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			return false
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+
+		var decoded struct {
+			Data struct {
+				Entity *struct {
+					KVRevision uint64 `json:"kvRevision"`
+					Entity     struct {
+						ID      string `json:"id"`
+						Triples []struct {
+							Predicate string `json:"predicate"`
+							Object    any    `json:"object"`
+						} `json:"triples"`
+					} `json:"entity"`
+				} `json:"entity"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(raw, &decoded) != nil || decoded.Data.Entity == nil || decoded.Data.Entity.KVRevision < 2 {
+			return false
+		}
+
+		byPred := make(map[string]any, len(decoded.Data.Entity.Entity.Triples))
+		for _, tr := range decoded.Data.Entity.Entity.Triples {
+			byPred[tr.Predicate] = tr.Object
+		}
+		if len(byPred) != 23 {
+			return false
+		}
+		if byPred[vocabulary.EntityIndexingProfile] != vocabulary.IndexingProfileSignal {
+			return false
+		}
+		if byPred[uxsvocab.PredicateDomainKind] != uxsvocab.DomainSurfaceBoat {
+			return false
+		}
+		if byPred[uxsvocab.PredicateAuthorityState] != uxsvocab.AuthorityCompanionTeleop {
+			return false
+		}
+		if byPred[uxsvocab.PredicateHealthArmed] != true {
+			return false
+		}
+		// D2 Option A: flags and quaternion arrive as native JSON map/slice in GraphQL.
+		flagsMap, ok := byPred[uxsvocab.PredicateHealthFlags].(map[string]any)
+		if !ok || flagsMap["clock_sync_locked"] != true {
+			return false
+		}
+		quatSlice, ok := byPred[uxsvocab.PredicateAttitudeQuaternion].([]any)
+		return ok && len(quatSlice) == 4
+	})
+
+	// Deterministically wait for graph-index to finish re-indexing snap2 via /metrics
+	// (no time.Sleep) and assert unchanged index-projection + zero extra predicate puts.
+	metricsURL := fmt.Sprintf("http://127.0.0.1:%d/metrics", rt.Endpoints().MetricsPort)
+	var metricsBody string
+	waitForCondition(t, 10*time.Second, "graph-index processed second VehicleSnapshot with unchanged projection", func() bool {
+		resp, getErr := http.Get(metricsURL)
+		if getErr != nil {
+			return false
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+		metricsBody = string(raw)
+		return strings.Contains(metricsBody, "semengine_graph_index_events_processed_total 2") &&
+			strings.Contains(metricsBody, `semengine_graph_index_reindex_events_total{result="unchanged"} 1`)
+	})
+	if !strings.Contains(metricsBody, `semengine_graph_index_reconcile_operations_total{index_type="predicate",operation="put",result="success"} 23`) {
+		t.Fatalf("expected exactly 23 predicate-index put operations across 2 snapshots; metrics:\n%s", metricsBody)
+	}
+	for _, pred := range expectedIndexPreds {
+		entry, getErr := predBucket.Get(ctx, pred+"."+entityID)
+		if getErr != nil {
+			t.Fatalf("PREDICATE_INDEX missing %s.%s: %v", pred, entityID, getErr)
+		}
+		if entry.Revision() != initialRevs[pred] {
+			t.Fatalf("PREDICATE_INDEX %s.%s revision = %d, want %d (unexpected rewrite)",
+				pred, entityID, entry.Revision(), initialRevs[pred])
+		}
 	}
 }

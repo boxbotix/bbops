@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/composition"
 	"github.com/c360studio/semengine/config"
@@ -233,6 +234,9 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	if cfg == nil {
 		return nil, errors.New("host: nil configuration")
+	}
+	if err := uxsvocab.Register(); err != nil {
+		return nil, fmt.Errorf("register uxs vocabulary pack: %w", err)
 	}
 	entityStream, ok := cfg.Streams[EntityStreamName]
 	if !ok {

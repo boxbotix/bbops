@@ -12,6 +12,8 @@ github.com/arbovm/levenshtein v0.0.0-20160628152529-48b4e1c0c4d0 h1:jfIu9sQUG6Ig
 github.com/arbovm/levenshtein v0.0.0-20160628152529-48b4e1c0c4d0/go.mod h1:t2tdKJDJF9BV14lnkjHmOQgcvEKgtqs5a1N3LNdJhGE=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+github.com/bluenviron/gomavlib/v3 v3.3.5 h1:4e0rxKqPH1ar1cJFkft0mjsdBDnVJKWUhDQQuuqhvyk=
+github.com/bluenviron/gomavlib/v3 v3.3.5/go.mod h1:tm3CnJMWdWqDGtHwUpmM2B8VY7TF67hCrCNBrwjYJpc=
 github.com/c360studio/semengine v0.1.0-alpha.7 h1:t4ICkxgP3sABMIB2Ivr/ZOCU7fpSUxU7sqAOEGGrY38=
 github.com/c360studio/semengine v0.1.0-alpha.7/go.mod h1:4sUfq/h0VbGmAoAZlItgi25FlH+DjkiaQTaqeOI1/GA=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=

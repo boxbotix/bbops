@@ -3,6 +3,7 @@ module github.com/boxbotix/bbops
 go 1.26.11
 
 require (
+	github.com/bluenviron/gomavlib/v3 v3.3.5
 	github.com/c360studio/semengine v0.1.0-alpha.7
 	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats-server/v2 v2.15.2
