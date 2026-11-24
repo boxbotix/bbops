@@ -332,6 +332,10 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
     expect(
       hostEl.querySelector('[data-testid="cortex-indexed-rev"]'),
     ).toBeNull();
+    expect(
+      hostEl.querySelector('[data-testid="cortex-hit-item"] .verb-badge')
+        ?.textContent,
+    ).toBe("entitiesByPredicate");
     const semanticCitationText =
       hostEl.querySelector('[data-testid="cortex-citation-list"]')
         ?.textContent ?? "";
@@ -750,6 +754,315 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
         ?.textContent ?? "";
     expect(fallbackText).toContain("Fresh Vessel");
     expect(fallbackText).not.toContain("Stale Vessel");
+
+    unmount(app);
+    hostEl.remove();
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("locks submitted tier across mid-flight tier clicks, clears prior hits/revisions on transport failures, and aligns duplicate-hit citation revision with the winning scored record", async () => {
+    const skgStore = createSkgStore();
+    const rover = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard Rover",
+    });
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover.id,
+        revision: 11,
+        payload: rover,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 11,
+      }),
+    );
+
+    let resolveHeldLexical!: (res: Response) => void;
+    const heldLexicalPromise = new Promise<Response>((res) => {
+      resolveHeldLexical = res;
+    });
+
+    let fetchMode: "held-lexical" | "throw-error" | "duplicate-hybrid" =
+      "held-lexical";
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn().mockResolvedValue({
+        data: { entities: [rover.id] },
+        damagedEntities: 0,
+      }),
+      pathSearch: vi.fn().mockResolvedValue({
+        data: {
+          entities: [{ id: rover.id, depth: 0 }],
+          paths: [],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      }),
+    };
+
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async (_input, init) => {
+        if (fetchMode === "held-lexical") {
+          return heldLexicalPromise;
+        }
+        if (fetchMode === "throw-error") {
+          throw new TypeError("Failed to fetch");
+        }
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.verb === "globalSearch" || body.verb === "localSearch") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              verb: body.verb,
+              result: {
+                indexed_revision: 21,
+                damaged_entities: 0,
+                producer: "graph-query",
+                data:
+                  body.verb === "globalSearch"
+                    ? {
+                        text: {
+                          matches: [
+                            {
+                              id: rover.id,
+                              label: "Vanguard Rover",
+                              score: 1.4,
+                              entity: {},
+                            },
+                          ],
+                        },
+                      }
+                    : {
+                        matches: [
+                          {
+                            id: rover.id,
+                            label: "Vanguard Rover",
+                            score: 1.4,
+                            entity: {},
+                          },
+                        ],
+                      },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "semantic",
+            result: {
+              indexed_revision: 34,
+              damaged_entities: 0,
+              producer: "graph-query",
+              data: {
+                results: [
+                  {
+                    entity_id: rover.id,
+                    similarity: 3.85,
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+
+    const viewportStore = createViewportStore({ skgStore });
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+      },
+    });
+    flushSync();
+
+    // 1. Submit Lexical, click Semantic while Lexical is held in flight, then release Lexical reply.
+    // Single submission MUST NOT call entitiesByPredicate!
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-lexical"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    const input = hostEl.querySelector(
+      '[data-testid="cortex-query-input"]',
+    ) as HTMLInputElement;
+    input.value = "demo";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+
+    const form = hostEl.querySelector(
+      '[data-testid="cortex-query-bar"]',
+    ) as HTMLFormElement;
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    flushSync();
+
+    // Click Semantic mid-flight BEFORE the lexical reply settles.
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-semantic"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    resolveHeldLexical(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          verb: "globalSearch",
+          result: {
+            indexed_revision: 25,
+            damaged_entities: 0,
+            producer: "graph-query",
+            data: {
+              text: {
+                matches: [
+                  {
+                    id: rover.id,
+                    label: "Vanguard Rover",
+                    score: 2.2,
+                    entity: {},
+                  },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+    });
+    expect(mockGraphql.entitiesByPredicate).not.toHaveBeenCalled();
+    expect(
+      hostEl.querySelector('[data-testid="cortex-hit-item"] .verb-badge')
+        ?.textContent,
+    ).toBe("globalSearch");
+    expect(
+      hostEl.querySelector('[data-testid="cortex-indexed-rev"]')?.textContent,
+    ).toContain("idx rev #25");
+    expect(
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')?.textContent,
+    ).toContain("kv#11 · idx#25");
+
+    // 2. Follow successful revision-bearing lookup with a thrown transport error on a new Lexical search:
+    // old demo hit AND old idx#25 revision MUST be cleared!
+    fetchMode = "throw-error";
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-lexical"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    input.value = "unrelated search";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent,
+      ).toContain("Failed to fetch");
+    });
+    expect(
+      hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+    ).toHaveLength(0);
+    expect(
+      hostEl.querySelector('[data-testid="cortex-indexed-rev"]'),
+    ).toBeNull();
+    expect(
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')?.textContent,
+    ).not.toContain("idx#25");
+
+    // 3. Duplicate-ID Hybrid match (lexical score 1.4 @ idx#21 vs neural score 3.85 @ idx#34):
+    // winning badge ("semantic"), score ("3.850"), AND citation revision ("idx#34") come from the same winning hit!
+    fetchMode = "duplicate-hybrid";
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-hybrid"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    input.value = "Vanguard";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+    });
+    expect(
+      hostEl.querySelector('[data-testid="cortex-hit-item"] .verb-badge')
+        ?.textContent,
+    ).toBe("semantic");
+    expect(
+      hostEl.querySelector('[data-testid="cortex-hit-item"]')?.textContent,
+    ).toContain("score 3.850");
+    const dupCitationText =
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')
+        ?.textContent ?? "";
+    expect(dupCitationText).toContain("kv#11 · idx#34");
+    expect(dupCitationText).not.toContain("idx#21");
+
+    // 4. Transport error on 2-Hop & Similar ALSO clears prior hits and idx#34 revision!
+    fetchMode = "throw-error";
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-similar-btn"]',
+      ) as HTMLButtonElement
+    ).click();
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent,
+      ).toContain("Failed to fetch");
+    });
+    expect(
+      hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+    ).toHaveLength(0);
+    expect(
+      hostEl.querySelector('[data-testid="cortex-indexed-rev"]'),
+    ).toBeNull();
+    expect(
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')?.textContent,
+    ).not.toContain("idx#34");
 
     unmount(app);
     hostEl.remove();

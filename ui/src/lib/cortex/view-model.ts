@@ -9,7 +9,7 @@ import {
   shortEntityLabel,
 } from "../skg/graphology-adapter";
 import type { CopEntityState } from "../stores/skg.svelte";
-import type { CortexSearchHit } from "./search-client";
+import type { CortexHitSource, CortexSearchHit } from "./search-client";
 
 export const CORTEX_QUERY_TIERS = [
   "hybrid",
@@ -42,8 +42,9 @@ export interface RankedCortexEntityView {
   readonly displayLabel: string;
   readonly entityKind: CopEntityState["kind"] | "path-neighbor";
   readonly scoreLabel: string;
-  readonly verbBadge: string;
+  readonly verbBadge: CortexHitSource;
   readonly kvRevision: number | null;
+  readonly indexedRevision: number | null;
 }
 
 export function isCortexQueryTier(value: unknown): value is CortexQueryTier {
@@ -55,7 +56,8 @@ export function isCortexQueryTier(value: unknown): value is CortexQueryTier {
 
 /**
  * Merges search hits from one or more Cortex query tiers with live skgStore
- * entity metadata in deterministic score-descending, ID-ascending order.
+ * entity metadata in deterministic score-descending, ID-ascending order,
+ * preserving the winning hit's source badge and indexedRevision together.
  */
 export function buildRankedCortexHits(
   hits: readonly CortexSearchHit[],
@@ -83,6 +85,10 @@ export function buildRankedCortexHits(
       (entity
         ? shortEntityLabel(entity.id, entity.title)
         : shortEntityLabel(hit.entityId));
+    const hitRevision =
+      typeof hit.indexedRevision === "number" && hit.indexedRevision > 0
+        ? hit.indexedRevision
+        : null;
     return {
       entityId: hit.entityId,
       displayLabel,
@@ -90,6 +96,7 @@ export function buildRankedCortexHits(
       scoreLabel: hit.score > 0 ? hit.score.toFixed(3) : "match",
       verbBadge: hit.verb,
       kvRevision: entity?.kvRevision ?? null,
+      indexedRevision: hitRevision,
     };
   });
 }

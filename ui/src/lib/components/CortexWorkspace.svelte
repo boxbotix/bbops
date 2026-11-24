@@ -133,7 +133,7 @@
     if (!selId) {
       return null;
     }
-    const matchedHit = rawHits.find((h) => h.entityId === selId);
+    const matchedHit = rankedHits.find((h) => h.entityId === selId);
     return matchedHit?.indexedRevision ?? null;
   });
 
@@ -216,17 +216,19 @@
     const controller = new AbortController();
     activeSearchController = controller;
     const reqSeq = ++searchReqSeq;
+    const tierAtStart = activeTier;
     const workspaceAtStart = viewportStore.workspace;
     const selectionAtStart = viewportStore.selectedEntityId;
     const epochAtStart = selectionEpoch;
 
     running = true;
+    rawHits = [];
+    pathResults = [];
     errorBanner = null;
     neuralStatusBanner = null;
     answerSummary = null;
     indexedRevision = null;
     damagedEntities = 0;
-    pathResults = [];
 
     try {
       const collected: CortexSearchHit[] = [];
@@ -236,7 +238,7 @@
       let nextNeuralBanner: string | null = null;
       let nextErrorBanner: string | null = null;
 
-      if (activeTier === "lexical" || activeTier === "hybrid") {
+      if (tierAtStart === "lexical" || tierAtStart === "hybrid") {
         const lex = selectionAtStart
           ? await searchClient.localSearch(
               {
@@ -256,7 +258,10 @@
         if (lex.ok) {
           collected.push(...lex.hits);
           if (lex.indexedRevision > 0) {
-            nextIndexedRevision = lex.indexedRevision;
+            nextIndexedRevision = Math.max(
+              nextIndexedRevision ?? 0,
+              lex.indexedRevision,
+            );
           }
           nextDamagedEntities = Math.max(
             nextDamagedEntities,
@@ -268,7 +273,7 @@
         }
       }
 
-      if (activeTier === "semantic") {
+      if (tierAtStart === "semantic") {
         const predRes = await graphqlClient.entitiesByPredicate(
           {
             predicate: trimmed,
@@ -280,7 +285,7 @@
             entityId: id,
             label: null,
             score: 1,
-            verb: "globalSearch",
+            verb: "entitiesByPredicate",
             wordRank: null,
             vectorRank: null,
             indexedRevision: null,
@@ -289,7 +294,7 @@
         nextDamagedEntities = predRes.damagedEntities;
       }
 
-      if (activeTier === "neural" || activeTier === "hybrid") {
+      if (tierAtStart === "neural" || tierAtStart === "hybrid") {
         const sem = await searchClient.semantic(
           {
             query: trimmed,
@@ -300,7 +305,10 @@
         if (sem.ok) {
           collected.push(...sem.hits);
           if (sem.indexedRevision > 0) {
-            nextIndexedRevision = sem.indexedRevision;
+            nextIndexedRevision = Math.max(
+              nextIndexedRevision ?? 0,
+              sem.indexedRevision,
+            );
           }
           nextDamagedEntities = Math.max(
             nextDamagedEntities,
@@ -308,7 +316,7 @@
           );
         } else if (sem.refusal?.notEnabled) {
           nextNeuralBanner = `Neural embeddings not enabled on host (${sem.refusal.code})`;
-        } else if (sem.refusal && activeTier === "neural") {
+        } else if (sem.refusal && tierAtStart === "neural") {
           nextErrorBanner = `${sem.refusal.code}: ${sem.refusal.message}`;
         }
       }
@@ -330,11 +338,15 @@
       errorBanner = nextErrorBanner;
 
       if (
+        (collected.length > 0 || nextErrorBanner === null) &&
         selectionEpoch === epochAtStart &&
         viewportStore.selectedEntityId === selectionAtStart &&
         viewportStore.workspace === workspaceAtStart
       ) {
-        const topId = collected[0]?.entityId ?? viewportStore.selectedEntityId;
+        const topRanked = buildRankedCortexHits(collected, (id) =>
+          skgStore.getEntity(id),
+        )[0];
+        const topId = topRanked?.entityId ?? viewportStore.selectedEntityId;
         if (topId) {
           if (topId !== viewportStore.selectedEntityId) {
             viewportStore.selectEntity(topId);
@@ -347,8 +359,14 @@
       if (
         !isUnmounted &&
         !isAbortError(err, controller.signal) &&
-        reqSeq === searchReqSeq
+        reqSeq === searchReqSeq &&
+        viewportStore.workspace === workspaceAtStart
       ) {
+        rawHits = [];
+        pathResults = [];
+        indexedRevision = null;
+        damagedEntities = 0;
+        answerSummary = null;
         errorBanner =
           err instanceof Error ? err.message : "Cortex query failed";
       }
@@ -377,6 +395,8 @@
     const epochAtStart = selectionEpoch;
 
     running = true;
+    rawHits = [];
+    pathResults = [];
     errorBanner = null;
     neuralStatusBanner = null;
     answerSummary = null;
@@ -419,8 +439,14 @@
       if (
         !isUnmounted &&
         !isAbortError(err, controller.signal) &&
-        reqSeq === searchReqSeq
+        reqSeq === searchReqSeq &&
+        viewportStore.workspace === workspaceAtStart
       ) {
+        rawHits = [];
+        pathResults = [];
+        indexedRevision = null;
+        damagedEntities = 0;
+        answerSummary = null;
         errorBanner =
           err instanceof Error ? err.message : "Similarity lookup failed";
       }

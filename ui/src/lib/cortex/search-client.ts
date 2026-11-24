@@ -12,12 +12,13 @@ export const GRAPH_SEARCH_VERBS = [
   "similar",
 ] as const;
 export type GraphSearchVerb = (typeof GRAPH_SEARCH_VERBS)[number];
+export type CortexHitSource = GraphSearchVerb | "entitiesByPredicate";
 
 export interface CortexSearchHit {
   readonly entityId: string;
   readonly label: string | null;
   readonly score: number;
-  readonly verb: GraphSearchVerb;
+  readonly verb: CortexHitSource;
   readonly wordRank: number | null;
   readonly vectorRank: number | null;
   readonly indexedRevision?: number | null;
