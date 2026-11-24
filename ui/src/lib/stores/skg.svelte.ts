@@ -351,20 +351,6 @@ function extractCommonMetadata(
     normalizeNonEmptyString(byPredicate["cop.contact.source"]?.object) ??
     normalizeNonEmptyString(byPredicate["cop.provenance.source"]?.object) ??
     normalizeNonEmptyString(byPredicate["prov.wasAttributedTo"]?.object);
-  let inferredTripleSource: string | null = null;
-  if (!explicitSource) {
-    let bestSourceTriple: SkgTriple | undefined;
-    for (const triple of triples) {
-      if (
-        triple.predicate === "entity.indexing.profile" ||
-        normalizeNonEmptyString(triple.source) === null
-      ) {
-        continue;
-      }
-      bestSourceTriple = selectWinningTriple(bestSourceTriple, triple);
-    }
-    inferredTripleSource = normalizeNonEmptyString(bestSourceTriple?.source);
-  }
 
   const explicitObserved =
     normalizeKnownTimestamp(byPredicate["cop.time.observed"]?.object) ??
@@ -374,24 +360,9 @@ function extractCommonMetadata(
     normalizeKnownTimestamp(byPredicate["cop.time.received"]?.object) ??
     normalizeKnownTimestamp(byPredicate["cop.contact.received_at"]?.object);
 
-  let expiresAt =
+  const expiresAt =
     normalizeKnownTimestamp(byPredicate["cop.time.expires"]?.object) ??
     normalizeKnownTimestamp(byPredicate["cop.contact.expires_at"]?.object);
-  if (!expiresAt) {
-    let earliestExpiryMs = Number.POSITIVE_INFINITY;
-    for (const triple of triples) {
-      const normalized = normalizeKnownTimestamp(triple.expires_at);
-      if (normalized) {
-        const ms = Date.parse(normalized);
-        if (ms < earliestExpiryMs) {
-          earliestExpiryMs = ms;
-        }
-      }
-    }
-    if (Number.isFinite(earliestExpiryMs)) {
-      expiresAt = new Date(earliestExpiryMs).toISOString();
-    }
-  }
 
   const rawUncertainty =
     byPredicate["cop.location.uncertainty_m"]?.object ??
@@ -415,7 +386,7 @@ function extractCommonMetadata(
     poisoned: false,
     poisonError: null,
     indexingProfile,
-    source: explicitSource ?? inferredTripleSource,
+    source: explicitSource,
     observedAt: explicitObserved,
     receivedAt,
     expiresAt,
@@ -524,8 +495,11 @@ export function parseCopEntityState(
       }
       const vehicleObservedAt =
         base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
+      const vehicleSource =
+        base.source ?? normalizeNonEmptyString(latestUxsTriple?.source);
       return {
         ...base,
+        source: vehicleSource,
         observedAt: vehicleObservedAt,
         kind: "uxs-vehicle",
         org: vehicleIdentity.org,
@@ -677,6 +651,14 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     return list;
   });
 
+  function clearFeedState(): void {
+    entities.clear();
+    stagedSnapshot.clear();
+    synced = false;
+    lastSyncedRevision = null;
+    malformedFrames = 0;
+  }
+
   function commitStagedSnapshot(syncRevision: number): void {
     for (const existingKey of Array.from(entities.keys())) {
       if (!stagedSnapshot.has(existingKey)) {
@@ -812,6 +794,9 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       synced = false;
       stagedSnapshot.clear();
     },
+    onEndpointChange() {
+      clearFeedState();
+    },
   });
 
   return {
@@ -867,11 +852,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     ingestRawFrame,
     reset() {
       wsClient.disconnect();
-      entities.clear();
-      stagedSnapshot.clear();
-      synced = false;
-      lastSyncedRevision = null;
-      malformedFrames = 0;
+      clearFeedState();
     },
   };
 }

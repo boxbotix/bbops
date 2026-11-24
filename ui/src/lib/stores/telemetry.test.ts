@@ -488,7 +488,7 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
   });
 
   // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
-  it("keeps connect() idempotent on the active URL and switches sockets, reported URL, and retry target atomically on connect(overrideUrl)", () => {
+  it("keeps connect() idempotent on the active URL and resets feed state, timestamp guards, and event history on connect(overrideUrl)", () => {
     const rig = new MockWebSocketRig();
     const urlA = "ws://127.0.0.1:8081/ws-a";
     const urlB = "ws://127.0.0.1:8091/ws-b";
@@ -504,13 +504,39 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     expect(store.status).toBe("connected");
     expect(rig.sockets).toHaveLength(1);
 
-    // Calling connect() or connect(urlA) while active on urlA is idempotent.
+    // Populate endpoint A with sysids 1 (ts 5000) and 2 (ts 5050) plus a transition event.
+    socketA.serverMessage(
+      buildKinematicEnvelope(1, {
+        ned_xyz: [50, 60, -10],
+        hdg_deg: 90,
+        timestamp: 5_000,
+      }),
+    );
+    socketA.serverMessage(
+      buildKinematicEnvelope(2, {
+        ned_xyz: [70, 80, -20],
+        hdg_deg: 180,
+        timestamp: 5_050,
+      }),
+    );
+    socketA.serverMessage(
+      buildTransitionEnvelope(1, {
+        failsafes: 3,
+        timestamp: 5_060,
+      }),
+    );
+    expect(store.vehicleCount).toBe(2);
+    expect(store.events).toHaveLength(1);
+
+    // Calling connect() or connect(urlA) while active on urlA is idempotent and preserves A's state.
     store.connect();
     store.connect(`  ${urlA}  `);
     expect(rig.sockets).toHaveLength(1);
     expect(store.url).toBe(urlA);
+    expect(store.vehicleCount).toBe(2);
+    expect(store.events).toHaveLength(1);
 
-    // Switching to urlB while connected to urlA closes socketA, updates store.url, and opens socketB.
+    // Switching to urlB while connected to urlA closes socketA, clears A's vehicles/events/timestamp watermarks, and opens socketB.
     store.connect(urlB);
     expect(store.url).toBe(urlB);
     expect(socketA.closeCalls).toEqual([
@@ -519,34 +545,47 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
         reason: "endpoint override",
       },
     ]);
+    expect(store.vehicleCount).toBe(0);
+    expect(store.getKinematics(1)).toBeUndefined();
+    expect(store.getKinematics(2)).toBeUndefined();
+    expect(store.events).toEqual([]);
+    expect(store.lastDisconnectedAt).toBeNull();
     expect(rig.sockets).toHaveLength(2);
     const socketB = rig.latest;
     expect(socketB.url).toBe(urlB);
 
-    // Any late message from detached socketA is ignored; socketB delivers frames cleanly.
+    // Any late message from detached socketA is ignored.
     socketA.serverMessage(
-      buildKinematicEnvelope(1, {
+      buildKinematicEnvelope(2, {
         ned_xyz: [99, 99, 99],
-        timestamp: 5_000,
+        timestamp: 6_000,
       }),
     );
-    expect(store.getKinematics(1)).toBeUndefined();
+    expect(store.getKinematics(2)).toBeUndefined();
 
+    // Endpoint B delivers sysid 1 at an earlier timestamp (4900 < A's 5000): accepted without out-of-order rejection, and A-only sysid 2 stays absent!
     socketB.serverOpen();
+    expect(store.reconnectCount).toBe(0);
     socketB.serverMessage(
       buildKinematicEnvelope(1, {
         ned_xyz: [12, 34, -5],
-        timestamp: 5_100,
+        hdg_deg: 270,
+        timestamp: 4_900,
       }),
     );
+    expect(store.droppedOutOfOrderCount).toBe(0);
+    expect(store.vehicleCount).toBe(1);
     expect(store.getKinematics(1)?.ned_xyz).toEqual([12, 34, -5]);
+    expect(store.getKinematics(1)?.timestamp).toBe(4_900);
+    expect(store.getKinematics(2)).toBeUndefined();
 
-    // When socketB drops, automatic reconnect targets urlB (never urlA).
+    // When socketB drops, same-endpoint reconnect preserves B's state and targets urlB (never urlA).
     socketB.serverDrop(1006);
     vi.advanceTimersByTime(500);
     expect(rig.sockets).toHaveLength(3);
     expect(rig.latest.url).toBe(urlB);
     expect(store.url).toBe(urlB);
+    expect(store.getKinematics(1)?.ned_xyz).toEqual([12, 34, -5]);
 
     store.disconnect();
   });

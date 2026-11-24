@@ -45,6 +45,7 @@ export interface ManagedWsOptions {
     code?: number;
     timestamp: number;
   }) => void;
+  onEndpointChange?: (nextUrl: string, previousUrl: string) => void;
 }
 
 export function resolveWebSocketUrl(
@@ -135,7 +136,8 @@ export class ManagedWebSocketClient {
             this.options.defaultPath,
           )
         : this.resolvedUrl;
-    const urlChanged = nextUrl !== this.resolvedUrl;
+    const previousUrl = this.resolvedUrl;
+    const urlChanged = nextUrl !== previousUrl;
 
     if (
       !urlChanged &&
@@ -164,7 +166,7 @@ export class ManagedWebSocketClient {
       ) {
         previous.close(1000, "endpoint override");
       }
-      if (wasConnected) {
+      if (!urlChanged && wasConnected) {
         this.options.onDisconnect?.({
           wasConnected: true,
           code: 1000,
@@ -176,6 +178,7 @@ export class ManagedWebSocketClient {
     if (urlChanged) {
       this.resolvedUrl = nextUrl;
       this.reconnectAttempt = 0;
+      this.options.onEndpointChange?.(nextUrl, previousUrl);
     }
 
     this.shouldReconnect = true;

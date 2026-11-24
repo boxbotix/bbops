@@ -427,6 +427,20 @@ export function createTelemetryStore(
     malformedFrames += 1;
   }
 
+  function clearFeedState(): void {
+    kinematicsBySysId.clear();
+    eventRing.fill(undefined);
+    ringWriteIdx = 0;
+    ringSize = 0;
+    droppedOutOfOrder = 0;
+    malformedFrames = 0;
+    hasEstablishedOnce = false;
+    vehicleCount = 0;
+    events = [];
+    reconnectCount = 0;
+    lastDisconnectedAt = null;
+  }
+
   const wsClient = new ManagedWebSocketClient({
     url: options.url,
     envUrl,
@@ -450,6 +464,9 @@ export function createTelemetryStore(
       if (info.wasConnected) {
         lastDisconnectedAt = info.timestamp;
       }
+    },
+    onEndpointChange() {
+      clearFeedState();
     },
   });
 
@@ -499,17 +516,7 @@ export function createTelemetryStore(
     },
     reset() {
       wsClient.disconnect();
-      kinematicsBySysId.clear();
-      eventRing.fill(undefined);
-      ringWriteIdx = 0;
-      ringSize = 0;
-      droppedOutOfOrder = 0;
-      malformedFrames = 0;
-      hasEstablishedOnce = false;
-      vehicleCount = 0;
-      events = [];
-      reconnectCount = 0;
-      lastDisconnectedAt = null;
+      clearFeedState();
     },
   };
 }

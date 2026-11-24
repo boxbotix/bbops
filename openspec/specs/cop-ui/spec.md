@@ -48,4 +48,3 @@ The `ui/src/lib/stores/viewport.svelte.ts` module SHALL expose pure TypeScript c
 #### Scenario: Viewport state round-trips through URL hash serialization and sanitizes invalid fragments
 - **WHEN** non-default viewport state is serialized to a URL hash string and applied to a fresh viewport store, or a malformed URL hash containing unknown domains, bogus booleans, or unrecognized keys is parsed
 - **THEN** valid viewport state round-trips losslessly while unknown or malformed hash parameters fall back safely to canonical defaults without throwing
-

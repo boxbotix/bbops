@@ -216,22 +216,24 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
   it("keeps external COP contacts distinct with unknown-preserving metadata and excludes non-vehicles from command selectors", () => {
     const store = createSkgStore();
 
-    // 1. Minimal external contact with zero provenance/staleness metadata -> unknown remains null/"unknown"!
+    // 1. Minimal external contact with valid assertion-level metadata (e.g. a title edit by `label-editor` with its own triple expiry)
+    //    but zero contact-level provenance/staleness assertions -> contact-level source/observedAt/receivedAt/expiresAt MUST stay null!
     const sparseContactId = "boxbotix.local.tak.cop.responder.bravo2";
     const sparseContactPayload = {
       id: sparseContactId,
       updated_at: "2026-11-24T11:20:00.000Z",
       triples: [
         makeTriple(sparseContactId, "dc.terms.title", "Responder Bravo-2", {
-          source: "",
+          source: "label-editor",
           timestamp: "2026-11-24T11:20:00.000Z",
+          expires_at: "2026-11-24T11:22:00.000Z",
         }),
         makeTriple(sparseContactId, "geo.location.latitude", 37.801, {
-          source: "",
+          source: "geo-importer",
           timestamp: "2026-11-24T11:20:00.000Z",
         }),
         makeTriple(sparseContactId, "geo.location.longitude", -122.405, {
-          source: "",
+          source: "geo-importer",
           timestamp: "2026-11-24T11:20:00.000Z",
         }),
       ],
@@ -324,6 +326,12 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(sparse?.expiresAt).toBeNull();
     expect(sparse?.uncertaintyMeters).toBeNull();
     expect(sparse?.feedStatus).toBe("unknown");
+    // Assertion-level source and expires_at remain intact on the stored triple itself.
+    const titleTriple = sparse?.triples.find(
+      (t) => t.predicate === "dc.terms.title",
+    );
+    expect(titleTriple?.source).toBe("label-editor");
+    expect(titleTriple?.expires_at).toBe("2026-11-24T11:22:00.000Z");
     expect(sparse?.location).toEqual({
       latitude: 37.801,
       longitude: -122.405,
@@ -447,13 +455,13 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
               id: target.id,
               triples: [
                 makeTriple(target.id, "dc.terms.title", target.id, {
-                  source: "",
+                  source: "cop-ingest",
                 }),
                 makeTriple(target.id, "geo.location.latitude", 37.7, {
-                  source: "",
+                  source: "cop-ingest",
                 }),
                 makeTriple(target.id, "geo.location.longitude", -122.4, {
-                  source: "",
+                  source: "cop-ingest",
                 }),
               ],
             };
@@ -689,6 +697,66 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(store.entities.has(v1.id)).toBe(true);
     expect(store.getCommandableVehicle(v1.id)).toBeNull();
     expect(store.commandableVehicles).toHaveLength(0);
+
+    store.disconnect();
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("starts fresh SKG state on explicit connect(overrideUrl) without leaking prior endpoint vehicles or poison diagnostics", () => {
+    const rig = new MockWebSocketRig();
+    const urlA = "ws://127.0.0.1:8082/ws-a";
+    const urlB = "ws://127.0.0.1:8092/ws-b";
+    const store = createSkgStore({
+      url: urlA,
+      createSocket: rig.createSocket,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+    const v1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Alpha-A-Vehicle",
+    });
+    const v2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+    });
+    rig.latest.serverMessage(putFrame(v1.id, 10, v1));
+    rig.latest.serverMessage(putFrame(v2.id, 11, v2));
+    rig.latest.serverMessage(syncedFrame(11));
+    expect(store.getCommandableVehicle(v1.id)?.sysid).toBe(1);
+    expect(store.commandableVehicles).toHaveLength(2);
+
+    // Explicitly switch to endpoint B: A's vehicles MUST NOT remain readable before B's barrier or leak into B's poison diagnostics!
+    store.connect(urlB);
+    expect(store.url).toBe(urlB);
+    expect(store.synced).toBe(false);
+    expect(store.lastSyncedRevision).toBeNull();
+    expect(store.entities.size).toBe(0);
+    expect(store.getCommandableVehicle(v1.id)).toBeNull();
+    expect(store.commandableVehicles).toEqual([]);
+
+    rig.latest.serverOpen();
+    const v3 = buildVehicleStoredPayload(3, {
+      "uxs.domain.kind": "surface-boat",
+    });
+    // Key v1.id arrives poisoned on endpoint B with zero prior B record -> must NOT inherit endpoint A's vehicle kind/title/coordinates!
+    rig.latest.serverMessage(
+      poisonedFrame(v1.id, 1, "corrupt entry on endpoint B"),
+    );
+    rig.latest.serverMessage(putFrame(v3.id, 2, v3));
+    rig.latest.serverMessage(syncedFrame(2));
+
+    expect(store.entities.size).toBe(2);
+    expect(store.entities.has(v2.id)).toBe(false);
+    expect(store.commandableVehicles.map((v) => v.sysid)).toEqual([3]);
+
+    const poisonedB = store.getEntity(v1.id);
+    expect(poisonedB?.poisoned).toBe(true);
+    expect(poisonedB?.kind).toBe("generic");
+    expect(poisonedB?.title).toBeNull();
+    expect(poisonedB?.location).toBeNull();
+    expect(store.getVehicle(v1.id)).toBeNull();
+    expect(store.getCommandableVehicle(v1.id)).toBeNull();
 
     store.disconnect();
   });
