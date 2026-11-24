@@ -2,7 +2,7 @@
 
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval (`proposal.md` + `design.md` with `OQ1` Option A, `OQ2` Option A, and `OQ3` Option B rulings incorporated; premise: `.agents/protocol.md:17`, `.agents/contracts/architect.md:5`). Check: `proposal.md` carries owner `Approved-by: <name> (<YYYY-MM-DD>) sha256:<12 hex>` matching `ateam state spec-queue` and this hold is removed in the same edit.
+- [x] 1.1 Owner approved `proposal.md` and `design.md` together (`Approved-by: Coby Leuschke (2026-11-24) sha256:cda038dd3d15` following initial `sha256:549b47d3268a` draft; `OQ1` Option A, `OQ2` Option A, and `OQ3` Option B ruled).
 
 ## 2. Implementation
 

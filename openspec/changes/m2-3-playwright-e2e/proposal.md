@@ -1,5 +1,5 @@
 # Proposal: m2-3-playwright-e2e
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-24) sha256:cda038dd3d15
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track
