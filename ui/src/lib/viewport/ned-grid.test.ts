@@ -2012,4 +2012,448 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
     skgStore.disconnect();
     host.remove();
   });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("withholds rather than shifting a stationary beacon on t=0 -> +400ms GPS refresh -> +1500ms (or +450ms / coalesced) local-only report, while re-anchoring on confirmed relocation", () => {
+    const t0 = Date.parse("2026-11-24T16:00:00.000Z");
+    const sfBeaconLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const sfOriginLla = deriveNedOriginLla([0, 0, -2], sfBeaconLla)!;
+    const austinBeaconLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    // Exact reproduction on 800x600 fixed camera (zoom 4 px/m -> center x = 400):
+    // t=0 anchor -> +400ms identical geographic refresh -> +1500ms local report (-30 m East = +120 px if origin shifted) carrying cached +400ms fix.
+    const adapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+      ]),
+    ).toBe(true);
+    const projAtT0 = adapter.project({ lla: sfBeaconLla });
+    expect(projAtT0.visible).toBe(true);
+    expect(projAtT0.x).toBeCloseTo(400, 6);
+
+    // +400ms: refresh identical geographic fix while local NED remains at t0.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0 + 400,
+        },
+      ]),
+    ).toBe(true);
+    const projAt400 = adapter.project({ lla: sfBeaconLla });
+    expect(projAt400.visible).toBe(true);
+    expect(projAt400.x).toBe(projAtT0.x);
+
+    // +1500ms: local report moves 30 m West ([0, -30, -2]) carrying the cached +400ms GPS fix -> MUST withhold rather than shifting beacon to x=520!
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, -30, -2],
+          lla: sfBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 1_500,
+          globalPosObservedAtMs: t0 + 400,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(adapter.project({ lla: sfBeaconLla }).visible).toBe(false);
+
+    // Tight-skew variant (+400ms GPS refresh 5 m West within drift tolerance -> +450ms local-only jump carrying that cached +400ms fix) withholds because globalMs did not advance past +400ms.
+    const tightAdapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    const sfAt5mWestLla = localNedToLla([0, -5, -2], sfOriginLla)!;
+    expect(
+      anchorSharedFrameOrigin(tightAdapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+      ]),
+    ).toBe(true);
+    expect(
+      anchorSharedFrameOrigin(tightAdapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfAt5mWestLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0 + 400,
+        },
+      ]),
+    ).toBe(true);
+    expect(
+      anchorSharedFrameOrigin(tightAdapter, [
+        {
+          ned: [0, -50, -2],
+          lla: sfAt5mWestLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 450,
+          globalPosObservedAtMs: t0 + 400,
+        },
+      ]),
+    ).toBe(false);
+    expect(tightAdapter.getCamera().originLla).toBeNull();
+
+    // Coalesced variant (skipping intermediate +400ms render: t=0 -> t=+600ms with globalMs=+400ms and 30 m async move) also withholds across repeated ticks.
+    const coalescedAdapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    expect(
+      anchorSharedFrameOrigin(coalescedAdapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+      ]),
+    ).toBe(true);
+    const slightlyShiftedLla = localNedToLla([0, -2, -2], sfOriginLla)!;
+    for (let tick = 0; tick < 2; tick += 1) {
+      expect(
+        anchorSharedFrameOrigin(coalescedAdapter, [
+          {
+            ned: [0, -32, -2],
+            lla: slightlyShiftedLla,
+            hasLocalPos: true,
+            hasVerifiedFrameReference: true,
+            stale: false,
+            localPosObservedAtMs: t0 + 600,
+            globalPosObservedAtMs: t0 + 400,
+          },
+        ]),
+      ).toBe(false);
+      expect(coalescedAdapter.getCamera().originLla).toBeNull();
+    }
+
+    // Matching geographic fix at +1600ms restores SF reference with zero stationary shift (x === 400).
+    const sfMoved30mWestLla = localNedToLla([0, -30, -2], sfOriginLla)!;
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, -30, -2],
+          lla: sfMoved30mWestLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 1_500,
+          globalPosObservedAtMs: t0 + 1_600,
+        },
+      ]),
+    ).toBe(true);
+    const projRestored = adapter.project({ lla: sfBeaconLla });
+    expect(projRestored.visible).toBe(true);
+    expect(projRestored.x).toBeCloseTo(400, 6);
+    expect(projRestored.y).toBeCloseTo(300, 6);
+
+    // Positive relocation check: fresh contemporaneous Austin pair updates originLla so NED and LLA agree in Austin.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [10, -6, -3],
+          lla: austinBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 3_050,
+          globalPosObservedAtMs: t0 + 3_000,
+        },
+      ]),
+    ).toBe(true);
+    const austinNed = adapter.project({ ned: [10, -6, -3] });
+    const austinGeo = adapter.project({ lla: austinBeaconLla });
+    expect(austinGeo.visible).toBe(true);
+    expect(austinGeo.x).toBeCloseTo(austinNed.x, 4);
+    expect(austinGeo.y).toBeCloseTo(austinNed.y, 4);
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("preserves a conflict hold across staggered vehicle expirations (t=0 A, t=+500ms conflicting B, t=+2600ms A expired while B still fresh, t=+3200ms both expired) until new confirming observations arrive", () => {
+    let simNowMs = Date.parse("2026-11-24T17:00:00.000Z");
+    let ws2Socket: {
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    } | null = null;
+    const telemetryStore = createTelemetryStore({ now: () => simNowMs });
+    const skgStore = createSkgStore({
+      now: () => simNowMs,
+      createSocket: () => {
+        ws2Socket = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        return ws2Socket;
+      },
+    });
+    skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+    ws2Socket!.onopen?.(new Event("open") as never);
+
+    const viewportStore = createViewportStore({ skgStore });
+    const adapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    const vehAId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const vehBId = "boxbotix.local.robotics.uxs.vehicle.2";
+    const contactId = "ais.uscg.cop.contact.vessel.staggered-conflict";
+    const sfLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const austinLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    const makeVehicle = (
+      id: string,
+      sysid: number,
+      ned: [number, number, number],
+      lla: [number, number, number],
+      observedMs: number,
+      revision: number,
+    ) => {
+      const iso = new Date(observedMs).toISOString();
+      return {
+        id,
+        kind: "uxs-vehicle" as const,
+        title: `Veh-${sysid}`,
+        org: "boxbotix",
+        platform: "local",
+        sysid,
+        domain: "quadcopter" as const,
+        authority: "companion-teleop" as const,
+        companionMode: "teleop-velocity" as const,
+        linkTier: "mesh-high-rate" as const,
+        armed: true,
+        healthFlags: {
+          clock_sync_locked: true,
+          teleop_deadman_clamped: false,
+          crsf_link_healthy: true,
+          companion_trunk_healthy: true,
+        },
+        sysStatus: {
+          failsafes: 0,
+          crcErrors: 0,
+          loopDtUs: 1000,
+          maxLoopDtUs: 1200,
+          rttUs: 400,
+        },
+        attitudeQuaternion: [1, 0, 0, 0] as [number, number, number, number],
+        attitudeRates: [0, 0, 0] as [number, number, number],
+        ned,
+        velocityNed: [0, 0, 0] as [number, number, number],
+        headingDeg: 0,
+        location: { latitude: lla[0], longitude: lla[1], altitude: lla[2] },
+        hasAttitude: true,
+        hasLocalPos: true,
+        hasGlobalPos: true,
+        hasHeading: true,
+        poseObservedAt: iso,
+        localPosObservedAt: iso,
+        globalPosObservedAt: iso,
+        poseIngestedAtMs: observedMs,
+        poseIngestedLive: true,
+        kvRevision: revision,
+        updatedAt: iso,
+        poisoned: false,
+        poisonError: null,
+        indexingProfile: "full",
+        source: "mavlink_0xb1",
+        observedAt: iso,
+        receivedAt: iso,
+        expiresAt: null,
+        uncertaintyMeters: null,
+        feedStatus: "live" as const,
+        ingestedAtMs: observedMs,
+        triples: [],
+      };
+    };
+
+    const t0 = simNowMs;
+    skgStore.entities.set(
+      vehAId,
+      makeVehicle(vehAId, 1, [0, 0, -2], sfLla, t0, 1),
+    );
+    skgStore.entities.set(contactId, {
+      id: contactId,
+      kind: "external-contact",
+      kvRevision: 2,
+      poisoned: false,
+      poisonError: null,
+      title: "Austin Marker",
+      contactType: "ais",
+      indexingProfile: null,
+      source: "ais-bridge",
+      observedAt: new Date(t0).toISOString(),
+      receivedAt: new Date(t0).toISOString(),
+      updatedAt: new Date(t0).toISOString(),
+      expiresAt: null,
+      feedStatus: "live",
+      uncertaintyMeters: 5,
+      location: {
+        latitude: austinLla[0],
+        longitude: austinLla[1],
+        altitude: austinLla[2],
+      },
+      triples: [],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(TacticalCanvas, {
+      target: host,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        adapter,
+        now: () => simNowMs,
+      },
+    });
+    flushSync();
+
+    // 1. t=0: Vehicle A anchors SF reference.
+    expect(adapter.getCamera().originLla).not.toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("true");
+
+    // 2. t=+500ms: Conflicting Vehicle B arrives in Austin while A is still fresh -> clears originLla.
+    simNowMs = t0 + 500;
+    skgStore.entities.set(
+      vehBId,
+      makeVehicle(vehBId, 2, [0, 0, -2], austinLla, simNowMs, 3),
+    );
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+    expect(adapter.project({ lla: austinLla }).visible).toBe(false);
+
+    // 3. t=+2600ms: Vehicle A has expired (2600ms > 2500ms) while Vehicle B is still fresh (2100ms <= 2500ms), with NO new observations -> MUST stay withheld!
+    simNowMs = t0 + 2_600;
+    skgStore.entities.set(contactId, {
+      ...(skgStore.entities.get(contactId)! as ExternalContactEntityState),
+      kvRevision: 4,
+    });
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+    expect(adapter.project({ lla: austinLla }).visible).toBe(false);
+
+    // 4. t=+3200ms: Vehicle B also expires -> STILL withheld.
+    simNowMs = t0 + 3_200;
+    skgStore.entities.set(contactId, {
+      ...(skgStore.entities.get(contactId)! as ExternalContactEntityState),
+      kvRevision: 5,
+    });
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+
+    // 5. t=+3500ms: New confirming observations arrive for Vehicle B (while A remains expired) -> restores geographic overlay in Austin!
+    simNowMs = t0 + 3_500;
+    skgStore.entities.set(
+      vehBId,
+      makeVehicle(vehBId, 2, [4, -2, -2], austinLla, simNowMs, 6),
+    );
+    flushSync();
+
+    expect(adapter.getCamera().originLla).not.toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("true");
+    expect(adapter.project({ lla: austinLla }).visible).toBe(true);
+
+    unmount(app);
+    skgStore.disconnect();
+    host.remove();
+
+    // Direct timestamp-free adapter probe: staggered conflict expiration without timestamps also preserves the hold until new observations arrive.
+    const directAdapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    expect(
+      anchorSharedFrameOrigin(directAdapter, [
+        { ned: [0, 0, 0], lla: sfLla, stale: false },
+      ]),
+    ).toBe(true);
+    expect(
+      anchorSharedFrameOrigin(directAdapter, [
+        { ned: [0, 0, 0], lla: sfLla, stale: false },
+        { ned: [0, 0, 0], lla: austinLla, stale: false },
+      ]),
+    ).toBe(false);
+    expect(
+      anchorSharedFrameOrigin(directAdapter, [
+        { ned: [0, 0, 0], lla: sfLla, stale: true },
+        { ned: [0, 0, 0], lla: austinLla, stale: false },
+      ]),
+    ).toBe(false);
+    expect(directAdapter.getCamera().originLla).toBeNull();
+    const movedAustinLla = localNedToLla([2, 0, 0], austinLla)!;
+    expect(
+      anchorSharedFrameOrigin(directAdapter, [
+        { ned: [0, 0, 0], lla: sfLla, stale: true },
+        { ned: [2, 0, 0], lla: movedAustinLla, stale: false },
+      ]),
+    ).toBe(true);
+    expect(directAdapter.getCamera().originLla).not.toBeNull();
+  });
 });

@@ -246,7 +246,8 @@ export function deriveNedOriginLla(
 }
 
 export const SHARED_ORIGIN_MAX_DRIFT_M = 25;
-export const MAX_FRAME_PAIR_SKEW_MS = 1_500;
+export const MAX_FRAME_PAIR_SKEW_MS = 500;
+export const MAX_ASYNC_MOTION_SPEED_MPS = 60;
 
 interface VerifiedOriginBaseline {
   readonly ned: readonly [number, number, number];
@@ -256,19 +257,52 @@ interface VerifiedOriginBaseline {
 }
 
 interface AdapterOriginState {
-  activeBaseline: VerifiedOriginBaseline | null;
-  withheldBaseline: VerifiedOriginBaseline | null;
+  consistentMaxLocalMs: number | null;
+  consistentMaxGlobalMs: number | null;
+  consistentSnapshots: VerifiedOriginBaseline[];
+  isWithheld: boolean;
+  withheldFromOriginLla: [number, number, number] | null;
+  holdMaxLocalMs: number | null;
+  holdMaxGlobalMs: number | null;
+  holdOriginSnapshots: VerifiedOriginBaseline[];
+  holdSnapshots: VerifiedOriginBaseline[];
 }
 
 const adapterOriginStates = new WeakMap<ViewportAdapter, AdapterOriginState>();
 
+function createEmptyOriginState(): AdapterOriginState {
+  return {
+    consistentMaxLocalMs: null,
+    consistentMaxGlobalMs: null,
+    consistentSnapshots: [],
+    isWithheld: false,
+    withheldFromOriginLla: null,
+    holdMaxLocalMs: null,
+    holdMaxGlobalMs: null,
+    holdOriginSnapshots: [],
+    holdSnapshots: [],
+  };
+}
+
 function getOrCreateOriginState(adapter: ViewportAdapter): AdapterOriginState {
   let state = adapterOriginStates.get(adapter);
   if (!state) {
-    state = { activeBaseline: null, withheldBaseline: null };
+    state = createEmptyOriginState();
     adapterOriginStates.set(adapter, state);
   }
   return state;
+}
+
+function resetOriginState(state: AdapterOriginState): void {
+  state.consistentMaxLocalMs = null;
+  state.consistentMaxGlobalMs = null;
+  state.consistentSnapshots = [];
+  state.isWithheld = false;
+  state.withheldFromOriginLla = null;
+  state.holdMaxLocalMs = null;
+  state.holdMaxGlobalMs = null;
+  state.holdOriginSnapshots = [];
+  state.holdSnapshots = [];
 }
 
 function tuple3Equals(
@@ -281,6 +315,16 @@ function tuple3Equals(
     Math.abs(a[1] - b[1]) <= eps &&
     Math.abs(a[2] - b[2]) <= eps
   );
+}
+
+function maxObservedMs(
+  current: number | null,
+  candidate: number | null | undefined,
+): number | null {
+  if (!isFiniteNumber(candidate)) {
+    return current;
+  }
+  return current === null ? candidate : Math.max(current, candidate);
 }
 
 function hasContemporaneousObservations(
@@ -305,23 +349,6 @@ function hasContemporaneousObservations(
   );
 }
 
-function hasBothDomainsAdvancedSince(
-  candidate: VerifiedOriginBaseline,
-  baseline: VerifiedOriginBaseline,
-): boolean {
-  const localAdvanced =
-    isFiniteNumber(candidate.localPosObservedAtMs) &&
-    isFiniteNumber(baseline.localPosObservedAtMs)
-      ? candidate.localPosObservedAtMs > baseline.localPosObservedAtMs
-      : !tuple3Equals(candidate.ned, baseline.ned);
-  const globalAdvanced =
-    isFiniteNumber(candidate.globalPosObservedAtMs) &&
-    isFiniteNumber(baseline.globalPosObservedAtMs)
-      ? candidate.globalPosObservedAtMs > baseline.globalPosObservedAtMs
-      : !tuple3Equals(candidate.lla, baseline.lla);
-  return localAdvanced && globalAdvanced;
-}
-
 function toOriginBaseline(
   candidate: VerifiedOriginBaseline,
 ): VerifiedOriginBaseline {
@@ -333,32 +360,307 @@ function toOriginBaseline(
   };
 }
 
+function originDisagreementMeters(
+  ned: readonly [number, number, number],
+  lla: readonly [number, number, number],
+  originLla: readonly [number, number, number],
+): number {
+  const projectedNed = llaToLocalNed(lla, originLla);
+  if (!projectedNed) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.hypot(
+    projectedNed[0] - ned[0],
+    projectedNed[1] - ned[1],
+    projectedNed[2] - ned[2],
+  );
+}
+
 function poseAgreesWithOrigin(
   ned: readonly [number, number, number],
   lla: readonly [number, number, number],
   originLla: readonly [number, number, number],
   maxDriftM = SHARED_ORIGIN_MAX_DRIFT_M,
 ): boolean {
-  const projectedNed = llaToLocalNed(lla, originLla);
-  if (!projectedNed) {
+  return originDisagreementMeters(ned, lla, originLla) <= maxDriftM;
+}
+
+function hasAdvancedPastWatermarks(
+  candidate: VerifiedOriginBaseline,
+  maxLocalMs: number | null,
+  maxGlobalMs: number | null,
+  priorSnapshots: readonly VerifiedOriginBaseline[],
+): boolean {
+  const hasCandidateTimestamps =
+    isFiniteNumber(candidate.localPosObservedAtMs) &&
+    isFiniteNumber(candidate.globalPosObservedAtMs);
+
+  if (hasCandidateTimestamps && (maxLocalMs !== null || maxGlobalMs !== null)) {
+    const localNewer =
+      maxLocalMs === null || candidate.localPosObservedAtMs > maxLocalMs;
+    const globalNewer =
+      maxGlobalMs === null || candidate.globalPosObservedAtMs > maxGlobalMs;
+    return localNewer && globalNewer;
+  }
+
+  for (const snap of priorSnapshots) {
+    if (
+      tuple3Equals(candidate.ned, snap.ned) &&
+      tuple3Equals(candidate.lla, snap.lla)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isConfirmedRelocation(
+  candidate: VerifiedOriginBaseline,
+  referenceOriginLla: readonly [number, number, number],
+  maxLocalMs: number | null,
+  maxGlobalMs: number | null,
+  referenceSnapshots: readonly VerifiedOriginBaseline[],
+): boolean {
+  if (
+    !hasContemporaneousObservations(
+      candidate.localPosObservedAtMs,
+      candidate.globalPosObservedAtMs,
+    )
+  ) {
     return false;
   }
-  return (
-    Math.hypot(
-      projectedNed[0] - ned[0],
-      projectedNed[1] - ned[1],
-      projectedNed[2] - ned[2],
-    ) <= maxDriftM
+  if (
+    !hasAdvancedPastWatermarks(
+      candidate,
+      maxLocalMs,
+      maxGlobalMs,
+      referenceSnapshots,
+    )
+  ) {
+    return false;
+  }
+
+  const driftM = originDisagreementMeters(
+    candidate.ned,
+    candidate.lla,
+    referenceOriginLla,
   );
+  if (
+    isFiniteNumber(candidate.localPosObservedAtMs) &&
+    isFiniteNumber(candidate.globalPosObservedAtMs)
+  ) {
+    const skewMs = Math.abs(
+      candidate.localPosObservedAtMs - candidate.globalPosObservedAtMs,
+    );
+    if (skewMs > 0) {
+      const maxAsyncExplainableM =
+        SHARED_ORIGIN_MAX_DRIFT_M +
+        (skewMs / 1_000) * MAX_ASYNC_MOTION_SPEED_MPS;
+      if (driftM <= maxAsyncExplainableM) {
+        return false;
+      }
+      for (const snap of referenceSnapshots) {
+        if (
+          candidate.localPosObservedAtMs > candidate.globalPosObservedAtMs &&
+          tuple3Equals(candidate.lla, snap.lla)
+        ) {
+          return false;
+        }
+        if (
+          candidate.globalPosObservedAtMs > candidate.localPosObservedAtMs &&
+          tuple3Equals(candidate.ned, snap.ned)
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  for (const snap of referenceSnapshots) {
+    if (tuple3Equals(candidate.lla, snap.lla)) {
+      return false;
+    }
+    if (tuple3Equals(candidate.ned, snap.ned) && driftM <= 1_000) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function recordConsistentPoses(
+  state: AdapterOriginState,
+  poses: readonly VerifiedOriginBaseline[],
+): void {
+  for (const pose of poses) {
+    state.consistentMaxLocalMs = maxObservedMs(
+      state.consistentMaxLocalMs,
+      pose.localPosObservedAtMs,
+    );
+    state.consistentMaxGlobalMs = maxObservedMs(
+      state.consistentMaxGlobalMs,
+      pose.globalPosObservedAtMs,
+    );
+  }
+  state.consistentSnapshots = poses.map(toOriginBaseline);
+  state.isWithheld = false;
+  state.withheldFromOriginLla = null;
+  state.holdMaxLocalMs = null;
+  state.holdMaxGlobalMs = null;
+  state.holdOriginSnapshots = [];
+  state.holdSnapshots = [];
+}
+
+function enterHoldState(
+  state: AdapterOriginState,
+  blockedPoses: readonly VerifiedOriginBaseline[],
+): void {
+  let nextMaxLocalMs = maxObservedMs(
+    state.holdMaxLocalMs,
+    state.consistentMaxLocalMs,
+  );
+  let nextMaxGlobalMs = maxObservedMs(
+    state.holdMaxGlobalMs,
+    state.consistentMaxGlobalMs,
+  );
+  for (const pose of blockedPoses) {
+    nextMaxLocalMs = maxObservedMs(nextMaxLocalMs, pose.localPosObservedAtMs);
+    nextMaxGlobalMs = maxObservedMs(
+      nextMaxGlobalMs,
+      pose.globalPosObservedAtMs,
+    );
+  }
+  const mergedSnapshots = [
+    ...state.holdSnapshots,
+    ...state.consistentSnapshots,
+    ...blockedPoses.map(toOriginBaseline),
+  ];
+  state.isWithheld = true;
+  state.withheldFromOriginLla = null;
+  state.holdMaxLocalMs = nextMaxLocalMs;
+  state.holdMaxGlobalMs = nextMaxGlobalMs;
+  state.holdOriginSnapshots = [];
+  state.holdSnapshots = mergedSnapshots.slice(-16);
+  state.consistentMaxLocalMs = null;
+  state.consistentMaxGlobalMs = null;
+  state.consistentSnapshots = [];
+}
+
+function enterDivergenceHoldState(
+  state: AdapterOriginState,
+  divergedPoses: readonly VerifiedOriginBaseline[],
+  priorOriginLla: readonly [number, number, number],
+): void {
+  state.isWithheld = true;
+  state.withheldFromOriginLla = [
+    priorOriginLla[0],
+    priorOriginLla[1],
+    priorOriginLla[2],
+  ];
+  state.holdMaxLocalMs = maxObservedMs(
+    state.holdMaxLocalMs,
+    state.consistentMaxLocalMs,
+  );
+  state.holdMaxGlobalMs = maxObservedMs(
+    state.holdMaxGlobalMs,
+    state.consistentMaxGlobalMs,
+  );
+  state.holdOriginSnapshots = [...state.consistentSnapshots];
+  state.holdSnapshots = [
+    ...state.consistentSnapshots,
+    ...divergedPoses.map(toOriginBaseline),
+  ].slice(-16);
+  state.consistentMaxLocalMs = null;
+  state.consistentMaxGlobalMs = null;
+  state.consistentSnapshots = [];
+}
+
+function canLiftHold(
+  candidate: VerifiedOriginBaseline,
+  state: AdapterOriginState,
+): boolean {
+  if (
+    !hasContemporaneousObservations(
+      candidate.localPosObservedAtMs,
+      candidate.globalPosObservedAtMs,
+    )
+  ) {
+    return false;
+  }
+  if (
+    !hasAdvancedPastWatermarks(
+      candidate,
+      state.holdMaxLocalMs,
+      state.holdMaxGlobalMs,
+      state.holdSnapshots,
+    )
+  ) {
+    return false;
+  }
+  if (state.withheldFromOriginLla !== null) {
+    if (
+      poseAgreesWithOrigin(
+        candidate.ned,
+        candidate.lla,
+        state.withheldFromOriginLla,
+      )
+    ) {
+      return true;
+    }
+    return isConfirmedRelocation(
+      candidate,
+      state.withheldFromOriginLla,
+      state.holdMaxLocalMs,
+      state.holdMaxGlobalMs,
+      state.holdOriginSnapshots,
+    );
+  }
+  return true;
+}
+
+function collectVerifiedBaselines(
+  poses: ReadonlyArray<{
+    readonly ned: readonly [number, number, number];
+    readonly lla: readonly [number, number, number] | null;
+    readonly hasLocalPos?: boolean;
+    readonly hasVerifiedFrameReference?: boolean;
+    readonly localPosObservedAtMs?: number | null;
+    readonly globalPosObservedAtMs?: number | null;
+  }>,
+): Array<VerifiedOriginBaseline & { originLla: [number, number, number] }> {
+  const out: Array<
+    VerifiedOriginBaseline & { originLla: [number, number, number] }
+  > = [];
+  for (const pose of poses) {
+    if (
+      pose.hasVerifiedFrameReference === false ||
+      pose.hasLocalPos === false ||
+      pose.lla === null
+    ) {
+      continue;
+    }
+    const originLla = deriveNedOriginLla(pose.ned, pose.lla);
+    if (originLla !== null) {
+      out.push({
+        ned: pose.ned,
+        lla: pose.lla,
+        localPosObservedAtMs: pose.localPosObservedAtMs,
+        globalPosObservedAtMs: pose.globalPosObservedAtMs,
+        originLla,
+      });
+    }
+  }
+  return out;
 }
 
 /**
  * Reconciles the viewport's shared NED<->LLA reference against live vehicle
  * poses that carry both local NED and a verified geographic fix.
  * Keeps an established reference steady across ordinary asynchronous local or
- * global updates, withholds mixed-frame placement when divergence lacks fresh
- * contemporaneous confirmation in both domains or when vehicles conflict, and
- * never re-enables a cleared reference solely because live vehicles time out.
+ * global updates, withholds mixed-frame placement when divergence can be
+ * explained by asynchronous motion or when vehicles conflict, and preserves
+ * holds across staggered or complete timeouts until new confirming observations
+ * arrive.
  */
 export function anchorSharedFrameOrigin(
   adapter: ViewportAdapter,
@@ -374,8 +676,23 @@ export function anchorSharedFrameOrigin(
 ): boolean {
   const state = getOrCreateOriginState(adapter);
   const currentOrigin = adapter.getCamera().originLla;
-  if (currentOrigin === null && state.activeBaseline !== null) {
-    state.activeBaseline = null;
+  if (
+    currentOrigin === null &&
+    (state.consistentMaxLocalMs !== null ||
+      state.consistentMaxGlobalMs !== null ||
+      state.consistentSnapshots.length > 0)
+  ) {
+    state.consistentMaxLocalMs = null;
+    state.consistentMaxGlobalMs = null;
+    state.consistentSnapshots = [];
+  }
+  if (currentOrigin !== null && state.isWithheld) {
+    state.isWithheld = false;
+    state.withheldFromOriginLla = null;
+    state.holdMaxLocalMs = null;
+    state.holdMaxGlobalMs = null;
+    state.holdOriginSnapshots = [];
+    state.holdSnapshots = [];
   }
 
   const allPoses = Array.from(vehiclePoses);
@@ -387,8 +704,7 @@ export function anchorSharedFrameOrigin(
     }
     if (allPoses.length === 0) {
       adapter.setCamera({ originLla: null });
-      state.activeBaseline = null;
-      state.withheldBaseline = null;
+      resetOriginState(state);
       return false;
     }
     const staleStillConsistent = allPoses.every(
@@ -400,45 +716,22 @@ export function anchorSharedFrameOrigin(
     );
     if (!staleStillConsistent) {
       adapter.setCamera({ originLla: null });
-      state.activeBaseline = null;
-      state.withheldBaseline = null;
+      enterHoldState(state, collectVerifiedBaselines(allPoses));
       return false;
     }
     return true;
   }
 
-  const verified: Array<
-    VerifiedOriginBaseline & {
-      originLla: [number, number, number];
-    }
-  > = [];
-
-  for (const pose of livePoses) {
-    if (
-      pose.hasVerifiedFrameReference === false ||
-      pose.hasLocalPos === false ||
-      pose.lla === null
-    ) {
-      continue;
-    }
-    const originLla = deriveNedOriginLla(pose.ned, pose.lla);
-    if (originLla !== null) {
-      verified.push({
-        ned: pose.ned,
-        lla: pose.lla,
-        localPosObservedAtMs: pose.localPosObservedAtMs,
-        globalPosObservedAtMs: pose.globalPosObservedAtMs,
-        originLla,
-      });
-    }
-  }
+  const verified = collectVerifiedBaselines(livePoses);
 
   if (verified.length === 0) {
+    const staleVerified = collectVerifiedBaselines(allPoses);
     if (currentOrigin !== null) {
       adapter.setCamera({ originLla: null });
+      enterHoldState(state, staleVerified);
+    } else if (state.isWithheld || staleVerified.length > 0) {
+      enterHoldState(state, staleVerified);
     }
-    state.activeBaseline = null;
-    state.withheldBaseline = null;
     return false;
   }
 
@@ -449,8 +742,7 @@ export function anchorSharedFrameOrigin(
       if (currentOrigin !== null) {
         adapter.setCamera({ originLla: null });
       }
-      state.activeBaseline = null;
-      state.withheldBaseline = null;
+      enterHoldState(state, verified);
       return false;
     }
   }
@@ -460,54 +752,60 @@ export function anchorSharedFrameOrigin(
       poseAgreesWithOrigin(item.ned, item.lla, currentOrigin),
     );
     if (allAgreeWithCurrent) {
-      if (
-        hasContemporaneousObservations(
-          primary.localPosObservedAtMs,
-          primary.globalPosObservedAtMs,
-        ) &&
-        (state.activeBaseline === null ||
-          hasBothDomainsAdvancedSince(primary, state.activeBaseline))
-      ) {
-        state.activeBaseline = toOriginBaseline(primary);
-      }
-      state.withheldBaseline = null;
+      recordConsistentPoses(state, verified);
       return true;
     }
 
-    const confirmedRelocation =
-      hasContemporaneousObservations(
-        primary.localPosObservedAtMs,
-        primary.globalPosObservedAtMs,
-      ) &&
-      (state.activeBaseline === null ||
-        hasBothDomainsAdvancedSince(primary, state.activeBaseline));
+    const confirmedRelocation = verified.some((item) =>
+      isConfirmedRelocation(
+        item,
+        currentOrigin,
+        state.consistentMaxLocalMs,
+        state.consistentMaxGlobalMs,
+        state.consistentSnapshots,
+      ),
+    );
     if (!confirmedRelocation) {
       adapter.setCamera({ originLla: null });
-      state.withheldBaseline = state.activeBaseline;
-      state.activeBaseline = null;
+      enterDivergenceHoldState(state, verified, currentOrigin);
       return false;
     }
 
     adapter.setCamera({ originLla: primary.originLla });
-    state.activeBaseline = toOriginBaseline(primary);
-    state.withheldBaseline = null;
+    recordConsistentPoses(state, verified);
     return true;
   }
 
-  const confirmedInitialOrRestored =
+  if (state.isWithheld) {
+    const liftConfirmed = verified.some((item) => canLiftHold(item, state));
+    if (!liftConfirmed) {
+      return false;
+    }
+    const restorePriorOrigin =
+      state.withheldFromOriginLla !== null &&
+      verified.every((item) =>
+        poseAgreesWithOrigin(item.ned, item.lla, state.withheldFromOriginLla!),
+      );
+    const nextOrigin = restorePriorOrigin
+      ? state.withheldFromOriginLla!
+      : primary.originLla;
+    adapter.setCamera({ originLla: nextOrigin });
+    recordConsistentPoses(state, verified);
+    return true;
+  }
+
+  const initialConfirmed = verified.some((item) =>
     hasContemporaneousObservations(
-      primary.localPosObservedAtMs,
-      primary.globalPosObservedAtMs,
-    ) &&
-    (state.withheldBaseline === null ||
-      hasBothDomainsAdvancedSince(primary, state.withheldBaseline));
-  if (!confirmedInitialOrRestored) {
+      item.localPosObservedAtMs,
+      item.globalPosObservedAtMs,
+    ),
+  );
+  if (!initialConfirmed) {
     return false;
   }
 
   adapter.setCamera({ originLla: primary.originLla });
-  state.activeBaseline = toOriginBaseline(primary);
-  state.withheldBaseline = null;
+  recordConsistentPoses(state, verified);
   return true;
 }
 
