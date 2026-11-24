@@ -1051,4 +1051,60 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(v2Parsed.hasHeading).toBe(true);
     expect(v2Parsed.hasGlobalPos).toBe(true);
   });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("expires poseIngestedLive and poseIngestedAtMs when a post-synced put carries a regressed pose timestamp while preserving identical and health-only puts", () => {
+    let browserNowMs = Date.parse("2026-11-24T13:10:00.000Z");
+    const store = createSkgStore({ now: () => browserNowMs });
+
+    const t0Iso = new Date(browserNowMs).toISOString();
+    const initPayload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 10 },
+      { observedAt: t0Iso, updatedAt: t0Iso },
+    );
+    store.ingestRawFrame(putFrame(initPayload.id, 1, initPayload));
+    store.ingestRawFrame(syncedFrame(1));
+
+    // Deliver a live post-synced 20° pose at +250ms.
+    browserNowMs += 250;
+    const liveReceiptMs = browserNowMs;
+    const live20Iso = new Date(browserNowMs).toISOString();
+    const live20Payload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 20 },
+      { observedAt: live20Iso, updatedAt: live20Iso },
+    );
+    store.ingestRawFrame(putFrame(live20Payload.id, 2, live20Payload));
+    const afterLive20 = store.getCommandableVehicle(live20Payload.id)!;
+    expect(afterLive20.poseIngestedLive).toBe(true);
+    expect(afterLive20.poseIngestedAtMs).toBe(liveReceiptMs);
+
+    // Identical pose observation at rev 3 preserves liveReceiptMs and poseIngestedLive=true.
+    browserNowMs += 100;
+    store.ingestRawFrame(putFrame(live20Payload.id, 3, live20Payload));
+    const afterIdentical = store.getCommandableVehicle(live20Payload.id)!;
+    expect(afterIdentical.poseIngestedLive).toBe(true);
+    expect(afterIdentical.poseIngestedAtMs).toBe(liveReceiptMs);
+
+    // Higher KV revision (rev 4) carrying an hour-old 30° pose MUST expire poseIngestedLive and poseIngestedAtMs!
+    browserNowMs += 100;
+    const hourOldIso = new Date(browserNowMs - 3_600_000).toISOString();
+    const regressed30Payload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 30 },
+      {
+        observedAt: hourOldIso,
+        updatedAt: new Date(browserNowMs).toISOString(),
+      },
+    );
+    store.ingestRawFrame(
+      putFrame(regressed30Payload.id, 4, regressed30Payload),
+    );
+    const afterRegressed = store.getCommandableVehicle(regressed30Payload.id)!;
+    expect(afterRegressed.headingDeg).toBe(30);
+    expect(afterRegressed.poseObservedAt).toBe(hourOldIso);
+    expect(afterRegressed.poseIngestedLive).toBe(false);
+    expect(afterRegressed.poseIngestedAtMs).toBeLessThan(0);
+  });
 });

@@ -188,10 +188,20 @@ function parseTelemetryPayload(
     quat[1] * quat[1] +
     quat[2] * quat[2] +
     quat[3] * quat[3];
+  const wrappedHdg = ((payload.hdg_deg % 360) + 360) % 360;
+  const hdgDistFromNorth = Math.min(wrappedHdg, 360 - wrappedHdg);
+  const hasNonZeroRates = rates[0] !== 0 || rates[1] !== 0 || rates[2] !== 0;
+  const isLegacyUnmeasuredBirthQuat =
+    payload.msg_id !== 31 &&
+    Math.abs(quat[0] - 1) < 1e-9 &&
+    Math.abs(quat[1]) < 1e-9 &&
+    Math.abs(quat[2]) < 1e-9 &&
+    Math.abs(quat[3]) < 1e-9 &&
+    (hdgDistFromNorth > 0.5 || !hasNonZeroRates);
   const hasAttitude =
     typeof payload.has_attitude === "boolean"
       ? payload.has_attitude && quatNormSq >= 1e-6
-      : quatNormSq >= 1e-6;
+      : quatNormSq >= 1e-6 && !isLegacyUnmeasuredBirthQuat;
   const hasLocalPos =
     typeof payload.has_local_pos === "boolean" ? payload.has_local_pos : false;
   const hasHeading =

@@ -682,5 +682,55 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
       }),
     );
     expect(first?.has_heading).toBe(false);
+
+    // Legacy WS1 startup wire shape (msg_id=33, [1,0,0,0] birth quat, [0,0,0] rates, hdg_deg=0, neither has_attitude nor has_heading):
+    const legacyWire = JSON.stringify({
+      type: "data",
+      subject: "bbops.telemetry.2",
+      timestamp: 10_200,
+      payload: {
+        sysid: 2,
+        domain: "rover",
+        seq: 1,
+        msg_id: 33,
+        quat_wxyz: [1, 0, 0, 0],
+        body_rates: [0, 0, 0],
+        ned_xyz: [0, 0, 0],
+        ned_vel: [0, 0, 0],
+        lat_lon_alt: [30.2672, -97.7431, 150],
+        has_global_pos: true,
+        hdg_deg: 0,
+        timestamp: 10_200,
+      },
+    });
+    store.ingestRawFrame(legacyWire);
+    const legacyParsed = store.getKinematics(2);
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+
+    // Legacy #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) still reports measured attitude + heading.
+    store.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.2",
+        timestamp: 10_250,
+        payload: {
+          sysid: 2,
+          domain: "rover",
+          seq: 2,
+          msg_id: 31,
+          quat_wxyz: [1, 0, 0, 0],
+          body_rates: [0, 0, 0],
+          ned_xyz: [0, 0, 0],
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: [30.2672, -97.7431, 150],
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: 10_250,
+        },
+      }),
+    );
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
   });
 });

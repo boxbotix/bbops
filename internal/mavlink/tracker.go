@@ -521,11 +521,17 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	next.PoseMetadata = true
 	next.HasGlobalPos = true
 	next.GlobalPosObservedUnixNs = obsNs
-	validHdg := !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg
-	if validHdg {
-		next.HeadingDeg = float64(msg.Hdg) / 100.0
-		next.HasHeading = true
-		next.HeadingObservedUnixNs = obsNs
+	hasFallbackHdg := !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg
+	if !sess.hasAttitude {
+		if hasFallbackHdg {
+			next.HeadingDeg = float64(msg.Hdg) / 100.0
+			next.HasHeading = true
+			next.HeadingObservedUnixNs = obsNs
+		} else {
+			next.HeadingDeg = 0
+			next.HasHeading = false
+			next.HeadingObservedUnixNs = 0
+		}
 	}
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
@@ -534,8 +540,8 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 
 	sess.snap = next
 	sess.hasGlobalPos = true
-	if validHdg {
-		sess.hasHeading = true
+	if !sess.hasAttitude {
+		sess.hasHeading = hasFallbackHdg
 	}
 	sess.rev++
 	if peer.IsValid() {

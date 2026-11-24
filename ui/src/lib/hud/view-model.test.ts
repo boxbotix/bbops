@@ -1927,6 +1927,113 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(drawnTexts).toContain("N");
       expect(drawnTexts).toContain("R -- P -- HDG 000°");
+
+      // 5. Post-synced higher KV revision carrying an hour-old 30° pose when WS1 is disconnected MUST mark stale=true!
+      nowMs += 100;
+      const hourOldPoseIso = new Date(nowMs - 3_600_000).toISOString();
+      skgStore.ingestRawFrame(makeHeadingSkgPut(3, true, 30, hourOldPoseIso));
+      drawnTexts.length = 0;
+      flushTicks();
+
+      const regressedPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        {
+          telemetryStatus: telemetryStore.status,
+          skgStatus: "connected",
+          nowMs,
+        },
+      );
+      expect(regressedPose.source).toBe("skg");
+      expect(regressedPose.headingDeg).toBe(30);
+      expect(regressedPose.stale).toBe(true);
+      expect(hudPanel?.getAttribute("data-stale")).toBe("true");
+
+      // 6. Reconnect WS1 and deliver legacy startup wire shape ([1,0,0,0], [0,0,0], msg_id=33, hdg_deg=0, omitted flags) -> NO ATT + NO HDG!
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Socket!.onopen?.(new Event("open") as never);
+      nowMs += 50;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 10,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [30.2672, -97.7431, 150],
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+      drawnTexts.length = 0;
+      flushTicks();
+
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
+      expect(
+        hudHost
+          .querySelector('[data-testid="hud-attitude-unavailable"]')
+          ?.textContent?.trim(),
+      ).toBe("NO ATT");
+      expect(
+        hudHost
+          .querySelector('[data-testid="hud-heading-unavailable"]')
+          ?.textContent?.trim(),
+      ).toBe("NO HDG");
+      expect(drawnTexts).toContain("ATTITUDE UNAVAILABLE");
+      expect(drawnTexts).toContain("HDG UNAVAILABLE");
+      expect(drawnTexts).toContain("R -- P -- HDG ---");
+      expect(drawnTexts).not.toContain("N");
+
+      // 7. Modern positive control on WS1: genuine #31 level-North attitude clears both NO ATT and NO HDG!
+      nowMs += 50;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 11,
+            msg_id: 31,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            has_local_pos: true,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [30.2672, -97.7431, 150],
+            has_global_pos: true,
+            hdg_deg: 0,
+            has_heading: true,
+            timestamp: nowMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+      drawnTexts.length = 0;
+      flushTicks();
+
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+      expect(
+        hudHost.querySelector('[data-testid="hud-attitude-unavailable"]'),
+      ).toBeNull();
+      expect(
+        hudHost.querySelector('[data-testid="hud-heading-unavailable"]'),
+      ).toBeNull();
+      expect(drawnTexts).toContain("N");
+      expect(drawnTexts).toContain("R 0° P 0° Y 0°");
     } finally {
       if (hudApp) unmount(hudApp);
       telemetryStore.disconnect();

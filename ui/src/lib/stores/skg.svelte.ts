@@ -919,8 +919,21 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           entity.poseIngestedAtMs = receiptMs;
           entity.poseIngestedLive = true;
         } else if (prevLive?.kind === "uxs-vehicle") {
-          entity.poseIngestedAtMs = prevLive.poseIngestedAtMs ?? null;
-          entity.poseIngestedLive = prevLive.poseIngestedLive ?? false;
+          const nextPoseObs = entity.poseObservedAt;
+          const prevPoseObs = prevLive.poseObservedAt;
+          const regressed =
+            (!nextPoseObs && Boolean(prevPoseObs)) ||
+            (Boolean(nextPoseObs) &&
+              Boolean(prevPoseObs) &&
+              parseTripleInstantNs(nextPoseObs as string) <
+                parseTripleInstantNs(prevPoseObs as string));
+          if (regressed) {
+            entity.poseIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
+            entity.poseIngestedLive = false;
+          } else {
+            entity.poseIngestedAtMs = prevLive.poseIngestedAtMs ?? null;
+            entity.poseIngestedLive = prevLive.poseIngestedLive ?? false;
+          }
         } else {
           entity.poseIngestedAtMs = null;
           entity.poseIngestedLive = false;

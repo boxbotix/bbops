@@ -549,6 +549,28 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false HasHeading=true", gpOut2.Telemetry)
 	}
 
+	// Subsequent #33 with unknown Hdg=65535 before any #31 MUST invalidate fallback heading on both lanes!
+	gpOutLostHdg := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpUnknownHdg), peerB, t0.Add(3250*time.Millisecond))
+	if !gpOutLostHdg.Accepted || gpOutLostHdg.Telemetry == nil || gpOutLostHdg.Telemetry.HasAttitude ||
+		gpOutLostHdg.Telemetry.HasHeading || gpOutLostHdg.Telemetry.HdgDeg != 0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535 after 274.5) = %+v, want HasHeading=false HdgDeg=0", gpOutLostHdg.Telemetry)
+	}
+	snapLostHdg, _ := tracker.Snapshot(2)
+	if hdgTr := snapLostHdg.Triples()[17]; hdgTr.Confidence != 0 || hdgTr.Context != "" {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535 after 274.5) heading triple = %+v, want Confidence=0 Context=\"\"", hdgTr)
+	}
+
+	// Measured 0.00 deg North restores HasHeading=true and Confidence=1 / Context="measured".
+	gpOutRestoredNorth := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpZeroNorthHdg), peerB, t0.Add(3500*time.Millisecond))
+	if !gpOutRestoredNorth.Accepted || gpOutRestoredNorth.Telemetry == nil || gpOutRestoredNorth.Telemetry.HasAttitude ||
+		!gpOutRestoredNorth.Telemetry.HasHeading || gpOutRestoredNorth.Telemetry.HdgDeg != 0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0 after unknown) = %+v, want HasHeading=true HdgDeg=0", gpOutRestoredNorth.Telemetry)
+	}
+	snapRestoredNorth, _ := tracker.Snapshot(2)
+	if hdgTr := snapRestoredNorth.Triples()[17]; hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 0.0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0 after unknown) heading triple = %+v, want Confidence=1 Context=measured Object=0", hdgTr)
+	}
+
 	// #31 arrives with 90 deg East yaw ([cos(45), 0, 0, sin(45)]).
 	s45 := float32(math.Sqrt2 / 2)
 	attEast := mavcodec.AttitudeQuaternion{Q1: s45, Q2: 0, Q3: 0, Q4: s45, Yawspeed: 0.25}
@@ -1057,6 +1079,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		failsafes    int
 		hasAttitude  bool
 		hasGlobalPos bool
+		hasHeading   bool
 		hdgDeg       float64
 		latLonAlt    [3]float64
 		nedXYZ       [3]float64
@@ -1089,6 +1112,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		sawSysStatusBaseline int
 		sawQuatOverride      int
 		sawHdgFallback       int
+		sawHdgInvalidation   int
 		sawHeartbeatEdge     int
 		sawFailsafeEdge      int
 		sawStatusText        int
@@ -1251,9 +1275,10 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					sawQuatOverride++
 				}
 				rv.hasAttitude = true
+				rv.hasHeading = true
 				rv.hdgDeg = wantYaw
 				rv.rev++
-				if out.Telemetry == nil || angularDiffDeg(out.Telemetry.HdgDeg, wantYaw) > 1e-2 {
+				if out.Telemetry == nil || !out.Telemetry.HasHeading || angularDiffDeg(out.Telemetry.HdgDeg, wantYaw) > 1e-2 {
 					t.Fatalf("seed %d: #31 telemetry heading = %+v, want %v", seed, out.Telemetry, wantYaw)
 				}
 
@@ -1287,13 +1312,22 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				}
 				rv.hasGlobalPos = true
 				rv.latLonAlt = [3]float64{float64(latE7) / 1e7, float64(lonE7) / 1e7, 25.0}
-				if !rv.hasAttitude && hdgCdeg < 36000 {
-					rv.hdgDeg = float64(hdgCdeg) / 100.0
-					sawHdgFallback++
+				if !rv.hasAttitude {
+					if hdgCdeg < 36000 {
+						rv.hdgDeg = float64(hdgCdeg) / 100.0
+						rv.hasHeading = true
+						sawHdgFallback++
+					} else {
+						if rv.hasHeading {
+							sawHdgInvalidation++
+						}
+						rv.hdgDeg = 0
+						rv.hasHeading = false
+					}
 				}
 				rv.rev++
-				if out.Telemetry == nil || !out.Telemetry.HasGlobalPos || angularDiffDeg(out.Telemetry.HdgDeg, rv.hdgDeg) > 1e-2 {
-					t.Fatalf("seed %d: #33 telemetry = %+v, want hdg=%v", seed, out.Telemetry, rv.hdgDeg)
+				if out.Telemetry == nil || !out.Telemetry.HasGlobalPos || out.Telemetry.HasHeading != rv.hasHeading || angularDiffDeg(out.Telemetry.HdgDeg, rv.hdgDeg) > 1e-2 {
+					t.Fatalf("seed %d: #33 telemetry = %+v, want hasHeading=%v hdg=%v", seed, out.Telemetry, rv.hasHeading, rv.hdgDeg)
 				}
 
 			case 4: // #32 LOCAL_POSITION_NED
@@ -1371,7 +1405,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 			}
 			if snap.Domain != rv.domain || snap.Armed != rv.armed || snap.Authority != rv.authority ||
 				snap.CompanionMode != rv.mode || snap.LinkTier != rv.tier || snap.Flags != rv.flags ||
-				snap.Failsafes != rv.failsafes || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
+				snap.Failsafes != rv.failsafes || snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
 				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt {
 				t.Fatalf("seed %d sysid=%d materialized mismatch:\ngot =%+v\nwant=%+v", seed, sysid, snap, *rv)
 			}
@@ -1379,11 +1413,11 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		publishedMu.Unlock()
 	}
 
-	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 ||
+	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 || sawHdgInvalidation == 0 ||
 		sawHeartbeatEdge == 0 || sawFailsafeEdge == 0 || sawStatusText == 0 ||
 		sawSanitizedReject == 0 || sawDroppedPeriodic == 0 {
-		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d",
-			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic)
+		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d",
+			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic)
 	}
 }
 
