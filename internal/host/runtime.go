@@ -68,6 +68,7 @@ type Runtime struct {
 	mutations      *projection.MutationClient
 
 	onReadinessCheck atomic.Pointer[func()]
+	wsProxyCancel    context.CancelFunc
 	started          atomic.Bool
 	initialReady     atomic.Bool
 	stopping         atomic.Bool
@@ -97,7 +98,8 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	baseCfg := prepared.Base
 
-	rt := &Runtime{}
+	wsProxyCtx, wsProxyCancel := context.WithCancel(context.Background())
+	rt := &Runtime{wsProxyCancel: wsProxyCancel}
 	cleanup := func(cause error) (*Runtime, error) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -274,8 +276,17 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		uiDir = defaultUIDir
 	}
 
+	uiMiddleware, err := NewUIMiddleware(uiDir, rt.isUIAdmitted, WebSocketProxyRoutes{
+		TelemetryWS: endpoints.TelemetryWS,
+		GraphWS:     endpoints.GraphWS,
+		ShutdownCtx: wsProxyCtx,
+	})
+	if err != nil {
+		return cleanup(fmt.Errorf("configure UI/WebSocket middleware: %w", err))
+	}
+
 	svcMgr := service.NewServiceManager(svcReg)
-	svcMgr.UseHTTPMiddleware(NewStaticUIMiddleware(uiDir, rt.isUIAdmitted))
+	svcMgr.UseHTTPMiddleware(uiMiddleware)
 
 	svcDeps := &service.Dependencies{
 		NATSClient:        client,
@@ -499,6 +510,9 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 	rt.stopping.Store(true)
 	rt.initialReady.Store(false)
+	if rt.wsProxyCancel != nil {
+		rt.wsProxyCancel()
+	}
 
 	rt.stopMu.Lock()
 	defer rt.stopMu.Unlock()

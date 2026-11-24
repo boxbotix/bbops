@@ -2,8 +2,12 @@ package host
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io/fs"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -11,12 +15,70 @@ import (
 	"github.com/c360studio/semengine/service"
 )
 
+const (
+	telemetryWSFrontDoorPath = "/ws/telemetry"
+	graphWSFrontDoorPath     = "/ws/graph"
+)
+
+// WebSocketProxyRoutes holds the resolved internal output/websocket URLs to
+// expose at same-origin /ws/telemetry and /ws/graph on the HTTP front door.
+type WebSocketProxyRoutes struct {
+	TelemetryWS string
+	GraphWS     string
+	ShutdownCtx context.Context
+}
+
 // NewStaticUIMiddleware serves compiled SvelteKit static assets from uiDir on
 // unmatched GET/HEAD paths once isReady reports true, while passing all reserved
 // SemEngine diagnostic, component, and ADR-115 GraphQL routes straight through.
 func NewStaticUIMiddleware(uiDir string, isReady func() bool) service.HTTPMiddleware {
+	mw, _ := NewUIMiddleware(uiDir, isReady, WebSocketProxyRoutes{})
+	return mw
+}
+
+// NewUIMiddleware extends NewStaticUIMiddleware with same-origin WebSocket
+// reverse-proxying for /ws/telemetry and /ws/graph gated on runtime readiness.
+func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyRoutes) (service.HTTPMiddleware, error) {
+	telemetryProxy, err := newSingleEndpointWSProxy("telemetry_ws", wsRoutes.TelemetryWS)
+	if err != nil {
+		return nil, err
+	}
+	graphProxy, err := newSingleEndpointWSProxy("graph_ws", wsRoutes.GraphWS)
+	if err != nil {
+		return nil, err
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			normalizedPath := strings.ToLower(path.Clean("/" + r.URL.Path))
+			wsProxy := matchWebSocketProxy(normalizedPath, telemetryProxy, graphProxy)
+			if wsProxy != nil || isReservedWebSocketPath(normalizedPath) {
+				if r.Method != http.MethodGet {
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				if isReady != nil && !isReady() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte("NOT READY"))
+					return
+				}
+				if wsProxy == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
+				if wsRoutes.ShutdownCtx != nil {
+					reqCtx, cancel := context.WithCancel(r.Context())
+					stopCancel := context.AfterFunc(wsRoutes.ShutdownCtx, cancel)
+					defer func() {
+						stopCancel()
+						cancel()
+					}()
+					r = r.WithContext(reqCtx)
+				}
+				wsProxy.ServeHTTP(w, r)
+				return
+			}
+
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				next.ServeHTTP(w, r)
 				return
@@ -70,7 +132,60 @@ func NewStaticUIMiddleware(uiDir string, isReady func() bool) service.HTTPMiddle
 			}
 			next.ServeHTTP(w, r)
 		})
+	}, nil
+}
+
+func newSingleEndpointWSProxy(label, rawTarget string) (http.Handler, error) {
+	trimmed := strings.TrimSpace(rawTarget)
+	if trimmed == "" {
+		return nil, nil
 	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid %s URL %q", label, rawTarget)
+	}
+	var scheme string
+	switch strings.ToLower(parsed.Scheme) {
+	case "ws", "http":
+		scheme = "http"
+	case "wss", "https":
+		scheme = "https"
+	default:
+		return nil, fmt.Errorf("unsupported %s scheme %q", label, parsed.Scheme)
+	}
+	targetPath := parsed.Path
+	if targetPath == "" {
+		targetPath = "/ws"
+	}
+	upstreamBase := &url.URL{
+		Scheme: scheme,
+		Host:   parsed.Host,
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(upstreamBase)
+			pr.Out.URL.Path = targetPath
+			pr.Out.URL.RawPath = ""
+			pr.Out.Host = upstreamBase.Host
+			pr.SetXForwarded()
+		},
+	}
+	return proxy, nil
+}
+
+func matchWebSocketProxy(normalizedPath string, telemetryProxy, graphProxy http.Handler) http.Handler {
+	switch normalizedPath {
+	case telemetryWSFrontDoorPath:
+		return telemetryProxy
+	case graphWSFrontDoorPath:
+		return graphProxy
+	default:
+		return nil
+	}
+}
+
+func isReservedWebSocketPath(normalizedPath string) bool {
+	return normalizedPath == "/ws" || strings.HasPrefix(normalizedPath, "/ws/")
 }
 
 func serveIndexHTML(w http.ResponseWriter, r *http.Request, fsys fs.FS) {

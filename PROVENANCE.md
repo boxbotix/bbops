@@ -9,6 +9,7 @@
 | :--- | :--- | :--- | :--- |
 | **SemEngine** | `C360Studio/semengine` | MIT | Embedded NATS/JetStream runtime, SKG graph pipeline (`ENTITY_STATES`, `graph-ingest`, `graph-index`, `graph-query`, `graph-lexical`), ADR-100/110/111/115 HTTP & dual-WebSocket surfaces |
 | **SemBoids** | `C360Studio/semboids` | MIT | 3-lane hybrid SKG telemetry split (`ADR-001`), SvelteKit 2 + Svelte 5 Runes stores, imperative `requestAnimationFrame` canvas, shared `pkg/graphview.View` patterns |
+| **SemStreams UI** | `C360Studio/semstreams-ui` | MIT | Svelte 5 + `sigma` v3 + `graphology` + `ForceAtlas2` SKG topology canvas (`SigmaCanvas.svelte`, `graphology-adapter.ts`, `sigma-layout.ts`) |
 | **ATeam** | `C360Studio/ateam` | MIT | Agentic harness, OpenSpec gates, `test-spec` attribution, Go `-overlay` mutation checks, cross-provider review workflow |
 | **BoxBotix Stack** | `boxbotix/bbstack` | Apache-2.0 OR MIT | `bbnav` `0xB1` Edge MAVLink v2 contract, 4-state `CommandMux` authority model, SITL physics harness (`bbsim`) |
 | **MAVLink Standard Dialects** | `mavlink/mavlink` | MIT | `minimal.xml` and `common.xml` standard dialect definitions ONLY (local UDP `127.0.0.1:14550` edge boundary) |

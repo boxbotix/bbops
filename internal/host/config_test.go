@@ -352,15 +352,40 @@ func TestStaticUIMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("BACKEND:" + r.URL.Path))
 	})
-	handler := NewStaticUIMiddleware(uiDir, ready.Load)(backend)
+	var telemetryRewrittenPath atomic.Value
+	telemetryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		telemetryRewrittenPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UPSTREAM-TELEMETRY:" + r.URL.Path))
+	}))
+	t.Cleanup(telemetryUpstream.Close)
 
-	// 1. Before readiness, GET / answers 503 NOT READY (never 200 SPA or 404) while reserved routes still pass through.
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "NOT READY" {
-		t.Fatalf("pre-ready GET / = %d %q, want 503 NOT READY", rec.Code, rec.Body.String())
+	var graphRewrittenPath atomic.Value
+	graphUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		graphRewrittenPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UPSTREAM-GRAPH:" + r.URL.Path))
+	}))
+	t.Cleanup(graphUpstream.Close)
+
+	uiMiddleware, err := NewUIMiddleware(uiDir, ready.Load, WebSocketProxyRoutes{
+		TelemetryWS: strings.Replace(telemetryUpstream.URL, "http://", "ws://", 1) + "/ws",
+		GraphWS:     strings.Replace(graphUpstream.URL, "http://", "ws://", 1) + "/ws",
+	})
+	if err != nil {
+		t.Fatalf("NewUIMiddleware: %v", err)
 	}
-	rec = httptest.NewRecorder()
+	handler := uiMiddleware(backend)
+
+	// 1. Before readiness, GET /, /ws/telemetry, and /ws/graph answer 503 NOT READY while reserved diagnostic routes pass through.
+	for _, preReadyPath := range []string{"/", "/ws/telemetry", "/ws/graph"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, preReadyPath, nil))
+		if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "NOT READY" {
+			t.Fatalf("pre-ready GET %s = %d %q, want 503 NOT READY", preReadyPath, rec.Code, rec.Body.String())
+		}
+	}
+	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/services/health", nil))
 	if got, want := rec.Body.String(), "BACKEND:/services/health"; got != want {
 		t.Fatalf("pre-ready GET /services/health = %q, want %q", got, want)
@@ -382,6 +407,26 @@ func TestStaticUIMiddleware(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/assets/app.js", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "console.log('cop');" {
 		t.Fatalf("GET /assets/app.js = %d %q", rec.Code, rec.Body.String())
+	}
+
+	// 3b. Same-origin /ws/telemetry and /ws/graph rewrite to /ws on their upstream listeners and reject non-GET methods.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ws/telemetry", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "UPSTREAM-TELEMETRY:/ws" || telemetryRewrittenPath.Load() != "/ws" {
+		t.Fatalf("GET /ws/telemetry = %d %q, want 200 UPSTREAM-TELEMETRY:/ws", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ws/graph", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "UPSTREAM-GRAPH:/ws" || graphRewrittenPath.Load() != "/ws" {
+		t.Fatalf("GET /ws/graph = %d %q, want 200 UPSTREAM-GRAPH:/ws", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ws/telemetry", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /ws/telemetry = %d, want 405", rec.Code)
+	}
+	if _, badErr := NewUIMiddleware(uiDir, ready.Load, WebSocketProxyRoutes{TelemetryWS: "ftp://127.0.0.1:8081/ws"}); badErr == nil {
+		t.Fatal("expected unsupported WebSocket scheme to return error")
 	}
 
 	// 4. Reserved routes (including /services/health) and POST GraphQL requests bypass static UI unconditionally.
@@ -467,7 +512,7 @@ func FuzzStaticUIMiddlewareRouting(f *testing.F) {
 		f.Fatalf("write parent secret: %v", err)
 	}
 	uiDir := filepath.Join(parentDir, "build")
-	for _, rel := range []string{"assets", "graph-gateway", "services"} {
+	for _, rel := range []string{"assets", "graph-gateway", "services", "ws"} {
 		if err := os.MkdirAll(filepath.Join(uiDir, rel), 0o750); err != nil {
 			f.Fatalf("mkdir %s: %v", rel, err)
 		}
@@ -479,6 +524,8 @@ func FuzzStaticUIMiddlewareRouting(f *testing.F) {
 		"healthz":               "DECOY-HEALTHZ",
 		"services/health":       "DECOY-SERVICES-HEALTH",
 		"graph-gateway/graphql": "DECOY-GRAPHQL",
+		"ws/telemetry":          "DECOY-WS-TELEMETRY",
+		"ws/graph":              "DECOY-WS-GRAPH",
 	}
 	for rel, content := range files {
 		if err := os.WriteFile(filepath.Join(uiDir, filepath.FromSlash(rel)), []byte(content), 0o600); err != nil {
@@ -503,6 +550,10 @@ func FuzzStaticUIMiddlewareRouting(f *testing.F) {
 		{2, "/graph-gateway/graphql", true},
 		{0, "/graph-gateway/graphql", true},
 		{0, "/components/graph-ingest", true},
+		{0, "/ws/telemetry", false},
+		{0, "/ws/telemetry", true},
+		{0, "/ws/graph", true},
+		{2, "/ws/telemetry", true},
 		{0, "/../../secret.txt", true},
 		{0, "/..\\secret.txt", true},
 		{3, "/", true},
@@ -545,6 +596,25 @@ func FuzzStaticUIMiddlewareRouting(f *testing.F) {
 			t.Fatalf("reserved backend route shadowed by static decoy file for %s %q: %q", method, reqPath, body)
 		}
 
+		if referenceReservedWSRoute(reqPath) {
+			if method != http.MethodGet {
+				if rec.Code != http.StatusMethodNotAllowed || backendHits.Load() != 0 {
+					t.Fatalf("expected 405 without backend hit for %s %q, got code=%d hits=%d", method, reqPath, rec.Code, backendHits.Load())
+				}
+				return
+			}
+			if !ready {
+				if rec.Code != http.StatusServiceUnavailable || body != "NOT READY" || backendHits.Load() != 0 {
+					t.Fatalf("expected 503 NOT READY for pre-ready WS %q, got %d %q", reqPath, rec.Code, body)
+				}
+				return
+			}
+			if backendHits.Load() != 1 || rec.Header().Get("X-Backend-Hit") != "1" {
+				t.Fatalf("expected unconfigured WS route %q to pass through when ready, got %d %q", reqPath, rec.Code, body)
+			}
+			return
+		}
+
 		expectBackend := (method != http.MethodGet && method != http.MethodHead) ||
 			referenceReservedBackendRoute(reqPath)
 
@@ -564,6 +634,23 @@ func FuzzStaticUIMiddlewareRouting(f *testing.F) {
 			}
 		}
 	})
+}
+
+func referenceReservedWSRoute(reqPath string) bool {
+	var stack []string
+	for _, seg := range strings.Split(reqPath, "/") {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		default:
+			stack = append(stack, strings.ToLower(seg))
+		}
+	}
+	return len(stack) > 0 && stack[0] == "ws"
 }
 
 // referenceReservedBackendRoute independently resolves dot-segments without calling
@@ -1237,4 +1324,78 @@ func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
 	if !admitted {
 		t.Fatalf("telemetry sent to advertised UDP %s was not received by bound listener %s", gotAdvAddr, gotBoundAddr)
 	}
+}
+
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+func TestUIMiddlewareWebSocketProxyRouting(t *testing.T) {
+	telemetryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			t.Errorf("telemetry upstream path = %q, want /ws", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UPSTREAM-TELEMETRY:" + r.URL.Path))
+	}))
+	defer telemetryUpstream.Close()
+
+	graphUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			t.Errorf("graph upstream path = %q, want /ws", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UPSTREAM-GRAPH:" + r.URL.Path))
+	}))
+	defer graphUpstream.Close()
+
+	if _, err := NewUIMiddleware("", nil, WebSocketProxyRoutes{TelemetryWS: "ftp://127.0.0.1:8081/ws"}); err == nil {
+		t.Fatal("expected unsupported WebSocket scheme error")
+	}
+
+	var ready atomic.Bool
+	mw, err := NewUIMiddleware("", ready.Load, WebSocketProxyRoutes{
+		TelemetryWS: strings.Replace(telemetryUpstream.URL, "http://", "ws://", 1) + "/ws",
+		GraphWS:     strings.Replace(graphUpstream.URL, "http://", "ws://", 1) + "/ws",
+	})
+	if err != nil {
+		t.Fatalf("NewUIMiddleware: %v", err)
+	}
+	frontDoor := httptest.NewServer(mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte("FALLBACK"))
+	})))
+	defer frontDoor.Close()
+
+	checkGet := func(url string, wantStatus int, wantBody string) {
+		t.Helper()
+		resp, err := http.Get(url) //nolint:noctx
+		if err != nil {
+			t.Fatalf("GET %s: %v", url, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read %s body: %v", url, err)
+		}
+		if resp.StatusCode != wantStatus || string(body) != wantBody {
+			t.Fatalf("GET %s = (%d, %q), want (%d, %q)", url, resp.StatusCode, string(body), wantStatus, wantBody)
+		}
+	}
+
+	// Pre-ready: 503 NOT READY
+	checkGet(frontDoor.URL+"/ws/telemetry", http.StatusServiceUnavailable, "NOT READY")
+	checkGet(frontDoor.URL+"/ws/graph", http.StatusServiceUnavailable, "NOT READY")
+
+	// Method guard: POST /ws/telemetry -> 405
+	postResp, err := http.Post(frontDoor.URL+"/ws/telemetry", "application/json", strings.NewReader("{}")) //nolint:noctx
+	if err != nil {
+		t.Fatalf("POST /ws/telemetry: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /ws/telemetry status = %d, want 405", postResp.StatusCode)
+	}
+
+	// Post-ready: routes to distinct upstream telemetry/graph servers rewritten to /ws.
+	ready.Store(true)
+	checkGet(frontDoor.URL+"/ws/telemetry", http.StatusOK, "UPSTREAM-TELEMETRY:/ws")
+	checkGet(frontDoor.URL+"/ws/graph", http.StatusOK, "UPSTREAM-GRAPH:/ws")
 }

@@ -1,5 +1,5 @@
 # Proposal: m2-2-cop-ui-canvas
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-24) sha256:26077d8b7548
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track
