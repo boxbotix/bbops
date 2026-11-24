@@ -38,17 +38,19 @@ const (
 
 // Options configures a bbops embedded SemEngine + NATS/JetStream runtime instance.
 type Options struct {
-	ConfigPath            string
-	DataDir               string
-	NATSURL               string
-	UIDir                 string
-	Version               string
-	Overrides             PortOverrides
-	Logger                *slog.Logger
-	RegisterPayloads      func(*payloadregistry.Registry) error
-	Contracts             []projection.Contract
-	beforeMigrationCreate func(ctx context.Context, client *natsclient.Client) error
-	afterEndpointSnapshot func(ctx context.Context, client *natsclient.Client, cfgMgr *config.Manager) error
+	ConfigPath             string
+	DataDir                string
+	NATSURL                string
+	UIDir                  string
+	Version                string
+	Overrides              PortOverrides
+	Logger                 *slog.Logger
+	RegisterPayloads       func(*payloadregistry.Registry) error
+	Contracts              []projection.Contract
+	beforeMigrationCreate  func(ctx context.Context, client *natsclient.Client) error
+	beforeOverrideSnapshot func(ctx context.Context, client *natsclient.Client, cfgMgr *config.Manager) error
+	afterOverrideSnapshot  func(ctx context.Context, client *natsclient.Client, cfgMgr *config.Manager) error
+	afterEndpointSnapshot  func(ctx context.Context, client *natsclient.Client, cfgMgr *config.Manager) error
 }
 
 // Runtime owns a started bbops host instance (embedded NATS/JetStream,
@@ -170,9 +172,17 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		rt.configManager = cfgMgr
 	}
 
+	if opts.beforeOverrideSnapshot != nil {
+		if err := opts.beforeOverrideSnapshot(ctx, client, cfgMgr); err != nil {
+			return cleanup(fmt.Errorf("before override snapshot hook: %w", err))
+		}
+	}
+
 	// Apply explicit process listener overrides and server version AFTER KV
-	// arbitration so warm restarts honor CLI/ephemeral overrides instead of
-	// silently binding stale KV ports.
+	// arbitration and capture effectiveCfg inside the same SafeConfig.Mutate
+	// lock so no concurrent KV watcher update can slip in between applying
+	// process overrides and snapshotting the boot configuration.
+	var effectiveCfg *config.Config
 	if err := cfgMgr.GetConfig().Mutate(func(c *config.Config) error {
 		if err := ApplyPortOverrides(c, opts.Overrides); err != nil {
 			return err
@@ -182,12 +192,18 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 				return err
 			}
 		}
+		effectiveCfg = c.Clone()
 		return nil
 	}); err != nil {
 		return cleanup(fmt.Errorf("apply process overrides after config arbitration: %w", err))
 	}
 
-	effectiveCfg := cfgMgr.GetConfig().Get()
+	if opts.afterOverrideSnapshot != nil {
+		if err := opts.afterOverrideSnapshot(ctx, client, cfgMgr); err != nil {
+			return cleanup(fmt.Errorf("after override snapshot hook: %w", err))
+		}
+	}
+
 	if _, err := ValidateOffline(effectiveCfg); err != nil {
 		return cleanup(fmt.Errorf("validate effective configuration: %w", err))
 	}

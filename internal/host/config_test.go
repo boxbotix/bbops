@@ -1087,9 +1087,11 @@ func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
 	}
 
 	// 3. Synchronized delayed-watcher test during upgrade with an explicit UDP port override:
-	// delay/deliver a KV watcher update carrying a stale stored port AFTER rt.endpoints is snapshotted
-	// and BEFORE service/component construction, then verify the actual bound UDP socket matches
-	// the requested override and receives live MAVLink traffic.
+	// deliver real KV watcher updates carrying distinct stale stored ports on BOTH sides of
+	// boot snapshot capture (before SafeConfig.Mutate, immediately after Mutate before
+	// ValidateOffline/ResolveEndpoints, and after ResolveEndpoints before ComponentManager
+	// construction), then verify both the advertised endpoint and bound UDP socket match the
+	// requested override and receive live MAVLink traffic.
 	watcherDataDir := t.TempDir()
 	seedLegacyM02KV(watcherDataDir)
 
@@ -1097,16 +1099,49 @@ func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocateLoopbackPorts: %v", err)
 	}
-	udpPorts, err := AllocateLoopbackUDPPorts(2)
+	udpPorts, err := AllocateLoopbackUDPPorts(4)
 	if err != nil {
 		t.Fatalf("AllocateLoopbackUDPPorts: %v", err)
 	}
-	requestedUDPPort, staleUDPPort := udpPorts[0], udpPorts[1]
-	if requestedUDPPort == staleUDPPort {
-		t.Fatalf("expected distinct UDP ports, got %d", requestedUDPPort)
+	requestedUDPPort := udpPorts[0]
+	preCaptureStalePort := udpPorts[1]
+	postMutateStalePort := udpPorts[2]
+	postEndpointStalePort := udpPorts[3]
+
+	injectAndAwaitWatcherPort := func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager, stalePort int, done *atomic.Bool) error {
+		staleCfg, lErr := LoadConfig("", PortOverrides{BindHost: "127.0.0.1", MAVLinkUDPPort: stalePort})
+		if lErr != nil {
+			return lErr
+		}
+		staleComp := staleCfg.Components[MAVLinkIngestComponent]
+		rawStale, mErr := json.Marshal(staleComp)
+		if mErr != nil {
+			return mErr
+		}
+		hookJS, jsErr := client.JetStream()
+		if jsErr != nil {
+			return jsErr
+		}
+		hookKV, kvErr := hookJS.KeyValue(hookCtx, bucketName)
+		if kvErr != nil {
+			return kvErr
+		}
+		if _, pErr := hookKV.Put(hookCtx, "components."+MAVLinkIngestComponent, rawStale); pErr != nil {
+			return pErr
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			_, portNow, eErr := extractMAVLinkUDPEndpoint(liveMgr.GetConfig().Get())
+			if eErr == nil && portNow == stalePort {
+				done.Store(true)
+				return nil
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return fmt.Errorf("timed out waiting for ConfigManager watcher to apply stale port %d", stalePort)
 	}
 
-	var watcherReplayed atomic.Bool
+	var preSnapshotReplayed, postMutateReplayed, postEndpointReplayed atomic.Bool
 	rtDelayed, err := Start(ctx, Options{
 		DataDir: watcherDataDir,
 		UIDir:   uiDir,
@@ -1119,39 +1154,14 @@ func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
 			MetricsPort:     tcpPorts[3],
 			MAVLinkUDPPort:  requestedUDPPort,
 		},
+		beforeOverrideSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, preCaptureStalePort, &preSnapshotReplayed)
+		},
+		afterOverrideSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, postMutateStalePort, &postMutateReplayed)
+		},
 		afterEndpointSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
-			// Inject a KV update carrying staleUDPPort and wait for ConfigManager's real
-			// background watcher to overwrite liveMgr.GetConfig() before ServiceManager constructs ComponentManager.
-			staleCfg, lErr := LoadConfig("", PortOverrides{BindHost: "127.0.0.1", MAVLinkUDPPort: staleUDPPort})
-			if lErr != nil {
-				return lErr
-			}
-			staleComp := staleCfg.Components[MAVLinkIngestComponent]
-			rawStale, mErr := json.Marshal(staleComp)
-			if mErr != nil {
-				return mErr
-			}
-			hookJS, jsErr := client.JetStream()
-			if jsErr != nil {
-				return jsErr
-			}
-			hookKV, kvErr := hookJS.KeyValue(hookCtx, bucketName)
-			if kvErr != nil {
-				return kvErr
-			}
-			if _, pErr := hookKV.Put(hookCtx, "components."+MAVLinkIngestComponent, rawStale); pErr != nil {
-				return pErr
-			}
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				_, portNow, eErr := extractMAVLinkUDPEndpoint(liveMgr.GetConfig().Get())
-				if eErr == nil && portNow == staleUDPPort {
-					watcherReplayed.Store(true)
-					return nil
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
-			return fmt.Errorf("timed out waiting for ConfigManager watcher to apply stale port %d", staleUDPPort)
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, postEndpointStalePort, &postEndpointReplayed)
 		},
 	})
 	if err != nil {
@@ -1162,8 +1172,9 @@ func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
 		defer stopCancel()
 		_ = rtDelayed.Stop(stopCtx)
 	})
-	if !watcherReplayed.Load() {
-		t.Fatal("delayed watcher replay hook did not complete")
+	if !preSnapshotReplayed.Load() || !postMutateReplayed.Load() || !postEndpointReplayed.Load() {
+		t.Fatalf("watcher replay hooks incomplete: pre=%v postMutate=%v postEndpoint=%v",
+			preSnapshotReplayed.Load(), postMutateReplayed.Load(), postEndpointReplayed.Load())
 	}
 
 	delayedReadyCtx, delayedReadyCancel := context.WithTimeout(ctx, 15*time.Second)
