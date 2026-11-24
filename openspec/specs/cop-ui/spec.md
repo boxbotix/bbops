@@ -99,4 +99,3 @@ The `ui/e2e/` Playwright harness and `ui/src/lib/components/` COP workspace SHAL
 #### Scenario: Selecting an external COP contact in the live browser preserves strict vehicle authority isolation
 - **WHEN** `ENTITY_STATES` delivers a non-UXS external contact record and the operator selects it in the live browser workspace
 - **THEN** `AuthorityBanner` renders only the unknown-preserving external-contact provenance card, `VehicleHud` withholds vehicle attitude/link-tier controls, and zero UXS `ControlAuthority` or `armed` badges appear in the DOM
-

@@ -9,8 +9,8 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
 import { test as base, expect, type Page } from "@playwright/test";
+import { repoRoot, uiRoot } from "./paths";
 
 export interface StackVehicles {
   readonly quadcopter: string;
@@ -62,10 +62,6 @@ interface HarnessReply {
   error?: string;
   ready?: boolean;
 }
-
-const e2eDir = path.dirname(fileURLToPath(import.meta.url));
-const uiRoot = path.resolve(e2eDir, "..");
-const repoRoot = path.resolve(uiRoot, "..");
 
 function ensureCompiledUiBuild(): string {
   const configuredDir = process.env.BBOPS_E2E_UI_DIR?.trim();

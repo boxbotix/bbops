@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
-import os from "node:os";
-import path from "node:path";
 import { defineConfig, devices } from "@playwright/test";
+import { resolvePlaywrightOutputDir } from "./e2e/paths";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -16,7 +15,7 @@ export default defineConfig({
     timeout: 10_000,
   },
   reporter: "list",
-  outputDir: path.join(os.tmpdir(), "bbops-playwright-results"),
+  outputDir: resolvePlaywrightOutputDir(),
   use: {
     ...devices["Desktop Chrome"],
     viewport: { width: 1440, height: 900 },

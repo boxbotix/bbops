@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
+import os from "node:os";
+import path from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./fixtures";
+import { resolvePlaywrightOutputDir, uiRoot } from "./paths";
 
 interface BoxRect {
   readonly x: number;
@@ -107,11 +110,155 @@ async function sampleCanvas2DPixels(
   }, bgRgb);
 }
 
+interface SigmaHoverSample {
+  readonly exists: boolean;
+  readonly darkPillPixels: number;
+  readonly lightTextPixels: number;
+  readonly pureWhitePixels: number;
+  readonly centroidX: number;
+  readonly centroidY: number;
+}
+
+async function sampleSigmaHoverLayer(
+  sigmaStage: Locator,
+): Promise<SigmaHoverSample> {
+  return await sigmaStage.evaluate((stageEl) => {
+    const hoverCanvas = stageEl.querySelector(
+      "canvas.sigma-hovers",
+    ) as HTMLCanvasElement | null;
+    if (!hoverCanvas || hoverCanvas.width === 0 || hoverCanvas.height === 0) {
+      return {
+        exists: false,
+        darkPillPixels: 0,
+        lightTextPixels: 0,
+        pureWhitePixels: 0,
+        centroidX: 0,
+        centroidY: 0,
+      };
+    }
+    const ctx = hoverCanvas.getContext("2d");
+    if (!ctx) {
+      return {
+        exists: false,
+        darkPillPixels: 0,
+        lightTextPixels: 0,
+        pureWhitePixels: 0,
+        centroidX: 0,
+        centroidY: 0,
+      };
+    }
+    const { width, height } = hoverCanvas;
+    const scaleX =
+      hoverCanvas.clientWidth > 0 ? hoverCanvas.clientWidth / width : 0.5;
+    const scaleY =
+      hoverCanvas.clientHeight > 0 ? hoverCanvas.clientHeight / height : 0.5;
+    const { data } = ctx.getImageData(0, 0, width, height);
+    let darkPillPixels = 0;
+    let lightTextPixels = 0;
+    let pureWhitePixels = 0;
+    let sumX = 0;
+    let sumY = 0;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const idx = (y * width + x) * 4;
+        const a = data[idx + 3]!;
+        if (a < 180) {
+          continue;
+        }
+        const r = data[idx]!;
+        const g = data[idx + 1]!;
+        const b = data[idx + 2]!;
+        // #0f172a = rgb(15, 23, 42)
+        if (
+          Math.abs(r - 15) <= 4 &&
+          Math.abs(g - 23) <= 4 &&
+          Math.abs(b - 42) <= 4
+        ) {
+          darkPillPixels += 1;
+          sumX += x * scaleX;
+          sumY += y * scaleY;
+        }
+        // #f8fafc = rgb(248, 250, 252) (or antialiased blend toward #0f172a)
+        if (r >= 200 && g >= 205 && b >= 210) {
+          lightTextPixels += 1;
+        }
+        // Sigma's unstyled default white hover background (#ffffff = 255,255,255)
+        if (r === 255 && g === 255 && b === 255) {
+          pureWhitePixels += 1;
+        }
+      }
+    }
+    return {
+      exists: true,
+      darkPillPixels,
+      lightTextPixels,
+      pureWhitePixels,
+      centroidX: darkPillPixels > 0 ? sumX / darkPillPixels : 0,
+      centroidY: darkPillPixels > 0 ? sumY / darkPillPixels : 0,
+    };
+  });
+}
+
+async function locateSigmaNodeViaWebGLPicking(
+  sigmaStage: Locator,
+  targetEntityId: string,
+): Promise<{ readonly x: number; readonly y: number } | null> {
+  return await sigmaStage.evaluate((stageEl, entityId) => {
+    const mouseCanvas = stageEl.querySelector(
+      "canvas.sigma-mouse",
+    ) as HTMLCanvasElement | null;
+    if (!mouseCanvas) {
+      return null;
+    }
+    const bbox = mouseCanvas.getBoundingClientRect();
+    let hitCount = 0;
+    let sumX = 0;
+    let sumY = 0;
+    for (let y = 12; y < bbox.height - 12; y += 5) {
+      for (let x = 12; x < bbox.width - 12; x += 5) {
+        mouseCanvas.dispatchEvent(
+          new MouseEvent("mousemove", {
+            bubbles: true,
+            clientX: bbox.left + x,
+            clientY: bbox.top + y,
+          }),
+        );
+        if (stageEl.getAttribute("data-hovered-node") === entityId) {
+          hitCount += 1;
+          sumX += x;
+          sumY += y;
+        }
+      }
+    }
+    // Clear hover state before returning so real Playwright click drives selection cleanly.
+    mouseCanvas.dispatchEvent(
+      new MouseEvent("mousemove", {
+        bubbles: true,
+        clientX: -100,
+        clientY: -100,
+      }),
+    );
+    if (hitCount === 0) {
+      return null;
+    }
+    return { x: sumX / hitCount, y: sumY / hitCount };
+  }, targetEntityId);
+}
+
 test.describe("Full-stack Chromium COP workspace end-to-end verification", () => {
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
   test("streams live multi-domain dual-WebSocket telemetry and SKG state across Canvas2D, WebGL Sigma, non-overlapping HUD readouts, 2-hop pathSearch, hotkeys, and Lane 3 transitions", async ({
     copStack,
-  }) => {
+  }, testInfo) => {
+    // 0. Checkout-scoped Playwright artifact directory never collides across git worktrees.
+    expect(testInfo.project.outputDir).toBe(path.join(uiRoot, "test-results"));
+    expect(testInfo.project.outputDir).not.toBe(
+      path.join(os.tmpdir(), "bbops-playwright-results"),
+    );
+    expect(resolvePlaywrightOutputDir("/worktrees/wt-a/ui", "")).not.toBe(
+      resolvePlaywrightOutputDir("/worktrees/wt-b/ui", ""),
+    );
+
     const { page, info } = copStack;
     await page.goto(info.baseURL);
 
@@ -128,13 +275,21 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
       timeout: 15_000,
     });
 
-    // 2. Real WebGL Sigma topology mounts (never jsdom fallback) with DPR=2 canvases.
+    // 2. Real WebGL Sigma topology mounts (never jsdom fallback) with DPR=2 canvases and settles ForceAtlas2 layout.
     await expect(page.getByTestId("skg-topology-fallback")).toHaveCount(0);
     const sigmaStage = page.getByTestId("skg-sigma-stage");
     await expect(sigmaStage).toBeVisible();
     await expect(sigmaStage).toHaveAttribute("data-sigma-ready", "true", {
       timeout: 10_000,
     });
+    await expect(page.locator(".skg-topology-card .meta-count")).toContainText(
+      "5N · 2E",
+      { timeout: 10_000 },
+    );
+    await expect(
+      page.locator(".skg-topology-card .meta-count"),
+    ).not.toContainText("layout", { timeout: 10_000 });
+
     const sigmaCanvasMetrics = await sigmaStage.evaluate((stageEl) => {
       const canvases = Array.from(stageEl.querySelectorAll("canvas"));
       return {
@@ -149,7 +304,13 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     expect(sigmaCanvasMetrics.canvasCount).toBeGreaterThanOrEqual(2);
     expect(sigmaCanvasMetrics.allDprScaled).toBe(true);
 
-    // 3. TacticalCanvas DPR=2 layers paint non-blank NED grid & vehicle glyphs, and toolbar is unobstructed.
+    // Unselected Sigma hover layer starts blank (proving highlight pill pixels come exclusively from selection/hover).
+    const unselectedHover = await sampleSigmaHoverLayer(sigmaStage);
+    expect(unselectedHover.exists).toBe(true);
+    expect(unselectedHover.darkPillPixels).toBe(0);
+    expect(unselectedHover.lightTextPixels).toBe(0);
+
+    // 3. TacticalCanvas DPR=2 layers paint non-blank NED grid & vehicle glyphs, and concentric range-ring labels clear .viewport-toolbar.
     await expect
       .poll(async () => {
         const grid = await sampleCanvas2DPixels(
@@ -172,8 +333,86 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
       .toBe(true);
 
     const toolbarBox = await page.getByTestId("viewport-toolbar").boundingBox();
+    const gridCanvasBox = await page
+      .locator(".surface-grid-canvas")
+      .boundingBox();
     expect(toolbarBox).not.toBeNull();
+    expect(gridCanvasBox).not.toBeNull();
     expect(toolbarBox!.height).toBeGreaterThan(20);
+
+    const toolbarClearance = await page
+      .locator(".surface-grid-canvas")
+      .evaluate(
+        (el, localToolbar) => {
+          const canvas = el as HTMLCanvasElement;
+          const ctx = canvas.getContext("2d")!;
+          const dprX = canvas.width / canvas.clientWidth;
+          const dprY = canvas.height / canvas.clientHeight;
+          const { data, width, height } = ctx.getImageData(
+            0,
+            0,
+            canvas.width,
+            canvas.height,
+          );
+
+          const tbLeft = Math.max(0, Math.floor(localToolbar.left * dprX));
+          const tbRight = Math.min(width, Math.ceil(localToolbar.right * dprX));
+          const tbTop = Math.max(0, Math.floor(localToolbar.top * dprY));
+          const tbBottom = Math.min(
+            height,
+            Math.ceil(localToolbar.bottom * dprY),
+          );
+          const cxPx = Math.round(width * 0.5);
+
+          let ringArcPixelsInToolbarBand = 0;
+          let glyphPixelsUnderToolbar = 0;
+          let eastAxisLabelPixels = 0;
+
+          for (let y = tbTop; y < tbBottom; y += 1) {
+            for (let x = tbLeft; x < tbRight; x += 1) {
+              const idx = (y * width + x) * 4;
+              const r = data[idx]!;
+              const g = data[idx + 1]!;
+              const b = data[idx + 2]!;
+              // Ring stroke rgba(51,65,85,0.45) over #090d16 blends to ~rgb(28,36,50); crosshair blends to ~rgb(33,56,86).
+              if (Math.abs(x - cxPx) > 12 && b >= 42 && g < 52) {
+                ringArcPixelsInToolbarBand += 1;
+              }
+              // Range-ring labels rgba(148,163,184,0.72) blend to ~rgb(109,121,139) and North "N" #60a5fa has G=165.
+              if (g >= 80 || r >= 70) {
+                glyphPixelsUnderToolbar += 1;
+              }
+            }
+          }
+
+          // East-axis relocated range-ring label ("100m") sits to the right of cx and strictly below toolbarBottom.
+          for (let y = tbBottom; y < height; y += 1) {
+            for (let x = cxPx + Math.round(60 * dprX); x < width; x += 1) {
+              const idx = (y * width + x) * 4;
+              const r = data[idx]!;
+              const g = data[idx + 1]!;
+              if (r >= 75 && g >= 85) {
+                eastAxisLabelPixels += 1;
+              }
+            }
+          }
+
+          return {
+            ringArcPixelsInToolbarBand,
+            glyphPixelsUnderToolbar,
+            eastAxisLabelPixels,
+          };
+        },
+        {
+          left: toolbarBox!.x - gridCanvasBox!.x,
+          right: toolbarBox!.x + toolbarBox!.width - gridCanvasBox!.x,
+          top: toolbarBox!.y - gridCanvasBox!.y,
+          bottom: toolbarBox!.y + toolbarBox!.height - gridCanvasBox!.y,
+        },
+      );
+    expect(toolbarClearance.ringArcPixelsInToolbarBand).toBeGreaterThan(20);
+    expect(toolbarClearance.glyphPixelsUnderToolbar).toBe(0);
+    expect(toolbarClearance.eastAxisLabelPixels).toBeGreaterThan(20);
 
     // 4. Hit-test Quadcopter #1 directly on the TacticalCanvas (NED [24, -14] at default 4 px/m zoom).
     const initialCanvasSize = await page
@@ -232,35 +471,78 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
       page.getByTestId("hud-readout-attitude"),
     ]);
 
-    // Verify highlighted Sigma hover/label 2D layers contain zero #ffffff white-on-white pills.
+    // Positively verify dark #0f172a hover pill + #f8fafc text and zero #ffffff white-on-white background on canvas.sigma-hovers.
     await expect(sigmaStage).toHaveAttribute(
       "data-highlighted-node",
       info.vehicles.quadcopter,
     );
-    const sigmaHoverWhiteCount = await sigmaStage.evaluate((stageEl) => {
-      let pureWhite = 0;
-      for (const canvas of Array.from(stageEl.querySelectorAll("canvas"))) {
-        const ctx = canvas.getContext("2d");
-        if (!ctx || canvas.width === 0 || canvas.height === 0) {
-          continue;
-        }
-        const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        for (let idx = 0; idx < data.length; idx += 16) {
-          if (
-            data[idx + 3]! > 220 &&
-            data[idx]! >= 252 &&
-            data[idx + 1]! >= 252 &&
-            data[idx + 2]! >= 252
-          ) {
-            pureWhite += 1;
-          }
-        }
-      }
-      return pureWhite;
-    });
-    expect(sigmaHoverWhiteCount).toBe(0);
+    let quadHover = await sampleSigmaHoverLayer(sigmaStage);
+    await expect
+      .poll(async () => {
+        quadHover = await sampleSigmaHoverLayer(sigmaStage);
+        return (
+          quadHover.darkPillPixels > 80 &&
+          quadHover.lightTextPixels > 8 &&
+          quadHover.pureWhitePixels === 0
+        );
+      })
+      .toBe(true);
 
-    // 6. Click 2-Hop and verify live /graph-gateway/graphql pathSearch HTTP 200 + topology expansion.
+    // Click Rover #2 directly on the real WebGL Sigma stage and verify bidirectional selection + highlight shift.
+    const roverSigmaPos = await locateSigmaNodeViaWebGLPicking(
+      sigmaStage,
+      info.vehicles.rover,
+    );
+    expect(roverSigmaPos).not.toBeNull();
+    await sigmaStage
+      .locator("canvas.sigma-mouse")
+      .click({ position: roverSigmaPos! });
+    // Move pointer away from Sigma so canvas.sigma-hovers reflects persistent clickNode selection rather than pointer hover.
+    await page.mouse.move(8, 8);
+
+    await expect
+      .poll(() => new URL(page.url()).hash)
+      .toContain(`sel=${info.vehicles.rover}`);
+    await expect(authBanner).toContainText("UXS #2 · rover");
+    await expect(page.getByTestId("authority-badge")).toHaveText(
+      "P3 CompanionAutonomous",
+    );
+    await expect(page.getByTestId("skg-triple-inspector")).toContainText(
+      "companion-autonomous",
+    );
+    await expect(sigmaStage).toHaveAttribute(
+      "data-highlighted-node",
+      info.vehicles.rover,
+    );
+    await expect
+      .poll(async () => {
+        const roverHover = await sampleSigmaHoverLayer(sigmaStage);
+        return (
+          roverHover.darkPillPixels > 80 &&
+          roverHover.lightTextPixels > 8 &&
+          roverHover.pureWhitePixels === 0 &&
+          Math.hypot(
+            roverHover.centroidX - quadHover.centroidX,
+            roverHover.centroidY - quadHover.centroidY,
+          ) > 15
+        );
+      })
+      .toBe(true);
+
+    // Click Quadcopter #1 back via the real WebGL Sigma stage before 2-Hop pathSearch expansion.
+    const quadSigmaPos = await locateSigmaNodeViaWebGLPicking(
+      sigmaStage,
+      info.vehicles.quadcopter,
+    );
+    expect(quadSigmaPos).not.toBeNull();
+    await sigmaStage
+      .locator("canvas.sigma-mouse")
+      .click({ position: quadSigmaPos! });
+    await page.mouse.move(8, 8);
+    await expect
+      .poll(() => new URL(page.url()).hash)
+      .toContain(`sel=${info.vehicles.quadcopter}`);
+    await expect(authBanner).toContainText("UXS #1 · quadcopter");
     const expandButton = page.getByRole("button", { name: "2-Hop" });
     await expect(expandButton).toBeEnabled();
     const [gqlResponse] = await Promise.all([

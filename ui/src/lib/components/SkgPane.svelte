@@ -199,9 +199,11 @@
           });
           renderer.on("enterNode", ({ node }) => {
             hoveredNodeId = node;
+            sigmaContainerEl?.setAttribute("data-hovered-node", node);
           });
           renderer.on("leaveNode", () => {
             hoveredNodeId = null;
+            sigmaContainerEl?.setAttribute("data-hovered-node", "");
           });
 
           sigmaInstance = renderer;
@@ -294,6 +296,7 @@
       data-testid="skg-sigma-stage"
       data-sigma-ready={sigmaReady ? "true" : "false"}
       data-highlighted-node={viewportStore.selectedEntityId ?? ""}
+      data-hovered-node={hoveredNodeId ?? ""}
       bind:this={sigmaContainerEl}
       class:hidden={!webglAvailable}
     ></div>

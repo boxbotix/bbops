@@ -521,7 +521,7 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
   });
 
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
-  it("renders high-contrast dark SKG hover pills without #ffffff fills and flips right-edge node labels inside the stage", () => {
+  it("renders high-contrast dark SKG hover pills without #ffffff fills and clamps or truncates wide node labels inside the stage", () => {
     expect(SKG_HOVER_PILL_FILL).toBe("#0f172a");
     expect(SKG_HOVER_TEXT_HEX).toBe("#f8fafc");
     expect(isReservedSafetyHue(SKG_HOVER_PILL_FILL)).toBe(false);
@@ -536,6 +536,20 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
     expect(rightEdge.side).toBe("left");
     expect(rightEdge.boxX).toBeGreaterThanOrEqual(4);
     expect(rightEdge.boxX + rightEdge.boxWidth).toBeLessThanOrEqual(356);
+
+    // Label wider than the entire 360px stage (440px) never overflows [4, 356].
+    const widerPlacement = computeClampedLabelPlacement(
+      180,
+      90,
+      9,
+      440,
+      11,
+      360,
+    );
+    expect(widerPlacement.boxX).toBeGreaterThanOrEqual(4);
+    expect(widerPlacement.boxX + widerPlacement.boxWidth).toBeLessThanOrEqual(
+      356,
+    );
 
     const fillStylesUsed: string[] = [];
     const drawnLabels: Array<{ text: string; x: number; y: number }> = [];
@@ -561,7 +575,7 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
       arc: vi.fn(),
       fill: vi.fn(),
       stroke: vi.fn(),
-      measureText: (txt: string) => ({ width: txt.length * 7 }),
+      measureText: (txt: string) => ({ width: Array.from(txt).length * 7 }),
       fillRect: (x: number, y: number, w: number, h: number) => {
         drawnRects.push({ x, y, w, h });
       },
@@ -604,10 +618,61 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
       settings,
     );
     expect(drawnRects).toHaveLength(1);
+    expect(drawnRects[0]!.x).toBeGreaterThanOrEqual(4);
     expect(drawnRects[0]!.x + drawnRects[0]!.w).toBeLessThanOrEqual(356);
     expect(fillStylesUsed).toContain("#0f172a");
     expect(fillStylesUsed).toContain("#f8fafc");
     expect(fillStylesUsed).not.toContain("#fff");
     expect(fillStylesUsed).not.toContain("#ffffff");
+
+    // External contact title wider than the 360px stage (66 chars * 7px = 462px) at left, center, and right coordinates.
+    const wideContactTitle =
+      "AIS Maritime Contact Vessel Harbor-77 Long-Range Patrol Track Alpha";
+    expect(Array.from(wideContactTitle).length * 7).toBeGreaterThan(360);
+
+    for (const nodeX of [18, 180, 342]) {
+      drawnLabels.length = 0;
+      drawnRects.length = 0;
+
+      drawSkgNodeLabel(
+        mockCtx,
+        {
+          x: nodeX,
+          y: 110,
+          size: 8,
+          label: wideContactTitle,
+          color: "#a855f7",
+        },
+        settings,
+      );
+      expect(drawnLabels).toHaveLength(1);
+      const normalLabel = drawnLabels[0]!;
+      expect(normalLabel.text.endsWith("…")).toBe(true);
+      const normalWidth = Array.from(normalLabel.text).length * 7;
+      expect(normalLabel.x).toBeGreaterThanOrEqual(4);
+      expect(normalLabel.x + normalWidth).toBeLessThanOrEqual(356);
+
+      drawSkgNodeHover(
+        mockCtx,
+        {
+          x: nodeX,
+          y: 110,
+          size: 8,
+          label: wideContactTitle,
+          color: "#a855f7",
+        },
+        settings,
+      );
+      expect(drawnRects).toHaveLength(1);
+      expect(drawnLabels).toHaveLength(2);
+      const pill = drawnRects[0]!;
+      const hoverLabel = drawnLabels[1]!;
+      expect(pill.x).toBeGreaterThanOrEqual(4);
+      expect(pill.x + pill.w).toBeLessThanOrEqual(356);
+      expect(hoverLabel.text.endsWith("…")).toBe(true);
+      const hoverWidth = Array.from(hoverLabel.text).length * 7;
+      expect(hoverLabel.x).toBeGreaterThanOrEqual(pill.x);
+      expect(hoverLabel.x + hoverWidth).toBeLessThanOrEqual(pill.x + pill.w);
+    }
   });
 });
