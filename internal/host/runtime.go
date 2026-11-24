@@ -26,6 +26,7 @@ import (
 	"github.com/c360studio/semengine/service"
 	"github.com/c360studio/semengine/types"
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -37,15 +38,16 @@ const (
 
 // Options configures a bbops embedded SemEngine + NATS/JetStream runtime instance.
 type Options struct {
-	ConfigPath       string
-	DataDir          string
-	NATSURL          string
-	UIDir            string
-	Version          string
-	Overrides        PortOverrides
-	Logger           *slog.Logger
-	RegisterPayloads func(*payloadregistry.Registry) error
-	Contracts        []projection.Contract
+	ConfigPath            string
+	DataDir               string
+	NATSURL               string
+	UIDir                 string
+	Version               string
+	Overrides             PortOverrides
+	Logger                *slog.Logger
+	RegisterPayloads      func(*payloadregistry.Registry) error
+	Contracts             []projection.Contract
+	beforeMigrationCreate func(ctx context.Context, client *natsclient.Client) error
 }
 
 // Runtime owns a started bbops host instance (embedded NATS/JetStream,
@@ -141,9 +143,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.configManager = cfgMgr
 
 	// Migrate valid pre-M1.2 (7-component, version 1.0.0) persisted KV flows by
-	// adding the missing mavlink-ingest component before endpoint overrides and
-	// effective validation while preserving all existing operator customizations.
-	if err := migratePersistedFlow(ctx, cfgMgr, baseCfg, opts.Overrides, opts.Version); err != nil {
+	// conditionally creating the missing mavlink-ingest component before endpoint
+	// overrides and effective validation while preserving existing operator writes.
+	if err := migratePersistedFlow(ctx, client, cfgMgr, baseCfg, opts.Overrides, opts.Version, opts.beforeMigrationCreate); err != nil {
 		return cleanup(fmt.Errorf("migrate persisted configuration: %w", err))
 	}
 
@@ -696,13 +698,15 @@ func setServerVersion(cfg *config.Config, ver string) error {
 
 func migratePersistedFlow(
 	ctx context.Context,
+	client *natsclient.Client,
 	cfgMgr *config.Manager,
 	baseCfg *config.Config,
 	overrides PortOverrides,
 	version string,
+	beforeCreate func(ctx context.Context, client *natsclient.Client) error,
 ) error {
-	if cfgMgr == nil || baseCfg == nil {
-		return errors.New("host: nil config manager or base configuration")
+	if client == nil || cfgMgr == nil || baseCfg == nil {
+		return errors.New("host: nil NATS client, config manager, or base configuration")
 	}
 	current := cfgMgr.GetConfig().Get()
 	if _, exists := current.Components[MAVLinkIngestComponent]; exists {
@@ -733,8 +737,53 @@ func migratePersistedFlow(
 		return err
 	}
 
-	if err := cfgMgr.PutComponentToKV(ctx, MAVLinkIngestComponent, mavComp); err != nil {
-		return fmt.Errorf("persist %s component during upgrade: %w", MAVLinkIngestComponent, err)
+	if beforeCreate != nil {
+		if err := beforeCreate(ctx, client); err != nil {
+			return err
+		}
 	}
-	return nil
+
+	js, err := client.JetStream()
+	if err != nil {
+		return fmt.Errorf("acquire JetStream for config migration: %w", err)
+	}
+	bucketName, err := config.BucketName(baseCfg.Platform.Org, baseCfg.Platform.ID)
+	if err != nil {
+		return fmt.Errorf("resolve config bucket name: %w", err)
+	}
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		return fmt.Errorf("open config bucket %q: %w", bucketName, err)
+	}
+	rawComp, err := json.Marshal(mavComp)
+	if err != nil {
+		return fmt.Errorf("encode %s component config: %w", MAVLinkIngestComponent, err)
+	}
+
+	kvKey := "components." + MAVLinkIngestComponent
+	chosen := mavComp
+	if _, createErr := kv.Create(ctx, kvKey, rawComp); createErr != nil {
+		if !errors.Is(createErr, jetstream.ErrKeyExists) {
+			return fmt.Errorf("conditionally create %s component during upgrade: %w", MAVLinkIngestComponent, createErr)
+		}
+		entry, getErr := kv.Get(ctx, kvKey)
+		if getErr != nil {
+			return fmt.Errorf("read winning %s component after concurrent create: %w", MAVLinkIngestComponent, getErr)
+		}
+		var winner types.ComponentConfig
+		if err := json.Unmarshal(entry.Value(), &winner); err != nil {
+			return fmt.Errorf("decode winning %s component config: %w", MAVLinkIngestComponent, err)
+		}
+		chosen = winner
+	}
+
+	return cfgMgr.GetConfig().Mutate(func(c *config.Config) error {
+		if c.Components == nil {
+			c.Components = make(config.ComponentConfigs)
+		}
+		if _, alreadyApplied := c.Components[MAVLinkIngestComponent]; !alreadyApplied {
+			c.Components[MAVLinkIngestComponent] = chosen
+		}
+		return nil
+	})
 }

@@ -1,9 +1,12 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,7 +20,12 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/c360studio/semengine/composition"
+	"github.com/c360studio/semengine/config"
+	"github.com/c360studio/semengine/natsclient"
+	"github.com/c360studio/semengine/types"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 )
 
 // spec: host-runtime / Host CLI version and flag entrypoint
@@ -767,5 +775,268 @@ func TestRuntimeStopDoesNotDeadlockInFlightPreReadyUIRequest(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("in-flight pre-ready GET / did not complete after Stop")
+	}
+}
+
+// spec: host-runtime / Host CLI version and flag entrypoint
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// 1. Construct the exact pre-M1.2 base configs/bbops.json (7 components, no mavlink-ingest)
+	// and verify both PrepareConfig and live runtime boot succeed in memory without touching disk.
+	mavStart := bytes.Index(configs.DefaultFlowJSON, []byte(`    "mavlink-ingest": {`))
+	giStart := bytes.Index(configs.DefaultFlowJSON, []byte(`    "graph-ingest": {`))
+	if mavStart < 0 || giStart <= mavStart {
+		t.Fatalf("unexpected DefaultFlowJSON layout (mavStart=%d giStart=%d)", mavStart, giStart)
+	}
+	legacyRaw := append([]byte{}, configs.DefaultFlowJSON[:mavStart]...)
+	legacyRaw = append(legacyRaw, configs.DefaultFlowJSON[giStart:]...)
+
+	parsedCheck, err := config.NewLoader().LoadFromBytes(legacyRaw)
+	if err != nil {
+		t.Fatalf("LoadFromBytes(legacyRaw): %v", err)
+	}
+	if len(parsedCheck.Components) != 7 || parsedCheck.Version != "1.0.0" {
+		t.Fatalf("legacyRaw = (%d components, version %q), want (7, \"1.0.0\")", len(parsedCheck.Components), parsedCheck.Version)
+	}
+
+	baseLegacyPath := filepath.Join(t.TempDir(), "legacy-m02-bbops.json")
+	if err := os.WriteFile(baseLegacyPath, legacyRaw, 0o600); err != nil {
+		t.Fatalf("WriteFile(baseLegacyPath): %v", err)
+	}
+
+	prepared, err := PrepareConfig(baseLegacyPath, PortOverrides{}, "v0.3.0")
+	if err != nil {
+		t.Fatalf("PrepareConfig(baseLegacyPath) failed: %v", err)
+	}
+	if got, want := len(prepared.Composition.Graph.Nodes), 8; got != want {
+		t.Fatalf("legacy PrepareConfig admitted %d nodes, want %d", got, want)
+	}
+	baseEP, err := ResolveEndpoints(prepared.Base)
+	if err != nil {
+		t.Fatalf("ResolveEndpoints(prepared.Base): %v", err)
+	}
+	if baseEP.MAVLinkUDPPort != 14550 || baseEP.MAVLinkUDPAddr != "127.0.0.1:14550" {
+		t.Fatalf("legacy prepared Base MAVLink endpoint = (%d, %q), want (14550, 127.0.0.1:14550)",
+			baseEP.MAVLinkUDPPort, baseEP.MAVLinkUDPAddr)
+	}
+
+	// Malformed flows (wrong schema version, extra unknown component without mavlink-ingest,
+	// or disabled required M0.2 component) must NOT be silently upgraded and must fail closed.
+	writeFlow := func(name string, mutate func(doc map[string]any)) string {
+		var doc map[string]any
+		if uErr := json.Unmarshal(legacyRaw, &doc); uErr != nil {
+			t.Fatalf("Unmarshal legacyRaw: %v", uErr)
+		}
+		mutate(doc)
+		raw, mErr := json.Marshal(doc)
+		if mErr != nil {
+			t.Fatalf("Marshal %s: %v", name, mErr)
+		}
+		p := filepath.Join(t.TempDir(), name)
+		if wErr := os.WriteFile(p, raw, 0o600); wErr != nil {
+			t.Fatalf("WriteFile %s: %v", name, wErr)
+		}
+		return p
+	}
+
+	badVersionPath := writeFlow("bad-version.json", func(doc map[string]any) {
+		doc["version"] = "2.0.0"
+	})
+	if _, bErr := PrepareConfig(badVersionPath, PortOverrides{}, "v0.3.0"); bErr == nil || !strings.Contains(bErr.Error(), MAVLinkIngestComponent) {
+		t.Fatalf("PrepareConfig(badVersionPath) = %v, want missing %s error", bErr, MAVLinkIngestComponent)
+	}
+
+	extraCompPath := writeFlow("extra-comp.json", func(doc map[string]any) {
+		comps := doc["components"].(map[string]any)
+		comps["rogue-extra"] = map[string]any{"type": "input", "name": "websocket", "enabled": true, "config": map[string]any{}}
+	})
+	if _, eErr := PrepareConfig(extraCompPath, PortOverrides{}, "v0.3.0"); eErr == nil || !strings.Contains(eErr.Error(), MAVLinkIngestComponent) {
+		t.Fatalf("PrepareConfig(extraCompPath) = %v, want missing %s error", eErr, MAVLinkIngestComponent)
+	}
+
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>legacy-file</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+
+	rtFile, err := StartEphemeral(ctx, Options{
+		ConfigPath: baseLegacyPath,
+		DataDir:    t.TempDir(),
+		UIDir:      uiDir,
+		Version:    "v0.3.0",
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral(baseLegacyPath): %v", err)
+	}
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := rtFile.WaitReady(readyCtx); err != nil {
+		readyCancel()
+		_ = rtFile.Stop(context.Background())
+		t.Fatalf("rtFile.WaitReady: %v", err)
+	}
+	readyCancel()
+	if rtFile.MAVLinkIngest() == nil || rtFile.Endpoints().MAVLinkUDPPort == 0 {
+		_ = rtFile.Stop(context.Background())
+		t.Fatalf("rtFile MAVLinkIngest = %v, endpoints = %+v, want active UDP listener", rtFile.MAVLinkIngest(), rtFile.Endpoints())
+	}
+	stopFileCtx, stopFileCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := rtFile.Stop(stopFileCtx); err != nil {
+		stopFileCancel()
+		t.Fatalf("rtFile.Stop: %v", err)
+	}
+	stopFileCancel()
+
+	afterBytes, err := os.ReadFile(baseLegacyPath)
+	if err != nil {
+		t.Fatalf("ReadFile(baseLegacyPath): %v", err)
+	}
+	if !bytes.Equal(afterBytes, legacyRaw) {
+		t.Fatal("explicit legacy flow file on disk was modified")
+	}
+
+	// 2. Synchronized concurrent operator write between KV snapshot lookup and conditional kv.Create:
+	// seed a 7-component M0.2 KV store, then create components.mavlink-ingest (enabled: false)
+	// inside beforeMigrationCreate and assert both KV and effective listener state honor the operator winner.
+	raceDataDir := t.TempDir()
+	srv, err := natsserver.NewServer(&natsserver.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, JetStream: true,
+		StoreDir: filepath.Join(raceDataDir, "jetstream"),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatal("seed NATS server not ready")
+	}
+	discardLogger := slog.New(slog.DiscardHandler)
+	seedCfg := parsedCheck.Clone()
+	seedCfg.NATS.URLs = []string{srv.ClientURL()}
+	seedClient, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithLogger(discardLogger))
+	if err != nil {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := seedClient.Connect(ctx); err != nil {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatalf("seedClient.Connect: %v", err)
+	}
+	if err := config.NewStreamsManager(seedClient, discardLogger).EnsureStreams(ctx, seedCfg); err != nil {
+		_ = seedClient.Close(context.Background())
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatalf("EnsureStreams: %v", err)
+	}
+	seedMgr, err := config.NewConfigManager(seedCfg, seedClient, discardLogger)
+	if err != nil {
+		_ = seedClient.Close(context.Background())
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+	if err := seedMgr.Start(ctx); err != nil {
+		_ = seedClient.Close(context.Background())
+		srv.Shutdown()
+		srv.WaitForShutdown()
+		t.Fatalf("seedMgr.Start: %v", err)
+	}
+	_ = seedMgr.Stop(context.Background())
+	_ = seedClient.Close(context.Background())
+	srv.Shutdown()
+	srv.WaitForShutdown()
+
+	var hookFired atomic.Bool
+	var operatorRev atomic.Uint64
+	rtRace, err := StartEphemeral(ctx, Options{
+		DataDir: raceDataDir,
+		UIDir:   uiDir,
+		Version: "v0.3.0-race",
+		beforeMigrationCreate: func(hookCtx context.Context, client *natsclient.Client) error {
+			hookFired.Store(true)
+			js, jsErr := client.JetStream()
+			if jsErr != nil {
+				return jsErr
+			}
+			bucketName, bErr := config.BucketName("boxbotix", "bbops")
+			if bErr != nil {
+				return bErr
+			}
+			kv, kvErr := js.KeyValue(hookCtx, bucketName)
+			if kvErr != nil {
+				return kvErr
+			}
+			operatorWinner := types.ComponentConfig{
+				Type:    types.ComponentTypeInput,
+				Name:    mavlink.FactoryName,
+				Enabled: false,
+			}
+			rawWinner, mErr := json.Marshal(operatorWinner)
+			if mErr != nil {
+				return mErr
+			}
+			rev, cErr := kv.Create(hookCtx, "components."+MAVLinkIngestComponent, rawWinner)
+			if cErr != nil {
+				return fmt.Errorf("operator concurrent kv.Create: %w", cErr)
+			}
+			operatorRev.Store(rev)
+			return nil
+		},
+	}, 1)
+	if err != nil {
+		t.Fatalf("StartEphemeral concurrent migration race failed: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = rtRace.Stop(stopCtx)
+	})
+	if !hookFired.Load() || operatorRev.Load() == 0 {
+		t.Fatal("beforeMigrationCreate hook did not fire")
+	}
+
+	raceReadyCtx, raceReadyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer raceReadyCancel()
+	if err := rtRace.WaitReady(raceReadyCtx); err != nil {
+		t.Fatalf("rtRace.WaitReady: %v", err)
+	}
+
+	// Assert the concurrent operator write (enabled: false, exact KV revision) was NOT overwritten in KV.
+	js, err := rtRace.NATSClient().JetStream()
+	if err != nil {
+		t.Fatalf("rtRace JetStream: %v", err)
+	}
+	bucketName, err := config.BucketName("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("BucketName: %v", err)
+	}
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("KeyValue: %v", err)
+	}
+	entry, err := kv.Get(ctx, "components."+MAVLinkIngestComponent)
+	if err != nil {
+		t.Fatalf("kv.Get components.%s: %v", MAVLinkIngestComponent, err)
+	}
+	var stored types.ComponentConfig
+	if err := json.Unmarshal(entry.Value(), &stored); err != nil {
+		t.Fatalf("Unmarshal stored %s: %v", MAVLinkIngestComponent, err)
+	}
+	if entry.Revision() != operatorRev.Load() || stored.Enabled {
+		t.Fatalf("concurrent operator write overwritten: rev=%d (want %d) stored=%+v, want enabled=false",
+			entry.Revision(), operatorRev.Load(), stored)
+	}
+
+	// Assert effective runtime listener state honors enabled: false (no UDP listener started).
+	if rtRace.MAVLinkIngest() != nil || rtRace.Endpoints().MAVLinkUDPPort != 0 || rtRace.Endpoints().MAVLinkUDPAddr != "" {
+		t.Fatalf("effective runtime ignored concurrent operator enabled=false: ingest=%v endpoints=%+v",
+			rtRace.MAVLinkIngest(), rtRace.Endpoints())
 	}
 }

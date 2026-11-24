@@ -125,6 +125,110 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		}
 	})
 
+	t.Run("validate and boot accept explicit legacy M0.2 flow file in memory while preserving operator settings and file on disk", func(t *testing.T) {
+		legacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			telWS := components[host.TelemetryWSComponent].(map[string]any)
+			telWS["config"].(map[string]any)["path"] = "/legacy-file-ws"
+		})
+		diskBefore, err := os.ReadFile(legacyPath)
+		if err != nil {
+			t.Fatalf("ReadFile before: %v", err)
+		}
+
+		var valStdout, valStderr bytes.Buffer
+		if code := run([]string{"-validate", "-config", legacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		// Malformed legacy flow (missing graph-ingest alongside missing mavlink-ingest) still fails closed.
+		malformedLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			delete(components, "graph-ingest")
+		})
+		var badStdout, badStderr bytes.Buffer
+		if code := run([]string{"-validate", "-config", malformedLegacyPath}, &badStdout, &badStderr, "v0.3.0", "abc1234"); code != 1 || !strings.Contains(badStderr.String(), "graph-ingest") {
+			t.Fatalf("malformed legacy -validate: code=%d stdout=%q stderr=%q, want exit 1 naming graph-ingest", code, badStdout.String(), badStderr.String())
+		}
+
+		ports, err := host.AllocateLoopbackPorts(4)
+		if err != nil {
+			t.Fatalf("AllocateLoopbackPorts: %v", err)
+		}
+		udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+		if err != nil {
+			t.Fatalf("AllocateLoopbackUDPPorts: %v", err)
+		}
+		uiDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>legacy-cfg</html>"), 0o600); err != nil {
+			t.Fatalf("write index.html: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		var runStdout, runStderr syncBuffer
+		done := make(chan int, 1)
+		go func() {
+			done <- runContext(ctx, []string{
+				"-config", legacyPath,
+				"-data-dir", filepath.Join(t.TempDir(), "data"),
+				"-ui-dir", uiDir,
+				"-bind-host", "127.0.0.1",
+				"-http-port", strconv.Itoa(ports[0]),
+				"-telemetry-ws-port", strconv.Itoa(ports[1]),
+				"-graph-ws-port", strconv.Itoa(ports[2]),
+				"-metrics-port", strconv.Itoa(ports[3]),
+				"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
+			}, &runStdout, &runStderr, "v0.3.0", "abc1234")
+		}()
+
+		deadline := time.Now().Add(15 * time.Second)
+		ready := false
+		for time.Now().Before(deadline) {
+			if strings.Contains(runStderr.String(), "bbops host ready") {
+				ready = true
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !ready {
+			cancel()
+			<-done
+			t.Fatalf("legacy -config daemon did not reach ready; stderr=%s", runStderr.String())
+		}
+		if !strings.Contains(runStderr.String(), "/legacy-file-ws") ||
+			!strings.Contains(runStderr.String(), "mavlink_udp=127.0.0.1:"+strconv.Itoa(udpPorts[0])) {
+			cancel()
+			<-done
+			t.Fatalf("legacy -config ready log missing preserved /legacy-file-ws or mavlink_udp: %s", runStderr.String())
+		}
+		resp, getErr := http.Get("http://127.0.0.1:" + strconv.Itoa(ports[0]) + "/readyz") //nolint:noctx
+		if getErr != nil {
+			cancel()
+			<-done
+			t.Fatalf("GET /readyz: %v", getErr)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			cancel()
+			<-done
+			t.Fatalf("/readyz status = %d, want 200", resp.StatusCode)
+		}
+		cancel()
+		if exitCode := <-done; exitCode != 0 {
+			t.Fatalf("legacy -config daemon exit = %d, want 0", exitCode)
+		}
+
+		diskAfter, err := os.ReadFile(legacyPath)
+		if err != nil {
+			t.Fatalf("ReadFile after: %v", err)
+		}
+		if !bytes.Equal(diskAfter, diskBefore) {
+			t.Fatal("legacy flow file on disk was modified")
+		}
+	})
+
 	t.Run("validate flag accepts null service configs with CLI port overrides without panicking", func(t *testing.T) {
 		nullSvcPath := writeMutatedFlowFile(t, func(doc map[string]any) {
 			services := doc["services"].(map[string]any)

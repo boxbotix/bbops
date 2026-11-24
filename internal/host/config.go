@@ -133,7 +133,10 @@ type PreparedConfig struct {
 }
 
 // LoadConfig reads path (or the embedded configs/bbops.json default when path is
-// empty), parses it via SemEngine's loader, and applies any PortOverrides.
+// empty), parses it via SemEngine's loader, applies the additive pre-M1.2
+// mavlink-ingest upgrade in memory when loading a recognized legacy flow file
+// (preserving explicit operator values and leaving path untouched on disk), and
+// applies any PortOverrides.
 func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
 	var data []byte
 	var err error
@@ -149,10 +152,46 @@ func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if path != "" {
+		if err := upgradeLegacyFlowInMemory(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if err := ApplyPortOverrides(cfg, overrides); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func upgradeLegacyFlowInMemory(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if _, hasMAV := cfg.Components[MAVLinkIngestComponent]; hasMAV {
+		return nil
+	}
+	if cfg.Version != "1.0.0" || len(cfg.Components) != len(requiredM02Components) {
+		return nil
+	}
+	for _, req := range requiredM02Components {
+		comp, exists := cfg.Components[req.instance]
+		if !exists || !comp.Enabled || comp.Name != req.factory {
+			return nil
+		}
+	}
+	defaultCfg, err := config.NewLoader().LoadFromBytes(configs.DefaultFlowJSON)
+	if err != nil {
+		return fmt.Errorf("parse embedded default config: %w", err)
+	}
+	mavComp, ok := defaultCfg.Components[MAVLinkIngestComponent]
+	if !ok {
+		return fmt.Errorf("embedded default config missing %q", MAVLinkIngestComponent)
+	}
+	if cfg.Components == nil {
+		cfg.Components = make(config.ComponentConfigs)
+	}
+	cfg.Components[MAVLinkIngestComponent] = mavComp
+	return nil
 }
 
 // PrepareConfig reads path once, validates the un-overridden base flow that
@@ -564,7 +603,7 @@ func patchMAVLinkUDPEndpoint(cfg *config.Config, host string, port int) error {
 	if !ok {
 		return fmt.Errorf("missing required component %q", MAVLinkIngestComponent)
 	}
-	if !comp.Enabled && port == 0 {
+	if !comp.Enabled {
 		return nil
 	}
 	if isEmptyOrNullJSON(comp.Config) {
