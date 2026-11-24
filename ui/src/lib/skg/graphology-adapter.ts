@@ -489,3 +489,166 @@ export function formatTransitionEvent(
     }
   }
 }
+
+export const SKG_HOVER_PILL_FILL = "#0f172a";
+export const SKG_HOVER_TEXT_HEX = "#f8fafc";
+
+export interface ClampedNodeLabelPlacement {
+  readonly textX: number;
+  readonly textY: number;
+  readonly boxX: number;
+  readonly boxY: number;
+  readonly boxWidth: number;
+  readonly boxHeight: number;
+  readonly side: "right" | "left";
+}
+
+export function computeClampedLabelPlacement(
+  nodeX: number,
+  nodeY: number,
+  nodeSize: number,
+  textWidth: number,
+  fontSize: number,
+  stageWidthPx: number,
+): ClampedNodeLabelPlacement {
+  const padX = 5;
+  const padY = 3;
+  const gap = 4;
+  const boxWidth = Math.ceil(Math.max(0, textWidth) + padX * 2);
+  const boxHeight = Math.ceil(fontSize + padY * 2);
+  const textY = nodeY + fontSize / 3;
+  const boxY = Math.round(nodeY - boxHeight * 0.5);
+
+  const rightBoxX = Math.round(nodeX + nodeSize + gap);
+  if (stageWidthPx > 0 && rightBoxX + boxWidth > stageWidthPx - 4) {
+    const leftBoxX = Math.max(4, Math.round(nodeX - nodeSize - gap - boxWidth));
+    return {
+      textX: leftBoxX + padX,
+      textY,
+      boxX: leftBoxX,
+      boxY,
+      boxWidth,
+      boxHeight,
+      side: "left",
+    };
+  }
+
+  return {
+    textX: rightBoxX + padX,
+    textY,
+    boxX: rightBoxX,
+    boxY,
+    boxWidth,
+    boxHeight,
+    side: "right",
+  };
+}
+
+export interface SigmaNodeRenderDataLike {
+  readonly x: number;
+  readonly y: number;
+  readonly size: number;
+  readonly label?: string | null;
+  readonly color: string;
+}
+
+export interface SigmaLabelSettingsLike {
+  readonly labelSize: number;
+  readonly labelFont: string;
+  readonly labelWeight: string;
+  readonly labelColor:
+    | { readonly attribute: string; readonly color?: string }
+    | { readonly color: string; readonly attribute?: undefined };
+}
+
+function resolveCanvasCssWidth(context: CanvasRenderingContext2D): number {
+  const canvas = context.canvas as
+    { clientWidth?: number; width?: number } | undefined;
+  if (
+    canvas &&
+    typeof canvas.clientWidth === "number" &&
+    canvas.clientWidth > 0
+  ) {
+    return canvas.clientWidth;
+  }
+  const dpr =
+    typeof window !== "undefined" && window.devicePixelRatio > 0
+      ? window.devicePixelRatio
+      : 1;
+  return canvas && typeof canvas.width === "number" ? canvas.width / dpr : 0;
+}
+
+export function drawSkgNodeLabel(
+  context: CanvasRenderingContext2D,
+  data: SigmaNodeRenderDataLike,
+  settings: SigmaLabelSettingsLike,
+): void {
+  if (typeof data.label !== "string" || data.label.length === 0) {
+    return;
+  }
+  const fontSize = settings.labelSize;
+  context.font = `${settings.labelWeight} ${fontSize}px ${settings.labelFont}`;
+  const textWidth = context.measureText(data.label).width;
+  const stageWidth = resolveCanvasCssWidth(context);
+  const placement = computeClampedLabelPlacement(
+    data.x,
+    data.y,
+    data.size,
+    textWidth,
+    fontSize,
+    stageWidth,
+  );
+  context.fillStyle = settings.labelColor.color ?? "#e2e8f0";
+  context.fillText(data.label, placement.textX, placement.textY);
+}
+
+export function drawSkgNodeHover(
+  context: CanvasRenderingContext2D,
+  data: SigmaNodeRenderDataLike,
+  settings: SigmaLabelSettingsLike,
+): void {
+  const fontSize = settings.labelSize;
+  context.save();
+  context.font = `${settings.labelWeight} ${fontSize}px ${settings.labelFont}`;
+  const accentColor = data.color || SKG_EDGE_PALETTE.uxs;
+
+  // Halo ring around highlighted/hovered node disc on dark theme.
+  context.beginPath();
+  context.arc(data.x, data.y, data.size + 3, 0, Math.PI * 2);
+  context.fillStyle = SKG_HOVER_PILL_FILL;
+  context.fill();
+  context.lineWidth = 1.5;
+  context.strokeStyle = accentColor;
+  context.stroke();
+
+  if (typeof data.label === "string" && data.label.length > 0) {
+    const textWidth = context.measureText(data.label).width;
+    const stageWidth = resolveCanvasCssWidth(context);
+    const placement = computeClampedLabelPlacement(
+      data.x,
+      data.y,
+      data.size,
+      textWidth,
+      fontSize,
+      stageWidth,
+    );
+    context.fillStyle = SKG_HOVER_PILL_FILL;
+    context.fillRect(
+      placement.boxX,
+      placement.boxY,
+      placement.boxWidth,
+      placement.boxHeight,
+    );
+    context.lineWidth = 1.2;
+    context.strokeStyle = accentColor;
+    context.strokeRect(
+      placement.boxX,
+      placement.boxY,
+      placement.boxWidth,
+      placement.boxHeight,
+    );
+    context.fillStyle = SKG_HOVER_TEXT_HEX;
+    context.fillText(data.label, placement.textX, placement.textY);
+  }
+  context.restore();
+}

@@ -18,8 +18,13 @@ import {
 import { createViewportStore } from "../stores/viewport.svelte";
 import {
   SKG_EDGE_PALETTE,
+  SKG_HOVER_PILL_FILL,
+  SKG_HOVER_TEXT_HEX,
   SKG_NODE_PALETTE,
   buildSkgTopologyModel,
+  computeClampedLabelPlacement,
+  drawSkgNodeHover,
+  drawSkgNodeLabel,
   formatEntityTriples,
   formatTransitionEvent,
   syncTopologyToGraph,
@@ -513,5 +518,96 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
 
     unmount(app);
     host.remove();
+  });
+
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  it("renders high-contrast dark SKG hover pills without #ffffff fills and flips right-edge node labels inside the stage", () => {
+    expect(SKG_HOVER_PILL_FILL).toBe("#0f172a");
+    expect(SKG_HOVER_TEXT_HEX).toBe("#f8fafc");
+    expect(isReservedSafetyHue(SKG_HOVER_PILL_FILL)).toBe(false);
+
+    // Interior node places label to the right of the disc.
+    const interior = computeClampedLabelPlacement(120, 90, 9, 88, 11, 360);
+    expect(interior.side).toBe("right");
+    expect(interior.boxX + interior.boxWidth).toBeLessThanOrEqual(356);
+
+    // Right-edge node flips label left of the disc so boxX + boxWidth stays inside stageWidthPx - 4.
+    const rightEdge = computeClampedLabelPlacement(338, 90, 9, 112, 11, 360);
+    expect(rightEdge.side).toBe("left");
+    expect(rightEdge.boxX).toBeGreaterThanOrEqual(4);
+    expect(rightEdge.boxX + rightEdge.boxWidth).toBeLessThanOrEqual(356);
+
+    const fillStylesUsed: string[] = [];
+    const drawnLabels: Array<{ text: string; x: number; y: number }> = [];
+    const drawnRects: Array<{ x: number; y: number; w: number; h: number }> =
+      [];
+    let currentFill = "#000000";
+
+    const mockCtx = {
+      canvas: { clientWidth: 360, width: 720 },
+      font: "",
+      lineWidth: 1,
+      strokeStyle: "",
+      get fillStyle() {
+        return currentFill;
+      },
+      set fillStyle(val: string) {
+        currentFill = val;
+        fillStylesUsed.push(val.toLowerCase());
+      },
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      arc: vi.fn(),
+      fill: vi.fn(),
+      stroke: vi.fn(),
+      measureText: (txt: string) => ({ width: txt.length * 7 }),
+      fillRect: (x: number, y: number, w: number, h: number) => {
+        drawnRects.push({ x, y, w, h });
+      },
+      strokeRect: vi.fn(),
+      fillText: (text: string, x: number, y: number) => {
+        drawnLabels.push({ text, x, y });
+      },
+    } as unknown as CanvasRenderingContext2D;
+
+    const settings = {
+      labelSize: 11,
+      labelFont: "monospace",
+      labelWeight: "600",
+      labelColor: { color: "#e2e8f0" },
+    };
+
+    drawSkgNodeLabel(
+      mockCtx,
+      {
+        x: 342,
+        y: 80,
+        size: 9,
+        label: "quadcopter#1 [companion-teleop]",
+        color: "#06b6d4",
+      },
+      settings,
+    );
+    expect(drawnLabels).toHaveLength(1);
+    expect(drawnLabels[0]!.x).toBeLessThan(342);
+
+    drawSkgNodeHover(
+      mockCtx,
+      {
+        x: 342,
+        y: 80,
+        size: 9,
+        label: "quadcopter#1 [companion-teleop]",
+        color: "#06b6d4",
+      },
+      settings,
+    );
+    expect(drawnRects).toHaveLength(1);
+    expect(drawnRects[0]!.x + drawnRects[0]!.w).toBeLessThanOrEqual(356);
+    expect(fillStylesUsed).toContain("#0f172a");
+    expect(fillStylesUsed).toContain("#f8fafc");
+    expect(fillStylesUsed).not.toContain("#fff");
+    expect(fillStylesUsed).not.toContain("#ffffff");
   });
 });

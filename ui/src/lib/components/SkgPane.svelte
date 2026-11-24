@@ -15,6 +15,8 @@
   import {
     SKG_EDGE_PALETTE,
     buildSkgTopologyModel,
+    drawSkgNodeHover,
+    drawSkgNodeLabel,
     formatEntityTriples,
     formatTransitionEvent,
     syncTopologyToGraph,
@@ -42,6 +44,7 @@
 
   let sigmaContainerEl: HTMLDivElement | undefined = $state();
   let webglAvailable = $state(false);
+  let sigmaReady = $state(false);
   let layoutRunning = $state(false);
   let hoveredNodeId = $state<string | null>(null);
   let expanding = $state(false);
@@ -150,10 +153,13 @@
           }
           const renderer = new Sigma(graph, sigmaContainerEl, {
             renderEdgeLabels: false,
+            stagePadding: 32,
             defaultNodeColor: "#60a5fa",
             defaultEdgeColor: SKG_EDGE_PALETTE.default,
             labelColor: { color: "#e2e8f0" },
             labelSize: 11,
+            defaultDrawNodeLabel: drawSkgNodeLabel,
+            defaultDrawNodeHover: drawSkgNodeHover,
             nodeReducer: (node, data) => {
               const res = { ...data };
               const focusId = hoveredNodeId ?? viewportStore.selectedEntityId;
@@ -199,17 +205,20 @@
           });
 
           sigmaInstance = renderer;
+          sigmaReady = true;
           if (graph.order >= 2 && graph.size > 0) {
             layoutController.start(graph);
           }
         })
         .catch(() => {
+          sigmaReady = false;
           webglAvailable = false;
         });
     }
 
     return () => {
       disposed = true;
+      sigmaReady = false;
       layoutController.stop();
       sigmaInstance?.kill();
       sigmaInstance = null;
@@ -282,6 +291,9 @@
 
     <div
       class="sigma-stage"
+      data-testid="skg-sigma-stage"
+      data-sigma-ready={sigmaReady ? "true" : "false"}
+      data-highlighted-node={viewportStore.selectedEntityId ?? ""}
       bind:this={sigmaContainerEl}
       class:hidden={!webglAvailable}
     ></div>
@@ -378,6 +390,7 @@
 
 <style>
   .skg-pane {
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -395,6 +408,11 @@
     padding: 8px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
+  }
+
+  .inspector-card {
+    flex: 1 1 auto;
+    min-height: 190px;
   }
 
   .pane-header {
@@ -493,7 +511,9 @@
   }
 
   .table-scroll {
-    max-height: 170px;
+    flex: 1 1 auto;
+    min-height: 150px;
+    max-height: 320px;
     overflow: auto;
   }
 
