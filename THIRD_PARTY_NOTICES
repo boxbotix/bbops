@@ -35,10 +35,12 @@
      `bluenviron/gomavlib` @ `33ff3fce8d7f2e832e08e08cf02b946de821208e` (`v3.3.5`)
 
 7. **Sigma.js & Graphology UI Runtime Dependencies — MIT License**
-   - `sigma` (`^3.0.3`, Copyright (c) Alexis Jacomy & OuestWare, MIT)
-   - `graphology` (`^0.26.0`, Copyright (c) Guillaume Plique, MIT)
-   - `graphology-types` (`^0.24.8`, Copyright (c) Guillaume Plique, MIT)
-   - `graphology-layout-forceatlas2` (`^0.10.1`, Copyright (c) Guillaume Plique, MIT)
+   - `sigma` (`3.0.3`, `Copyright (C) 2013-2025, Alexis Jacomy, Guillaume Plique, Benoît Simard https://www.sigmajs.org`, MIT)
+   - `graphology` (`0.26.0`, `Copyright (c) 2016-2021 Guillaume Plique (Yomguithereal)`, MIT)
+   - `graphology-types` (`0.24.8`, `Copyright (c) 2020-2021 Guillaume Plique (Yomguithereal)`, MIT)
+   - `graphology-layout-forceatlas2` (`0.10.1`, `Copyright (c) 2016-2021 Guillaume Plique (Yomguithereal)`, MIT)
+   - `graphology-utils` (`2.5.2`, `Copyright (c) 2017-2021 Guillaume Plique (Yomguithereal)`, MIT)
+   - `events` (`3.3.0`, `Copyright Joyent, Inc. and other Node contributors.`, MIT)
 
 ---
 

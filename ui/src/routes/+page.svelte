@@ -106,7 +106,11 @@
     </div>
 
     <div class="inspector-column">
-      <VehicleHud {telemetryStore} vehicle={selectedVehicle} />
+      <VehicleHud
+        {telemetryStore}
+        vehicle={selectedVehicle}
+        skgStatus={skgStore.status}
+      />
       <SkgPane
         {skgStore}
         {telemetryStore}

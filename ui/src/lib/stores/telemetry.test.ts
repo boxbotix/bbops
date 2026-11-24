@@ -589,4 +589,235 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
 
     store.disconnect();
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  it("stamps receivedAtMs from the local browser clock across +60s and -60s server skew while retaining producer timestamps and defaulting omitted has_local_pos to false", () => {
+    let browserNowMs = 1_732_400_100_000;
+    const store = createTelemetryStore({
+      now: () => browserNowMs,
+    });
+
+    // +60s ahead server envelope & producer timestamp, with legacy omitted has_local_pos.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(
+        1,
+        {
+          seq: 1,
+          timestamp: browserNowMs + 60_000,
+        },
+        browserNowMs + 60_000,
+      ),
+    );
+    const ahead = store.getKinematics(1);
+    expect(ahead?.receivedAtMs).toBe(browserNowMs);
+    expect(ahead?.timestamp).toBe(browserNowMs + 60_000);
+    expect(ahead?.has_local_pos).toBe(false);
+
+    // -60s behind server envelope & producer timestamp on sysid 2, with explicit has_local_pos: true.
+    browserNowMs += 250;
+    store.ingestRawFrame(
+      buildKinematicEnvelope(
+        2,
+        {
+          seq: 1,
+          has_local_pos: true,
+          timestamp: browserNowMs - 60_000,
+        },
+        browserNowMs - 60_000,
+      ),
+    );
+    const behind = store.getKinematics(2);
+    expect(behind?.receivedAtMs).toBe(browserNowMs);
+    expect(behind?.timestamp).toBe(browserNowMs - 60_000);
+    expect(behind?.has_local_pos).toBe(true);
+  });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  it("preserves explicit has_heading availability across unknown #33 heading and measured 0° North in-place updates", () => {
+    const store = createTelemetryStore();
+
+    // #33 GLOBAL_POSITION_INT with Hdg=65535 before #31 -> hdg_deg: 0, has_heading: false.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 1,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: false,
+        timestamp: 10_000,
+      }),
+    );
+    const first = store.getKinematics(1);
+    expect(first?.hdg_deg).toBe(0);
+    expect(first?.has_attitude).toBe(false);
+    expect(first?.has_heading).toBe(false);
+
+    // Measured 0° North #33 update overwrites in place with has_heading: true.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 2,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: true,
+        timestamp: 10_050,
+      }),
+    );
+    expect(store.getKinematics(1)).toBe(first);
+    expect(first?.hdg_deg).toBe(0);
+    expect(first?.has_heading).toBe(true);
+
+    // Subsequent unknown-heading #33 update clears has_heading back to false in place.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 3,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: false,
+        timestamp: 10_100,
+      }),
+    );
+    expect(first?.has_heading).toBe(false);
+
+    // Legacy WS1 session on one connection:
+    // 1) unannotated #33 position -> [false, false]
+    // 2) genuine #31 level-North attitude ([1,0,0,0], [0,0,0], hdg_deg=0) -> [true, true]
+    // 3) #32 local-position 50 ms later with fused [1,0,0,0] -> stays [true, true]
+    // 4) #33 global-position 50 ms later with fused [1,0,0,0] -> stays [true, true]
+    // 5) session disconnect + new session -> resets back to [false, false] on unannotated #33!
+    const rig = new MockWebSocketRig();
+    const legacyStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: rig.createSocket,
+    });
+    legacyStore.connect();
+    rig.latest.serverOpen();
+
+    const makeLegacyFrame = (
+      seq: number,
+      msgId: number,
+      timestamp: number,
+      extra: Record<string, unknown> = {},
+    ) =>
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.2",
+        timestamp,
+        payload: {
+          sysid: 2,
+          domain: "rover",
+          seq,
+          msg_id: msgId,
+          quat_wxyz: [1, 0, 0, 0],
+          body_rates: [0, 0, 0],
+          ned_xyz: [0, 0, 0],
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: [30.2672, -97.7431, 150],
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp,
+          ...extra,
+        },
+      });
+
+    rig.latest.serverMessage(makeLegacyFrame(1, 33, 10_200));
+    const legacyParsed = legacyStore.getKinematics(2);
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    // Out-of-order #31 and #32 frames (timestamp < 10_200) are dropped and MUST NOT latch attitude or local pos!
+    rig.latest.serverMessage(makeLegacyFrame(2, 31, 10_150));
+    rig.latest.serverMessage(makeLegacyFrame(2, 32, 10_160));
+    expect(legacyStore.droppedOutOfOrderCount).toBe(2);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    // First in-order legacy #32 LOCAL_POSITION_NED (including measured zero [0,0,0]) latches local pos while attitude stays unmeasured!
+    rig.latest.serverMessage(makeLegacyFrame(3, 32, 10_225));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    // Genuine in-order #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) latches attitude + heading and preserves local pos!
+    rig.latest.serverMessage(makeLegacyFrame(4, 31, 10_250));
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    // #32 LOCAL_POSITION_NED 50 ms later carrying fused [1,0,0,0] retains measured attitude + heading + local pos!
+    rig.latest.serverMessage(
+      makeLegacyFrame(5, 32, 10_300, { ned_xyz: [4, -2, 0] }),
+    );
+    expect(legacyParsed?.ned_xyz).toEqual([4, -2, 0]);
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    // #33 GLOBAL_POSITION_INT 50 ms later carrying fused [1,0,0,0] also retains measured attitude + heading + local pos!
+    rig.latest.serverMessage(
+      makeLegacyFrame(6, 33, 10_350, {
+        ned_xyz: [4, -2, 0],
+        lat_lon_alt: [30.2673, -97.7432, 150],
+      }),
+    );
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    // Explicit modern availability flags override the legacy latch immediately (even on msg_id=32)!
+    rig.latest.serverMessage(
+      makeLegacyFrame(7, 32, 10_400, {
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        has_local_pos: false,
+        has_heading: true,
+        hdg_deg: 0,
+      }),
+    );
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(true);
+
+    // Re-latch via #32 + #31, verify link_lost clears latches on next legacy #33, then re-latch and verify socket reconnect resets inference!
+    rig.latest.serverMessage(
+      makeLegacyFrame(8, 32, 10_425, { ned_xyz: [12, -5, -4] }),
+    );
+    rig.latest.serverMessage(
+      makeLegacyFrame(9, 31, 10_450, { ned_xyz: [12, -5, -4] }),
+    );
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(2, {
+        kind: "link_lost",
+        timestamp: 10_460,
+      }),
+    );
+    rig.latest.serverMessage(makeLegacyFrame(10, 33, 10_475));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    rig.latest.serverMessage(makeLegacyFrame(11, 32, 10_480));
+    rig.latest.serverMessage(makeLegacyFrame(12, 31, 10_490));
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    rig.latest.serverOpen();
+
+    rig.latest.serverMessage(makeLegacyFrame(13, 33, 10_500));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    legacyStore.disconnect();
+  });
 });

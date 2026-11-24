@@ -82,6 +82,16 @@ type VehicleSnapshot struct {
 	Altitude  float64 `json:"altitude"`
 
 	ObservedAt time.Time `json:"observed_at"`
+
+	PoseMetadata            bool  `json:"pose_metadata,omitempty"`
+	HasAttitude             bool  `json:"has_attitude,omitempty"`
+	HasLocalPos             bool  `json:"has_local_pos,omitempty"`
+	HasGlobalPos            bool  `json:"has_global_pos,omitempty"`
+	HasHeading              bool  `json:"has_heading,omitempty"`
+	AttitudeObservedUnixNs  int64 `json:"attitude_observed_unix_ns,omitempty"`
+	LocalPosObservedUnixNs  int64 `json:"local_pos_observed_unix_ns,omitempty"`
+	GlobalPosObservedUnixNs int64 `json:"global_pos_observed_unix_ns,omitempty"`
+	HeadingObservedUnixNs   int64 `json:"heading_observed_unix_ns,omitempty"`
 }
 
 var (
@@ -91,10 +101,12 @@ var (
 )
 
 // NewVehicleSnapshot constructs a VehicleSnapshot initialized with neutral
-// finite defaults (identity quaternion [1, 0, 0, 0], zero kinematics/GPS/counters,
+// finite defaults (PoseMetadata=true with Has*=false indicating no #31/#32/#33
+// measurements yet, zero-norm quaternion [0, 0, 0, 0], zero kinematics/GPS/counters,
 // disarmed mode, mcu-failsafe authority, sitl-local link tier) so snapshots
-// emitted before SYS_STATUS (#1) or GLOBAL_POSITION_INT (#33) arrive still
-// carry the full 22-predicate set.
+// emitted before SYS_STATUS (#1), ATTITUDE_QUATERNION (#31), LOCAL_POSITION_NED
+// (#32), or GLOBAL_POSITION_INT (#33) arrive carry the full 22-predicate set
+// without claiming unverified pose fixes.
 func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*VehicleSnapshot, error) {
 	if _, err := VehicleEntityID(org, platform, sysid); err != nil {
 		return nil, err
@@ -111,7 +123,7 @@ func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*Vehi
 		Authority:     AuthorityMCUFailsafe,
 		CompanionMode: ModeDisarmed,
 		LinkTier:      LinkTierSITLLocal,
-		Quaternion:    [4]float64{1, 0, 0, 0},
+		PoseMetadata:  true,
 	}, nil
 }
 
@@ -153,6 +165,9 @@ func (s *VehicleSnapshot) Validate() error {
 	}
 	if s.Failsafes < 0 || s.CRCErrors < 0 || s.LoopDtUs < 0 || s.MaxLoopDtUs < 0 || s.RTTUs < 0 {
 		return errors.New("uxsvocab: health counters and durations must be non-negative")
+	}
+	if s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
+		return errors.New("uxsvocab: domain observation timestamps must be non-negative")
 	}
 
 	for i, v := range s.Quaternion {
@@ -277,9 +292,10 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 	if entityID == "" {
 		return nil
 	}
+	epochZero := time.Unix(0, 0).UTC()
 	ts := s.ObservedAt
 	if ts.IsZero() {
-		ts = time.Unix(0, 0).UTC()
+		ts = epochZero
 	} else {
 		ts = ts.UTC()
 	}
@@ -299,6 +315,69 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		}
 	}
 
+	hasPoseMeta := s.PoseMetadata ||
+		s.HasAttitude ||
+		s.HasLocalPos ||
+		s.HasGlobalPos ||
+		s.HasHeading ||
+		s.AttitudeObservedUnixNs > 0 ||
+		s.LocalPosObservedUnixNs > 0 ||
+		s.GlobalPosObservedUnixNs > 0 ||
+		s.HeadingObservedUnixNs > 0
+
+	quatNormSq := s.Quaternion[0]*s.Quaternion[0] +
+		s.Quaternion[1]*s.Quaternion[1] +
+		s.Quaternion[2]*s.Quaternion[2] +
+		s.Quaternion[3]*s.Quaternion[3]
+	legacyAtt := quatNormSq >= 1e-6 &&
+		!(s.Quaternion == ([4]float64{1, 0, 0, 0}) && s.BodyRates == ([3]float64{}))
+	legacyLocal := s.NED != ([3]float64{}) || s.Vx != 0 || s.Vy != 0 || s.Vz != 0
+	legacyHdg := s.HeadingDeg != 0 || legacyAtt
+	legacyGlobal := s.Latitude != 0 || s.Longitude != 0 || s.Altitude != 0
+
+	poseTriple := func(predicate string, obj any, hasDomain bool, observedUnixNs int64, legacyPresent bool) message.Triple {
+		if hasPoseMeta {
+			if !hasDomain {
+				unmeasuredTS := epochZero
+				if observedUnixNs > 0 {
+					unmeasuredTS = time.Unix(0, observedUnixNs).UTC()
+				}
+				return message.Triple{
+					Subject:    entityID,
+					Predicate:  predicate,
+					Object:     obj,
+					Source:     TripleSource,
+					Timestamp:  unmeasuredTS,
+					Confidence: 0.0,
+				}
+			}
+			obsTS := ts
+			if observedUnixNs > 0 {
+				obsTS = time.Unix(0, observedUnixNs).UTC()
+			}
+			return message.Triple{
+				Subject:    entityID,
+				Predicate:  predicate,
+				Object:     obj,
+				Source:     TripleSource,
+				Timestamp:  obsTS,
+				Confidence: 1.0,
+				Context:    "measured",
+			}
+		}
+		if !legacyPresent {
+			return message.Triple{
+				Subject:    entityID,
+				Predicate:  predicate,
+				Object:     obj,
+				Source:     TripleSource,
+				Timestamp:  epochZero,
+				Confidence: 0.0,
+			}
+		}
+		return triple(predicate, obj)
+	}
+
 	return []message.Triple{
 		triple(PredicateDomainKind, s.Domain),
 		triple(PredicateAuthorityState, s.Authority),
@@ -311,16 +390,16 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		triple(PredicateHealthLoopDtUs, s.LoopDtUs),
 		triple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs),
 		triple(PredicateHealthRTTUs, s.RTTUs),
-		triple(PredicateAttitudeQuaternion, s.Quaternion),
-		triple(PredicateAttitudeRates, s.BodyRates),
-		triple(PredicateKinematicsNED, s.NED),
-		triple(PredicateKinematicsVx, s.Vx),
-		triple(PredicateKinematicsVy, s.Vy),
-		triple(PredicateKinematicsVz, s.Vz),
-		triple(PredicateKinematicsHeadingDeg, s.HeadingDeg),
-		triple(vocabulary.GeoLocationLatitude, s.Latitude),
-		triple(vocabulary.GeoLocationLongitude, s.Longitude),
-		triple(vocabulary.GeoLocationAltitude, s.Altitude),
+		poseTriple(PredicateAttitudeQuaternion, s.Quaternion, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
+		poseTriple(PredicateAttitudeRates, s.BodyRates, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
+		poseTriple(PredicateKinematicsNED, s.NED, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		poseTriple(PredicateKinematicsVx, s.Vx, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		poseTriple(PredicateKinematicsVy, s.Vy, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		poseTriple(PredicateKinematicsVz, s.Vz, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		poseTriple(PredicateKinematicsHeadingDeg, s.HeadingDeg, s.HasHeading, s.HeadingObservedUnixNs, legacyHdg),
+		poseTriple(vocabulary.GeoLocationLatitude, s.Latitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
+		poseTriple(vocabulary.GeoLocationLongitude, s.Longitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
+		poseTriple(vocabulary.GeoLocationAltitude, s.Altitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
 		triple(vocabulary.DCTermsTitle, title),
 	}
 }

@@ -9,7 +9,7 @@
   @ 3814b3d59dab7136011429cad99a8148aeceb0cc (MIT).
 -->
 <script lang="ts">
-  import MultiDirectedGraph from "graphology";
+  import { MultiDirectedGraph } from "graphology";
   import { onMount } from "svelte";
   import type { GraphQLClient, PathSearchResult } from "$lib/graphql";
   import {
@@ -162,7 +162,7 @@
               }
               if (focusId && graph.hasNode(focusId) && node !== focusId) {
                 const isNeighbor =
-                  graph.hasEdge(focusId, node) || graph.hasEdge(node, focusId);
+                  graph.hasNode(node) && graph.areNeighbors(focusId, node);
                 if (!isNeighbor) {
                   res.color = "#334155";
                   res.label = "";
@@ -332,14 +332,16 @@
               <th>Predicate</th>
               <th>Value</th>
               <th>Source</th>
+              <th>Timestamp</th>
             </tr>
           </thead>
           <tbody>
-            {#each tripleRows as row (`${row.predicate}:${row.timestamp}`)}
+            {#each tripleRows as row, idx (`${idx}:${row.predicate}:${row.source}:${row.timestamp}`)}
               <tr>
                 <td class="pred-cell">{row.predicate}</td>
                 <td class="val-cell">{row.objectText}</td>
                 <td class="src-cell">{row.source}</td>
+                <td class="ts-cell">{row.timestamp}</td>
               </tr>
             {/each}
           </tbody>
@@ -523,8 +525,10 @@
     word-break: break-word;
   }
 
-  .src-cell {
+  .src-cell,
+  .ts-cell {
     color: var(--ui-text-muted, #64748b);
+    white-space: nowrap;
   }
 
   .event-list {

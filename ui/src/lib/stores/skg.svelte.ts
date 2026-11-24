@@ -89,6 +89,7 @@ export interface CopEntityBase {
   expiresAt: string | null;
   uncertaintyMeters: number | null;
   feedStatus: CopFeedStatus;
+  ingestedAtMs?: number;
   triples: readonly SkgTriple[];
 }
 
@@ -114,6 +115,15 @@ export interface VehicleEntityState extends CopEntityBase {
     longitude: number;
     altitude: number;
   };
+  hasAttitude?: boolean;
+  hasLocalPos?: boolean;
+  hasGlobalPos?: boolean;
+  hasHeading?: boolean;
+  poseObservedAt?: string | null;
+  localPosObservedAt?: string | null;
+  globalPosObservedAt?: string | null;
+  poseIngestedAtMs?: number | null;
+  poseIngestedLive?: boolean;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -400,6 +410,7 @@ export function parseCopEntityState(
   stored: unknown,
   kvRevision: number,
   expectedKey?: string,
+  ingestedAtMs?: number,
 ): CopEntityState | null {
   if (!isRecord(stored) || !isValidEntityIdString(stored.id)) {
     return null;
@@ -434,6 +445,9 @@ export function parseCopEntityState(
     stored.updated_at,
     kvRevision,
   );
+  if (ingestedAtMs !== undefined && isFiniteNumber(ingestedAtMs)) {
+    base.ingestedAtMs = ingestedAtMs;
+  }
 
   const vehicleIdentity = parseVehicleEntityId(stored.id);
   if (vehicleIdentity !== null) {
@@ -493,6 +507,95 @@ export function parseCopEntityState(
           latestUxsTriple = selectWinningTriple(latestUxsTriple, triple);
         }
       }
+      const posePredicates = [
+        "uxs.attitude.quaternion",
+        "uxs.attitude.rates",
+        "uxs.kinematics.ned",
+        "uxs.kinematics.vx",
+        "uxs.kinematics.vy",
+        "uxs.kinematics.vz",
+        "uxs.kinematics.headingdeg",
+        "geo.location.latitude",
+        "geo.location.longitude",
+        "geo.location.altitude",
+      ] as const;
+      const isMeasuredAssertion = (
+        triple: SkgTriple | undefined,
+      ): triple is SkgTriple =>
+        triple !== undefined &&
+        triple.confidence > 0 &&
+        normalizeKnownTimestamp(triple.timestamp) !== null;
+
+      let latestPoseTriple: SkgTriple | undefined;
+      for (const pred of posePredicates) {
+        const candidate = byPredicate[pred];
+        if (isMeasuredAssertion(candidate)) {
+          latestPoseTriple = selectWinningTriple(latestPoseTriple, candidate);
+        }
+      }
+
+      const quatTriple = byPredicate["uxs.attitude.quaternion"];
+      const nedTriple = byPredicate["uxs.kinematics.ned"];
+      const hdgTriple = byPredicate["uxs.kinematics.headingdeg"];
+      const latTriple = byPredicate["geo.location.latitude"];
+      const lonTriple = byPredicate["geo.location.longitude"];
+      const quatNormSq =
+        quat[0] * quat[0] +
+        quat[1] * quat[1] +
+        quat[2] * quat[2] +
+        quat[3] * quat[3];
+      const wrappedHeading = ((headingDeg % 360) + 360) % 360;
+      const headingDistFromNorth = Math.min(
+        wrappedHeading,
+        360 - wrappedHeading,
+      );
+      const hasNonZeroRates =
+        rates[0] !== 0 || rates[1] !== 0 || rates[2] !== 0;
+      const isUnmeasuredIdentityQuat =
+        quatTriple?.context !== "measured" &&
+        Math.abs(quat[0] - 1) < 1e-9 &&
+        Math.abs(quat[1]) < 1e-9 &&
+        Math.abs(quat[2]) < 1e-9 &&
+        Math.abs(quat[3]) < 1e-9 &&
+        (headingDistFromNorth > 0.5 || !hasNonZeroRates);
+      const hasAttitude =
+        isMeasuredAssertion(quatTriple) &&
+        quatNormSq >= 1e-6 &&
+        !isUnmeasuredIdentityQuat;
+      const hasNonZeroLocalKinematics =
+        ned[0] !== 0 ||
+        ned[1] !== 0 ||
+        ned[2] !== 0 ||
+        vx !== 0 ||
+        vy !== 0 ||
+        vz !== 0;
+      const hasLocalPos =
+        isMeasuredAssertion(nedTriple) &&
+        (nedTriple.context === "measured" || hasNonZeroLocalKinematics);
+      const hasGlobalPos =
+        isMeasuredAssertion(latTriple) &&
+        isMeasuredAssertion(lonTriple) &&
+        (latTriple.context === "measured" ||
+          lat !== 0 ||
+          lon !== 0 ||
+          alt !== 0);
+      const hasHeading =
+        isMeasuredAssertion(hdgTriple) &&
+        (hdgTriple.context === "measured" || headingDeg !== 0 || hasAttitude);
+
+      const poseObservedAt = normalizeKnownTimestamp(
+        latestPoseTriple?.timestamp,
+      );
+      const localPosObservedAt = hasLocalPos
+        ? normalizeKnownTimestamp(nedTriple?.timestamp)
+        : null;
+      const latestGlobalPosTriple =
+        latTriple !== undefined && lonTriple !== undefined
+          ? selectWinningTriple(latTriple, lonTriple)
+          : (latTriple ?? lonTriple);
+      const globalPosObservedAt = hasGlobalPos
+        ? normalizeKnownTimestamp(latestGlobalPosTriple?.timestamp)
+        : null;
       const vehicleObservedAt =
         base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
       const vehicleSource =
@@ -501,6 +604,13 @@ export function parseCopEntityState(
         ...base,
         source: vehicleSource,
         observedAt: vehicleObservedAt,
+        poseObservedAt,
+        localPosObservedAt,
+        globalPosObservedAt,
+        hasAttitude,
+        hasLocalPos,
+        hasGlobalPos,
+        hasHeading,
         kind: "uxs-vehicle",
         org: vehicleIdentity.org,
         platform: vehicleIdentity.platform,
@@ -558,6 +668,7 @@ function buildPoisonedEntity(
   prior: CopEntityState | undefined,
   revision: number,
   errorMessage: string,
+  ingestedAtMs?: number,
 ): CopEntityState {
   if (prior !== undefined) {
     return {
@@ -565,6 +676,7 @@ function buildPoisonedEntity(
       kvRevision: revision,
       poisoned: true,
       poisonError: errorMessage,
+      ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
     };
   }
   const sixParts = parseSixPartEntityId(key);
@@ -586,6 +698,7 @@ function buildPoisonedEntity(
       expiresAt: null,
       uncertaintyMeters: null,
       feedStatus: "unknown",
+      ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
       triples: [],
     };
   }
@@ -605,11 +718,129 @@ function buildPoisonedEntity(
     expiresAt: null,
     uncertaintyMeters: null,
     feedStatus: "unknown",
+    ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
     triples: [],
   };
 }
 
+function tuplesEqual(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const EXPIRED_POSE_RECEIPT_MS = -1e15;
+
+function didVehiclePoseAdvance(
+  prior: CopEntityState | undefined,
+  next: VehicleEntityState,
+): boolean {
+  if (!next.poseObservedAt) {
+    return false;
+  }
+  if (
+    prior === undefined ||
+    prior.kind !== "uxs-vehicle" ||
+    !prior.poseObservedAt
+  ) {
+    return true;
+  }
+  const nextNs = parseTripleInstantNs(next.poseObservedAt);
+  const priorNs = parseTripleInstantNs(prior.poseObservedAt);
+  if (nextNs > priorNs) {
+    return true;
+  }
+  if (nextNs < priorNs) {
+    return false;
+  }
+  return (
+    next.hasAttitude !== prior.hasAttitude ||
+    next.hasLocalPos !== prior.hasLocalPos ||
+    next.hasGlobalPos !== prior.hasGlobalPos ||
+    next.hasHeading !== prior.hasHeading ||
+    next.headingDeg !== prior.headingDeg ||
+    next.location.latitude !== prior.location.latitude ||
+    next.location.longitude !== prior.location.longitude ||
+    next.location.altitude !== prior.location.altitude ||
+    !tuplesEqual(next.attitudeQuaternion, prior.attitudeQuaternion) ||
+    !tuplesEqual(next.attitudeRates, prior.attitudeRates) ||
+    !tuplesEqual(next.ned, prior.ned) ||
+    !tuplesEqual(next.velocityNed, prior.velocityNed)
+  );
+}
+
+interface VehiclePoseHighWater {
+  observedNs: bigint;
+  pose: VehicleEntityState;
+  ingestedAtMs: number | null;
+  ingestedLive: boolean;
+}
+
+function applyVehiclePoseReceipt(
+  highWater: VehiclePoseHighWater | undefined,
+  next: VehicleEntityState,
+  receiptMs: number,
+  isLivePostSync: boolean,
+): VehiclePoseHighWater | undefined {
+  const nextPoseObs = next.poseObservedAt;
+  if (!nextPoseObs) {
+    next.poseIngestedAtMs =
+      highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
+    next.poseIngestedLive = false;
+    return highWater;
+  }
+
+  const nextNs = parseTripleInstantNs(nextPoseObs);
+  if (highWater === undefined || nextNs > highWater.observedNs) {
+    next.poseIngestedAtMs = receiptMs;
+    next.poseIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: next.poseIngestedLive,
+    };
+  }
+
+  if (nextNs < highWater.observedNs) {
+    next.poseIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
+    next.poseIngestedLive = false;
+    return highWater;
+  }
+
+  if (didVehiclePoseAdvance(highWater.pose, next)) {
+    next.poseIngestedAtMs = receiptMs;
+    next.poseIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: next.poseIngestedLive,
+    };
+  }
+
+  next.poseIngestedAtMs =
+    highWater.ingestedAtMs ?? (isLivePostSync ? null : EXPIRED_POSE_RECEIPT_MS);
+  next.poseIngestedLive = isLivePostSync ? highWater.ingestedLive : false;
+  if (!isLivePostSync) {
+    return {
+      observedNs: highWater.observedNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: false,
+    };
+  }
+  return highWater;
+}
+
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
+  const now = options.now ?? (() => Date.now());
   const envUrl =
     typeof import.meta !== "undefined" && import.meta.env
       ? (import.meta.env.VITE_GRAPH_WS_URL as string | undefined)
@@ -619,6 +850,10 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   // D2 Option A: pre-synced shadow buffer intentionally stays off Svelte reactive tracking.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const stagedSnapshot = new Map<string, CopEntityState>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const maxPoseByKey = new Map<string, VehiclePoseHighWater>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const stagedMaxPoseByKey = new Map<string, VehiclePoseHighWater>();
   let malformedFrames = 0;
 
   let status = $state<WsConnectionStatus>("disconnected");
@@ -654,6 +889,8 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   function clearFeedState(): void {
     entities.clear();
     stagedSnapshot.clear();
+    maxPoseByKey.clear();
+    stagedMaxPoseByKey.clear();
     synced = false;
     lastSyncedRevision = null;
     malformedFrames = 0;
@@ -663,12 +900,28 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     for (const existingKey of Array.from(entities.keys())) {
       if (!stagedSnapshot.has(existingKey)) {
         entities.delete(existingKey);
+        maxPoseByKey.delete(existingKey);
+      }
+    }
+    for (const trackedKey of Array.from(maxPoseByKey.keys())) {
+      const stagedEntity = stagedSnapshot.get(trackedKey);
+      if (!stagedEntity || stagedEntity.kind !== "uxs-vehicle") {
+        maxPoseByKey.delete(trackedKey);
       }
     }
     for (const [key, entity] of stagedSnapshot.entries()) {
       entities.set(key, entity);
+      if (entity.kind === "uxs-vehicle") {
+        const nextHighWater = stagedMaxPoseByKey.get(key);
+        if (nextHighWater !== undefined) {
+          maxPoseByKey.set(key, nextHighWater);
+        }
+      } else {
+        maxPoseByKey.delete(key);
+      }
     }
     stagedSnapshot.clear();
+    stagedMaxPoseByKey.clear();
     synced = true;
     lastSyncedRevision = syncRevision;
   }
@@ -703,7 +956,13 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     const key = parsed.key;
 
     if (parsed.type === "put") {
-      const entity = parseCopEntityState(parsed.payload, revision, key);
+      const receiptMs = now();
+      const entity = parseCopEntityState(
+        parsed.payload,
+        revision,
+        key,
+        receiptMs,
+      );
       if (!entity) {
         malformedFrames += 1;
         return;
@@ -713,12 +972,40 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
           return;
         }
+        if (entity.kind === "uxs-vehicle") {
+          const priorHighWater =
+            stagedMaxPoseByKey.get(key) ?? maxPoseByKey.get(key);
+          const nextHighWater = applyVehiclePoseReceipt(
+            priorHighWater,
+            entity,
+            receiptMs,
+            false,
+          );
+          if (nextHighWater !== undefined) {
+            stagedMaxPoseByKey.set(key, nextHighWater);
+          }
+        } else {
+          stagedMaxPoseByKey.delete(key);
+        }
         stagedSnapshot.set(key, entity);
         return;
       }
       const prevLive = entities.get(key);
       if (prevLive && revision > 0 && revision < prevLive.kvRevision) {
         return;
+      }
+      if (entity.kind === "uxs-vehicle") {
+        const nextHighWater = applyVehiclePoseReceipt(
+          maxPoseByKey.get(key),
+          entity,
+          receiptMs,
+          true,
+        );
+        if (nextHighWater !== undefined) {
+          maxPoseByKey.set(key, nextHighWater);
+        }
+      } else {
+        maxPoseByKey.delete(key);
       }
       entities.set(key, entity);
       return;
@@ -731,6 +1018,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           return;
         }
         stagedSnapshot.delete(key);
+        stagedMaxPoseByKey.delete(key);
         return;
       }
       const prevLive = entities.get(key);
@@ -738,6 +1026,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         return;
       }
       entities.delete(key);
+      maxPoseByKey.delete(key);
       return;
     }
 
@@ -746,6 +1035,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         typeof parsed.error === "string" && parsed.error.length > 0
           ? parsed.error
           : "entity state decode error";
+      const receiptMs = now();
       if (!synced) {
         const prevStaged = stagedSnapshot.get(key);
         if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
@@ -754,7 +1044,13 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         const diagnosticPrior = prevStaged ?? entities.get(key);
         stagedSnapshot.set(
           key,
-          buildPoisonedEntity(key, diagnosticPrior, revision, errorMsg),
+          buildPoisonedEntity(
+            key,
+            diagnosticPrior,
+            revision,
+            errorMsg,
+            receiptMs,
+          ),
         );
         return;
       }
@@ -764,7 +1060,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       }
       entities.set(
         key,
-        buildPoisonedEntity(key, priorLive, revision, errorMsg),
+        buildPoisonedEntity(key, priorLive, revision, errorMsg, receiptMs),
       );
       return;
     }
@@ -779,7 +1075,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     keepaliveIntervalMs: options.keepaliveIntervalMs,
     initialBackoffMs: options.initialBackoffMs,
     maxBackoffMs: options.maxBackoffMs,
-    now: options.now,
+    now,
     createSocket: options.createSocket,
     onStatusChange(nextStatus) {
       status = nextStatus;
@@ -788,23 +1084,27 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       // Begin staging pre-synced snapshot without clearing live `entities` (gapless reconnect).
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
     onMessage: ingestRawFrame,
     onDisconnect() {
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
-    onEndpointChange() {
+    onEndpointChange(nextUrl) {
+      currentUrl = nextUrl;
       clearFeedState();
     },
   });
+  let currentUrl = $state(wsClient.url);
 
   return {
     get status() {
       return status;
     },
     get url() {
-      return wsClient.url;
+      return currentUrl;
     },
     get synced() {
       return synced;
@@ -834,6 +1134,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       wsClient.disconnect();
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
     getEntity(entityId: string | null | undefined) {
       if (!entityId) {

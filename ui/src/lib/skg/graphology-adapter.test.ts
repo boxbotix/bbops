@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
-import MultiDirectedGraph from "graphology";
+import { MultiDirectedGraph } from "graphology";
 import { flushSync, mount, unmount } from "svelte";
 import { describe, expect, it, vi } from "vitest";
 import SkgPane from "../components/SkgPane.svelte";
@@ -349,6 +349,167 @@ describe("SKG topology Graphology adapter, triple inspector, and transition time
       flushSync();
       expect(fallback!.textContent).toContain("relay:node3");
     });
+
+    unmount(app);
+    host.remove();
+  });
+
+  // spec: cop-ui / Live SKG topology graph, triple inspector, and transition event timeline
+  it("supports multiple predicates between the same ordered (source, target) pair across MultiDirectedGraph and SkgPane syncs", () => {
+    const sectorId = "boxbotix.local.cop.geo.sector.bravo";
+    const v1FirstSync = makeVehicle(1, sectorId);
+    const v1SecondSync: VehicleEntityState = {
+      ...v1FirstSync,
+      kvRevision: 2,
+      triples: [
+        ...v1FirstSync.triples,
+        {
+          subject: v1FirstSync.id,
+          predicate: "cop.comms.relay_target",
+          object: sectorId,
+          source: "mesh-router",
+          timestamp: "2026-11-24T12:00:02Z",
+          confidence: 0.9,
+        },
+      ],
+    };
+
+    const graph = new MultiDirectedGraph();
+    expect(graph.multi).toBe(true);
+    expect(graph.type).toBe("directed");
+
+    const pass1 = syncTopologyToGraph(
+      graph,
+      buildSkgTopologyModel([v1FirstSync], []),
+    );
+    expect(pass1.structureChanged).toBe(true);
+    expect(graph.size).toBe(1);
+
+    const pass2 = syncTopologyToGraph(
+      graph,
+      buildSkgTopologyModel([v1SecondSync], []),
+    );
+    expect(pass2.structureChanged).toBe(true);
+    expect(graph.size).toBe(2);
+    expect(graph.areNeighbors(v1FirstSync.id, sectorId)).toBe(true);
+    expect(
+      graph
+        .edges(v1FirstSync.id, sectorId)
+        .map((edgeKey) => graph.getEdgeAttribute(edgeKey, "label"))
+        .sort(),
+    ).toEqual(["cop.comms.relay_target", "cop.mission.assigned_sector"]);
+
+    // Also exercise mounted SkgPane across 2 live skgStore updates + node selection.
+    const skgStore = createSkgStore();
+    skgStore.entities.set(v1FirstSync.id, v1FirstSync);
+    const telemetryStore = createTelemetryStore();
+    const viewportStore = createViewportStore({ skgStore });
+    const graphqlClient: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn(),
+    };
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(SkgPane, {
+      target: host,
+      props: { skgStore, telemetryStore, viewportStore, graphqlClient },
+    });
+    flushSync();
+    expect(host.textContent).toContain("2N · 1E");
+
+    skgStore.entities.set(v1SecondSync.id, v1SecondSync);
+    viewportStore.selectEntity(v1SecondSync.id);
+    flushSync();
+    expect(host.textContent).toContain("2N · 2E");
+
+    unmount(app);
+    host.remove();
+  });
+
+  // spec: cop-ui / Live SKG topology graph, triple inspector, and transition event timeline
+  it("renders collision-free Triple Inspector rows with Timestamp column when multiple assertions share predicate and timestamp", () => {
+    const base = makeVehicle(2);
+    const multiSourceVehicle: VehicleEntityState = {
+      ...base,
+      triples: [
+        {
+          subject: base.id,
+          predicate: "cop.intel.observation",
+          object: "wake-plume-bearing-085",
+          source: "sensor-alpha",
+          timestamp: "2026-11-24T12:00:00Z",
+          confidence: 0.9,
+        },
+        {
+          subject: base.id,
+          predicate: "cop.intel.observation",
+          object: "acoustic-contact-bearing-087",
+          source: "sensor-bravo",
+          timestamp: "2026-11-24T12:00:00Z",
+          confidence: 0.85,
+        },
+        {
+          subject: base.id,
+          predicate: "cop.intel.note",
+          object: "first unclocked operator tag",
+          source: "operator-1",
+          timestamp: "",
+          confidence: 1,
+        },
+        {
+          subject: base.id,
+          predicate: "cop.intel.note",
+          object: "second unclocked operator tag",
+          source: "operator-2",
+          timestamp: "",
+          confidence: 1,
+        },
+      ],
+    };
+
+    const skgStore = createSkgStore();
+    skgStore.entities.set(multiSourceVehicle.id, multiSourceVehicle);
+    const telemetryStore = createTelemetryStore();
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(multiSourceVehicle.id);
+    const graphqlClient: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn(),
+    };
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(SkgPane, {
+      target: host,
+      props: { skgStore, telemetryStore, viewportStore, graphqlClient },
+    });
+    flushSync();
+
+    const inspector = host.querySelector(
+      '[data-testid="skg-triple-inspector"]',
+    );
+    expect(inspector).not.toBeNull();
+    const headers = Array.from(inspector!.querySelectorAll("thead th")).map(
+      (th) => th.textContent?.trim(),
+    );
+    expect(headers).toEqual(["Predicate", "Value", "Source", "Timestamp"]);
+
+    const bodyRows = Array.from(inspector!.querySelectorAll("tbody tr"));
+    expect(bodyRows).toHaveLength(4);
+    const tableText = inspector!.querySelector("tbody")?.textContent ?? "";
+    expect(tableText).toContain("sensor-alpha");
+    expect(tableText).toContain("sensor-bravo");
+    expect(tableText).toContain("2026-11-24T12:00:00Z");
+    expect(tableText).toContain("operator-1");
+    expect(tableText).toContain("operator-2");
+    expect(tableText).toContain("unknown");
 
     unmount(app);
     host.remove();

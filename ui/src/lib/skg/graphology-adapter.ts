@@ -7,7 +7,7 @@
 // @ 3814b3d59dab7136011429cad99a8148aeceb0cc (MIT), replacing status hues with
 // bbops non-safety topology tokens (#7 reserved-safety-color guardrail).
 
-import MultiDirectedGraph from "graphology";
+import type { MultiDirectedGraph } from "graphology";
 import type { PathSearchResult } from "../graphql";
 import type { SafetyBadgeSeverity } from "../hud/view-model";
 import type { CopEntityState, SkgTriple } from "../stores/skg.svelte";
@@ -120,6 +120,7 @@ function resolveEntityNode(entity: CopEntityState): SkgTopologyNode {
         : 8;
   const nedHint: [number, number] | null =
     entity.kind === "uxs-vehicle" &&
+    entity.hasLocalPos !== false &&
     isFiniteNumber(entity.ned[0]) &&
     isFiniteNumber(entity.ned[1])
       ? [entity.ned[0], entity.ned[1]]
