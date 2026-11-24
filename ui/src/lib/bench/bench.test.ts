@@ -241,4 +241,168 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
     unmount(app);
     hostEl.remove();
   });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("records accepted WS1 kinematics frames at ingress rather than inside rAF, retaining burst samples and recording zero false out-of-order drops across idle paints", () => {
+    const rafCallbacks = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        const id = nextRafId++;
+        rafCallbacks.set(id, cb);
+        return id;
+      });
+    const cafSpy = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id: number) => {
+        rafCallbacks.delete(id);
+      });
+
+    const strokeSpy = vi.fn();
+    const fake2dCtx = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      scale: vi.fn(),
+      setTransform: vi.fn(),
+      fillRect: vi.fn(),
+      strokeRect: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: strokeSpy,
+      fillText: vi.fn(),
+      measureText: () => ({ width: 32 }),
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      font: "",
+      textAlign: "left",
+    } as unknown as CanvasRenderingContext2D;
+    const getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(function (
+        this: HTMLCanvasElement,
+        contextId: string,
+      ) {
+        if (
+          contextId === "2d" &&
+          this.getAttribute("data-testid") === "bench-oscilloscope"
+        ) {
+          return fake2dCtx;
+        }
+        return null;
+      } as typeof HTMLCanvasElement.prototype.getContext);
+
+    const stepNextPaint = (frameTimeMs: number): void => {
+      const pending = [...rafCallbacks.entries()];
+      rafCallbacks.clear();
+      for (const [, cb] of pending) {
+        cb(frameTimeMs);
+      }
+    };
+
+    const makeWs1Frame = (
+      seq: number,
+      timestamp: number,
+      rollRateRadS: number,
+    ) =>
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.2",
+        payload: {
+          sysid: 2,
+          domain: "rover",
+          seq,
+          msg_id: 30,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [rollRateRadS, 0.05, -0.02],
+          ned_xyz: [4, -2, 0],
+          has_local_pos: true,
+          ned_vel: [1.5, 0.2, 0],
+          lat_lon_alt: [37.7749, -122.4194, 12],
+          has_global_pos: true,
+          hdg_deg: 90,
+          has_heading: true,
+          timestamp,
+        },
+      });
+
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore({ now: () => 5_000 });
+    const traceBook = new TelemetryTraceBook();
+    const rover = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "uxs.health.loopdtus": 1050,
+      "uxs.health.rttus": 390,
+    });
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover.id,
+        revision: 1,
+        payload: rover,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 1,
+      }),
+    );
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(rover.id);
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    try {
+      const app = mount(BenchWorkspace, {
+        target: hostEl,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          traceBook,
+        },
+      });
+      flushSync();
+
+      // Deliver TWO accepted WS1 frames before a single rAF paint executes.
+      telemetryStore.ingestRawFrame(makeWs1Frame(1, 1_000, 0.25));
+      telemetryStore.ingestRawFrame(makeWs1Frame(2, 1_050, 0.5));
+      expect(telemetryStore.malformedFrameCount).toBe(0);
+
+      // Run 1 paint frame: both samples are already recorded in order and rendered.
+      stepNextPaint(16);
+      const bufAfterBurst = traceBook.getBuffer(2);
+      expect(bufAfterBurst?.size).toBe(2);
+      expect(
+        bufAfterBurst?.toChronologicalSamples().map((s) => s.timestamp),
+      ).toEqual([1_000, 1_050]);
+      expect(bufAfterBurst?.droppedOutOfOrderCount).toBe(0);
+      expect(strokeSpy).toHaveBeenCalled();
+
+      // Run 3 additional rAF paints with NO new WS1 arrival: zero duplicate pushes or false out-of-order drops!
+      stepNextPaint(32);
+      stepNextPaint(48);
+      stepNextPaint(64);
+      expect(bufAfterBurst?.size).toBe(2);
+      expect(bufAfterBurst?.droppedOutOfOrderCount).toBe(0);
+      expect(
+        bufAfterBurst?.toChronologicalSamples().map((s) => s.timestamp),
+      ).toEqual([1_000, 1_050]);
+
+      unmount(app);
+    } finally {
+      hostEl.remove();
+      getContextSpy.mockRestore();
+      cafSpy.mockRestore();
+      rafSpy.mockRestore();
+    }
+  });
 });

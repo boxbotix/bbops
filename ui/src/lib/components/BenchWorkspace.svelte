@@ -216,19 +216,33 @@
     }
   }
 
-  onMount(() => {
+  $effect(() => {
+    return traceBook.attach(
+      telemetryStore,
+      (sysid) =>
+        skgStore.vehicles.find((v) => v.sysid === sysid)?.sysStatus ?? null,
+    );
+  });
+
+  function get2dContext(
+    canvas: HTMLCanvasElement,
+  ): CanvasRenderingContext2D | null {
     const isJsdom =
       typeof navigator !== "undefined" && /jsdom/i.test(navigator.userAgent);
-    if (
-      isJsdom ||
-      !scopeCanvasEl ||
-      typeof requestAnimationFrame === "undefined"
-    ) {
-      return;
+    const isMockedContext =
+      typeof canvas.getContext === "function" && "mock" in canvas.getContext;
+    if (isJsdom && !isMockedContext) {
+      return null;
     }
+    try {
+      return canvas.getContext("2d");
+    } catch {
+      return null;
+    }
+  }
 
-    const ctx = scopeCanvasEl.getContext("2d");
-    if (!ctx) {
+  onMount(() => {
+    if (typeof requestAnimationFrame === "undefined") {
       return;
     }
 
@@ -236,86 +250,93 @@
     let disposed = false;
 
     const renderFrame = (): void => {
-      if (disposed || !scopeCanvasEl) {
+      if (disposed) {
         return;
       }
 
-      for (const [sysid, kin] of telemetryStore.kinematicsEntries()) {
-        const veh = skgStore.vehicles.find((v) => v.sysid === sysid);
-        traceBook.recordKinematics(kin, veh?.sysStatus ?? null);
+      if (scopeCanvasEl) {
+        const ctx = get2dContext(scopeCanvasEl);
+        if (ctx) {
+          const dpr = Math.max(
+            1,
+            (typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1,
+          );
+          const cssWidth = Math.max(280, scopeCanvasEl.clientWidth || 560);
+          const cssHeight = Math.max(260, scopeCanvasEl.clientHeight || 330);
+          const targetW = Math.round(cssWidth * dpr);
+          const targetH = Math.round(cssHeight * dpr);
+          if (
+            scopeCanvasEl.width !== targetW ||
+            scopeCanvasEl.height !== targetH
+          ) {
+            scopeCanvasEl.width = targetW;
+            scopeCanvasEl.height = targetH;
+          }
+
+          ctx.save();
+          ctx.scale(dpr, dpr);
+          ctx.fillStyle = "#090d16";
+          ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+          const sysid = selectedVehicle?.sysid ?? null;
+          const samples =
+            sysid !== null
+              ? (traceBook.getBuffer(sysid)?.toChronologicalSamples() ?? [])
+              : [];
+
+          const gap = 6;
+          const bandHeight = Math.floor((cssHeight - gap * 2) / 3);
+
+          drawTraceBand(
+            ctx,
+            0,
+            0,
+            cssWidth,
+            bandHeight,
+            "CH1 · BODY ANGULAR RATES (deg/s)",
+            samples,
+            [
+              { label: "p", color: "#38bdf8", pick: (s) => s.rollRateDegS },
+              { label: "q", color: "#a78bfa", pick: (s) => s.pitchRateDegS },
+              { label: "r", color: "#22d3ee", pick: (s) => s.yawRateDegS },
+            ],
+            true,
+          );
+
+          drawTraceBand(
+            ctx,
+            0,
+            bandHeight + gap,
+            cssWidth,
+            bandHeight,
+            "CH2 · GROUNDSPEED & CLIMB (m/s)",
+            samples,
+            [
+              { label: "GS", color: "#60a5fa", pick: (s) => s.groundspeedMps },
+              { label: "VS", color: "#c084fc", pick: (s) => s.climbRateMps },
+            ],
+            true,
+          );
+
+          drawTraceBand(
+            ctx,
+            0,
+            (bandHeight + gap) * 2,
+            cssWidth,
+            cssHeight - (bandHeight + gap) * 2,
+            "CH3 · 0xB1 MCU LOOP & TRUNK RTT (us)",
+            samples,
+            [
+              { label: "loop_dt", color: "#38bdf8", pick: (s) => s.loopDtUs },
+              { label: "rtt", color: "#818cf8", pick: (s) => s.rttUs },
+            ],
+            false,
+          );
+
+          ctx.restore();
+        }
       }
 
-      const dpr = Math.max(1, window.devicePixelRatio || 1);
-      const cssWidth = Math.max(280, scopeCanvasEl.clientWidth || 560);
-      const cssHeight = Math.max(260, scopeCanvasEl.clientHeight || 330);
-      const targetW = Math.round(cssWidth * dpr);
-      const targetH = Math.round(cssHeight * dpr);
-      if (scopeCanvasEl.width !== targetW || scopeCanvasEl.height !== targetH) {
-        scopeCanvasEl.width = targetW;
-        scopeCanvasEl.height = targetH;
-      }
-
-      ctx.save();
-      ctx.scale(dpr, dpr);
-      ctx.fillStyle = "#090d16";
-      ctx.fillRect(0, 0, cssWidth, cssHeight);
-
-      const sysid = selectedVehicle?.sysid ?? null;
-      const samples =
-        sysid !== null
-          ? (traceBook.getBuffer(sysid)?.toChronologicalSamples() ?? [])
-          : [];
-
-      const gap = 6;
-      const bandHeight = Math.floor((cssHeight - gap * 2) / 3);
-
-      drawTraceBand(
-        ctx,
-        0,
-        0,
-        cssWidth,
-        bandHeight,
-        "CH1 · BODY ANGULAR RATES (deg/s)",
-        samples,
-        [
-          { label: "p", color: "#38bdf8", pick: (s) => s.rollRateDegS },
-          { label: "q", color: "#a78bfa", pick: (s) => s.pitchRateDegS },
-          { label: "r", color: "#22d3ee", pick: (s) => s.yawRateDegS },
-        ],
-        true,
-      );
-
-      drawTraceBand(
-        ctx,
-        0,
-        bandHeight + gap,
-        cssWidth,
-        bandHeight,
-        "CH2 · GROUNDSPEED & CLIMB (m/s)",
-        samples,
-        [
-          { label: "GS", color: "#60a5fa", pick: (s) => s.groundspeedMps },
-          { label: "VS", color: "#c084fc", pick: (s) => s.climbRateMps },
-        ],
-        true,
-      );
-
-      drawTraceBand(
-        ctx,
-        0,
-        (bandHeight + gap) * 2,
-        cssWidth,
-        cssHeight - (bandHeight + gap) * 2,
-        "CH3 · 0xB1 MCU LOOP & TRUNK RTT (us)",
-        samples,
-        [
-          { label: "loop_dt", color: "#38bdf8", pick: (s) => s.loopDtUs },
-          { label: "rtt", color: "#818cf8", pick: (s) => s.rttUs },
-        ],
-        false,
-      );
-
-      ctx.restore();
       rafId = requestAnimationFrame(renderFrame);
     };
 
@@ -379,6 +400,9 @@
         bind:this={scopeCanvasEl}
         class="scope-canvas"
         data-testid="bench-oscilloscope"
+        data-viewport-hotkey-scope="true"
+        tabindex="-1"
+        onpointerdown={() => scopeCanvasEl?.focus?.({ preventScroll: true })}
       ></canvas>
     </section>
 

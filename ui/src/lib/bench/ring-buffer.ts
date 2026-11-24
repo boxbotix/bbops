@@ -146,9 +146,29 @@ export class VehicleRingBuffer {
   }
 }
 
+export interface TelemetryIngressSource {
+  kinematicsEntries(): IterableIterator<[number, VehicleKinematics]>;
+  onKinematicsAccepted(
+    listener: (frame: VehicleKinematics) => void,
+  ): () => void;
+  onFeedReset?(listener: () => void): () => void;
+}
+
+type SysStatusLookup = (
+  sysid: number,
+) => Pick<VehicleSysStatus, "loopDtUs" | "rttUs"> | null;
+
 export class TelemetryTraceBook {
   readonly capacityPerVehicle: number;
   private readonly buffers = new Map<number, VehicleRingBuffer>();
+  private readonly attachments = new Map<
+    TelemetryIngressSource,
+    {
+      refCount: number;
+      lookupSysStatus?: SysStatusLookup;
+      unsubscribe: () => void;
+    }
+  >();
 
   constructor(capacityPerVehicle: number = DEFAULT_TRACE_CAPACITY) {
     this.capacityPerVehicle = capacityPerVehicle;
@@ -188,6 +208,76 @@ export class TelemetryTraceBook {
       loopDtUs: sysStatus?.loopDtUs ?? 0,
       rttUs: sysStatus?.rttUs ?? 0,
     });
+  }
+
+  /**
+   * Subscribes idempotently (reference-counted per TelemetryStore) to accepted
+   * WS #1 kinematics frames at ingress so animation frames never sample or drop
+   * intermediate arrivals.
+   */
+  attach(
+    source: TelemetryIngressSource,
+    lookupSysStatus?: SysStatusLookup,
+  ): () => void {
+    const existing = this.attachments.get(source);
+    if (existing) {
+      existing.refCount += 1;
+      if (lookupSysStatus) {
+        existing.lookupSysStatus = lookupSysStatus;
+      }
+      let detached = false;
+      return () => {
+        if (detached) return;
+        detached = true;
+        existing.refCount -= 1;
+        if (existing.refCount <= 0) {
+          this.attachments.delete(source);
+          existing.unsubscribe();
+        }
+      };
+    }
+
+    const entry: {
+      refCount: number;
+      lookupSysStatus?: SysStatusLookup;
+      unsubscribe: () => void;
+    } = {
+      refCount: 1,
+      lookupSysStatus,
+      unsubscribe: () => {},
+    };
+
+    for (const [sysid, kin] of source.kinematicsEntries()) {
+      if ((this.buffers.get(sysid)?.size ?? 0) === 0) {
+        this.recordKinematics(kin, entry.lookupSysStatus?.(sysid) ?? null);
+      }
+    }
+
+    const offAccepted = source.onKinematicsAccepted((frame) => {
+      this.recordKinematics(
+        frame,
+        entry.lookupSysStatus?.(frame.sysid) ?? null,
+      );
+    });
+    const offReset = source.onFeedReset?.(() => {
+      this.clear();
+    });
+    entry.unsubscribe = () => {
+      offAccepted();
+      offReset?.();
+    };
+    this.attachments.set(source, entry);
+
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      entry.refCount -= 1;
+      if (entry.refCount <= 0) {
+        this.attachments.delete(source);
+        entry.unsubscribe();
+      }
+    };
   }
 
   clear(): void {

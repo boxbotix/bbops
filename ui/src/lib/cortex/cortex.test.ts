@@ -291,6 +291,466 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       hostEl.querySelector('[data-testid="bench-tuning-rack"]'),
     ).toBeNull();
 
+    // Non-WebGL fallback mount hides .sigma-host and renders accessible fallback list.
+    expect(
+      hostEl
+        .querySelector('[data-testid="cortex-sigma-host"]')
+        ?.classList.contains("hidden"),
+    ).toBe(true);
+    expect(
+      hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]'),
+    ).not.toBeNull();
+
+    // Follow-up semantic (entitiesByPredicate) search with NO indexedRevision clears #21 from pill & citations!
+    (
+      mockGraphql.entitiesByPredicate as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({
+      data: { entities: [rover.id] },
+      damagedEntities: 1,
+    });
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-semantic"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    input.value = "uxs.domain.kind";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-damaged-pill"]')
+          ?.textContent,
+      ).toContain("damaged:1");
+    });
+
+    expect(
+      hostEl.querySelector('[data-testid="cortex-indexed-rev"]'),
+    ).toBeNull();
+    const semanticCitationText =
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')
+        ?.textContent ?? "";
+    expect(semanticCitationText).toContain("kv#11");
+    expect(semanticCitationText).not.toContain("idx#21");
+
+    // 2-Hop & Similar refusal also leaves indexedRevision cleared rather than resurrecting stale #21.
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-similar-btn"]',
+      ) as HTMLButtonElement
+    ).click();
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-neural-status"]')
+          ?.textContent,
+      ).toContain("Similarity embeddings not enabled");
+    });
+    expect(
+      hostEl.querySelector('[data-testid="cortex-indexed-rev"]'),
+    ).toBeNull();
+    expect(
+      hostEl.querySelector('[data-testid="cortex-citation-list"]')?.textContent,
+    ).not.toContain("idx#21");
+
+    unmount(app);
+    hostEl.remove();
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("initializes Sigma v3 against the bound host element on WebGL browsers, wires clickNode selection, and tears down on unmount", async () => {
+    const skgStore = createSkgStore();
+    const rover = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard Rover",
+    });
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover.id,
+        revision: 4,
+        payload: rover,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 4,
+      }),
+    );
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(rover.id);
+
+    const constructed: Array<{
+      graphOrder: number;
+      container: HTMLElement;
+      refreshCount: number;
+      killCount: number;
+      clickHandlers: Array<(payload: { node: string }) => void>;
+    }> = [];
+
+    class FakeSigma {
+      private readonly record: (typeof constructed)[number];
+
+      constructor(
+        graph: { order: number },
+        container: HTMLElement,
+        _settings: Record<string, unknown>,
+      ) {
+        this.record = {
+          graphOrder: graph.order,
+          container,
+          refreshCount: 0,
+          killCount: 0,
+          clickHandlers: [],
+        };
+        constructed.push(this.record);
+      }
+
+      refresh(): void {
+        this.record.refreshCount += 1;
+      }
+
+      kill(): void {
+        this.record.killCount += 1;
+      }
+
+      on(
+        event: "clickNode",
+        handler: (payload: { node: string }) => void,
+      ): void {
+        if (event === "clickNode") {
+          this.record.clickHandlers.push(handler);
+        }
+      }
+    }
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockResolvedValue({
+        data: {
+          entities: [{ id: rover.id, depth: 0 }],
+          paths: [],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      }),
+    };
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        probeWebGL: () => true,
+        loadSigma: async () => FakeSigma as never,
+      },
+    });
+    flushSync();
+
+    await vi.waitFor(() => {
+      flushSync();
+      expect(constructed).toHaveLength(1);
+    });
+
+    const sigmaHost = hostEl.querySelector(
+      '[data-testid="cortex-sigma-host"]',
+    ) as HTMLDivElement;
+    expect(sigmaHost).not.toBeNull();
+    expect(sigmaHost.classList.contains("hidden")).toBe(false);
+    expect(
+      hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]'),
+    ).toBeNull();
+    expect(constructed[0]?.container).toBe(sigmaHost);
+    expect(constructed[0]?.graphOrder).toBe(1);
+    expect(constructed[0]?.refreshCount).toBeGreaterThan(0);
+
+    // Clicking a Sigma node selects the entity through CortexWorkspace.
+    viewportStore.selectEntity(null);
+    constructed[0]?.clickHandlers[0]?.({ node: rover.id });
+    flushSync();
+    expect(viewportStore.selectedEntityId).toBe(rover.id);
+
+    unmount(app);
+    hostEl.remove();
+    expect(constructed[0]?.killCount).toBe(1);
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("guards deferred search replies and overlapping 2-hop expansions from overwriting newer selections", async () => {
+    const skgStore = createSkgStore();
+    const rover = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard Rover",
+    });
+    const quad = buildVehicleStoredPayload(5, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon Quad",
+    });
+    const staleContactId = "boxbotix.local.tak.cop.vessel.stale1";
+    const freshContactId = "boxbotix.local.tak.cop.vessel.fresh2";
+
+    for (const [rev, id, payload] of [
+      [1, rover.id, rover],
+      [2, quad.id, quad],
+      [
+        3,
+        staleContactId,
+        {
+          id: staleContactId,
+          triples: [
+            {
+              subject: staleContactId,
+              predicate: "dc.terms.title",
+              object: "Stale Vessel",
+              source: "ais",
+              timestamp: "2026-11-24T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+      [
+        4,
+        freshContactId,
+        {
+          id: freshContactId,
+          triples: [
+            {
+              subject: freshContactId,
+              predicate: "dc.terms.title",
+              object: "Fresh Vessel",
+              source: "ais",
+              timestamp: "2026-11-24T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+    ] as const) {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: id,
+          revision: rev,
+          payload,
+        }),
+      );
+    }
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 4,
+      }),
+    );
+
+    const createDeferred = <T>() => {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+
+    const deferredSearch = createDeferred<Response>();
+    const deferredRoverExpand = createDeferred<{
+      data: {
+        entities: Array<{ id: string; depth: number }>;
+        paths: Array<Array<{ from: string; predicate: string; to: string }>>;
+        truncated: boolean;
+      };
+      damagedEntities: number;
+    }>();
+    const deferredQuadExpand = createDeferred<{
+      data: {
+        entities: Array<{ id: string; depth: number }>;
+        paths: Array<Array<{ from: string; predicate: string; to: string }>>;
+        truncated: boolean;
+      };
+      damagedEntities: number;
+    }>();
+
+    const expandSignals: Record<string, AbortSignal | undefined> = {};
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockImplementation((vars, opts) => {
+        expandSignals[vars.startEntity] = opts?.signal;
+        if (vars.startEntity === rover.id) {
+          return deferredRoverExpand.promise;
+        }
+        return deferredQuadExpand.promise;
+      }),
+    };
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async () => deferredSearch.promise) as typeof fetch,
+    });
+
+    const viewportStore = createViewportStore({ skgStore });
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+      },
+    });
+    flushSync();
+
+    // 1. Start a deferred lexical search while selection is null, then select quad BEFORE search resolves.
+    (
+      hostEl.querySelector(
+        '[data-testid="cortex-tier-lexical"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+
+    const input = hostEl.querySelector(
+      '[data-testid="cortex-query-input"]',
+    ) as HTMLInputElement;
+    input.value = "Fleet";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+
+    const form = hostEl.querySelector(
+      '[data-testid="cortex-query-bar"]',
+    ) as HTMLFormElement;
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    flushSync();
+
+    // Operator selects Falcon Quad while lexical search is still in flight.
+    viewportStore.selectEntity(quad.id);
+    flushSync();
+
+    deferredSearch.resolve(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          verb: "globalSearch",
+          result: {
+            indexed_revision: 30,
+            damaged_entities: 0,
+            producer: "graph-query",
+            data: {
+              text: {
+                matches: [
+                  {
+                    id: rover.id,
+                    label: "Vanguard Rover",
+                    score: 4.0,
+                    entity: {},
+                  },
+                  {
+                    id: quad.id,
+                    label: "Falcon Quad",
+                    score: 2.5,
+                    entity: {},
+                  },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(2);
+    });
+
+    // Newer selection (Falcon Quad) was NOT overwritten by top hit (Vanguard Rover)!
+    expect(viewportStore.selectedEntityId).toBe(quad.id);
+
+    // 2. Click hit 1 (rover) then immediately click hit 2 (quad) with overlapping deferred 2-hop expansions.
+    const hitButtons = hostEl.querySelectorAll(
+      '[data-testid="cortex-hit-item"]',
+    ) as NodeListOf<HTMLButtonElement>;
+    hitButtons[0]!.click(); // selects rover, starts deferredRoverExpand
+    flushSync();
+    hitButtons[1]!.click(); // selects quad, aborts deferredRoverExpand, starts deferredQuadExpand
+    flushSync();
+
+    expect(viewportStore.selectedEntityId).toBe(quad.id);
+    expect(expandSignals[rover.id]?.aborted).toBe(true);
+
+    // Quad's expansion resolves first with freshContactId; stale rover expansion resolves second with staleContactId.
+    deferredQuadExpand.resolve({
+      data: {
+        entities: [
+          { id: quad.id, depth: 0 },
+          { id: freshContactId, depth: 1 },
+        ],
+        paths: [
+          [
+            {
+              from: quad.id,
+              predicate: "cop.proximity.near",
+              to: freshContactId,
+            },
+          ],
+        ],
+        truncated: false,
+      },
+      damagedEntities: 0,
+    });
+    await Promise.resolve();
+    flushSync();
+
+    deferredRoverExpand.resolve({
+      data: {
+        entities: [
+          { id: rover.id, depth: 0 },
+          { id: staleContactId, depth: 1 },
+        ],
+        paths: [
+          [
+            {
+              from: rover.id,
+              predicate: "cop.proximity.near",
+              to: staleContactId,
+            },
+          ],
+        ],
+        truncated: false,
+      },
+      damagedEntities: 0,
+    });
+    await Promise.resolve();
+    flushSync();
+
+    const fallbackText =
+      hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+        ?.textContent ?? "";
+    expect(fallbackText).toContain("Fresh Vessel");
+    expect(fallbackText).not.toContain("Stale Vessel");
+
     unmount(app);
     hostEl.remove();
   });

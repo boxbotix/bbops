@@ -20,6 +20,7 @@ export interface CortexSearchHit {
   readonly verb: GraphSearchVerb;
   readonly wordRank: number | null;
   readonly vectorRank: number | null;
+  readonly indexedRevision?: number | null;
 }
 
 export interface CortexSearchRefusal {
@@ -94,6 +95,7 @@ export interface GraphSearchClient {
 function parseTextMatches(
   rawMatches: unknown,
   verb: GraphSearchVerb,
+  hitRevision: number | null,
 ): CortexSearchHit[] {
   if (!Array.isArray(rawMatches)) {
     return [];
@@ -117,6 +119,7 @@ function parseTextMatches(
       verb,
       wordRank: isFiniteNumber(item.word_rank) ? item.word_rank : null,
       vectorRank: isFiniteNumber(item.vector_rank) ? item.vector_rank : null,
+      indexedRevision: hitRevision,
     });
   }
   return hits;
@@ -125,6 +128,7 @@ function parseTextMatches(
 function parseSimilarityHits(
   rawResults: unknown,
   verb: GraphSearchVerb,
+  hitRevision: number | null,
 ): CortexSearchHit[] {
   if (!Array.isArray(rawResults)) {
     return [];
@@ -145,6 +149,7 @@ function parseSimilarityHits(
       verb,
       wordRank: null,
       vectorRank: null,
+      indexedRevision: hitRevision,
     });
   }
   return hits;
@@ -188,6 +193,7 @@ function parseSearchEnvelope(
   const indexedRevision = isFiniteNumber(qr.indexed_revision)
     ? qr.indexed_revision
     : 0;
+  const hitRevision = indexedRevision > 0 ? indexedRevision : null;
   const damagedEntities = isFiniteNumber(qr.damaged_entities)
     ? qr.damaged_entities
     : 0;
@@ -200,14 +206,14 @@ function parseSearchEnvelope(
   if (verb === "globalSearch") {
     const text = isRecord(data.text) ? data.text : null;
     if (text) {
-      hits = parseTextMatches(text.matches, verb);
+      hits = parseTextMatches(text.matches, verb, hitRevision);
       answer = typeof text.answer === "string" ? text.answer : null;
     }
   } else if (verb === "localSearch") {
-    hits = parseTextMatches(data.matches, verb);
+    hits = parseTextMatches(data.matches, verb, hitRevision);
     answer = typeof data.answer === "string" ? data.answer : null;
   } else {
-    hits = parseSimilarityHits(data.results, verb);
+    hits = parseSimilarityHits(data.results, verb, hitRevision);
   }
 
   return {

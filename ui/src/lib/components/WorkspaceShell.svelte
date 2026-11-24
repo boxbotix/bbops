@@ -53,6 +53,14 @@
     buildFilmstripItems(skgStore.vehicles, skgStore.externalContacts),
   );
 
+  $effect(() => {
+    return traceBook.attach(
+      telemetryStore,
+      (sysid) =>
+        skgStore.vehicles.find((v) => v.sysid === sysid)?.sysStatus ?? null,
+    );
+  });
+
   const WORKSPACE_TABS: ReadonlyArray<{
     mode: WorkspaceMode;
     label: string;

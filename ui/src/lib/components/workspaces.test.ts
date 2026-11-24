@@ -2,7 +2,9 @@
 // Copyright (c) 2026 boxbotix
 
 import { flushSync, mount, unmount } from "svelte";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createGraphSearchClient } from "../cortex/search-client";
+import type { GraphQLClient } from "../graphql";
 import {
   buildFilmstripItems,
   buildHealthStrip,
@@ -17,6 +19,7 @@ import {
   buildVehicleStoredPayload,
 } from "../stores/test-helpers";
 import { createViewportStore } from "../stores/viewport.svelte";
+import { handleViewportHotkey } from "../viewport/hotkeys";
 import WorkspaceShell from "./WorkspaceShell.svelte";
 
 describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)", () => {
@@ -335,5 +338,245 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
 
     unmount(app);
     hostEl.remove();
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("cancels deferred Cortex searches across workspace switches without mutating COP selection/hash, and preserves Tab traversal between DOM toolbar buttons while scoping Lights-Out to focused viewports", async () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon 1",
+    });
+    const rover2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard 2",
+    });
+
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: quad1.id,
+        revision: 1,
+        payload: quad1,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover2.id,
+        revision: 2,
+        payload: rover2,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 2,
+      }),
+    );
+
+    let resolveDeferredSearch!: (res: Response) => void;
+    let searchAbortSignal: AbortSignal | undefined;
+    const deferredSearchPromise = new Promise<Response>((res) => {
+      resolveDeferredSearch = res;
+    });
+
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async (_input, init) => {
+        searchAbortSignal = init?.signal ?? undefined;
+        return deferredSearchPromise;
+      }) as typeof fetch,
+    });
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockResolvedValue({
+        data: { entities: [], paths: [], truncated: false },
+        damagedEntities: 0,
+      }),
+    };
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(quad1.id);
+
+    const syncedHashes: string[] = [];
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    const onKeyDown = (ev: KeyboardEvent): void => {
+      handleViewportHotkey(
+        {
+          key: ev.key,
+          ctrlKey: ev.ctrlKey,
+          metaKey: ev.metaKey,
+          altKey: ev.altKey,
+          shiftKey: ev.shiftKey,
+          repeat: ev.repeat,
+          defaultPrevented: ev.defaultPrevented,
+          target: ev.target as HTMLElement | null,
+          preventDefault: () => ev.preventDefault(),
+        },
+        viewportStore,
+        (hash) => syncedHashes.push(hash),
+        [quad1.id, rover2.id],
+      );
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    const app = mount(WorkspaceShell, {
+      target: hostEl,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+        onSyncHash: (hash) => syncedHashes.push(hash),
+      },
+    });
+    flushSync();
+
+    try {
+      // 1. Tab from page entry (document.body) and between toolbar buttons is NOT prevented.
+      const bodyTab = new KeyboardEvent("keydown", {
+        key: "Tab",
+        bubbles: true,
+        cancelable: true,
+      });
+      document.body.dispatchEvent(bodyTab);
+      expect(bodyTab.defaultPrevented).toBe(false);
+      expect(viewportStore.lightsOut).toBe(false);
+
+      const copTabBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-cop"]',
+      ) as HTMLButtonElement;
+      const pilotTabBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-pilot"]',
+      ) as HTMLButtonElement;
+      copTabBtn.focus();
+      expect(document.activeElement).toBe(copTabBtn);
+      const toolbarTab = new KeyboardEvent("keydown", {
+        key: "Tab",
+        bubbles: true,
+        cancelable: true,
+      });
+      copTabBtn.dispatchEvent(toolbarTab);
+      expect(toolbarTab.defaultPrevented).toBe(false);
+      expect(viewportStore.lightsOut).toBe(false);
+      pilotTabBtn.focus();
+      expect(document.activeElement).toBe(pilotTabBtn);
+
+      // Focusing the interactive tactical canvas surface scopes Tab to Lights-Out toggle.
+      const scopedCanvas = hostEl.querySelector(
+        '[data-viewport-hotkey-scope="true"]',
+      ) as HTMLCanvasElement;
+      expect(scopedCanvas).not.toBeNull();
+      scopedCanvas.focus();
+      expect(document.activeElement).toBe(scopedCanvas);
+      const canvasTab = new KeyboardEvent("keydown", {
+        key: "Tab",
+        bubbles: true,
+        cancelable: true,
+      });
+      scopedCanvas.dispatchEvent(canvasTab);
+      flushSync();
+      expect(canvasTab.defaultPrevented).toBe(true);
+      expect(viewportStore.lightsOut).toBe(true);
+
+      // Toggle Lights-Out back off via the same scoped viewport shortcut.
+      const canvasTabOff = new KeyboardEvent("keydown", {
+        key: "Tab",
+        bubbles: true,
+        cancelable: true,
+      });
+      scopedCanvas.dispatchEvent(canvasTabOff);
+      flushSync();
+      expect(viewportStore.lightsOut).toBe(false);
+
+      // 2. Switch to Cortex, launch deferred lexical search, then switch back to COP before it resolves.
+      (
+        hostEl.querySelector(
+          '[data-testid="workspace-tab-cortex"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-lexical"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+
+      const input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      input.value = "Vanguard";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+
+      const form = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      flushSync();
+
+      // Switch back to COP before deferred search settles.
+      copTabBtn.click();
+      flushSync();
+      expect(viewportStore.workspace).toBe("cop");
+      expect(searchAbortSignal?.aborted).toBe(true);
+      const hashCountAtCopSwitch = syncedHashes.length;
+      const hashAtCopSwitch = syncedHashes.at(-1);
+
+      // Deferred search resolves with rover2.id after Cortex was torn down.
+      resolveDeferredSearch(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "globalSearch",
+            result: {
+              indexed_revision: 42,
+              damaged_entities: 0,
+              producer: "graph-query",
+              data: {
+                text: {
+                  matches: [
+                    {
+                      id: rover2.id,
+                      label: "Vanguard 2",
+                      score: 5.0,
+                      entity: {},
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      flushSync();
+
+      expect(viewportStore.workspace).toBe("cop");
+      expect(viewportStore.selectedEntityId).toBe(quad1.id);
+      expect(syncedHashes).toHaveLength(hashCountAtCopSwitch);
+      expect(syncedHashes.at(-1)).toBe(hashAtCopSwitch);
+      expect(mockGraphql.pathSearch).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", onKeyDown);
+      unmount(app);
+      hostEl.remove();
+    }
   });
 });

@@ -25,7 +25,17 @@ export interface HotkeyEventLike {
   preventDefault?(): void;
 }
 
+export const VIEWPORT_HOTKEY_SCOPE_ATTR = "data-viewport-hotkey-scope";
+
 const EDITABLE_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+const INTERACTIVE_CONTROL_TAGS = new Set([
+  "BUTTON",
+  "A",
+  "INPUT",
+  "TEXTAREA",
+  "SELECT",
+  "SUMMARY",
+]);
 
 export function isEditableHotkeyTarget(
   target: HotkeyTargetLike | null | undefined,
@@ -51,6 +61,24 @@ export function isEditableHotkeyTarget(
   return false;
 }
 
+export function isViewportScopeTarget(
+  target: HotkeyTargetLike | null | undefined,
+): boolean {
+  if (!target || isEditableHotkeyTarget(target)) {
+    return false;
+  }
+  if (
+    typeof target.tagName === "string" &&
+    INTERACTIVE_CONTROL_TAGS.has(target.tagName.toUpperCase())
+  ) {
+    return false;
+  }
+  return (
+    typeof target.getAttribute === "function" &&
+    target.getAttribute(VIEWPORT_HOTKEY_SCOPE_ATTR) === "true"
+  );
+}
+
 export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
   const idx = DECLUTTER_LEVELS.indexOf(current);
   if (idx < 0) {
@@ -66,7 +94,9 @@ export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
  * - B: switch to Bench workspace ("bench")
  * - K: switch to Cortex workspace ("cortex")
  * - M: toggle Pilot layout ("map" <-> "split") when in Pilot workspace
- * - Tab: toggle Lights-Out chrome mode
+ * - Tab: toggle Lights-Out chrome mode ONLY when an interactive viewport surface
+ *   (`[data-viewport-hotkey-scope="true"]`) is explicitly focused, preserving
+ *   normal Tab traversal from page entry and between toolbar/form controls
  * - 1..9: select nth entity in FleetFilmstrip
  * - T: toggle tether on selected entity (or untether when already tethered)
  * - C: toggle chase heading lock (auto-tethers selected entity if untethered)
@@ -129,8 +159,10 @@ export function handleViewportHotkey(
       break;
     }
     case "Tab": {
-      viewport.setLightsOut(!viewport.lightsOut);
-      mutated = true;
+      if (isViewportScopeTarget(event.target)) {
+        viewport.setLightsOut(!viewport.lightsOut);
+        mutated = true;
+      }
       break;
     }
     case "1":

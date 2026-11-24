@@ -31,66 +31,27 @@
   import type { SkgStore } from "$lib/stores/skg.svelte";
   import type { ViewportStore } from "$lib/stores/viewport.svelte";
 
+  export interface CortexSigmaRenderer {
+    refresh(): void;
+    kill(): void;
+    on(event: "clickNode", handler: (payload: { node: string }) => void): void;
+  }
+
+  export type CortexSigmaConstructor = new (
+    graph: MultiDirectedGraph,
+    container: HTMLElement,
+    settings: Record<string, unknown>,
+  ) => CortexSigmaRenderer;
+
   interface Props {
     skgStore: SkgStore;
     viewportStore: ViewportStore;
     graphqlClient: GraphQLClient;
     searchClient?: GraphSearchClient;
+    probeWebGL?: () => boolean;
+    loadSigma?: () => Promise<CortexSigmaConstructor>;
     onSyncHash?: (hash: string) => void;
   }
-
-  let {
-    skgStore,
-    viewportStore,
-    graphqlClient,
-    searchClient = createGraphSearchClient(),
-    onSyncHash,
-  }: Props = $props();
-
-  let queryText = $state("");
-  let activeTier = $state<CortexQueryTier>("hybrid");
-  let running = $state(false);
-  let errorBanner = $state<string | null>(null);
-  let neuralStatusBanner = $state<string | null>(null);
-  let answerSummary = $state<string | null>(null);
-  let indexedRevision = $state<number | null>(null);
-  let damagedEntities = $state<number>(0);
-
-  let rawHits = $state.raw<readonly CortexSearchHit[]>([]);
-  let pathResults = $state.raw<readonly PathSearchResult[]>([]);
-
-  let sigmaContainerEl: HTMLDivElement | undefined = $state();
-  let webglAvailable = $state(false);
-  let layoutRunning = $state(false);
-
-  const graph = new MultiDirectedGraph();
-  const layoutController = new LayoutController((active) => {
-    layoutRunning = active;
-  });
-
-  interface SigmaLike {
-    refresh(): void;
-    kill(): void;
-  }
-
-  let sigmaInstance: SigmaLike | null = null;
-
-  const rankedHits = $derived(
-    buildRankedCortexHits(rawHits, (id) => skgStore.getEntity(id)),
-  );
-
-  const causalSubgraph = $derived(
-    buildCausalSubgraphModel(
-      skgStore.entities.values(),
-      rankedHits.map((h) => h.entityId),
-      pathResults,
-      viewportStore.selectedEntityId,
-    ),
-  );
-
-  const citations = $derived(
-    buildGroundedTripleCitations(viewportStore.selectedEntity, indexedRevision),
-  );
 
   function probeWebGLSupport(): boolean {
     if (
@@ -109,63 +70,211 @@
     }
   }
 
-  async function expand2Hop(entityId: string): Promise<void> {
-    if (!entityId) {
+  const defaultLoadSigma = (): Promise<CortexSigmaConstructor> =>
+    import("sigma").then(
+      (mod) => mod.default as unknown as CortexSigmaConstructor,
+    );
+
+  let {
+    skgStore,
+    viewportStore,
+    graphqlClient,
+    searchClient = createGraphSearchClient(),
+    probeWebGL = probeWebGLSupport,
+    loadSigma = defaultLoadSigma,
+    onSyncHash,
+  }: Props = $props();
+
+  let queryText = $state("");
+  let activeTier = $state<CortexQueryTier>("hybrid");
+  let running = $state(false);
+  let errorBanner = $state<string | null>(null);
+  let neuralStatusBanner = $state<string | null>(null);
+  let answerSummary = $state<string | null>(null);
+  let indexedRevision = $state<number | null>(null);
+  let damagedEntities = $state<number>(0);
+
+  let rawHits = $state.raw<readonly CortexSearchHit[]>([]);
+  let pathResults = $state.raw<readonly PathSearchResult[]>([]);
+
+  let sigmaContainerEl: HTMLDivElement | undefined = $state();
+  let mounted = $state(false);
+  let webglAvailable = $state(false);
+  let layoutRunning = $state(false);
+
+  const graph = new MultiDirectedGraph();
+  const layoutController = new LayoutController((active) => {
+    layoutRunning = active;
+  });
+
+  let sigmaInstance: CortexSigmaRenderer | null = null;
+  let isUnmounted = false;
+  let activeSearchController: AbortController | null = null;
+  let activeExpandController: AbortController | null = null;
+  let searchReqSeq = 0;
+  let expandReqSeq = 0;
+  let selectionEpoch = 0;
+
+  const rankedHits = $derived(
+    buildRankedCortexHits(rawHits, (id) => skgStore.getEntity(id)),
+  );
+
+  const causalSubgraph = $derived(
+    buildCausalSubgraphModel(
+      skgStore.entities.values(),
+      rankedHits.map((h) => h.entityId),
+      pathResults,
+      viewportStore.selectedEntityId,
+    ),
+  );
+
+  const selectedHitRevision = $derived.by(() => {
+    const selId = viewportStore.selectedEntityId;
+    if (!selId) {
+      return null;
+    }
+    const matchedHit = rawHits.find((h) => h.entityId === selId);
+    return matchedHit?.indexedRevision ?? null;
+  });
+
+  const citations = $derived(
+    buildGroundedTripleCitations(
+      viewportStore.selectedEntity,
+      selectedHitRevision,
+    ),
+  );
+
+  function isAbortError(err: unknown, signal: AbortSignal): boolean {
+    if (signal.aborted) {
+      return true;
+    }
+    return (
+      typeof err === "object" &&
+      err !== null &&
+      "name" in err &&
+      (err as { name?: string }).name === "AbortError"
+    );
+  }
+
+  async function expand2Hop(
+    entityId: string,
+    workspaceAtStart = viewportStore.workspace,
+  ): Promise<void> {
+    if (!entityId || isUnmounted) {
       return;
     }
+    activeExpandController?.abort();
+    const controller = new AbortController();
+    activeExpandController = controller;
+    const reqSeq = ++expandReqSeq;
+    const epochAtStart = selectionEpoch;
+
     try {
-      const res = await graphqlClient.pathSearch({
-        startEntity: entityId,
-        direction: "both",
-        maxDepth: 2,
-        maxNodes: 40,
-      });
+      const res = await graphqlClient.pathSearch(
+        {
+          startEntity: entityId,
+          direction: "both",
+          maxDepth: 2,
+          maxNodes: 40,
+        },
+        { signal: controller.signal },
+      );
+      if (
+        isUnmounted ||
+        controller.signal.aborted ||
+        reqSeq !== expandReqSeq ||
+        selectionEpoch !== epochAtStart ||
+        viewportStore.workspace !== workspaceAtStart
+      ) {
+        return;
+      }
+      if (
+        viewportStore.selectedEntityId !== null &&
+        viewportStore.selectedEntityId !== entityId
+      ) {
+        return;
+      }
       pathResults = [res.data];
     } catch {
-      // Keep existing subgraph if optional GraphQL expansion fails.
+      // Keep existing subgraph if optional GraphQL expansion fails or is aborted.
+    } finally {
+      if (activeExpandController === controller) {
+        activeExpandController = null;
+      }
     }
   }
 
   async function executeSearch(ev?: Event): Promise<void> {
     ev?.preventDefault();
     const trimmed = queryText.trim();
-    if (!trimmed || running) {
+    if (!trimmed || running || isUnmounted) {
       return;
     }
+
+    activeSearchController?.abort();
+    activeExpandController?.abort();
+    const controller = new AbortController();
+    activeSearchController = controller;
+    const reqSeq = ++searchReqSeq;
+    const workspaceAtStart = viewportStore.workspace;
+    const selectionAtStart = viewportStore.selectedEntityId;
+    const epochAtStart = selectionEpoch;
 
     running = true;
     errorBanner = null;
     neuralStatusBanner = null;
     answerSummary = null;
+    indexedRevision = null;
+    damagedEntities = 0;
+    pathResults = [];
 
     try {
       const collected: CortexSearchHit[] = [];
+      let nextIndexedRevision: number | null = null;
+      let nextDamagedEntities = 0;
+      let nextAnswerSummary: string | null = null;
+      let nextNeuralBanner: string | null = null;
+      let nextErrorBanner: string | null = null;
 
       if (activeTier === "lexical" || activeTier === "hybrid") {
-        const lex = viewportStore.selectedEntityId
-          ? await searchClient.localSearch({
-              entityId: viewportStore.selectedEntityId,
-              query: trimmed,
-              limit: 15,
-            })
-          : await searchClient.globalSearch({
-              query: trimmed,
-              limit: 15,
-            });
+        const lex = selectionAtStart
+          ? await searchClient.localSearch(
+              {
+                entityId: selectionAtStart,
+                query: trimmed,
+                limit: 15,
+              },
+              controller.signal,
+            )
+          : await searchClient.globalSearch(
+              {
+                query: trimmed,
+                limit: 15,
+              },
+              controller.signal,
+            );
         if (lex.ok) {
           collected.push(...lex.hits);
-          indexedRevision = lex.indexedRevision;
-          damagedEntities = lex.damagedEntities;
-          answerSummary = lex.answer;
+          if (lex.indexedRevision > 0) {
+            nextIndexedRevision = lex.indexedRevision;
+          }
+          nextDamagedEntities = Math.max(
+            nextDamagedEntities,
+            lex.damagedEntities,
+          );
+          nextAnswerSummary = lex.answer;
         } else if (lex.refusal) {
-          errorBanner = `${lex.refusal.code}: ${lex.refusal.message}`;
+          nextErrorBanner = `${lex.refusal.code}: ${lex.refusal.message}`;
         }
       }
 
       if (activeTier === "semantic") {
-        const predRes = await graphqlClient.entitiesByPredicate({
-          predicate: trimmed,
-        });
+        const predRes = await graphqlClient.entitiesByPredicate(
+          {
+            predicate: trimmed,
+          },
+          { signal: controller.signal },
+        );
         for (const id of predRes.data.entities) {
           collected.push({
             entityId: id,
@@ -174,73 +283,167 @@
             verb: "globalSearch",
             wordRank: null,
             vectorRank: null,
+            indexedRevision: null,
           });
         }
-        damagedEntities = predRes.damagedEntities;
+        nextDamagedEntities = predRes.damagedEntities;
       }
 
       if (activeTier === "neural" || activeTier === "hybrid") {
-        const sem = await searchClient.semantic({
-          query: trimmed,
-          limit: 10,
-        });
+        const sem = await searchClient.semantic(
+          {
+            query: trimmed,
+            limit: 10,
+          },
+          controller.signal,
+        );
         if (sem.ok) {
           collected.push(...sem.hits);
           if (sem.indexedRevision > 0) {
-            indexedRevision = sem.indexedRevision;
+            nextIndexedRevision = sem.indexedRevision;
           }
+          nextDamagedEntities = Math.max(
+            nextDamagedEntities,
+            sem.damagedEntities,
+          );
         } else if (sem.refusal?.notEnabled) {
-          neuralStatusBanner = `Neural embeddings not enabled on host (${sem.refusal.code})`;
+          nextNeuralBanner = `Neural embeddings not enabled on host (${sem.refusal.code})`;
         } else if (sem.refusal && activeTier === "neural") {
-          errorBanner = `${sem.refusal.code}: ${sem.refusal.message}`;
+          nextErrorBanner = `${sem.refusal.code}: ${sem.refusal.message}`;
         }
       }
 
+      if (
+        isUnmounted ||
+        controller.signal.aborted ||
+        reqSeq !== searchReqSeq ||
+        viewportStore.workspace !== workspaceAtStart
+      ) {
+        return;
+      }
+
       rawHits = collected;
-      const topId = collected[0]?.entityId ?? viewportStore.selectedEntityId;
-      if (topId) {
-        viewportStore.selectEntity(topId);
-        onSyncHash?.(viewportStore.toUrlHash());
-        await expand2Hop(topId);
+      indexedRevision = nextIndexedRevision;
+      damagedEntities = nextDamagedEntities;
+      answerSummary = nextAnswerSummary;
+      neuralStatusBanner = nextNeuralBanner;
+      errorBanner = nextErrorBanner;
+
+      if (
+        selectionEpoch === epochAtStart &&
+        viewportStore.selectedEntityId === selectionAtStart &&
+        viewportStore.workspace === workspaceAtStart
+      ) {
+        const topId = collected[0]?.entityId ?? viewportStore.selectedEntityId;
+        if (topId) {
+          if (topId !== viewportStore.selectedEntityId) {
+            viewportStore.selectEntity(topId);
+            onSyncHash?.(viewportStore.toUrlHash());
+          }
+          await expand2Hop(topId, workspaceAtStart);
+        }
       }
     } catch (err) {
-      errorBanner = err instanceof Error ? err.message : "Cortex query failed";
+      if (
+        !isUnmounted &&
+        !isAbortError(err, controller.signal) &&
+        reqSeq === searchReqSeq
+      ) {
+        errorBanner =
+          err instanceof Error ? err.message : "Cortex query failed";
+      }
     } finally {
-      running = false;
+      if (activeSearchController === controller) {
+        activeSearchController = null;
+      }
+      if (!isUnmounted && reqSeq === searchReqSeq) {
+        running = false;
+      }
     }
   }
 
   async function runFindSimilar(): Promise<void> {
     const entityId = viewportStore.selectedEntityId;
-    if (!entityId || running) {
+    if (!entityId || running || isUnmounted) {
       return;
     }
+
+    activeSearchController?.abort();
+    activeExpandController?.abort();
+    const controller = new AbortController();
+    activeSearchController = controller;
+    const reqSeq = ++searchReqSeq;
+    const workspaceAtStart = viewportStore.workspace;
+    const epochAtStart = selectionEpoch;
+
     running = true;
     errorBanner = null;
     neuralStatusBanner = null;
+    answerSummary = null;
+    indexedRevision = null;
+    damagedEntities = 0;
 
     try {
-      const sim = await searchClient.similar({ entityId, limit: 10 });
+      const sim = await searchClient.similar(
+        { entityId, limit: 10 },
+        controller.signal,
+      );
+      if (
+        isUnmounted ||
+        controller.signal.aborted ||
+        reqSeq !== searchReqSeq ||
+        viewportStore.workspace !== workspaceAtStart
+      ) {
+        return;
+      }
       if (sim.ok) {
         rawHits = sim.hits;
-      } else if (sim.refusal?.notEnabled) {
-        neuralStatusBanner = `Similarity embeddings not enabled on host (${sim.refusal.code})`;
-      } else if (sim.refusal) {
-        errorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
+        indexedRevision = sim.indexedRevision > 0 ? sim.indexedRevision : null;
+        damagedEntities = sim.damagedEntities;
+      } else {
+        rawHits = [];
+        if (sim.refusal?.notEnabled) {
+          neuralStatusBanner = `Similarity embeddings not enabled on host (${sim.refusal.code})`;
+        } else if (sim.refusal) {
+          errorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
+        }
       }
-      await expand2Hop(entityId);
+      if (
+        selectionEpoch === epochAtStart &&
+        viewportStore.selectedEntityId === entityId &&
+        viewportStore.workspace === workspaceAtStart
+      ) {
+        await expand2Hop(entityId, workspaceAtStart);
+      }
     } catch (err) {
-      errorBanner =
-        err instanceof Error ? err.message : "Similarity lookup failed";
+      if (
+        !isUnmounted &&
+        !isAbortError(err, controller.signal) &&
+        reqSeq === searchReqSeq
+      ) {
+        errorBanner =
+          err instanceof Error ? err.message : "Similarity lookup failed";
+      }
     } finally {
-      running = false;
+      if (activeSearchController === controller) {
+        activeSearchController = null;
+      }
+      if (!isUnmounted && reqSeq === searchReqSeq) {
+        running = false;
+      }
     }
   }
 
   function selectHit(entityId: string): void {
+    if (isUnmounted) {
+      return;
+    }
+    selectionEpoch += 1;
+    pathResults = [];
+    const workspaceAtClick = viewportStore.workspace;
     viewportStore.selectEntity(entityId);
     onSyncHash?.(viewportStore.toUrlHash());
-    void expand2Hop(entityId);
+    void expand2Hop(entityId, workspaceAtClick);
   }
 
   $effect(() => {
@@ -254,38 +457,67 @@
     }
   });
 
-  onMount(() => {
-    webglAvailable = probeWebGLSupport();
-    let disposed = false;
-
-    if (webglAvailable && sigmaContainerEl) {
-      void import("sigma")
-        .then(({ default: Sigma }) => {
-          if (disposed || !sigmaContainerEl) {
-            return;
-          }
-          const renderer = new Sigma(graph, sigmaContainerEl, {
-            renderEdgeLabels: false,
-            defaultNodeColor: "#60a5fa",
-            defaultEdgeColor: SKG_EDGE_PALETTE.default,
-            labelColor: { color: "#e2e8f0" },
-            labelSize: 11,
-          });
-          renderer.on("clickNode", ({ node }) => {
-            selectHit(node);
-          });
-          sigmaInstance = renderer;
-          if (graph.order > 1) {
-            layoutController.start(graph);
-          }
-        })
-        .catch(() => {
-          webglAvailable = false;
-        });
+  $effect(() => {
+    if (!mounted || !webglAvailable || !sigmaContainerEl) {
+      return;
     }
+    const container = sigmaContainerEl;
+    let cancelled = false;
+    let createdRenderer: CortexSigmaRenderer | null = null;
+
+    void loadSigma()
+      .then((Sigma) => {
+        if (cancelled || isUnmounted || !webglAvailable) {
+          return;
+        }
+        syncTopologyToGraph(graph, causalSubgraph);
+        const renderer = new Sigma(graph, container, {
+          renderEdgeLabels: false,
+          defaultNodeColor: "#60a5fa",
+          defaultEdgeColor: SKG_EDGE_PALETTE.default,
+          labelColor: { color: "#e2e8f0" },
+          labelSize: 11,
+        });
+        renderer.on("clickNode", ({ node }) => {
+          selectHit(node);
+        });
+        createdRenderer = renderer;
+        sigmaInstance = renderer;
+        renderer.refresh();
+        if (graph.order > 1) {
+          layoutController.start(graph);
+        }
+      })
+      .catch(() => {
+        if (!cancelled && !isUnmounted) {
+          webglAvailable = false;
+        }
+      });
 
     return () => {
-      disposed = true;
+      cancelled = true;
+      layoutController.stop();
+      if (createdRenderer) {
+        createdRenderer.kill();
+        if (sigmaInstance === createdRenderer) {
+          sigmaInstance = null;
+        }
+      }
+    };
+  });
+
+  onMount(() => {
+    isUnmounted = false;
+    webglAvailable = probeWebGL();
+    mounted = true;
+
+    return () => {
+      isUnmounted = true;
+      mounted = false;
+      activeSearchController?.abort();
+      activeExpandController?.abort();
+      activeSearchController = null;
+      activeExpandController = null;
       layoutController.stop();
       sigmaInstance?.kill();
       sigmaInstance = null;
@@ -350,6 +582,10 @@
         {#if damagedEntities > 0}
           · damaged:{damagedEntities}
         {/if}
+      </span>
+    {:else if damagedEntities > 0}
+      <span class="rev-pill" data-testid="cortex-damaged-pill">
+        damaged:{damagedEntities}
       </span>
     {/if}
   </form>
@@ -430,9 +666,21 @@
         <span class="legend-chip neighbor">2-Hop Neighbor</span>
       </div>
 
-      {#if webglAvailable}
-        <div bind:this={sigmaContainerEl} class="sigma-host"></div>
-      {:else}
+      <div
+        bind:this={sigmaContainerEl}
+        class="sigma-host"
+        class:hidden={!webglAvailable}
+        data-testid="cortex-sigma-host"
+        data-viewport-hotkey-scope="true"
+        role="application"
+        aria-label="Causal SKG interactive WebGL canvas"
+        tabindex="-1"
+        onpointerdown={() => {
+          sigmaContainerEl?.focus?.({ preventScroll: true });
+        }}
+      ></div>
+
+      {#if !webglAvailable}
         <div class="subgraph-fallback" data-testid="cortex-subgraph-fallback">
           {#if causalSubgraph.nodes.length === 0}
             <p class="muted">No SKG nodes in causal scope.</p>
@@ -731,6 +979,16 @@
     background: #090d16;
     border: 1px solid var(--ui-border-subtle, #1e293b);
     padding: 6px;
+  }
+
+  .sigma-host {
+    position: relative;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .sigma-host.hidden {
+    display: none;
   }
 
   .node-swatch {
