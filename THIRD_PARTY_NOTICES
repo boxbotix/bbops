@@ -16,8 +16,8 @@
 
 3. **SemBoids (`C360Studio/semboids`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
-   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, Caddy reverse-proxy rules, flow configuration patterns, and sentinel `ui/go.mod` boundary:
-     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/Caddyfile`, `configs/flock.json` (adapted in `configs/bbops.json`), `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
+   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, Caddy reverse-proxy rules, dual-WebSocket Svelte 5 Runes store lifecycle patterns (`ui/src/lib/stores/ws-client.ts`, `ui/src/lib/stores/telemetry.svelte.ts`, `ui/src/lib/stores/skg.svelte.ts` adapted from `ui/src/lib/stores/flock.svelte.ts` and `ui/src/lib/stores/graph.svelte.ts`), flow configuration patterns, and sentinel `ui/go.mod` boundary:
+     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/Caddyfile`, `ui/src/lib/stores/flock.svelte.ts`, `ui/src/lib/stores/graph.svelte.ts`, `configs/flock.json` (adapted in `configs/bbops.json`), `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
 
 4. **SemEngine (`C360Studio/semengine`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
