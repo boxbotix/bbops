@@ -1,5 +1,5 @@
 # Proposal: m2-4-workspace-modes
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-24) sha256:b6345c29de2f
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track
