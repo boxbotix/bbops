@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,13 +17,15 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/c360studio/semengine/composition"
 )
 
 // spec: host-runtime / Host CLI version and flag entrypoint
 // spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
 // spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
 func TestValidateOfflineAndPortOverrides(t *testing.T) {
-	t.Run("embedded default flow validates all seven components and endpoints", func(t *testing.T) {
+	t.Run("embedded default flow validates all eight components, flow paths, and endpoints", func(t *testing.T) {
 		cfg, err := LoadConfig("", PortOverrides{})
 		if err != nil {
 			t.Fatalf("LoadConfig default: %v", err)
@@ -31,8 +34,12 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ValidateOffline default: %v", err)
 		}
-		if got, want := len(res.Graph.Nodes), 7; got != want {
+		if got, want := len(res.Graph.Nodes), 8; got != want {
 			t.Fatalf("admitted component nodes = %d, want %d", got, want)
+		}
+		paths := composition.FlowPaths(res.Graph)[MAVLinkIngestComponent]
+		if !slices.Contains(paths, TelemetryWSComponent) || !slices.Contains(paths, "graph-ingest") {
+			t.Fatalf("mavlink-ingest flow paths = %v, want reachability to %s and graph-ingest", paths, TelemetryWSComponent)
 		}
 		endpoints, err := ResolveEndpoints(cfg)
 		if err != nil {
@@ -49,6 +56,9 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		}
 		if endpoints.MetricsPort != 9090 {
 			t.Fatalf("MetricsPort = %d, want 9090", endpoints.MetricsPort)
+		}
+		if endpoints.MAVLinkUDPPort != 14550 || endpoints.MAVLinkUDPAddr != "127.0.0.1:14550" {
+			t.Fatalf("MAVLinkUDP = (%d, %q), want (14550, 127.0.0.1:14550)", endpoints.MAVLinkUDPPort, endpoints.MAVLinkUDPAddr)
 		}
 	})
 
@@ -223,6 +233,12 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		if _, err := LoadConfig("", PortOverrides{TelemetryWSPort: 65536}); err == nil {
 			t.Fatal("expected error for TelemetryWSPort > 65535")
 		}
+		if _, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: 1023}); err == nil {
+			t.Fatal("expected error for MAVLinkUDPPort < 1024")
+		}
+		if _, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: 65536}); err == nil {
+			t.Fatal("expected error for MAVLinkUDPPort > 65535")
+		}
 
 		colliding, err := LoadConfig("", PortOverrides{
 			HTTPPort:        18080,
@@ -240,6 +256,7 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 			TelemetryWSPort: 18081,
 			GraphWSPort:     18082,
 			MetricsPort:     -1,
+			MAVLinkUDPPort:  14555,
 			BindHost:        "127.0.0.1",
 		})
 		if err != nil {
@@ -254,6 +271,39 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		}
 		if endpoints.TelemetryWS != "ws://127.0.0.1:18081/ws" || endpoints.GraphWS != "ws://127.0.0.1:18082/ws" {
 			t.Fatalf("unexpected WS endpoints: %+v", endpoints)
+		}
+		if endpoints.MAVLinkUDPPort != 14555 || endpoints.MAVLinkUDPAddr != "127.0.0.1:14555" {
+			t.Fatalf("unexpected MAVLinkUDP endpoints: %+v", endpoints)
+		}
+
+		disabledUDP, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: -1})
+		if err != nil {
+			t.Fatalf("LoadConfig MAVLinkUDPPort=-1: %v", err)
+		}
+		resDisabled, err := ValidateOffline(disabledUDP)
+		if err != nil {
+			t.Fatalf("ValidateOffline MAVLinkUDPPort=-1: %v", err)
+		}
+		if got, want := len(resDisabled.Graph.Nodes), 7; got != want {
+			t.Fatalf("admitted nodes with MAVLinkUDPPort=-1 = %d, want %d", got, want)
+		}
+		epDisabled, err := ResolveEndpoints(disabledUDP)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints MAVLinkUDPPort=-1: %v", err)
+		}
+		if epDisabled.MAVLinkUDPPort != 0 || epDisabled.MAVLinkUDPAddr != "" {
+			t.Fatalf("disabled MAVLinkUDP endpoints = (%d, %q), want (0, empty)", epDisabled.MAVLinkUDPPort, epDisabled.MAVLinkUDPAddr)
+		}
+
+		wrongFactory, err := LoadConfig("", PortOverrides{})
+		if err != nil {
+			t.Fatalf("LoadConfig wrong factory: %v", err)
+		}
+		mv := wrongFactory.Components[MAVLinkIngestComponent]
+		mv.Name = "websocket"
+		wrongFactory.Components[MAVLinkIngestComponent] = mv
+		if _, err := ValidateOffline(wrongFactory); err == nil || !strings.Contains(err.Error(), MAVLinkIngestComponent) {
+			t.Fatalf("expected wrong mavlink-ingest factory error, got %v", err)
 		}
 	})
 }

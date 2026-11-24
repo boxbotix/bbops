@@ -1,5 +1,5 @@
 # Proposal: m1-2-mavlink-3lane-ingest
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-23) sha256:be4c1633d413
 Architect: gemini (gemini-4-carbon, medium)
 
 ## Track

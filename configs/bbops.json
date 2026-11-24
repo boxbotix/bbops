@@ -53,6 +53,45 @@
     }
   },
   "components": {
+    "mavlink-ingest": {
+      "type": "input",
+      "name": "mavlink-udp",
+      "enabled": true,
+      "config": {
+        "skg_hz": 1,
+        "ports": {
+          "inputs": [
+            {
+              "name": "mavlink_udp",
+              "required": true,
+              "external": true,
+              "config": {
+                "kind": "network",
+                "protocol": "udp",
+                "host": "127.0.0.1",
+                "port": 14550
+              }
+            }
+          ],
+          "outputs": [
+            {
+              "name": "telemetry",
+              "config": {
+                "kind": "nats",
+                "subject": "bbops.telemetry.>"
+              }
+            },
+            {
+              "name": "entity_upsert",
+              "config": {
+                "kind": "nats",
+                "subject": "entity.uxs.upsert"
+              }
+            }
+          ]
+        }
+      }
+    },
     "graph-ingest": {
       "type": "processor",
       "name": "graph-ingest",

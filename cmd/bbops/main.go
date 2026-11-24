@@ -44,7 +44,8 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer, ve
 		telemetryWSPort = fs.Int("telemetry-ws-port", 0, "override telemetry output/websocket port (1024..65535)")
 		graphWSPort     = fs.Int("graph-ws-port", 0, "override SKG ENTITY_STATES output/websocket port (1024..65535)")
 		metricsPort     = fs.Int("metrics-port", 0, "override Prometheus metrics port (1024..65535; <0 disables)")
-		bindHost        = fs.String("bind-host", "", "override output/websocket bind host (e.g. 127.0.0.1)")
+		mavlinkUDPPort  = fs.Int("mavlink-udp-port", 0, "override MAVLink v2 UDP ingest port (1024..65535; <0 disables)")
+		bindHost        = fs.String("bind-host", "", "override output/websocket and UDP bind host (e.g. 127.0.0.1)")
 		shutdownTimeout = fs.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
 	)
 
@@ -65,6 +66,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer, ve
 		TelemetryWSPort: *telemetryWSPort,
 		GraphWSPort:     *graphWSPort,
 		MetricsPort:     *metricsPort,
+		MAVLinkUDPPort:  *mavlinkUDPPort,
 		BindHost:        *bindHost,
 	}
 
@@ -100,6 +102,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer, ve
 			"http", endpoints.HTTPBaseURL,
 			"telemetry_ws", endpoints.TelemetryWS,
 			"graph_ws", endpoints.GraphWS,
+			"mavlink_udp", endpoints.MAVLinkUDPAddr,
 			"nats", rt.NATSURL(),
 		)
 		<-ctx.Done()

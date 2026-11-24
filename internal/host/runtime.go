@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/config"
@@ -48,7 +49,7 @@ type Options struct {
 }
 
 // Runtime owns a started bbops host instance (embedded NATS/JetStream,
-// ConfigManager, ServiceManager, and ADR-115 HTTP/WS surfaces).
+// ConfigManager, ServiceManager, MAVLink UDP ingest, and ADR-115 HTTP/WS surfaces).
 type Runtime struct {
 	endpoints      ResolvedEndpoints
 	natsURL        string
@@ -57,6 +58,7 @@ type Runtime struct {
 	natsClient     *natsclient.Client
 	configManager  *config.Manager
 	serviceManager atomic.Pointer[service.Manager]
+	mavlinkIngest  atomic.Pointer[mavlink.Component]
 	serviceNames   []string
 	mutations      *projection.MutationClient
 
@@ -70,9 +72,9 @@ type Runtime struct {
 
 // Start boots embedded NATS + JetStream (unless opts.NATSURL is set), ensures
 // the ENTITY stream and kvcatalog retention invariants, starts ConfigManager and
-// ServiceManager (including graph-ingest, graph-index, graph-lexical, graph-query,
-// graph-gateway, and dual output/websocket planes), and returns once listeners
-// are bound. Callers awaiting full ADR-109 component readiness should call WaitReady.
+// ServiceManager (including mavlink-ingest, graph-ingest, graph-index, graph-lexical,
+// graph-query, graph-gateway, and dual output/websocket planes), and returns once
+// listeners are bound. Callers awaiting full ADR-109 component readiness should call WaitReady.
 func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	if ctx == nil {
 		return nil, errors.New("host: nil context")
@@ -190,7 +192,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 
 	compReg := component.NewRegistry()
-	if err := RegisterComponents(compReg); err != nil {
+	if err := registerComponentsWithHook(compReg, func(c *mavlink.Component) {
+		rt.mavlinkIngest.Store(c)
+	}); err != nil {
 		return cleanup(err)
 	}
 
@@ -239,9 +243,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	return rt, nil
 }
 
-// StartEphemeral allocates free loopback ports in 1024..65535 and starts Runtime,
-// retrying up to maxAttempts when a concurrent process claims an ephemeral port
-// between probing and bind.
+// StartEphemeral allocates free loopback TCP and UDP ports in 1024..65535 and
+// starts Runtime, retrying up to maxAttempts when a concurrent process claims an
+// ephemeral port between probing and bind.
 func StartEphemeral(ctx context.Context, opts Options, maxAttempts int) (*Runtime, error) {
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -259,6 +263,13 @@ func StartEphemeral(ctx context.Context, opts Options, maxAttempts int) (*Runtim
 		tryOpts.Overrides.GraphWSPort = ports[2]
 		if tryOpts.Overrides.MetricsPort == 0 {
 			tryOpts.Overrides.MetricsPort = ports[3]
+		}
+		if tryOpts.Overrides.MAVLinkUDPPort == 0 {
+			udpPorts, udpErr := AllocateLoopbackUDPPorts(1)
+			if udpErr != nil {
+				return nil, udpErr
+			}
+			tryOpts.Overrides.MAVLinkUDPPort = udpPorts[0]
 		}
 		rt, err := Start(ctx, tryOpts)
 		if err == nil {
@@ -300,8 +311,39 @@ func AllocateLoopbackPorts(count int) ([]int, error) {
 	return ports, nil
 }
 
-// Endpoints returns the resolved HTTP and WebSocket URLs of the started runtime.
+// AllocateLoopbackUDPPorts reserves count distinct free loopback UDP ports in
+// 1024..65535 simultaneously before releasing them.
+func AllocateLoopbackUDPPorts(count int) ([]int, error) {
+	if count <= 0 {
+		return nil, errors.New("UDP port count must be positive")
+	}
+	conns := make([]*net.UDPConn, 0, count)
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	ports := make([]int, 0, count)
+	for range count {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			return nil, fmt.Errorf("allocate loopback UDP port: %w", err)
+		}
+		conns = append(conns, conn)
+		addr, ok := conn.LocalAddr().(*net.UDPAddr)
+		if !ok || addr.Port < minUserPort || addr.Port > maxUserPort {
+			return nil, fmt.Errorf("allocated UDP port out of user range: %v", conn.LocalAddr())
+		}
+		ports = append(ports, addr.Port)
+	}
+	return ports, nil
+}
+
+// Endpoints returns the resolved HTTP, WebSocket, and MAVLink UDP endpoints of the started runtime.
 func (rt *Runtime) Endpoints() ResolvedEndpoints { return rt.endpoints }
+
+// MAVLinkIngest returns the active mavlink-ingest Component instance, or nil when disabled/stopped.
+func (rt *Runtime) MAVLinkIngest() *mavlink.Component { return rt.mavlinkIngest.Load() }
 
 // NATSURL returns the active NATS client URL with any credentials redacted.
 func (rt *Runtime) NATSURL() string { return rt.natsURL }
@@ -413,6 +455,7 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 		if err := svcMgr.StopAll(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("stop service manager: %w", err))
 		} else {
+			rt.mavlinkIngest.Store(nil)
 			rt.serviceManager.Store(nil)
 		}
 	}

@@ -80,6 +80,13 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if !strings.Contains(stderr.String(), "http-port") {
 			t.Fatalf("stderr = %q, want diagnostic naming http-port", stderr.String())
 		}
+
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-validate", "-mavlink-udp-port", "80"}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "mavlink-udp-port") {
+			t.Fatalf("mavlink-udp-port=80: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
 	})
 
 	t.Run("validate flag rejects disabled mandatory component-manager or missing graph-gateway", func(t *testing.T) {
@@ -244,6 +251,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("allocate loopback ports: %v", err)
 		}
+		udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+		if err != nil {
+			t.Fatalf("allocate loopback UDP port: %v", err)
+		}
 		uiDir := t.TempDir()
 		const wantIndex = "<html>cli-cop</html>"
 		if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte(wantIndex), 0o600); err != nil {
@@ -264,6 +275,7 @@ func TestRunCLIEntrypoint(t *testing.T) {
 				"-telemetry-ws-port", strconv.Itoa(ports[1]),
 				"-graph-ws-port", strconv.Itoa(ports[2]),
 				"-metrics-port", strconv.Itoa(ports[3]),
+				"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
 			}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
 		}()
 
@@ -332,6 +344,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if !ready {
 			cancel()
 			t.Fatalf("CLI daemon never transitioned to /readyz 200 + ready log (stderr=%s)", stderr.String())
+		}
+		wantUDPField := "mavlink_udp=127.0.0.1:" + strconv.Itoa(udpPorts[0])
+		if !strings.Contains(stderr.String(), wantUDPField) {
+			t.Fatalf("expected %s in ready stderr, got:\n%s", wantUDPField, stderr.String())
 		}
 
 		rootResp2, err := http.Get(baseURL + "/") //nolint:noctx
@@ -425,6 +441,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 				if err != nil {
 					t.Fatalf("allocate loopback ports: %v", err)
 				}
+				udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+				if err != nil {
+					t.Fatalf("allocate loopback UDP port: %v", err)
+				}
 
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -440,6 +460,7 @@ func TestRunCLIEntrypoint(t *testing.T) {
 						"-telemetry-ws-port", strconv.Itoa(ports[1]),
 						"-graph-ws-port", strconv.Itoa(ports[2]),
 						"-metrics-port", strconv.Itoa(ports[3]),
+						"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
 					}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
 				}()
 
