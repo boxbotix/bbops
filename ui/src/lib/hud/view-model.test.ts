@@ -2241,4 +2241,439 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
     expect(afterCatchUp.stale).toBe(false);
     expect(afterCatchUp.headingDeg).toBe(35);
   });
+
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("clears retained previous-session attitude, heading, and local position across an ingest restart while keeping a new global fix live and re-enabling each domain independently", () => {
+    const entityId = "boxbotix.bbops.robotics.uxs.vehicle.1";
+    let nowMs = Date.parse("2026-11-24T12:00:00.300Z");
+    const skgStore = createSkgStore({ now: () => nowMs });
+    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+
+    interface DomainAssertion<T> {
+      value: T;
+      measured: boolean;
+      timestamp: string;
+    }
+
+    const buildMergedPut = (opts: {
+      revision: number;
+      healthIso: string;
+      quat: DomainAssertion<[number, number, number, number]>;
+      ned: DomainAssertion<[number, number, number]>;
+      heading: DomainAssertion<number>;
+      globalPos: DomainAssertion<[number, number, number]>;
+      crcErrors?: number;
+    }): string => {
+      const healthTriple = (predicate: string, object: unknown): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: opts.healthIso,
+        confidence: 1,
+      });
+      const poseTriple = (
+        predicate: string,
+        object: unknown,
+        domain: { measured: boolean; timestamp: string },
+      ): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: domain.timestamp,
+        confidence: domain.measured ? 1 : 0,
+        ...(domain.measured ? { context: "measured" } : {}),
+      });
+
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: opts.revision,
+        payload: {
+          id: entityId,
+          updated_at: opts.healthIso,
+          triples: [
+            healthTriple("uxs.domain.kind", "rover"),
+            healthTriple("uxs.authority.state", "companion-teleop"),
+            healthTriple("uxs.mode.companion", "teleop-velocity"),
+            healthTriple("uxs.link.tier", "mesh-high-rate"),
+            healthTriple("uxs.health.armed", true),
+            healthTriple("uxs.health.flags", {
+              clock_sync_locked: true,
+              teleop_deadman_clamped: false,
+              crsf_link_healthy: true,
+              companion_trunk_healthy: true,
+            }),
+            healthTriple("uxs.health.failsafes", 0),
+            healthTriple("uxs.health.crcerrors", opts.crcErrors ?? 0),
+            healthTriple("uxs.health.loopdtus", 950),
+            healthTriple("uxs.health.maxloopdtus", 1100),
+            healthTriple("uxs.health.rttus", 350),
+            poseTriple("uxs.attitude.quaternion", opts.quat.value, opts.quat),
+            poseTriple("uxs.attitude.rates", [0, 0, 0], opts.quat),
+            poseTriple("uxs.kinematics.ned", opts.ned.value, opts.ned),
+            poseTriple("uxs.kinematics.vx", 0, opts.ned),
+            poseTriple("uxs.kinematics.vy", 0, opts.ned),
+            poseTriple("uxs.kinematics.vz", 0, opts.ned),
+            poseTriple(
+              "uxs.kinematics.headingdeg",
+              opts.heading.value,
+              opts.heading,
+            ),
+            poseTriple(
+              "geo.location.latitude",
+              opts.globalPos.value[0],
+              opts.globalPos,
+            ),
+            poseTriple(
+              "geo.location.longitude",
+              opts.globalPos.value[1],
+              opts.globalPos,
+            ),
+            poseTriple(
+              "geo.location.altitude",
+              opts.globalPos.value[2],
+              opts.globalPos,
+            ),
+            healthTriple("dc.terms.title", "UXS rover #1"),
+          ],
+        },
+      });
+    };
+
+    const drawnTexts: string[] = [];
+    const mockCtx = {
+      clearRect: vi.fn(),
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      closePath: vi.fn(),
+      rect: vi.fn(),
+      clip: vi.fn(),
+      translate: vi.fn(),
+      rotate: vi.fn(),
+      setTransform: vi.fn(),
+      fillRect: vi.fn(),
+      strokeRect: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      arc: vi.fn(),
+      fill: vi.fn(),
+      stroke: vi.fn(),
+      setLineDash: vi.fn(),
+      fillText: vi.fn((text: string) => {
+        drawnTexts.push(text);
+      }),
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      globalAlpha: 1,
+      font: "",
+      textAlign: "left",
+    } as unknown as CanvasRenderingContext2D;
+
+    const rafCallbacks: FrameRequestCallback[] = [];
+    const getCtxSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(((contextId: string) =>
+        contextId === "2d"
+          ? mockCtx
+          : null) as typeof HTMLCanvasElement.prototype.getContext);
+    const rafSpy = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb);
+        return rafCallbacks.length;
+      });
+    const cafSpy = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation(() => undefined);
+
+    const flushTicks = (): void => {
+      flushSync();
+      for (const cb of rafCallbacks.splice(0, rafCallbacks.length)) {
+        cb(nowMs);
+      }
+      flushSync();
+    };
+
+    const hudHost = document.createElement("div");
+    document.body.append(hudHost);
+    let hudApp: Record<string, unknown> | null = null;
+
+    try {
+      // Session 1 (12:00:00Z): measured 90 deg East yaw, local NED, and global fix.
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 1,
+          healthIso: "2026-11-24T12:00:00.300Z",
+          quat: {
+            value: eulerRadToQuaternionWxyz(0, 0, Math.PI / 2),
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.100Z",
+          },
+          ned: {
+            value: [12.5, -4.25, -2],
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.200Z",
+          },
+          heading: {
+            value: 90,
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.100Z",
+          },
+          globalPos: {
+            value: [37.7749, -122.4194, 25],
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.300Z",
+          },
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      hudApp = mount(VehicleHud, {
+        target: hudHost,
+        props: {
+          telemetryStore,
+          get vehicle() {
+            return skgStore.getCommandableVehicle(entityId);
+          },
+          skgStatus: "connected",
+          now: () => nowMs,
+        },
+      });
+      flushTicks();
+
+      const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+
+      // Session 2 restarts 1 hour later (13:00:00.000Z admission) and receives #33 global fix with Hdg=65535 at 13:00:00.250Z.
+      nowMs = Date.parse("2026-11-24T13:00:00.250Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 2,
+          healthIso: "2026-11-24T13:00:00.250Z",
+          quat: {
+            value: [0, 0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          ned: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          heading: {
+            value: 0,
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.250Z",
+          },
+          globalPos: {
+            value: [30.2672, -97.7431, 150],
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.250Z",
+          },
+        }),
+      );
+      drawnTexts.length = 0;
+      flushTicks();
+
+      const afterRestartPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        {
+          telemetryStatus: "reconnecting",
+          skgStatus: "connected",
+          nowMs,
+        },
+      );
+      expect(afterRestartPose.source).toBe("skg");
+      expect(afterRestartPose.stale).toBe(false);
+      expect(afterRestartPose.lla).toEqual([30.2672, -97.7431, 150]);
+      expect(afterRestartPose.hasAttitude).toBe(false);
+      expect(afterRestartPose.hasHeading).toBe(false);
+      expect(afterRestartPose.hasVerifiedFrameReference).toBe(false);
+      expect(afterRestartPose.quat).toEqual([0, 0, 0, 0]);
+      expect(afterRestartPose.ned).toEqual([0, 0, 0]);
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
+      expect(
+        hudHost.querySelector('[data-testid="hud-heading-unavailable"]')
+          ?.textContent,
+      ).toContain("NO HDG");
+      expect(drawnTexts).toContain("ATTITUDE UNAVAILABLE");
+      expect(drawnTexts).toContain("HDG UNAVAILABLE");
+
+      // Health-only update at 13:00:00.500Z preserves per-domain pose timestamps and unavailability.
+      nowMs = Date.parse("2026-11-24T13:00:00.500Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 3,
+          healthIso: "2026-11-24T13:00:00.500Z",
+          crcErrors: 2,
+          quat: {
+            value: [0, 0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          ned: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          heading: {
+            value: 0,
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.250Z",
+          },
+          globalPos: {
+            value: [30.2672, -97.7431, 150],
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.250Z",
+          },
+        }),
+      );
+      flushTicks();
+      const vehAfterHealth = skgStore.getCommandableVehicle(entityId)!;
+      expect(vehAfterHealth.poseObservedAt).toBe("2026-11-24T13:00:00.250Z");
+      expect(vehAfterHealth.hasAttitude).toBe(false);
+      expect(vehAfterHealth.hasHeading).toBe(false);
+      expect(vehAfterHealth.hasLocalPos).toBe(false);
+      expect(vehAfterHealth.hasGlobalPos).toBe(true);
+
+      // Re-measure heading (#33 Hdg=180 deg) while attitude and local position remain unavailable.
+      nowMs = Date.parse("2026-11-24T13:00:00.750Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 4,
+          healthIso: "2026-11-24T13:00:00.750Z",
+          quat: {
+            value: [0, 0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          ned: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          heading: {
+            value: 180,
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.750Z",
+          },
+          globalPos: {
+            value: [30.2672, -97.7431, 150],
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.750Z",
+          },
+        }),
+      );
+      flushTicks();
+      const afterHdgPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        { telemetryStatus: "reconnecting", skgStatus: "connected", nowMs },
+      );
+      expect(afterHdgPose.hasHeading).toBe(true);
+      expect(afterHdgPose.headingDeg).toBe(180);
+      expect(afterHdgPose.hasAttitude).toBe(false);
+      expect(afterHdgPose.hasVerifiedFrameReference).toBe(false);
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
+
+      // Re-measure local position (#32) while attitude remains unavailable.
+      nowMs = Date.parse("2026-11-24T13:00:01.000Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 5,
+          healthIso: "2026-11-24T13:00:01.000Z",
+          quat: {
+            value: [0, 0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T13:00:00.000Z",
+          },
+          ned: {
+            value: [15, -8, -4],
+            measured: true,
+            timestamp: "2026-11-24T13:00:01.000Z",
+          },
+          heading: {
+            value: 180,
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.750Z",
+          },
+          globalPos: {
+            value: [30.2672, -97.7431, 150],
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.750Z",
+          },
+        }),
+      );
+      flushTicks();
+      const afterNedPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        { telemetryStatus: "reconnecting", skgStatus: "connected", nowMs },
+      );
+      expect(afterNedPose.hasVerifiedFrameReference).toBe(true);
+      expect(afterNedPose.ned).toEqual([15, -8, -4]);
+      expect(afterNedPose.hasAttitude).toBe(false);
+
+      // Re-measure attitude (#31 45 deg yaw) -> all domains measured again.
+      nowMs = Date.parse("2026-11-24T13:00:01.250Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 6,
+          healthIso: "2026-11-24T13:00:01.250Z",
+          quat: {
+            value: eulerRadToQuaternionWxyz(0, 0, Math.PI / 4),
+            measured: true,
+            timestamp: "2026-11-24T13:00:01.250Z",
+          },
+          ned: {
+            value: [15, -8, -4],
+            measured: true,
+            timestamp: "2026-11-24T13:00:01.000Z",
+          },
+          heading: {
+            value: 45,
+            measured: true,
+            timestamp: "2026-11-24T13:00:01.250Z",
+          },
+          globalPos: {
+            value: [30.2672, -97.7431, 150],
+            measured: true,
+            timestamp: "2026-11-24T13:00:00.750Z",
+          },
+        }),
+      );
+      drawnTexts.length = 0;
+      flushTicks();
+      const afterAttPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        { telemetryStatus: "reconnecting", skgStatus: "connected", nowMs },
+      );
+      expect(afterAttPose.hasAttitude).toBe(true);
+      expect(afterAttPose.hasHeading).toBe(true);
+      expect(afterAttPose.headingDeg).toBeCloseTo(45, 5);
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+      expect(drawnTexts).toContain("R 0° P 0° Y 45°");
+    } finally {
+      if (hudApp) unmount(hudApp);
+      telemetryStore.disconnect();
+      hudHost.remove();
+      getCtxSpy.mockRestore();
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+    }
+  });
 });

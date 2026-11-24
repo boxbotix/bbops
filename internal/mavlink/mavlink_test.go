@@ -1105,6 +1105,176 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 }
 
 // spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerRestartClearsRetainedGraphPoseDomains(t *testing.T) {
+	peer := netip.MustParseAddrPort("127.0.0.1:47001")
+	findTriple := func(triples []message.Triple, pred string) message.Triple {
+		t.Helper()
+		for _, tr := range triples {
+			if tr.Predicate == pred {
+				return tr
+			}
+		}
+		t.Fatalf("predicate %q missing from merged triples", pred)
+		return message.Triple{}
+	}
+
+	// Session 1 (12:00:00Z): vehicle measures 90° East yaw (#31), local NED (#32), and global fix (#33).
+	tracker1, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker(1): %v", err)
+	}
+	t1 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	hb := makeVehicleHB(
+		mavcodec.DomainRover,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierMeshHighRate,
+		uxsvocab.HealthFlags{ClockSyncLocked: true, CRSFLinkHealthy: true, CompanionTrunkHealthy: true},
+	)
+	tracker1.IngestDatagram(encodeFrameBytes(t, 1, 1, 1, hb), peer, t1)
+	s45 := float32(math.Sqrt2 / 2)
+	tracker1.IngestDatagram(encodeFrameBytes(t, 1, 1, 2, mavcodec.AttitudeQuaternion{
+		Q1: s45, Q2: 0, Q3: 0, Q4: s45, Yawspeed: 0.1,
+	}), peer, t1.Add(100*time.Millisecond))
+	tracker1.IngestDatagram(encodeFrameBytes(t, 1, 1, 3, mavcodec.LocalPositionNED{
+		X: 12.5, Y: -4.25, Z: -2.0, Vx: 1.2, Vy: -0.3, Vz: 0.0,
+	}), peer, t1.Add(200*time.Millisecond))
+	tracker1.IngestDatagram(encodeFrameBytes(t, 1, 1, 4, mavcodec.GlobalPositionInt{
+		Lat: 377749000, Lon: -1224194000, Alt: 25000, Hdg: 9000,
+	}), peer, t1.Add(300*time.Millisecond))
+
+	snap1, ok := tracker1.Snapshot(1)
+	if !ok {
+		t.Fatal("missing session 1 snapshot")
+	}
+	retained := graph.ReplaceBySource(nil, snap1.Triples())
+	if len(retained.Stale) != 0 {
+		t.Fatalf("session 1 ReplaceBySource stale = %+v, want empty", retained.Stale)
+	}
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 1.0 || qTr.Context != "measured" {
+		t.Fatalf("session 1 quaternion triple = %+v, want measured", qTr)
+	}
+
+	// Session 2 restarts 1 hour later (13:00:00Z) on the same vehicle identity.
+	tracker2, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker(2): %v", err)
+	}
+	t2 := t1.Add(time.Hour)
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 1, hb), peer, t2)
+
+	// Health-only #1 SYS_STATUS before any pose frame MUST preserve t2 on all 4 unmeasured pose domains.
+	t2Health1 := t2.Add(100 * time.Millisecond)
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 2, mavcodec.SysStatus{
+		Load: 950, ErrorsComm: 1, ErrorsCount1: 0, ErrorsCount2: 1100, ErrorsCount3: 350,
+	}), peer, t2Health1)
+	snapAdmitHealth, _ := tracker2.Snapshot(1)
+	for _, pred := range []string{
+		uxsvocab.PredicateAttitudeQuaternion,
+		uxsvocab.PredicateAttitudeRates,
+		uxsvocab.PredicateKinematicsNED,
+		uxsvocab.PredicateKinematicsVx,
+		uxsvocab.PredicateKinematicsVy,
+		uxsvocab.PredicateKinematicsVz,
+		uxsvocab.PredicateKinematicsHeadingDeg,
+	} {
+		tr := findTriple(snapAdmitHealth.Triples(), pred)
+		if tr.Confidence != 0.0 || tr.Context != "" || !tr.Timestamp.Equal(t2) {
+			t.Fatalf("post-admission health-only %s = %+v, want Confidence=0 Timestamp=%v", pred, tr, t2)
+		}
+	}
+
+	// Global fix with unknown heading (65535) arrives before any #31/#32 frame, then merges directly
+	// onto Session 1's retained graph (exercising the case where Session 2 had not flushed yet).
+	t2Global := t2.Add(250 * time.Millisecond)
+	gpOut := tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 3, mavcodec.GlobalPositionInt{
+		Lat: 302672000, Lon: -977431000, Alt: 150000, Hdg: 65535,
+	}), peer, t2Global)
+	if !gpOut.Accepted || gpOut.Telemetry == nil || gpOut.Telemetry.HasAttitude || gpOut.Telemetry.HasHeading || gpOut.Telemetry.HasLocalPos || !gpOut.Telemetry.HasGlobalPos {
+		t.Fatalf("session 2 direct telemetry after #33(Hdg=65535) = %+v, want only HasGlobalPos=true", gpOut.Telemetry)
+	}
+
+	snap2Global, _ := tracker2.Snapshot(1)
+	retained = graph.ReplaceBySource(retained.Triples, snap2Global.Triples())
+	if len(retained.Stale) != 0 {
+		t.Fatalf("session 2 ReplaceBySource rejected unmeasured pose reset as stale: %+v", retained.Stale)
+	}
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 0.0 || qTr.Context != "" || qTr.Object != ([4]float64{0, 0, 0, 0}) || !qTr.Timestamp.Equal(t2) {
+		t.Fatalf("retained quaternion after restart = %+v, want [0,0,0,0] Confidence=0 Timestamp=%v", qTr, t2)
+	}
+	if nedTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsNED); nedTr.Confidence != 0.0 || nedTr.Context != "" || nedTr.Object != ([3]float64{0, 0, 0}) || !nedTr.Timestamp.Equal(t2) {
+		t.Fatalf("retained NED after restart = %+v, want [0,0,0] Confidence=0 Timestamp=%v", nedTr, t2)
+	}
+	if hdgTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 0.0 || hdgTr.Context != "" || hdgTr.Object != 0.0 || !hdgTr.Timestamp.Equal(t2Global) {
+		t.Fatalf("retained heading after restart = %+v, want 0 Confidence=0 Timestamp=%v", hdgTr, t2Global)
+	}
+	if latTr := findTriple(retained.Triples, "geo.location.latitude"); latTr.Confidence != 1.0 || latTr.Context != "measured" || math.Abs(latTr.Object.(float64)-30.2672) > 1e-6 || !latTr.Timestamp.Equal(t2Global) {
+		t.Fatalf("retained latitude after restart = %+v, want 30.2672 Confidence=1 Timestamp=%v", latTr, t2Global)
+	}
+
+	// Another health-only update (#0 HEARTBEAT) keeps attitude/local-pos at t2 and global/heading at t2Global.
+	t2Health2 := t2.Add(500 * time.Millisecond)
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 4, hb), peer, t2Health2)
+	snap2Health2, _ := tracker2.Snapshot(1)
+	retained = graph.ReplaceBySource(retained.Triples, snap2Health2.Triples())
+	if len(retained.Stale) != 0 {
+		t.Fatalf("health-only ReplaceBySource stale = %+v", retained.Stale)
+	}
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 0.0 || !qTr.Timestamp.Equal(t2) {
+		t.Fatalf("quaternion after health-only update = %+v, want Confidence=0 Timestamp=%v", qTr, t2)
+	}
+	if hdgTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 0.0 || !hdgTr.Timestamp.Equal(t2Global) {
+		t.Fatalf("heading after health-only update = %+v, want Confidence=0 Timestamp=%v", hdgTr, t2Global)
+	}
+
+	// Re-measure heading (#33 Hdg=18000), then local position (#32), then attitude (#31) one by one.
+	t2Hdg := t2.Add(750 * time.Millisecond)
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 5, mavcodec.GlobalPositionInt{
+		Lat: 302672000, Lon: -977431000, Alt: 150000, Hdg: 18000,
+	}), peer, t2Hdg)
+	snap2Hdg, _ := tracker2.Snapshot(1)
+	retained = graph.ReplaceBySource(retained.Triples, snap2Hdg.Triples())
+	if hdgTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 180.0 || !hdgTr.Timestamp.Equal(t2Hdg) {
+		t.Fatalf("re-measured heading = %+v, want 180 Confidence=1 Timestamp=%v", hdgTr, t2Hdg)
+	}
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 0.0 {
+		t.Fatalf("attitude unexpectedly measured on #33: %+v", qTr)
+	}
+	if nedTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsNED); nedTr.Confidence != 0.0 {
+		t.Fatalf("local NED unexpectedly measured on #33: %+v", nedTr)
+	}
+
+	t2Ned := t2.Add(1000 * time.Millisecond)
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 6, mavcodec.LocalPositionNED{
+		X: 15.0, Y: -8.0, Z: -4.0, Vx: 0.5, Vy: 0.0, Vz: 0.0,
+	}), peer, t2Ned)
+	snap2Ned, _ := tracker2.Snapshot(1)
+	retained = graph.ReplaceBySource(retained.Triples, snap2Ned.Triples())
+	if nedTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsNED); nedTr.Confidence != 1.0 || nedTr.Context != "measured" || nedTr.Object != ([3]float64{15, -8, -4}) || !nedTr.Timestamp.Equal(t2Ned) {
+		t.Fatalf("re-measured NED = %+v, want [15,-8,-4] Confidence=1 Timestamp=%v", nedTr, t2Ned)
+	}
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 0.0 {
+		t.Fatalf("attitude unexpectedly measured on #32: %+v", qTr)
+	}
+
+	t2Att := t2.Add(1250 * time.Millisecond)
+	c225 := float32(math.Cos(math.Pi / 8))
+	s225 := float32(math.Sin(math.Pi / 8))
+	tracker2.IngestDatagram(encodeFrameBytes(t, 1, 1, 7, mavcodec.AttitudeQuaternion{
+		Q1: c225, Q2: 0, Q3: 0, Q4: s225,
+	}), peer, t2Att)
+	snap2Att, _ := tracker2.Snapshot(1)
+	retained = graph.ReplaceBySource(retained.Triples, snap2Att.Triples())
+	if qTr := findTriple(retained.Triples, uxsvocab.PredicateAttitudeQuaternion); qTr.Confidence != 1.0 || qTr.Context != "measured" || !qTr.Timestamp.Equal(t2Att) {
+		t.Fatalf("re-measured attitude = %+v, want Confidence=1 Timestamp=%v", qTr, t2Att)
+	}
+	if hdgTr := findTriple(retained.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 1.0 || angularDiffDeg(hdgTr.Object.(float64), 45.0) > 1e-2 {
+		t.Fatalf("attitude yaw heading = %+v, want 45 deg", hdgTr)
+	}
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
 func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 	if err := uxsvocab.Register(); err != nil {
 		t.Fatalf("uxsvocab.Register: %v", err)
@@ -1126,6 +1296,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		hasSysStatus bool
 		failsafes    int
 		hasAttitude  bool
+		hasLocalPos  bool
 		hasGlobalPos bool
 		hasHeading   bool
 		hdgDeg       float64
@@ -1166,6 +1337,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		sawStatusText        int
 		sawSanitizedReject   int
 		sawDroppedPeriodic   int
+		sawTrackerRestart    int
 	)
 
 	for seed := uint64(1); seed <= 40; seed++ {
@@ -1185,36 +1357,79 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		mergedTriples := map[uint8][]message.Triple{}
 		lastObservedAt := map[uint8]time.Time{}
 
-		pub := NewPublisher(
-			DefaultEntitySubject,
-			func(_ context.Context, _ string, msgs [][]byte) error {
-				publishedMu.Lock()
-				defer publishedMu.Unlock()
-				for _, raw := range msgs {
-					bm, uErr := decoder.Decode(raw)
-					if uErr != nil {
-						t.Fatalf("seed %d: decoder.Decode: %v", seed, uErr)
+		newPub := func() *Publisher {
+			return NewPublisher(
+				DefaultEntitySubject,
+				func(_ context.Context, _ string, msgs [][]byte) error {
+					publishedMu.Lock()
+					defer publishedMu.Unlock()
+					for _, raw := range msgs {
+						bm, uErr := decoder.Decode(raw)
+						if uErr != nil {
+							t.Fatalf("seed %d: decoder.Decode: %v", seed, uErr)
+						}
+						snap := *bm.Payload().(*uxsvocab.VehicleSnapshot)
+						if prevTS, ok := lastObservedAt[snap.SysID]; ok && snap.ObservedAt.Before(prevTS) {
+							t.Fatalf("seed %d sysid=%d: monotonic ObservedAt regressed (%v < %v)", seed, snap.SysID, snap.ObservedAt, prevTS)
+						}
+						lastObservedAt[snap.SysID] = snap.ObservedAt
+						materialized[snap.SysID] = snap
+						rep := graph.ReplaceBySource(mergedTriples[snap.SysID], snap.Triples())
+						if len(rep.Stale) != 0 {
+							t.Fatalf("seed %d sysid=%d: ReplaceBySource rejected triples as stale: %+v", seed, snap.SysID, rep.Stale)
+						}
+						mergedTriples[snap.SysID] = rep.Triples
 					}
-					snap := *bm.Payload().(*uxsvocab.VehicleSnapshot)
-					if prevTS, ok := lastObservedAt[snap.SysID]; ok && snap.ObservedAt.Before(prevTS) {
-						t.Fatalf("seed %d sysid=%d: monotonic ObservedAt regressed (%v < %v)", seed, snap.SysID, snap.ObservedAt, prevTS)
-					}
-					lastObservedAt[snap.SysID] = snap.ObservedAt
-					materialized[snap.SysID] = snap
-					rep := graph.ReplaceBySource(mergedTriples[snap.SysID], snap.Triples())
-					if len(rep.Stale) != 0 {
-						t.Fatalf("seed %d sysid=%d: ReplaceBySource rejected triples as stale: %+v", seed, snap.SysID, rep.Stale)
-					}
-					mergedTriples[snap.SysID] = rep.Triples
-				}
-				return nil
-			},
-			tracker.BuildUrgentBatch,
-			func() { t.Errorf("seed %d: unexpected publisher error", seed) },
-		)
+					return nil
+				},
+				func(sysids []uint8) ([]SnapshotBatchItem, error) {
+					return tracker.BuildUrgentBatch(sysids)
+				},
+				func() { t.Errorf("seed %d: unexpected publisher error", seed) },
+			)
+		}
+		pub := newPub()
+
+		drainPub := func() {
+			runCtx, runCancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				pub.Run(runCtx)
+			}()
+			time.Sleep(10 * time.Millisecond)
+			runCancel()
+			<-done
+		}
 
 		now := time.Date(2026, 11, 24, 3, 0, 0, 0, time.UTC)
 		for step := range 60 {
+			if seed%2 == 0 && step == 30 {
+				epochBatch, bErr := tracker.BuildPeriodicBatch()
+				if bErr != nil {
+					t.Fatalf("seed %d: pre-restart BuildPeriodicBatch: %v", seed, bErr)
+				}
+				pub.EnqueuePeriodic(epochBatch)
+				sawDroppedPeriodic += int(pub.DroppedPeriodic())
+				drainPub()
+
+				tracker, err = NewTracker("boxbotix", "bbops")
+				if err != nil {
+					t.Fatalf("seed %d: restart NewTracker: %v", seed, err)
+				}
+				pub = newPub()
+				publishedMu.Lock()
+				materialized = map[uint8]uxsvocab.VehicleSnapshot{}
+				publishedMu.Unlock()
+				ref = map[uint8]*refVehicle{
+					1: {},
+					2: {},
+					3: {},
+				}
+				now = now.Add(time.Minute)
+				sawTrackerRestart++
+			}
+
 			now = now.Add(50 * time.Millisecond)
 			sysid := uint8(1 + rng.IntN(3))
 			peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(40000+int(sysid)*10+rng.IntN(5)))
@@ -1393,9 +1608,10 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				if !rv.admitted {
 					continue
 				}
+				rv.hasLocalPos = true
 				rv.nedXYZ = [3]float64{float64(x), 5, -10}
 				rv.rev++
-				if out.Telemetry == nil || out.Telemetry.NEDXYZ != rv.nedXYZ {
+				if out.Telemetry == nil || !out.Telemetry.HasLocalPos || out.Telemetry.NEDXYZ != rv.nedXYZ {
 					t.Fatalf("seed %d: #32 telemetry = %+v, want %v", seed, out.Telemetry, rv.nedXYZ)
 				}
 
@@ -1433,18 +1649,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		}
 		pub.EnqueuePeriodic(finalBatch)
 		sawDroppedPeriodic += int(pub.DroppedPeriodic())
+		drainPub()
 
-		runCtx, runCancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			pub.Run(runCtx)
-		}()
-		time.Sleep(15 * time.Millisecond)
-		runCancel()
-		<-done
-
-		// Verify materialized SKG snapshots match the reference model for every admitted sysid.
+		// Verify materialized SKG snapshots and retained ReplaceBySource triples match the reference model.
 		publishedMu.Lock()
 		for sysid, rv := range ref {
 			snap, ok := materialized[sysid]
@@ -1459,30 +1666,38 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 			}
 			if snap.Domain != rv.domain || snap.Armed != rv.armed || snap.Authority != rv.authority ||
 				snap.CompanionMode != rv.mode || snap.LinkTier != rv.tier || snap.Flags != rv.flags ||
-				snap.Failsafes != rv.failsafes || snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
+				snap.Failsafes != rv.failsafes || snap.HasAttitude != rv.hasAttitude ||
+				snap.HasLocalPos != rv.hasLocalPos || snap.HasGlobalPos != rv.hasGlobalPos ||
+				snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
 				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt {
 				t.Fatalf("seed %d sysid=%d materialized mismatch:\ngot =%+v\nwant=%+v", seed, sysid, snap, *rv)
 			}
-			var gotHdgTr *message.Triple
-			for i := range mergedTriples[sysid] {
-				if mergedTriples[sysid][i].Predicate == uxsvocab.PredicateKinematicsHeadingDeg {
-					gotHdgTr = &mergedTriples[sysid][i]
-					break
+			assertMergedDomain := func(pred string, wantMeasured bool) message.Triple {
+				for i := range mergedTriples[sysid] {
+					if mergedTriples[sysid][i].Predicate == pred {
+						tr := mergedTriples[sysid][i]
+						wantConf := 0.0
+						wantCtx := ""
+						if wantMeasured {
+							wantConf = 1.0
+							wantCtx = "measured"
+						}
+						if tr.Confidence != wantConf || tr.Context != wantCtx {
+							t.Fatalf("seed %d sysid=%d ReplaceBySource %s = %+v, want measured=%v", seed, sysid, pred, tr, wantMeasured)
+						}
+						return tr
+					}
 				}
+				t.Fatalf("seed %d sysid=%d: missing %s in ReplaceBySource output", seed, sysid, pred)
+				return message.Triple{}
 			}
-			if gotHdgTr == nil {
-				t.Fatalf("seed %d sysid=%d: missing heading triple in ReplaceBySource output", seed, sysid)
-			}
+			assertMergedDomain(uxsvocab.PredicateAttitudeQuaternion, rv.hasAttitude)
+			assertMergedDomain(uxsvocab.PredicateKinematicsNED, rv.hasLocalPos)
+			assertMergedDomain("geo.location.latitude", rv.hasGlobalPos)
+			gotHdgTr := assertMergedDomain(uxsvocab.PredicateKinematicsHeadingDeg, rv.hasHeading)
 			gotHdgVal, okHdg := gotHdgTr.Object.(float64)
-			wantConf := 0.0
-			wantCtx := ""
-			if rv.hasHeading {
-				wantConf = 1.0
-				wantCtx = "measured"
-			}
-			if !okHdg || gotHdgTr.Confidence != wantConf || gotHdgTr.Context != wantCtx || angularDiffDeg(gotHdgVal, rv.hdgDeg) > 1e-2 {
-				t.Fatalf("seed %d sysid=%d ReplaceBySource heading triple = %+v, want hasHeading=%v hdg=%v",
-					seed, sysid, *gotHdgTr, rv.hasHeading, rv.hdgDeg)
+			if !okHdg || angularDiffDeg(gotHdgVal, rv.hdgDeg) > 1e-2 {
+				t.Fatalf("seed %d sysid=%d ReplaceBySource heading value = %+v, want %v", seed, sysid, gotHdgTr, rv.hdgDeg)
 			}
 		}
 		publishedMu.Unlock()
@@ -1490,9 +1705,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 || sawHdgInvalidation == 0 ||
 		sawHeartbeatEdge == 0 || sawFailsafeEdge == 0 || sawStatusText == 0 ||
-		sawSanitizedReject == 0 || sawDroppedPeriodic == 0 {
-		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d",
-			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic)
+		sawSanitizedReject == 0 || sawDroppedPeriodic == 0 || sawTrackerRestart == 0 {
+		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d restart=%d",
+			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic, sawTrackerRestart)
 	}
 }
 

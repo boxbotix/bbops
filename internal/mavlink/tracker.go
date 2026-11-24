@@ -225,11 +225,17 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		if initErr != nil {
 			return IngestOutcome{CountedError: true}
 		}
+		obsNs := unixNanoOrZero(now)
 		snap.Armed = vh.Armed
 		snap.Authority = authStr
 		snap.CompanionMode = modeStr
 		snap.LinkTier = tierStr
 		snap.Flags = vh.Custom.HealthFlags
+		snap.PoseMetadata = true
+		snap.AttitudeObservedUnixNs = obsNs
+		snap.LocalPosObservedUnixNs = obsNs
+		snap.GlobalPosObservedUnixNs = obsNs
+		snap.HeadingObservedUnixNs = obsNs
 		snap.ObservedAt = now
 		if valErr := snap.Validate(); valErr != nil {
 			return IngestOutcome{CountedError: true}
