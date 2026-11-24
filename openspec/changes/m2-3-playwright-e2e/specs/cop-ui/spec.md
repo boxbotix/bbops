@@ -9,7 +9,7 @@ The `ui/e2e/` Playwright harness and `ui/src/lib/components/` COP workspace SHAL
 
 #### Scenario: VehicleHud readouts, USV crab-angle indicator, and TacticalCanvas range labels remain non-overlapping at inspector column widths
 - **WHEN** a `Quadcopter` or crabbing `SurfaceBoat` reports multi-digit altitude, groundspeed, and signed roll/pitch/yaw (`+/-180 deg`) inside the `360px` desktop inspector column alongside `.viewport-toolbar` on `TacticalCanvas`
-- **THEN** `GS/VS/ALT`, `R/P/Y`, and active `SurfaceBoat` signed crab-angle readouts render without horizontal text collision or clipping, and northern range-ring labels remain unobstructed below `.viewport-toolbar`
+- **THEN** `VehicleHud` renders `GS`, `VS`, `ALT`, `R/P/Y`, and active `SurfaceBoat` signed crab-angle readouts in a `4 Hz`-throttled semantic HTML strip beneath the `60 fps` horizon `<canvas>` with zero horizontal `boundingBox()` overlap or clipping, and northern range-ring labels remain unobstructed below `.viewport-toolbar`
 
 #### Scenario: Selecting an external COP contact in the live browser preserves strict vehicle authority isolation
 - **WHEN** `ENTITY_STATES` delivers a non-UXS external contact record and the operator selects it in the live browser workspace
