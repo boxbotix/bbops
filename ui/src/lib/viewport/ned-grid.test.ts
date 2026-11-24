@@ -14,7 +14,9 @@ import {
   NedGridAdapter,
   USV_CRAB_SPEED_DEADBAND_MPS,
   WakeTrailBook,
+  anchorSharedFrameOrigin,
   computeCrabAngleVectors,
+  deriveNedOriginLla,
   llaToLocalNed,
   localNedToLla,
   resolveContactPalette,
@@ -361,5 +363,298 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
     expect(viewport.declutter).toBe("tactical");
     handleViewportHotkey({ key: "h" }, viewport, recordHash);
     expect(viewport.declutter).toBe("none");
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("derives NED=[0,0,0] WGS-84 origin from nonzero initial vehicle offsets and withholds external contacts until a verified (ned, lla) vehicle anchors", () => {
+    const trueOriginLla: [number, number, number] = [30.2672, -97.7431, 150];
+    const vehicleOffsetNed: [number, number, number] = [100, -45, -20];
+    const vehicleLla = localNedToLla(vehicleOffsetNed, trueOriginLla)!;
+    expect(vehicleLla).not.toBeNull();
+
+    // Direct inverse check: deriveNedOriginLla recovers NED=[0,0,0] WGS-84 origin, not vehicleLla.
+    const solvedOrigin = deriveNedOriginLla(vehicleOffsetNed, vehicleLla)!;
+    expect(solvedOrigin).not.toBeNull();
+    expect(solvedOrigin[0]).toBeCloseTo(trueOriginLla[0], 9);
+    expect(solvedOrigin[1]).toBeCloseTo(trueOriginLla[1], 9);
+    expect(solvedOrigin[2]).toBeCloseTo(trueOriginLla[2], 6);
+
+    const coLocatedContactNed = llaToLocalNed(vehicleLla, solvedOrigin)!;
+    expect(coLocatedContactNed[0]).toBeCloseTo(vehicleOffsetNed[0], 6);
+    expect(coLocatedContactNed[1]).toBeCloseTo(vehicleOffsetNed[1], 6);
+    expect(coLocatedContactNed[2]).toBeCloseTo(vehicleOffsetNed[2], 6);
+
+    // Unverified candidate must not anchor adapter origin.
+    const helperAdapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    expect(
+      anchorSharedFrameOrigin(helperAdapter, [
+        {
+          ned: [0, 0, -20],
+          lla: vehicleLla,
+          hasVerifiedFrameReference: false,
+        },
+      ]),
+    ).toBe(false);
+    expect(helperAdapter.getCamera().originLla).toBeNull();
+
+    const nowMs = Date.parse("2026-11-24T12:10:00.000Z");
+    const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const contactId = "boxbotix.local.tak.cot.contact.colocated";
+
+    const makeVehicleEntity = (
+      ned: [number, number, number],
+      lla: [number, number, number],
+    ) => ({
+      id: vehicleId,
+      kind: "uxs-vehicle" as const,
+      title: "Quad-1",
+      org: "boxbotix",
+      platform: "local",
+      sysid: 1,
+      domain: "quadcopter" as const,
+      authority: "companion-teleop" as const,
+      companionMode: "teleop-velocity" as const,
+      linkTier: "mesh-high-rate" as const,
+      armed: true,
+      healthFlags: {
+        clock_sync_locked: true,
+        teleop_deadman_clamped: false,
+        crsf_link_healthy: true,
+        companion_trunk_healthy: true,
+      },
+      sysStatus: {
+        failsafes: 0,
+        crcErrors: 0,
+        loopDtUs: 1000,
+        maxLoopDtUs: 1200,
+        rttUs: 400,
+      },
+      attitudeQuaternion: [1, 0, 0, 0] as [number, number, number, number],
+      attitudeRates: [0, 0, 0] as [number, number, number],
+      ned,
+      velocityNed: [0, 0, 0] as [number, number, number],
+      headingDeg: 0,
+      location: { latitude: lla[0], longitude: lla[1], altitude: lla[2] },
+      kvRevision: 1,
+      updatedAt: new Date(nowMs).toISOString(),
+      poisoned: false,
+      poisonError: null,
+      indexingProfile: "full",
+      source: "mavlink-ingest",
+      observedAt: new Date(nowMs).toISOString(),
+      receivedAt: new Date(nowMs).toISOString(),
+      expiresAt: null,
+      uncertaintyMeters: null,
+      feedStatus: "live" as const,
+      ingestedAtMs: nowMs,
+      triples: [],
+    });
+
+    const coLocatedContact = {
+      id: contactId,
+      kind: "external-contact" as const,
+      title: "CoLocated-Contact",
+      contactType: "a-f-G-U-C",
+      location: {
+        latitude: vehicleLla[0],
+        longitude: vehicleLla[1],
+        altitude: vehicleLla[2],
+      },
+      kvRevision: 1,
+      updatedAt: null,
+      poisoned: false,
+      poisonError: null,
+      indexingProfile: null,
+      source: "tak-bridge",
+      observedAt: null,
+      receivedAt: null,
+      expiresAt: null,
+      uncertaintyMeters: 5,
+      feedStatus: "live" as const,
+      ingestedAtMs: nowMs,
+      triples: [],
+    };
+
+    // Arrival Order 1: Vehicle with nonzero initial NED offset arrives first, co-located contact second.
+    {
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const telemetryStore = createTelemetryStore({ now: () => nowMs });
+      const skgStore = createSkgStore({ now: () => nowMs });
+      const viewportStore = createViewportStore({ skgStore });
+      const adapter = new NedGridAdapter({
+        widthPx: 640,
+        heightPx: 420,
+        zoomPxPerM: 1.5,
+      });
+
+      skgStore.entities.set(
+        vehicleId,
+        makeVehicleEntity(vehicleOffsetNed, vehicleLla),
+      );
+      const app = mount(TacticalCanvas, {
+        target: host,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          adapter,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+
+      expect(
+        host
+          .querySelector('[data-testid="tactical-viewport"]')
+          ?.getAttribute("data-origin-anchored"),
+      ).toBe("true");
+      expect(adapter.getCamera().originLla?.[0]).toBeCloseTo(
+        trueOriginLla[0],
+        8,
+      );
+      expect(adapter.getCamera().originLla?.[1]).toBeCloseTo(
+        trueOriginLla[1],
+        8,
+      );
+
+      skgStore.entities.set(contactId, coLocatedContact);
+      flushSync();
+
+      const vehScreen = adapter.project({ ned: vehicleOffsetNed });
+      const contactScreen = adapter.project({ lla: vehicleLla });
+      expect(vehScreen.visible).toBe(true);
+      expect(contactScreen.visible).toBe(true);
+      expect(contactScreen.x).toBeCloseTo(vehScreen.x, 4);
+      expect(contactScreen.y).toBeCloseTo(vehScreen.y, 4);
+
+      unmount(app);
+      host.remove();
+    }
+
+    // Arrival Order 2: External contact arrives first -> withheld; #33-before-#32 vehicle -> still withheld; #32 arrives -> co-located!
+    {
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const telemetryStore = createTelemetryStore({ now: () => nowMs });
+      const skgStore = createSkgStore({ now: () => nowMs });
+      const viewportStore = createViewportStore({ skgStore });
+      const adapter = new NedGridAdapter({
+        widthPx: 640,
+        heightPx: 420,
+        zoomPxPerM: 1.5,
+      });
+
+      skgStore.entities.set(contactId, coLocatedContact);
+      const app = mount(TacticalCanvas, {
+        target: host,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          adapter,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+
+      // Contact alone MUST NOT establish tactical origin.
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(adapter.project({ lla: vehicleLla }).visible).toBe(false);
+      expect(
+        host
+          .querySelector('[data-testid="tactical-viewport"]')
+          ?.getAttribute("data-origin-anchored"),
+      ).toBe("false");
+      expect(
+        host.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
+
+      // Vehicle arrives with #33 global position only (has_local_pos: false -> ned_xyz still [0,0,0]).
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs + 10,
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 1,
+            msg_id: 33,
+            quat_wxyz: [0, 0, 0, 0],
+            has_attitude: false,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, -20],
+            has_local_pos: false,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: vehicleLla,
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs + 10,
+          },
+        }),
+      );
+      skgStore.entities.set(
+        vehicleId,
+        makeVehicleEntity([0, 0, -20], vehicleLla),
+      );
+      flushSync();
+
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(
+        host.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
+
+      // Now #32 LOCAL_POSITION_NED arrives with true offset [100, -45, -20] and has_local_pos: true.
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs + 20,
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 2,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: vehicleOffsetNed,
+            has_local_pos: true,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: vehicleLla,
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs + 20,
+          },
+        }),
+      );
+      skgStore.entities.set(
+        vehicleId,
+        makeVehicleEntity(vehicleOffsetNed, vehicleLla),
+      );
+      flushSync();
+
+      expect(adapter.getCamera().originLla?.[0]).toBeCloseTo(
+        trueOriginLla[0],
+        8,
+      );
+      expect(adapter.getCamera().originLla?.[1]).toBeCloseTo(
+        trueOriginLla[1],
+        8,
+      );
+      expect(
+        host.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).toBeNull();
+
+      const vehScreen = adapter.project({ ned: vehicleOffsetNed });
+      const contactScreen = adapter.project({ lla: vehicleLla });
+      expect(contactScreen.visible).toBe(true);
+      expect(contactScreen.x).toBeCloseTo(vehScreen.x, 4);
+      expect(contactScreen.y).toBeCloseTo(vehScreen.y, 4);
+
+      unmount(app);
+      host.remove();
+    }
   });
 });

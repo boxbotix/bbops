@@ -290,15 +290,289 @@ export function buildHealthStrip(
   ];
 }
 
+export const WS1_KINEMATICS_FRESH_MS = 1_000;
+export const SKG_VEHICLE_FRESH_MS = 2_500;
+
+const DEG_TO_RAD = Math.PI / 180;
+
+export interface LiveVehiclePoseOptions {
+  readonly fast?: {
+    readonly quat_wxyz: readonly [number, number, number, number];
+    readonly has_attitude: boolean;
+    readonly ned_xyz: readonly [number, number, number];
+    readonly has_local_pos?: boolean;
+    readonly ned_vel: readonly [number, number, number];
+    readonly lat_lon_alt: readonly [number, number, number];
+    readonly has_global_pos: boolean;
+    readonly hdg_deg: number;
+    readonly timestamp: number;
+    readonly receivedAtMs: number;
+  };
+  readonly telemetryStatus?: string;
+  readonly skgStatus?: string;
+  readonly nowMs?: number;
+}
+
+export interface ResolvedVehiclePose {
+  readonly source: "ws1" | "skg";
+  readonly stale: boolean;
+  readonly hasAttitude: boolean;
+  readonly hasVerifiedFrameReference: boolean;
+  readonly quat: [number, number, number, number];
+  readonly ned: [number, number, number];
+  readonly vel: [number, number, number];
+  readonly headingDeg: number;
+  readonly headingRad: number;
+  readonly lla: [number, number, number] | null;
+}
+
+function normalizeHeadingDeg360(deg: number): number {
+  if (!isFiniteNumber(deg)) {
+    return 0;
+  }
+  const wrapped = ((deg % 360) + 360) % 360;
+  return wrapped >= 360 || Object.is(wrapped, -0) ? 0 : wrapped;
+}
+
+function parseIsoEpochMs(iso: string | null | undefined): number | null {
+  if (!iso) {
+    return null;
+  }
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isValidNonZeroLla(lat: number, lon: number, alt: number): boolean {
+  return (
+    isFiniteNumber(lat) &&
+    isFiniteNumber(lon) &&
+    isFiniteNumber(alt) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180 &&
+    (lat !== 0 || lon !== 0 || alt !== 0)
+  );
+}
+
+/**
+ * Returns true only when quatWxyz carries a measured unit/non-zero attitude
+ * quaternion rather than the pre-#31 zero-norm [0, 0, 0, 0] sentinel (or an
+ * unmeasured [1, 0, 0, 0] placeholder paired with a divergent #33 heading).
+ */
+export function isMeasuredAttitudeQuaternion(
+  quatWxyz: readonly [number, number, number, number],
+  resolvedHeadingDeg?: number,
+): boolean {
+  const [w, x, y, z] = quatWxyz;
+  if (
+    !isFiniteNumber(w) ||
+    !isFiniteNumber(x) ||
+    !isFiniteNumber(y) ||
+    !isFiniteNumber(z)
+  ) {
+    return false;
+  }
+  const normSq = w * w + x * x + y * y + z * z;
+  if (normSq < 1e-6) {
+    return false;
+  }
+  if (
+    resolvedHeadingDeg !== undefined &&
+    isFiniteNumber(resolvedHeadingDeg) &&
+    Math.abs(w - 1) < 1e-9 &&
+    Math.abs(x) < 1e-9 &&
+    Math.abs(y) < 1e-9 &&
+    Math.abs(z) < 1e-9
+  ) {
+    const wrappedHdg = normalizeHeadingDeg360(resolvedHeadingDeg);
+    const distFromNorth = Math.min(wrappedHdg, 360 - wrappedHdg);
+    if (distFromNorth > 0.5) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const MIN_COMPARABLE_EPOCH_MS = 946_684_800_000; // 2000-01-01T00:00:00Z
+
+/**
+ * Selects the freshest per-vehicle pose across WS #1 (20 Hz kinematics) and
+ * WS #2 (SKG ENTITY_STATES), honoring the tracker's resolved heading before
+ * the first #31 ATTITUDE_QUATERNION report and flagging stale state when
+ * neither feed is current.
+ */
+export function resolveLiveVehiclePose(
+  vehicle: VehicleEntityState,
+  options: LiveVehiclePoseOptions = {},
+): ResolvedVehiclePose {
+  const nowMs = options.nowMs ?? Date.now();
+  const fast = options.fast;
+
+  const ws1Connected = options.telemetryStatus === "connected";
+  const ws1AgeMs =
+    fast !== undefined
+      ? Math.max(0, nowMs - fast.receivedAtMs)
+      : Number.POSITIVE_INFINITY;
+  const ws1Fresh =
+    fast !== undefined && ws1Connected && ws1AgeMs <= WS1_KINEMATICS_FRESH_MS;
+
+  const skgSampleMs =
+    parseIsoEpochMs(vehicle.observedAt) ?? parseIsoEpochMs(vehicle.updatedAt);
+  const skgReceiptMs = vehicle.ingestedAtMs ?? skgSampleMs ?? Number.NaN;
+  const skgConnected =
+    options.skgStatus === undefined || options.skgStatus === "connected";
+  const skgAgeMs = Number.isFinite(skgReceiptMs)
+    ? Math.max(0, nowMs - skgReceiptMs)
+    : Number.POSITIVE_INFINITY;
+  const skgFresh =
+    skgConnected &&
+    vehicle.feedStatus !== "stale" &&
+    vehicle.feedStatus !== "disconnected" &&
+    skgAgeMs <= SKG_VEHICLE_FRESH_MS;
+
+  let skgNewer = false;
+  if (fast !== undefined) {
+    const comparableClocks =
+      skgSampleMs !== null &&
+      skgSampleMs >= MIN_COMPARABLE_EPOCH_MS &&
+      isFiniteNumber(fast.timestamp) &&
+      fast.timestamp >= MIN_COMPARABLE_EPOCH_MS;
+    if (comparableClocks) {
+      if (skgSampleMs > fast.timestamp) {
+        skgNewer = true;
+      } else if (
+        (!ws1Connected || skgSampleMs === fast.timestamp) &&
+        Number.isFinite(skgReceiptMs) &&
+        skgReceiptMs > fast.receivedAtMs
+      ) {
+        skgNewer = true;
+      }
+    } else if (Number.isFinite(skgReceiptMs)) {
+      skgNewer = skgReceiptMs > fast.receivedAtMs;
+    }
+  }
+
+  const useFast = fast !== undefined && !skgNewer && (ws1Fresh || !skgFresh);
+  const stale = !(ws1Fresh || skgFresh);
+
+  if (useFast && fast !== undefined) {
+    const quat: [number, number, number, number] = [
+      fast.quat_wxyz[0],
+      fast.quat_wxyz[1],
+      fast.quat_wxyz[2],
+      fast.quat_wxyz[3],
+    ];
+    const headingDeg = normalizeHeadingDeg360(fast.hdg_deg);
+    const hasAttitude =
+      fast.has_attitude && isMeasuredAttitudeQuaternion(quat, fast.hdg_deg);
+    const lla: [number, number, number] | null =
+      fast.has_global_pos &&
+      isFiniteNumber(fast.lat_lon_alt[0]) &&
+      isFiniteNumber(fast.lat_lon_alt[1]) &&
+      isFiniteNumber(fast.lat_lon_alt[2]) &&
+      fast.lat_lon_alt[0] >= -90 &&
+      fast.lat_lon_alt[0] <= 90 &&
+      fast.lat_lon_alt[1] >= -180 &&
+      fast.lat_lon_alt[1] <= 180
+        ? [fast.lat_lon_alt[0], fast.lat_lon_alt[1], fast.lat_lon_alt[2]]
+        : null;
+    const hasLocalPos = fast.has_local_pos ?? true;
+    return {
+      source: "ws1",
+      stale,
+      hasAttitude,
+      hasVerifiedFrameReference: hasLocalPos && lla !== null,
+      quat,
+      ned: [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]],
+      vel: [fast.ned_vel[0], fast.ned_vel[1], fast.ned_vel[2]],
+      headingDeg,
+      headingRad: headingDeg * DEG_TO_RAD,
+      lla,
+    };
+  }
+
+  const quat: [number, number, number, number] = [
+    vehicle.attitudeQuaternion[0],
+    vehicle.attitudeQuaternion[1],
+    vehicle.attitudeQuaternion[2],
+    vehicle.attitudeQuaternion[3],
+  ];
+  const headingDeg = normalizeHeadingDeg360(vehicle.headingDeg);
+  const hasAttitude = isMeasuredAttitudeQuaternion(quat, vehicle.headingDeg);
+  const lla: [number, number, number] | null = isValidNonZeroLla(
+    vehicle.location.latitude,
+    vehicle.location.longitude,
+    vehicle.location.altitude,
+  )
+    ? [
+        vehicle.location.latitude,
+        vehicle.location.longitude,
+        vehicle.location.altitude,
+      ]
+    : null;
+  const ws1HasUnanchoredLocalPos =
+    fast !== undefined && fast.has_local_pos === false;
+
+  return {
+    source: "skg",
+    stale,
+    hasAttitude,
+    hasVerifiedFrameReference: !ws1HasUnanchoredLocalPos && lla !== null,
+    quat,
+    ned: [vehicle.ned[0], vehicle.ned[1], vehicle.ned[2]],
+    vel: [
+      vehicle.velocityNed[0],
+      vehicle.velocityNed[1],
+      vehicle.velocityNed[2],
+    ],
+    headingDeg,
+    headingRad: headingDeg * DEG_TO_RAD,
+    lla,
+  };
+}
+
+/**
+ * Canonical UXS vehicle safety severity shared by both TacticalCanvas glyphs
+ * and AuthorityBanner arming indicators so active warnings never show green.
+ */
+export function evaluateVehicleSafetySeverity(
+  vehicle: Pick<
+    VehicleEntityState,
+    "poisoned" | "authority" | "armed" | "healthFlags" | "sysStatus"
+  >,
+): SafetyBadgeSeverity {
+  const flags: HealthFlags = vehicle.healthFlags;
+  const sys: VehicleSysStatus = vehicle.sysStatus;
+  if (
+    vehicle.poisoned ||
+    vehicle.authority === "mcu-failsafe" ||
+    sys.failsafes > 0 ||
+    !flags.crsf_link_healthy ||
+    !flags.companion_trunk_healthy
+  ) {
+    return "error";
+  }
+  if (
+    vehicle.authority === "direct-crsf-override" ||
+    flags.teleop_deadman_clamped ||
+    !flags.clock_sync_locked ||
+    sys.crcErrors > 0
+  ) {
+    return "warning";
+  }
+  if (vehicle.armed) {
+    return "success";
+  }
+  return "nominal";
+}
+
 export function buildVehicleBannerView(
   vehicle: VehicleEntityState,
 ): VehicleBannerView {
-  const hasFault =
-    vehicle.poisoned ||
-    vehicle.authority === "mcu-failsafe" ||
-    vehicle.sysStatus.failsafes > 0 ||
-    !vehicle.healthFlags.crsf_link_healthy ||
-    !vehicle.healthFlags.companion_trunk_healthy;
+  const overallSafety = evaluateVehicleSafetySeverity(vehicle);
+  const hasSafetyIssue =
+    overallSafety === "error" || overallSafety === "warning";
   return {
     kind: "uxs-vehicle",
     entityId: vehicle.id,
@@ -307,7 +581,7 @@ export function buildVehicleBannerView(
     poisoned: vehicle.poisoned,
     poisonError: vehicle.poisonError,
     authorityBadge: formatAuthorityBadge(vehicle.authority),
-    armedBadge: formatArmedBadge(vehicle.armed, hasFault),
+    armedBadge: formatArmedBadge(vehicle.armed, hasSafetyIssue),
     linkBadge: formatLinkTierBadge(vehicle.linkTier),
     healthStrip: buildHealthStrip(vehicle.healthFlags, vehicle.sysStatus),
   };

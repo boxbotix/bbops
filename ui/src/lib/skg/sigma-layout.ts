@@ -6,7 +6,7 @@
 // C360Studio/semstreams-ui src/lib/utils/sigma-layout.ts
 // @ 3814b3d59dab7136011429cad99a8148aeceb0cc (MIT).
 
-import type MultiDirectedGraph from "graphology";
+import type { MultiDirectedGraph } from "graphology";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 import FA2Layout from "graphology-layout-forceatlas2/worker";
 

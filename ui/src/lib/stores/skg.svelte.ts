@@ -89,6 +89,7 @@ export interface CopEntityBase {
   expiresAt: string | null;
   uncertaintyMeters: number | null;
   feedStatus: CopFeedStatus;
+  ingestedAtMs?: number;
   triples: readonly SkgTriple[];
 }
 
@@ -400,6 +401,7 @@ export function parseCopEntityState(
   stored: unknown,
   kvRevision: number,
   expectedKey?: string,
+  ingestedAtMs?: number,
 ): CopEntityState | null {
   if (!isRecord(stored) || !isValidEntityIdString(stored.id)) {
     return null;
@@ -434,6 +436,9 @@ export function parseCopEntityState(
     stored.updated_at,
     kvRevision,
   );
+  if (ingestedAtMs !== undefined && isFiniteNumber(ingestedAtMs)) {
+    base.ingestedAtMs = ingestedAtMs;
+  }
 
   const vehicleIdentity = parseVehicleEntityId(stored.id);
   if (vehicleIdentity !== null) {
@@ -558,6 +563,7 @@ function buildPoisonedEntity(
   prior: CopEntityState | undefined,
   revision: number,
   errorMessage: string,
+  ingestedAtMs?: number,
 ): CopEntityState {
   if (prior !== undefined) {
     return {
@@ -565,6 +571,7 @@ function buildPoisonedEntity(
       kvRevision: revision,
       poisoned: true,
       poisonError: errorMessage,
+      ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
     };
   }
   const sixParts = parseSixPartEntityId(key);
@@ -586,6 +593,7 @@ function buildPoisonedEntity(
       expiresAt: null,
       uncertaintyMeters: null,
       feedStatus: "unknown",
+      ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
       triples: [],
     };
   }
@@ -605,11 +613,13 @@ function buildPoisonedEntity(
     expiresAt: null,
     uncertaintyMeters: null,
     feedStatus: "unknown",
+    ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
     triples: [],
   };
 }
 
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
+  const now = options.now ?? (() => Date.now());
   const envUrl =
     typeof import.meta !== "undefined" && import.meta.env
       ? (import.meta.env.VITE_GRAPH_WS_URL as string | undefined)
@@ -703,7 +713,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     const key = parsed.key;
 
     if (parsed.type === "put") {
-      const entity = parseCopEntityState(parsed.payload, revision, key);
+      const entity = parseCopEntityState(parsed.payload, revision, key, now());
       if (!entity) {
         malformedFrames += 1;
         return;
@@ -746,6 +756,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         typeof parsed.error === "string" && parsed.error.length > 0
           ? parsed.error
           : "entity state decode error";
+      const receiptMs = now();
       if (!synced) {
         const prevStaged = stagedSnapshot.get(key);
         if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
@@ -754,7 +765,13 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         const diagnosticPrior = prevStaged ?? entities.get(key);
         stagedSnapshot.set(
           key,
-          buildPoisonedEntity(key, diagnosticPrior, revision, errorMsg),
+          buildPoisonedEntity(
+            key,
+            diagnosticPrior,
+            revision,
+            errorMsg,
+            receiptMs,
+          ),
         );
         return;
       }
@@ -764,7 +781,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       }
       entities.set(
         key,
-        buildPoisonedEntity(key, priorLive, revision, errorMsg),
+        buildPoisonedEntity(key, priorLive, revision, errorMsg, receiptMs),
       );
       return;
     }
@@ -779,7 +796,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     keepaliveIntervalMs: options.keepaliveIntervalMs,
     initialBackoffMs: options.initialBackoffMs,
     maxBackoffMs: options.maxBackoffMs,
-    now: options.now,
+    now,
     createSocket: options.createSocket,
     onStatusChange(nextStatus) {
       status = nextStatus;

@@ -51,8 +51,10 @@ export interface VehicleKinematics {
   seq: number;
   msg_id: number;
   quat_wxyz: [number, number, number, number];
+  has_attitude: boolean;
   body_rates: [number, number, number];
   ned_xyz: [number, number, number];
+  has_local_pos: boolean;
   ned_vel: [number, number, number];
   lat_lon_alt: [number, number, number];
   has_global_pos: boolean;
@@ -159,6 +161,10 @@ function parseTelemetryPayload(
     !isNonNegativeInt(payload.seq) ||
     payload.seq > 255 ||
     !isNonNegativeInt(payload.msg_id) ||
+    (payload.has_attitude !== undefined &&
+      typeof payload.has_attitude !== "boolean") ||
+    (payload.has_local_pos !== undefined &&
+      typeof payload.has_local_pos !== "boolean") ||
     typeof payload.has_global_pos !== "boolean" ||
     !isValidHeadingDeg(payload.hdg_deg) ||
     !isFiniteNumber(payload.timestamp)
@@ -176,14 +182,27 @@ function parseTelemetryPayload(
   if (!isValidLatLon(lla[0], lla[1])) {
     return null;
   }
+  const quatNormSq =
+    quat[0] * quat[0] +
+    quat[1] * quat[1] +
+    quat[2] * quat[2] +
+    quat[3] * quat[3];
+  const hasAttitude =
+    typeof payload.has_attitude === "boolean"
+      ? payload.has_attitude && quatNormSq >= 1e-6
+      : quatNormSq >= 1e-6;
+  const hasLocalPos =
+    typeof payload.has_local_pos === "boolean" ? payload.has_local_pos : true;
   return {
     sysid: expectedSysId,
     domain: payload.domain,
     seq: payload.seq,
     msg_id: payload.msg_id,
     quat_wxyz: quat,
+    has_attitude: hasAttitude,
     body_rates: rates,
     ned_xyz: ned,
+    has_local_pos: hasLocalPos,
     ned_vel: vel,
     lat_lon_alt: lla,
     has_global_pos: payload.has_global_pos,
@@ -204,12 +223,14 @@ function overwriteKinematicsInPlace(
   target.quat_wxyz[1] = next.quat_wxyz[1];
   target.quat_wxyz[2] = next.quat_wxyz[2];
   target.quat_wxyz[3] = next.quat_wxyz[3];
+  target.has_attitude = next.has_attitude;
   target.body_rates[0] = next.body_rates[0];
   target.body_rates[1] = next.body_rates[1];
   target.body_rates[2] = next.body_rates[2];
   target.ned_xyz[0] = next.ned_xyz[0];
   target.ned_xyz[1] = next.ned_xyz[1];
   target.ned_xyz[2] = next.ned_xyz[2];
+  target.has_local_pos = next.has_local_pos;
   target.ned_vel[0] = next.ned_vel[0];
   target.ned_vel[1] = next.ned_vel[1];
   target.ned_vel[2] = next.ned_vel[2];

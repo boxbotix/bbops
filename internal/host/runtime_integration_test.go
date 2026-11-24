@@ -273,7 +273,33 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 	// 5. Query POST /graph-gateway/graphql for exact entity and prefix match (once graph-index coalesces).
 	queryVehicleGraphQL(ctx, t, endpoints.HTTPBaseURL+"/graph-gateway/graphql", entityID, entityPrefix)
 
-	// 6. Dial output/websocket #1 (bbops.telemetry.>) both directly and via same-origin /ws/telemetry.
+	// 5b. Verify standalone front-door WebSocket routes reject foreign browser Origin headers
+	// with 403 Forbidden while accepting explicit same-origin Origin headers on both routes.
+	for _, wsRoute := range []string{"/ws/telemetry", "/ws/graph"} {
+		badHdr := http.Header{"Origin": []string{"http://evil.example:3000"}}
+		badConn, badResp, badErr := websocket.DefaultDialer.DialContext(ctx, frontDoorWSBase+wsRoute, badHdr)
+		if badConn != nil {
+			_ = badConn.Close()
+		}
+		if badResp != nil && badResp.Body != nil {
+			_ = badResp.Body.Close()
+		}
+		if badErr == nil || badResp == nil || badResp.StatusCode != http.StatusForbidden {
+			t.Fatalf("foreign Origin dial on %s = (err=%v, resp=%v), want HTTP 403", wsRoute, badErr, badResp)
+		}
+
+		sameOriginHdr := http.Header{"Origin": []string{endpoints.HTTPBaseURL}}
+		okConn, okResp, okErr := websocket.DefaultDialer.DialContext(ctx, frontDoorWSBase+wsRoute, sameOriginHdr)
+		if okResp != nil && okResp.Body != nil {
+			_ = okResp.Body.Close()
+		}
+		if okErr != nil {
+			t.Fatalf("same-origin dial on %s failed: %v", wsRoute, okErr)
+		}
+		_ = okConn.Close()
+	}
+
+	// 6. Dial output/websocket #1 (bbops.telemetry.>) both directly and via same-origin /ws/telemetry (native nil header).
 	telemetryConn := dialWebSocketWithRetry(ctx, t, endpoints.TelemetryWS)
 	defer func() { _ = telemetryConn.Close() }()
 	frontDoorTelemetryConn := dialWebSocketWithRetry(ctx, t, frontDoorWSBase+"/ws/telemetry")

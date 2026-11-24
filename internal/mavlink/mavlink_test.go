@@ -520,22 +520,25 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		Hdg: 65535, // UINT16_MAX = unknown
 	}
 	gpOut1 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpUnknownHdg), peerB, t0.Add(2*time.Second))
-	if !gpOut1.Accepted || gpOut1.Telemetry == nil || !gpOut1.Telemetry.HasGlobalPos || gpOut1.Telemetry.HdgDeg != 0 {
+	if !gpOut1.Accepted || gpOut1.Telemetry == nil || !gpOut1.Telemetry.HasGlobalPos || gpOut1.Telemetry.HasLocalPos ||
+		gpOut1.Telemetry.HasAttitude || gpOut1.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || gpOut1.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535) outcome = %+v", gpOut1)
 	}
 
 	gpFallbackHdg := gpUnknownHdg
 	gpFallbackHdg.Hdg = 27450 // 274.50 deg before any #31
 	gpOut2 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpFallbackHdg), peerB, t0.Add(3*time.Second))
-	if !gpOut2.Accepted || gpOut2.Telemetry == nil || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
-		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5", gpOut2.Telemetry)
+	if !gpOut2.Accepted || gpOut2.Telemetry == nil || gpOut2.Telemetry.HasAttitude || gpOut2.Telemetry.HasLocalPos ||
+		gpOut2.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false", gpOut2.Telemetry)
 	}
 
 	// #31 arrives with 90 deg East yaw ([cos(45), 0, 0, sin(45)]).
 	s45 := float32(math.Sqrt2 / 2)
 	attEast := mavcodec.AttitudeQuaternion{Q1: s45, Q2: 0, Q3: 0, Q4: s45, Yawspeed: 0.25}
 	attOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 7, attEast), peerB, t0.Add(4*time.Second))
-	if !attOut.Accepted || attOut.Telemetry == nil || math.Abs(attOut.Telemetry.HdgDeg-90.0) > 1e-4 || !attOut.Telemetry.HasGlobalPos {
+	if !attOut.Accepted || attOut.Telemetry == nil || !attOut.Telemetry.HasAttitude || attOut.Telemetry.HasLocalPos ||
+		math.Abs(attOut.Telemetry.HdgDeg-90.0) > 1e-4 || !attOut.Telemetry.HasGlobalPos {
 		t.Fatalf("ATTITUDE_QUATERNION East outcome = %+v", attOut.Telemetry)
 	}
 
@@ -556,7 +559,8 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	nedOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 9, mavcodec.LocalPositionNED{
 		X: 12.5, Y: -4.25, Z: -0.5, Vx: 1.5, Vy: -0.5, Vz: 0.0,
 	}), peerB, t0.Add(6*time.Second))
-	if !nedOut.Accepted || nedOut.Telemetry == nil || nedOut.Telemetry.NEDXYZ != [3]float64{12.5, -4.25, -0.5} ||
+	if !nedOut.Accepted || nedOut.Telemetry == nil || !nedOut.Telemetry.HasLocalPos ||
+		nedOut.Telemetry.NEDXYZ != [3]float64{12.5, -4.25, -0.5} ||
 		nedOut.Telemetry.NEDVel != [3]float64{1.5, -0.5, 0} || !nedOut.Telemetry.HasGlobalPos {
 		t.Fatalf("LOCAL_POSITION_NED fused frame = %+v", nedOut.Telemetry)
 	}

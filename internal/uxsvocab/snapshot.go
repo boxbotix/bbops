@@ -91,10 +91,11 @@ var (
 )
 
 // NewVehicleSnapshot constructs a VehicleSnapshot initialized with neutral
-// finite defaults (identity quaternion [1, 0, 0, 0], zero kinematics/GPS/counters,
-// disarmed mode, mcu-failsafe authority, sitl-local link tier) so snapshots
-// emitted before SYS_STATUS (#1) or GLOBAL_POSITION_INT (#33) arrive still
-// carry the full 22-predicate set.
+// finite defaults (zero-norm quaternion [0, 0, 0, 0] sentinel indicating no #31
+// attitude measurement yet, zero kinematics/GPS/counters, disarmed mode,
+// mcu-failsafe authority, sitl-local link tier) so snapshots emitted before
+// SYS_STATUS (#1), ATTITUDE_QUATERNION (#31), or GLOBAL_POSITION_INT (#33)
+// arrive still carry the full 22-predicate set.
 func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*VehicleSnapshot, error) {
 	if _, err := VehicleEntityID(org, platform, sysid); err != nil {
 		return nil, err
@@ -111,7 +112,6 @@ func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*Vehi
 		Authority:     AuthorityMCUFailsafe,
 		CompanionMode: ModeDisarmed,
 		LinkTier:      LinkTierSITLLocal,
-		Quaternion:    [4]float64{1, 0, 0, 0},
 	}, nil
 }
 

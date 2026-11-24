@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
+import { type UxsDomainKind, isFiniteNumber, isValidLatLon } from "../uxs";
 import {
-  type HealthFlags,
-  type UxsDomainKind,
-  isFiniteNumber,
-  isValidLatLon,
-} from "../uxs";
-import type {
-  CopFeedStatus,
-  VehicleEntityState,
-  VehicleSysStatus,
-} from "../stores/skg.svelte";
+  type ResolvedVehiclePose,
+  evaluateVehicleSafetySeverity,
+} from "../hud/view-model";
+import type { CopFeedStatus, VehicleEntityState } from "../stores/skg.svelte";
 import type {
   ScreenProjection,
   UnprojectedWorldPoint,
@@ -194,6 +189,89 @@ export function localNedToLla(
     wrapAngleSignedRad((lon0Deg + dLonDeg) * DEG_TO_RAD) * RAD_TO_DEG;
   const altM = alt0M - downM;
   return [latDeg, lonDeg, altM];
+}
+
+/**
+ * Solves for the WGS-84 tangent-plane origin [lat0Deg, lon0Deg, alt0M] at
+ * local NED = [0, 0, 0] from a verified co-registered (ned, lla) vehicle pair
+ * so llaToLocalNed(lla, originLla) == ned even when initial vehicle NED is
+ * nonzero (e.g. [100, -45, -20]).
+ */
+export function deriveNedOriginLla(
+  ned: readonly [number, number, number],
+  lla: readonly [number, number, number],
+): [number, number, number] | null {
+  const [northM, eastM, downM] = ned;
+  const [latDeg, lonDeg, altM] = lla;
+  if (
+    !isFiniteNumber(northM) ||
+    !isFiniteNumber(eastM) ||
+    !isFiniteNumber(downM) ||
+    !isValidLatLon(latDeg, lonDeg) ||
+    !isFiniteNumber(altM) ||
+    (latDeg === 0 && lonDeg === 0 && altM === 0)
+  ) {
+    return null;
+  }
+
+  const alt0M = altM + downM;
+  if (!isFiniteNumber(alt0M) || alt0M <= -WGS84_SEMI_MAJOR_M * 0.5) {
+    return null;
+  }
+
+  let lat0Deg = latDeg;
+  for (let i = 0; i < 4; i += 1) {
+    const { meridionalM } = wgs84RadiiAtLatRad(lat0Deg * DEG_TO_RAD);
+    const nextLat0Deg = latDeg - (northM / (meridionalM + alt0M)) * RAD_TO_DEG;
+    if (!isFiniteNumber(nextLat0Deg) || nextLat0Deg < -90 || nextLat0Deg > 90) {
+      return null;
+    }
+    lat0Deg = nextLat0Deg;
+  }
+
+  const lat0Rad = lat0Deg * DEG_TO_RAD;
+  const { primeVerticalM } = wgs84RadiiAtLatRad(lat0Rad);
+  const cosLat0 = Math.max(Math.cos(lat0Rad), 1e-9);
+  const dLonRad = eastM / ((primeVerticalM + alt0M) * cosLat0);
+  if (!isFiniteNumber(dLonRad) || Math.abs(dLonRad) >= Math.PI) {
+    return null;
+  }
+  const lon0Deg =
+    wrapAngleSignedRad(lonDeg * DEG_TO_RAD - dLonRad) * RAD_TO_DEG;
+  if (!isValidLatLon(lat0Deg, lon0Deg)) {
+    return null;
+  }
+
+  return [lat0Deg, lon0Deg, alt0M];
+}
+
+/**
+ * Anchors the viewport's shared NED<->LLA reference exclusively from a vehicle
+ * pose that carries both local NED and a verified geographic fix, withholding
+ * mixed-frame LLA contact placement until that shared reference exists.
+ */
+export function anchorSharedFrameOrigin(
+  adapter: ViewportAdapter,
+  vehiclePoses: Iterable<
+    Pick<ResolvedVehiclePose, "ned" | "lla"> & {
+      readonly hasVerifiedFrameReference?: boolean;
+    }
+  >,
+): boolean {
+  if (adapter.getCamera().originLla !== null) {
+    return true;
+  }
+  for (const pose of vehiclePoses) {
+    if (pose.hasVerifiedFrameReference === false || pose.lla === null) {
+      continue;
+    }
+    const originLla = deriveNedOriginLla(pose.ned, pose.lla);
+    if (originLla !== null) {
+      adapter.setCamera({ originLla });
+      return true;
+    }
+  }
+  return false;
 }
 
 function clampZoom(zoomPxPerM: number): number {
@@ -423,28 +501,7 @@ export function resolveVehicleSafetyTone(
     "poisoned" | "authority" | "armed" | "healthFlags" | "sysStatus"
   >,
 ): TacticalPaletteColors {
-  const flags: HealthFlags = vehicle.healthFlags;
-  const sys: VehicleSysStatus = vehicle.sysStatus;
-  if (
-    vehicle.poisoned ||
-    vehicle.authority === "mcu-failsafe" ||
-    sys.failsafes > 0 ||
-    !flags.crsf_link_healthy ||
-    !flags.companion_trunk_healthy
-  ) {
-    return TACTICAL_TONE_PALETTE.error;
-  }
-  if (
-    vehicle.authority === "direct-crsf-override" ||
-    flags.teleop_deadman_clamped ||
-    !flags.clock_sync_locked
-  ) {
-    return TACTICAL_TONE_PALETTE.warning;
-  }
-  if (vehicle.armed) {
-    return TACTICAL_TONE_PALETTE.success;
-  }
-  return TACTICAL_TONE_PALETTE.nominal;
+  return TACTICAL_TONE_PALETTE[evaluateVehicleSafetySeverity(vehicle)];
 }
 
 export function resolveContactPalette(

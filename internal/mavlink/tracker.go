@@ -44,8 +44,10 @@ type TelemetryFrame struct {
 	Seq          uint8      `json:"seq"`
 	MsgID        uint32     `json:"msg_id"`
 	QuatWXYZ     [4]float64 `json:"quat_wxyz"`
+	HasAttitude  bool       `json:"has_attitude"`
 	BodyRates    [3]float64 `json:"body_rates"`
 	NEDXYZ       [3]float64 `json:"ned_xyz"`
+	HasLocalPos  bool       `json:"has_local_pos"`
 	NEDVel       [3]float64 `json:"ned_vel"`
 	LatLonAlt    [3]float64 `json:"lat_lon_alt"`
 	HasGlobalPos bool       `json:"has_global_pos"`
@@ -108,6 +110,7 @@ type vehicleSession struct {
 	rev          uint64
 	hasSysStatus bool
 	hasAttitude  bool
+	hasLocalPos  bool
 	hasGlobalPos bool
 	peerAddr     netip.AddrPort
 }
@@ -460,6 +463,7 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	}
 
 	sess.snap = next
+	sess.hasLocalPos = true
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -581,8 +585,10 @@ func buildTelemetryFrame(sess *vehicleSession, seq uint8, msgID uint32, now time
 		Seq:          seq,
 		MsgID:        msgID,
 		QuatWXYZ:     sess.snap.Quaternion,
+		HasAttitude:  sess.hasAttitude,
 		BodyRates:    sess.snap.BodyRates,
 		NEDXYZ:       sess.snap.NED,
+		HasLocalPos:  sess.hasLocalPos,
 		NEDVel:       [3]float64{sess.snap.Vx, sess.snap.Vy, sess.snap.Vz},
 		LatLonAlt:    [3]float64{sess.snap.Latitude, sess.snap.Longitude, sess.snap.Altitude},
 		HasGlobalPos: sess.hasGlobalPos,

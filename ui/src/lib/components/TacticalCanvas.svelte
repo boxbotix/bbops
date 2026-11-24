@@ -9,7 +9,10 @@
 -->
 <script lang="ts">
   import { onMount, type Snippet } from "svelte";
-  import { quaternionToEulerDeg } from "$lib/hud/view-model";
+  import {
+    type ResolvedVehiclePose,
+    resolveLiveVehiclePose,
+  } from "$lib/hud/view-model";
   import type { SkgStore, VehicleEntityState } from "$lib/stores/skg.svelte";
   import type { TelemetryStore } from "$lib/stores/telemetry.svelte";
   import {
@@ -17,11 +20,12 @@
     DECLUTTER_LEVELS,
     type ViewportStore,
   } from "$lib/stores/viewport.svelte";
-  import { UXS_DOMAIN_KINDS, isValidLatLon } from "$lib/uxs";
+  import { UXS_DOMAIN_KINDS } from "$lib/uxs";
   import type { ViewportAdapter, WorldPoint } from "$lib/viewport/adapter";
   import {
     NedGridAdapter,
     WakeTrailBook,
+    anchorSharedFrameOrigin,
     computeCrabAngleVectors,
     resolveContactPalette,
     resolveDomainGlyphKind,
@@ -34,6 +38,7 @@
     viewportStore: ViewportStore;
     adapter?: ViewportAdapter;
     surfaceSlot?: Snippet;
+    now?: () => number;
     onSyncHash?: (hash: string) => void;
   }
 
@@ -43,12 +48,15 @@
     viewportStore,
     adapter = new NedGridAdapter(),
     surfaceSlot,
+    now = () => Date.now(),
     onSyncHash,
   }: Props = $props();
 
   let containerEl: HTMLDivElement | undefined = $state();
   let surfaceCanvasEl: HTMLCanvasElement | undefined = $state();
   let overlayCanvasEl: HTMLCanvasElement | undefined = $state();
+  let originAnchored = $state(false);
+  let staleVehicleIdsCsv = $state("");
 
   const wakeTrails = new WakeTrailBook();
 
@@ -65,77 +73,52 @@
   let lastPointerX = 0;
   let lastPointerY = 0;
 
-  const DEG_TO_RAD = Math.PI / 180;
-
-  function resolveVehicleKinematicsSnapshot(v: VehicleEntityState): {
-    ned: [number, number, number];
-    vel: [number, number, number];
-    headingRad: number;
-    lla: [number, number, number] | null;
-  } {
-    const fast = telemetryStore.getKinematics(v.sysid);
-    if (fast) {
-      const euler = quaternionToEulerDeg(fast.quat_wxyz);
-      const headingRad = Number.isFinite(euler.yawRad)
-        ? euler.yawRad
-        : fast.hdg_deg * DEG_TO_RAD;
-      const lla: [number, number, number] | null =
-        fast.has_global_pos &&
-        isValidLatLon(fast.lat_lon_alt[0], fast.lat_lon_alt[1])
-          ? [fast.lat_lon_alt[0], fast.lat_lon_alt[1], fast.lat_lon_alt[2]]
-          : null;
-      return {
-        ned: [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]],
-        vel: [fast.ned_vel[0], fast.ned_vel[1], fast.ned_vel[2]],
-        headingRad,
-        lla,
-      };
-    }
-    return {
-      ned: [v.ned[0], v.ned[1], v.ned[2]],
-      vel: [v.velocityNed[0], v.velocityNed[1], v.velocityNed[2]],
-      headingRad: v.headingDeg * DEG_TO_RAD,
-      lla: isValidLatLon(v.location.latitude, v.location.longitude)
-        ? [v.location.latitude, v.location.longitude, v.location.altitude]
-        : null,
-    };
+  function resolveVehiclePose(
+    v: VehicleEntityState,
+    nowMs = now(),
+  ): ResolvedVehiclePose {
+    return resolveLiveVehiclePose(v, {
+      fast: telemetryStore.getKinematics(v.sysid),
+      telemetryStatus: telemetryStore.status,
+      skgStatus: skgStore.status,
+      nowMs,
+    });
   }
 
-  function ensureOriginAnchored(vehicles: readonly VehicleEntityState[]): void {
-    const cam = adapter.getCamera();
-    if (cam.originLla !== null) {
-      return;
-    }
+  function reconcileSharedOriginAndStatuses(
+    vehicles: readonly VehicleEntityState[],
+    nowMs = now(),
+  ): Map<string, ResolvedVehiclePose> {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const poses = new Map<string, ResolvedVehiclePose>();
+    const staleIds: string[] = [];
     for (const v of vehicles) {
-      const snap = resolveVehicleKinematicsSnapshot(v);
-      if (
-        snap.lla &&
-        (snap.lla[0] !== 0 || snap.lla[1] !== 0) &&
-        Math.hypot(snap.ned[0], snap.ned[1]) < 10_000
-      ) {
-        adapter.setCamera({ originLla: snap.lla });
-        return;
+      const pose = resolveVehiclePose(v, nowMs);
+      poses.set(v.id, pose);
+      if (pose.stale) {
+        staleIds.push(v.id);
       }
     }
-    for (const contact of skgStore.externalContacts) {
-      if (
-        contact.location &&
-        isValidLatLon(contact.location.latitude, contact.location.longitude) &&
-        (contact.location.latitude !== 0 || contact.location.longitude !== 0)
-      ) {
-        adapter.setCamera({
-          originLla: [
-            contact.location.latitude,
-            contact.location.longitude,
-            contact.location.altitude ?? 0,
-          ],
-        });
-        return;
-      }
+    const anchored = anchorSharedFrameOrigin(adapter, poses.values());
+    if (originAnchored !== anchored) {
+      originAnchored = anchored;
     }
+    const nextStaleCsv = staleIds.join(",");
+    if (staleVehicleIdsCsv !== nextStaleCsv) {
+      staleVehicleIdsCsv = nextStaleCsv;
+    }
+    return poses;
   }
 
-  function applyTetherAndChase(vehicles: readonly VehicleEntityState[]): void {
+  const hasWithheldContacts = $derived(
+    !originAnchored &&
+      skgStore.externalContacts.some((contact) => contact.location !== null),
+  );
+
+  function applyTetherAndChase(
+    vehicles: readonly VehicleEntityState[],
+    poses: ReadonlyMap<string, ResolvedVehiclePose>,
+  ): void {
     const tetherId = viewportStore.tetheredEntityId;
     if (!tetherId) {
       if (!viewportStore.chaseLock && adapter.getCamera().bearingRad !== 0) {
@@ -146,7 +129,7 @@
 
     const vehicle = vehicles.find((item) => item.id === tetherId);
     if (vehicle) {
-      const snap = resolveVehicleKinematicsSnapshot(vehicle);
+      const snap = poses.get(vehicle.id) ?? resolveVehiclePose(vehicle);
       adapter.setCamera({
         centerNed: [snap.ned[0], snap.ned[1]],
         bearingRad: viewportStore.chaseLock ? snap.headingRad : 0,
@@ -171,6 +154,15 @@
       }
     }
   }
+
+  $effect(() => {
+    const vehicles = skgStore.vehicles;
+    void telemetryStore.status;
+    void skgStore.status;
+    void skgStore.externalContacts.length;
+    const poses = reconcileSharedOriginAndStatuses(vehicles);
+    applyTetherAndChase(vehicles, poses);
+  });
 
   function drawSurfaceGrid(
     ctx: CanvasRenderingContext2D,
@@ -362,6 +354,7 @@
     ctx: CanvasRenderingContext2D,
     widthPx: number,
     heightPx: number,
+    poses: ReadonlyMap<string, ResolvedVehiclePose>,
   ): void {
     ctx.clearRect(0, 0, widthPx, heightPx);
     const nextHits: RenderedHitTarget[] = [];
@@ -369,8 +362,6 @@
     const activeIds = new Set<string>();
 
     const vehicles = skgStore.vehicles;
-    ensureOriginAnchored(vehicles);
-    applyTetherAndChase(vehicles);
 
     const declutter = viewportStore.declutter;
     const showTrails = viewportStore.isLayerVisible("trails");
@@ -457,7 +448,7 @@
           continue;
         }
         activeIds.add(vehicle.id);
-        const snap = resolveVehicleKinematicsSnapshot(vehicle);
+        const snap = poses.get(vehicle.id) ?? resolveVehiclePose(vehicle);
         wakeTrails.record(vehicle.id, snap.ned);
 
         if (showTrails) {
@@ -545,6 +536,17 @@
           ctx.restore();
         }
 
+        if (snap.stale) {
+          ctx.save();
+          ctx.strokeStyle = "#94a3b8";
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.arc(proj.x, proj.y, 18, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+
         ctx.save();
         ctx.translate(proj.x, proj.y);
         drawDomainGlyph(
@@ -562,14 +564,17 @@
 
         if (
           declutter === "none" ||
-          (declutter === "minimal" && true) ||
+          declutter === "minimal" ||
           isSelected ||
+          snap.stale ||
           tone.tone === "error"
         ) {
           ctx.save();
-          ctx.fillStyle = "#e2e8f0";
+          ctx.fillStyle = snap.stale ? "#cbd5e1" : "#e2e8f0";
           ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
-          const callsign = `#${vehicle.sysid} ${vehicle.domain}`;
+          const callsign = snap.stale
+            ? `#${vehicle.sysid} ${vehicle.domain} · STALE`
+            : `#${vehicle.sysid} ${vehicle.domain}`;
           ctx.fillText(callsign, proj.x + 16, proj.y - 4);
           if (declutter === "none") {
             ctx.fillStyle = "#94a3b8";
@@ -596,10 +601,11 @@
   function get2dContext(
     canvas: HTMLCanvasElement,
   ): CanvasRenderingContext2D | null {
-    if (
-      typeof navigator !== "undefined" &&
-      /jsdom/i.test(navigator.userAgent)
-    ) {
+    const isJsdom =
+      typeof navigator !== "undefined" && /jsdom/i.test(navigator.userAgent);
+    const isMockedContext =
+      typeof canvas.getContext === "function" && "mock" in canvas.getContext;
+    if (isJsdom && !isMockedContext) {
       return null;
     }
     try {
@@ -643,6 +649,9 @@
 
     let rafId = 0;
     const renderTick = (): void => {
+      const vehicles = skgStore.vehicles;
+      const poses = reconcileSharedOriginAndStatuses(vehicles);
+      applyTetherAndChase(vehicles, poses);
       if (surfaceCanvasEl && overlayCanvasEl) {
         const { widthPx, heightPx } = adapter.getViewportSize();
         const surfaceCtx = get2dContext(surfaceCanvasEl);
@@ -651,7 +660,7 @@
           drawSurfaceGrid(surfaceCtx, widthPx, heightPx);
         }
         if (overlayCtx) {
-          drawSafetyHudOverlay(overlayCtx, widthPx, heightPx);
+          drawSafetyHudOverlay(overlayCtx, widthPx, heightPx, poses);
         }
       }
       rafId = window.requestAnimationFrame(renderTick);
@@ -761,6 +770,8 @@
   class="tactical-viewport"
   bind:this={containerEl}
   data-testid="tactical-viewport"
+  data-origin-anchored={originAnchored ? "true" : "false"}
+  data-stale-vehicles={staleVehicleIdsCsv}
 >
   <div class="viewport-surface" data-layer="viewport-surface">
     <canvas
@@ -784,6 +795,16 @@
     ondblclick={handleDoubleClick}
     onwheel={handleWheel}
   ></canvas>
+
+  {#if hasWithheldContacts}
+    <div
+      class="mixed-frame-notice"
+      data-testid="mixed-frame-withheld"
+      role="status"
+    >
+      Contacts withheld: awaiting verified vehicle (NED, LLA) origin
+    </div>
+  {/if}
 
   <div
     class="viewport-toolbar"
@@ -902,6 +923,21 @@
 
   .safety-hud-canvas:active {
     cursor: grabbing;
+  }
+
+  .mixed-frame-notice {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    z-index: 3;
+    padding: 3px 8px;
+    background: var(--ui-surface-overlay, rgba(16, 23, 38, 0.9));
+    border: 1px solid var(--ui-border-strong, #334155);
+    border-radius: 4px;
+    color: var(--ui-text-secondary, #94a3b8);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    pointer-events: none;
   }
 
   .viewport-toolbar {
