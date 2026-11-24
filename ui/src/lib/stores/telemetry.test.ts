@@ -683,42 +683,35 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     );
     expect(first?.has_heading).toBe(false);
 
-    // Legacy WS1 startup wire shape (msg_id=33, [1,0,0,0] birth quat, [0,0,0] rates, hdg_deg=0, neither has_attitude nor has_heading):
-    const legacyWire = JSON.stringify({
-      type: "data",
-      subject: "bbops.telemetry.2",
-      timestamp: 10_200,
-      payload: {
-        sysid: 2,
-        domain: "rover",
-        seq: 1,
-        msg_id: 33,
-        quat_wxyz: [1, 0, 0, 0],
-        body_rates: [0, 0, 0],
-        ned_xyz: [0, 0, 0],
-        ned_vel: [0, 0, 0],
-        lat_lon_alt: [30.2672, -97.7431, 150],
-        has_global_pos: true,
-        hdg_deg: 0,
-        timestamp: 10_200,
-      },
+    // Legacy WS1 session on one connection:
+    // 1) unannotated #33 position -> [false, false]
+    // 2) genuine #31 level-North attitude ([1,0,0,0], [0,0,0], hdg_deg=0) -> [true, true]
+    // 3) #32 local-position 50 ms later with fused [1,0,0,0] -> stays [true, true]
+    // 4) #33 global-position 50 ms later with fused [1,0,0,0] -> stays [true, true]
+    // 5) session disconnect + new session -> resets back to [false, false] on unannotated #33!
+    const rig = new MockWebSocketRig();
+    const legacyStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: rig.createSocket,
     });
-    store.ingestRawFrame(legacyWire);
-    const legacyParsed = store.getKinematics(2);
-    expect(legacyParsed?.has_attitude).toBe(false);
-    expect(legacyParsed?.has_heading).toBe(false);
+    legacyStore.connect();
+    rig.latest.serverOpen();
 
-    // Legacy #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) still reports measured attitude + heading.
-    store.ingestRawFrame(
+    const makeLegacyFrame = (
+      seq: number,
+      msgId: number,
+      timestamp: number,
+      extra: Record<string, unknown> = {},
+    ) =>
       JSON.stringify({
         type: "data",
         subject: "bbops.telemetry.2",
-        timestamp: 10_250,
+        timestamp,
         payload: {
           sysid: 2,
           domain: "rover",
-          seq: 2,
-          msg_id: 31,
+          seq,
+          msg_id: msgId,
           quat_wxyz: [1, 0, 0, 0],
           body_rates: [0, 0, 0],
           ned_xyz: [0, 0, 0],
@@ -726,11 +719,70 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
           lat_lon_alt: [30.2672, -97.7431, 150],
           has_global_pos: true,
           hdg_deg: 0,
-          timestamp: 10_250,
+          timestamp,
+          ...extra,
         },
+      });
+
+    rig.latest.serverMessage(makeLegacyFrame(1, 33, 10_200));
+    const legacyParsed = legacyStore.getKinematics(2);
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+
+    // Out-of-order #31 frame (timestamp 10_150 < 10_200) is dropped and MUST NOT latch attitude!
+    rig.latest.serverMessage(makeLegacyFrame(2, 31, 10_150));
+    expect(legacyStore.droppedOutOfOrderCount).toBe(1);
+    rig.latest.serverMessage(makeLegacyFrame(3, 32, 10_225));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+
+    // Genuine in-order #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) latches attitude + heading.
+    rig.latest.serverMessage(makeLegacyFrame(4, 31, 10_250));
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+
+    // #32 LOCAL_POSITION_NED 50 ms later carrying fused [1,0,0,0] retains measured attitude + heading!
+    rig.latest.serverMessage(
+      makeLegacyFrame(5, 32, 10_300, { ned_xyz: [4, -2, 0] }),
+    );
+    expect(legacyParsed?.ned_xyz).toEqual([4, -2, 0]);
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+
+    // #33 GLOBAL_POSITION_INT 50 ms later carrying fused [1,0,0,0] also retains measured attitude + heading!
+    rig.latest.serverMessage(
+      makeLegacyFrame(6, 33, 10_350, {
+        lat_lon_alt: [30.2673, -97.7432, 150],
       }),
     );
     expect(legacyParsed?.has_attitude).toBe(true);
     expect(legacyParsed?.has_heading).toBe(true);
+
+    // Explicit modern availability flags override the legacy latch immediately!
+    rig.latest.serverMessage(
+      makeLegacyFrame(7, 33, 10_400, {
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        has_heading: true,
+        hdg_deg: 0,
+      }),
+    );
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(true);
+
+    // Re-latch via #31, then drop the socket and open a new session: inference MUST reset!
+    rig.latest.serverMessage(makeLegacyFrame(8, 31, 10_450));
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_heading).toBe(true);
+
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    rig.latest.serverOpen();
+
+    rig.latest.serverMessage(makeLegacyFrame(9, 33, 10_500));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+
+    legacyStore.disconnect();
   });
 });

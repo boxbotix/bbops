@@ -761,35 +761,68 @@ function didVehiclePoseAdvance(
   );
 }
 
-function assignPreSyncPoseReceipt(
-  prior: CopEntityState | undefined,
+interface VehiclePoseHighWater {
+  observedNs: bigint;
+  pose: VehicleEntityState;
+  ingestedAtMs: number | null;
+  ingestedLive: boolean;
+}
+
+function applyVehiclePoseReceipt(
+  highWater: VehiclePoseHighWater | undefined,
   next: VehicleEntityState,
   receiptMs: number,
-): void {
-  next.poseIngestedLive = false;
-  if (!next.poseObservedAt) {
-    next.poseIngestedAtMs = null;
-    return;
+  isLivePostSync: boolean,
+): VehiclePoseHighWater | undefined {
+  const nextPoseObs = next.poseObservedAt;
+  if (!nextPoseObs) {
+    next.poseIngestedAtMs =
+      highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
+    next.poseIngestedLive = false;
+    return highWater;
   }
-  if (
-    prior === undefined ||
-    prior.kind !== "uxs-vehicle" ||
-    !prior.poseObservedAt
-  ) {
+
+  const nextNs = parseTripleInstantNs(nextPoseObs);
+  if (highWater === undefined || nextNs > highWater.observedNs) {
     next.poseIngestedAtMs = receiptMs;
-    return;
+    next.poseIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: next.poseIngestedLive,
+    };
   }
-  const nextNs = parseTripleInstantNs(next.poseObservedAt);
-  const priorNs = parseTripleInstantNs(prior.poseObservedAt);
-  if (nextNs < priorNs) {
+
+  if (nextNs < highWater.observedNs) {
     next.poseIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
-    return;
+    next.poseIngestedLive = false;
+    return highWater;
   }
-  if (didVehiclePoseAdvance(prior, next)) {
+
+  if (didVehiclePoseAdvance(highWater.pose, next)) {
     next.poseIngestedAtMs = receiptMs;
-    return;
+    next.poseIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: next.poseIngestedLive,
+    };
   }
-  next.poseIngestedAtMs = prior.poseIngestedAtMs ?? EXPIRED_POSE_RECEIPT_MS;
+
+  next.poseIngestedAtMs =
+    highWater.ingestedAtMs ?? (isLivePostSync ? null : EXPIRED_POSE_RECEIPT_MS);
+  next.poseIngestedLive = isLivePostSync ? highWater.ingestedLive : false;
+  if (!isLivePostSync) {
+    return {
+      observedNs: highWater.observedNs,
+      pose: next,
+      ingestedAtMs: next.poseIngestedAtMs,
+      ingestedLive: false,
+    };
+  }
+  return highWater;
 }
 
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
@@ -803,6 +836,10 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   // D2 Option A: pre-synced shadow buffer intentionally stays off Svelte reactive tracking.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const stagedSnapshot = new Map<string, CopEntityState>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const maxPoseByKey = new Map<string, VehiclePoseHighWater>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const stagedMaxPoseByKey = new Map<string, VehiclePoseHighWater>();
   let malformedFrames = 0;
 
   let status = $state<WsConnectionStatus>("disconnected");
@@ -838,6 +875,8 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   function clearFeedState(): void {
     entities.clear();
     stagedSnapshot.clear();
+    maxPoseByKey.clear();
+    stagedMaxPoseByKey.clear();
     synced = false;
     lastSyncedRevision = null;
     malformedFrames = 0;
@@ -847,12 +886,28 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     for (const existingKey of Array.from(entities.keys())) {
       if (!stagedSnapshot.has(existingKey)) {
         entities.delete(existingKey);
+        maxPoseByKey.delete(existingKey);
+      }
+    }
+    for (const trackedKey of Array.from(maxPoseByKey.keys())) {
+      const stagedEntity = stagedSnapshot.get(trackedKey);
+      if (!stagedEntity || stagedEntity.kind !== "uxs-vehicle") {
+        maxPoseByKey.delete(trackedKey);
       }
     }
     for (const [key, entity] of stagedSnapshot.entries()) {
       entities.set(key, entity);
+      if (entity.kind === "uxs-vehicle") {
+        const nextHighWater = stagedMaxPoseByKey.get(key);
+        if (nextHighWater !== undefined) {
+          maxPoseByKey.set(key, nextHighWater);
+        }
+      } else {
+        maxPoseByKey.delete(key);
+      }
     }
     stagedSnapshot.clear();
+    stagedMaxPoseByKey.clear();
     synced = true;
     lastSyncedRevision = syncRevision;
   }
@@ -904,8 +959,19 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           return;
         }
         if (entity.kind === "uxs-vehicle") {
-          const priorVehicle = prevStaged ?? entities.get(key);
-          assignPreSyncPoseReceipt(priorVehicle, entity, receiptMs);
+          const priorHighWater =
+            stagedMaxPoseByKey.get(key) ?? maxPoseByKey.get(key);
+          const nextHighWater = applyVehiclePoseReceipt(
+            priorHighWater,
+            entity,
+            receiptMs,
+            false,
+          );
+          if (nextHighWater !== undefined) {
+            stagedMaxPoseByKey.set(key, nextHighWater);
+          }
+        } else {
+          stagedMaxPoseByKey.delete(key);
         }
         stagedSnapshot.set(key, entity);
         return;
@@ -915,29 +981,17 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         return;
       }
       if (entity.kind === "uxs-vehicle") {
-        if (didVehiclePoseAdvance(prevLive, entity)) {
-          entity.poseIngestedAtMs = receiptMs;
-          entity.poseIngestedLive = true;
-        } else if (prevLive?.kind === "uxs-vehicle") {
-          const nextPoseObs = entity.poseObservedAt;
-          const prevPoseObs = prevLive.poseObservedAt;
-          const regressed =
-            (!nextPoseObs && Boolean(prevPoseObs)) ||
-            (Boolean(nextPoseObs) &&
-              Boolean(prevPoseObs) &&
-              parseTripleInstantNs(nextPoseObs as string) <
-                parseTripleInstantNs(prevPoseObs as string));
-          if (regressed) {
-            entity.poseIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
-            entity.poseIngestedLive = false;
-          } else {
-            entity.poseIngestedAtMs = prevLive.poseIngestedAtMs ?? null;
-            entity.poseIngestedLive = prevLive.poseIngestedLive ?? false;
-          }
-        } else {
-          entity.poseIngestedAtMs = null;
-          entity.poseIngestedLive = false;
+        const nextHighWater = applyVehiclePoseReceipt(
+          maxPoseByKey.get(key),
+          entity,
+          receiptMs,
+          true,
+        );
+        if (nextHighWater !== undefined) {
+          maxPoseByKey.set(key, nextHighWater);
         }
+      } else {
+        maxPoseByKey.delete(key);
       }
       entities.set(key, entity);
       return;
@@ -950,6 +1004,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           return;
         }
         stagedSnapshot.delete(key);
+        stagedMaxPoseByKey.delete(key);
         return;
       }
       const prevLive = entities.get(key);
@@ -957,6 +1012,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         return;
       }
       entities.delete(key);
+      maxPoseByKey.delete(key);
       return;
     }
 
@@ -1014,11 +1070,13 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       // Begin staging pre-synced snapshot without clearing live `entities` (gapless reconnect).
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
     onMessage: ingestRawFrame,
     onDisconnect() {
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
     onEndpointChange() {
       clearFeedState();
@@ -1060,6 +1118,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       wsClient.disconnect();
       synced = false;
       stagedSnapshot.clear();
+      stagedMaxPoseByKey.clear();
     },
     getEntity(entityId: string | null | undefined) {
       if (!entityId) {

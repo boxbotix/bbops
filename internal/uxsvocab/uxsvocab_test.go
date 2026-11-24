@@ -640,4 +640,37 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 	if err := json.Unmarshal([]byte("null"), &VehicleSnapshot{}); err == nil {
 		t.Fatal("json.Unmarshal(null) succeeded, want error")
 	}
+
+	// Invalidated domain (!HasHeading with HeadingObservedUnixNs > 0) MUST carry the invalidation
+	// timestamp so graph.ReplaceBySource supersedes a prior measured heading instead of rejecting epochZero!
+	t1 := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	t2 := t1.Add(250 * time.Millisecond)
+	measuredSnap := *valid
+	measuredSnap.PoseMetadata = true
+	measuredSnap.HasGlobalPos = true
+	measuredSnap.GlobalPosObservedUnixNs = t1.UnixNano()
+	measuredSnap.HasHeading = true
+	measuredSnap.HeadingDeg = 274.5
+	measuredSnap.HeadingObservedUnixNs = t1.UnixNano()
+	measuredSnap.ObservedAt = t1
+
+	invalidatedSnap := measuredSnap
+	invalidatedSnap.HasHeading = false
+	invalidatedSnap.HeadingDeg = 0
+	invalidatedSnap.HeadingObservedUnixNs = t2.UnixNano()
+	invalidatedSnap.GlobalPosObservedUnixNs = t2.UnixNano()
+	invalidatedSnap.ObservedAt = t2
+
+	rep1 := graph.ReplaceBySource(nil, measuredSnap.Triples())
+	rep2 := graph.ReplaceBySource(rep1.Triples, invalidatedSnap.Triples())
+	if len(rep2.Stale) != 0 {
+		t.Fatalf("ReplaceBySource rejected invalidated heading as stale: %+v", rep2.Stale)
+	}
+	for _, tr := range rep2.Triples {
+		if tr.Predicate == PredicateKinematicsHeadingDeg {
+			if tr.Confidence != 0.0 || tr.Context != "" || tr.Object != 0.0 || !tr.Timestamp.Equal(t2) {
+				t.Fatalf("ReplaceBySource invalidated heading triple = %+v, want Object=0 Confidence=0 Timestamp=%v", tr, t2)
+			}
+		}
+	}
 }

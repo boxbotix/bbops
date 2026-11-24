@@ -17,6 +17,7 @@ import (
 	"github.com/boxbotix/bbops/internal/mavcodec"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
+	"github.com/c360studio/semengine/graph"
 	"github.com/c360studio/semengine/message"
 	"github.com/c360studio/semengine/natsclient"
 	"github.com/c360studio/semengine/payloadregistry"
@@ -548,27 +549,74 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		!gpOut2.Telemetry.HasHeading || gpOut2.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false HasHeading=true", gpOut2.Telemetry)
 	}
+	findTriple := func(triples []message.Triple, pred string) message.Triple {
+		t.Helper()
+		for _, tr := range triples {
+			if tr.Predicate == pred {
+				return tr
+			}
+		}
+		t.Fatalf("predicate %q missing from merged triples", pred)
+		return message.Triple{}
+	}
+	snap274, _ := tracker.Snapshot(2)
+	skgMerged := graph.ReplaceBySource(nil, snap274.Triples())
+	if len(skgMerged.Stale) != 0 {
+		t.Fatalf("ReplaceBySource(274.5) stale = %+v, want empty", skgMerged.Stale)
+	}
+	if hdgTr := findTriple(skgMerged.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 274.5 {
+		t.Fatalf("ReplaceBySource(274.5) heading triple = %+v, want Object=274.5 Confidence=1 Context=measured", hdgTr)
+	}
 
-	// Subsequent #33 with unknown Hdg=65535 before any #31 MUST invalidate fallback heading on both lanes!
-	gpOutLostHdg := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpUnknownHdg), peerB, t0.Add(3250*time.Millisecond))
+	// Subsequent #33 with unknown Hdg=65535 before any #31 MUST invalidate fallback heading on both lanes
+	// AND carry obsNs so SemEngine graph.ReplaceBySource replaces the stored 274.5 deg triple!
+	tLostHdg := t0.Add(3250 * time.Millisecond)
+	gpOutLostHdg := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpUnknownHdg), peerB, tLostHdg)
 	if !gpOutLostHdg.Accepted || gpOutLostHdg.Telemetry == nil || gpOutLostHdg.Telemetry.HasAttitude ||
 		gpOutLostHdg.Telemetry.HasHeading || gpOutLostHdg.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535 after 274.5) = %+v, want HasHeading=false HdgDeg=0", gpOutLostHdg.Telemetry)
 	}
 	snapLostHdg, _ := tracker.Snapshot(2)
-	if hdgTr := snapLostHdg.Triples()[17]; hdgTr.Confidence != 0 || hdgTr.Context != "" {
-		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535 after 274.5) heading triple = %+v, want Confidence=0 Context=\"\"", hdgTr)
+	skgMerged = graph.ReplaceBySource(skgMerged.Triples, snapLostHdg.Triples())
+	if len(skgMerged.Stale) != 0 {
+		t.Fatalf("ReplaceBySource(unknown 65535 after 274.5) rejected invalidation as stale: %+v", skgMerged.Stale)
+	}
+	if hdgTr := findTriple(skgMerged.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 0 || hdgTr.Context != "" || hdgTr.Object != 0.0 || !hdgTr.Timestamp.Equal(tLostHdg) {
+		t.Fatalf("ReplaceBySource(unknown 65535 after 274.5) heading triple = %+v, want Object=0 Confidence=0 Context=\"\" Timestamp=%v", hdgTr, tLostHdg)
 	}
 
-	// Measured 0.00 deg North restores HasHeading=true and Confidence=1 / Context="measured".
-	gpOutRestoredNorth := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpZeroNorthHdg), peerB, t0.Add(3500*time.Millisecond))
+	// Health-only update while heading is unknown MUST keep heading unmeasured at tLostHdg (neither reverting to 274.5 nor advancing heading timestamp).
+	tHealthWhileUnknown := t0.Add(3375 * time.Millisecond)
+	hbSteadyWhileUnknown := makeVehicleHB(mavcodec.DomainRover, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
+	if hbWhileUnknownOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, hbSteadyWhileUnknown), peerB, tHealthWhileUnknown); !hbWhileUnknownOut.Accepted {
+		t.Fatalf("HEARTBEAT while heading unknown outcome = %+v", hbWhileUnknownOut)
+	}
+	snapHealthWhileUnknown, _ := tracker.Snapshot(2)
+	skgMerged = graph.ReplaceBySource(skgMerged.Triples, snapHealthWhileUnknown.Triples())
+	if len(skgMerged.Stale) != 0 {
+		t.Fatalf("ReplaceBySource(health-only while heading unknown) stale = %+v, want empty", skgMerged.Stale)
+	}
+	if hdgTr := findTriple(skgMerged.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 0 || hdgTr.Context != "" || hdgTr.Object != 0.0 || !hdgTr.Timestamp.Equal(tLostHdg) {
+		t.Fatalf("ReplaceBySource(health-only while heading unknown) heading triple = %+v, want Confidence=0 Timestamp=%v", hdgTr, tLostHdg)
+	}
+	if armedTr := findTriple(skgMerged.Triples, uxsvocab.PredicateHealthArmed); !armedTr.Timestamp.Equal(tHealthWhileUnknown) {
+		t.Fatalf("ReplaceBySource(health-only while heading unknown) armed timestamp = %v, want %v", armedTr.Timestamp, tHealthWhileUnknown)
+	}
+
+	// Measured 0.00 deg North restores HasHeading=true and Confidence=1 / Context="measured" in ReplaceBySource.
+	tRestoredNorth := t0.Add(3500 * time.Millisecond)
+	gpOutRestoredNorth := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpZeroNorthHdg), peerB, tRestoredNorth)
 	if !gpOutRestoredNorth.Accepted || gpOutRestoredNorth.Telemetry == nil || gpOutRestoredNorth.Telemetry.HasAttitude ||
 		!gpOutRestoredNorth.Telemetry.HasHeading || gpOutRestoredNorth.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0 after unknown) = %+v, want HasHeading=true HdgDeg=0", gpOutRestoredNorth.Telemetry)
 	}
 	snapRestoredNorth, _ := tracker.Snapshot(2)
-	if hdgTr := snapRestoredNorth.Triples()[17]; hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 0.0 {
-		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0 after unknown) heading triple = %+v, want Confidence=1 Context=measured Object=0", hdgTr)
+	skgMerged = graph.ReplaceBySource(skgMerged.Triples, snapRestoredNorth.Triples())
+	if len(skgMerged.Stale) != 0 {
+		t.Fatalf("ReplaceBySource(Hdg=0 after unknown) stale = %+v, want empty", skgMerged.Stale)
+	}
+	if hdgTr := findTriple(skgMerged.Triples, uxsvocab.PredicateKinematicsHeadingDeg); hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 0.0 || !hdgTr.Timestamp.Equal(tRestoredNorth) {
+		t.Fatalf("ReplaceBySource(Hdg=0 after unknown) heading triple = %+v, want Confidence=1 Context=measured Object=0 Timestamp=%v", hdgTr, tRestoredNorth)
 	}
 
 	// #31 arrives with 90 deg East yaw ([cos(45), 0, 0, sin(45)]).
@@ -1134,6 +1182,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 		var publishedMu sync.Mutex
 		materialized := map[uint8]uxsvocab.VehicleSnapshot{}
+		mergedTriples := map[uint8][]message.Triple{}
 		lastObservedAt := map[uint8]time.Time{}
 
 		pub := NewPublisher(
@@ -1152,6 +1201,11 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					lastObservedAt[snap.SysID] = snap.ObservedAt
 					materialized[snap.SysID] = snap
+					rep := graph.ReplaceBySource(mergedTriples[snap.SysID], snap.Triples())
+					if len(rep.Stale) != 0 {
+						t.Fatalf("seed %d sysid=%d: ReplaceBySource rejected triples as stale: %+v", seed, snap.SysID, rep.Stale)
+					}
+					mergedTriples[snap.SysID] = rep.Triples
 				}
 				return nil
 			},
@@ -1408,6 +1462,27 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				snap.Failsafes != rv.failsafes || snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
 				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt {
 				t.Fatalf("seed %d sysid=%d materialized mismatch:\ngot =%+v\nwant=%+v", seed, sysid, snap, *rv)
+			}
+			var gotHdgTr *message.Triple
+			for i := range mergedTriples[sysid] {
+				if mergedTriples[sysid][i].Predicate == uxsvocab.PredicateKinematicsHeadingDeg {
+					gotHdgTr = &mergedTriples[sysid][i]
+					break
+				}
+			}
+			if gotHdgTr == nil {
+				t.Fatalf("seed %d sysid=%d: missing heading triple in ReplaceBySource output", seed, sysid)
+			}
+			gotHdgVal, okHdg := gotHdgTr.Object.(float64)
+			wantConf := 0.0
+			wantCtx := ""
+			if rv.hasHeading {
+				wantConf = 1.0
+				wantCtx = "measured"
+			}
+			if !okHdg || gotHdgTr.Confidence != wantConf || gotHdgTr.Context != wantCtx || angularDiffDeg(gotHdgVal, rv.hdgDeg) > 1e-2 {
+				t.Fatalf("seed %d sysid=%d ReplaceBySource heading triple = %+v, want hasHeading=%v hdg=%v",
+					seed, sysid, *gotHdgTr, rv.hasHeading, rv.hdgDeg)
 			}
 		}
 		publishedMu.Unlock()

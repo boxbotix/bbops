@@ -1089,22 +1089,270 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
     // Higher KV revision (rev 4) carrying an hour-old 30° pose MUST expire poseIngestedLive and poseIngestedAtMs!
     browserNowMs += 100;
-    const hourOldIso = new Date(browserNowMs - 3_600_000).toISOString();
+    const hourOldBaseMs = browserNowMs - 3_600_000;
+    const hourOld100Iso = new Date(hourOldBaseMs + 100).toISOString();
     const regressed30Payload = buildVehicleStoredPayload(
       1,
       { "uxs.kinematics.headingdeg": 30 },
       {
-        observedAt: hourOldIso,
+        observedAt: hourOld100Iso,
         updatedAt: new Date(browserNowMs).toISOString(),
       },
     );
     store.ingestRawFrame(
       putFrame(regressed30Payload.id, 4, regressed30Payload),
     );
-    const afterRegressed = store.getCommandableVehicle(regressed30Payload.id)!;
-    expect(afterRegressed.headingDeg).toBe(30);
-    expect(afterRegressed.poseObservedAt).toBe(hourOldIso);
-    expect(afterRegressed.poseIngestedLive).toBe(false);
-    expect(afterRegressed.poseIngestedAtMs).toBeLessThan(0);
+    const afterRegressed1 = store.getCommandableVehicle(regressed30Payload.id)!;
+    expect(afterRegressed1.headingDeg).toBe(30);
+    expect(afterRegressed1.poseObservedAt).toBe(hourOld100Iso);
+    expect(afterRegressed1.poseIngestedLive).toBe(false);
+    expect(afterRegressed1.poseIngestedAtMs).toBeLessThan(0);
+
+    // Second and third replay updates advancing within the 11:00 replay window (+100ms, +200ms)
+    // MUST stay stale because they remain older than the entity's 13:10:00.250Z high-water mark!
+    browserNowMs += 100;
+    const hourOld200Iso = new Date(hourOldBaseMs + 200).toISOString();
+    const regressed31Payload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 31 },
+      {
+        observedAt: hourOld200Iso,
+        updatedAt: new Date(browserNowMs).toISOString(),
+      },
+    );
+    store.ingestRawFrame(
+      putFrame(regressed31Payload.id, 5, regressed31Payload),
+    );
+    const afterRegressed2 = store.getCommandableVehicle(regressed31Payload.id)!;
+    expect(afterRegressed2.headingDeg).toBe(31);
+    expect(afterRegressed2.poseObservedAt).toBe(hourOld200Iso);
+    expect(afterRegressed2.poseIngestedLive).toBe(false);
+    expect(afterRegressed2.poseIngestedAtMs).toBeLessThan(0);
+
+    browserNowMs += 100;
+    const hourOld300Iso = new Date(hourOldBaseMs + 300).toISOString();
+    const regressed32Payload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 32 },
+      {
+        observedAt: hourOld300Iso,
+        updatedAt: new Date(browserNowMs).toISOString(),
+      },
+    );
+    store.ingestRawFrame(
+      putFrame(regressed32Payload.id, 6, regressed32Payload),
+    );
+    const afterRegressed3 = store.getCommandableVehicle(regressed32Payload.id)!;
+    expect(afterRegressed3.poseIngestedLive).toBe(false);
+    expect(afterRegressed3.poseIngestedAtMs).toBeLessThan(0);
+
+    // Duplicate replay put (rev 7) and health-only update while holding replay pose (rev 8) MUST also remain stale!
+    browserNowMs += 100;
+    store.ingestRawFrame(
+      putFrame(regressed32Payload.id, 7, regressed32Payload),
+    );
+    expect(
+      store.getCommandableVehicle(regressed32Payload.id)?.poseIngestedLive,
+    ).toBe(false);
+    expect(
+      store.getCommandableVehicle(regressed32Payload.id)?.poseIngestedAtMs,
+    ).toBeLessThan(0);
+
+    browserNowMs += 100;
+    const healthAtReplayIso = new Date(browserNowMs).toISOString();
+    const healthDuringReplayTriples = regressed32Payload.triples.map((t) =>
+      t.predicate === "uxs.health.armed"
+        ? { ...t, object: false, timestamp: healthAtReplayIso }
+        : t,
+    );
+    store.ingestRawFrame(
+      putFrame(regressed32Payload.id, 8, {
+        id: regressed32Payload.id,
+        updated_at: healthAtReplayIso,
+        triples: healthDuringReplayTriples,
+      }),
+    );
+    const afterHealthDuringReplay = store.getCommandableVehicle(
+      regressed32Payload.id,
+    )!;
+    expect(afterHealthDuringReplay.armed).toBe(false);
+    expect(afterHealthDuringReplay.poseObservedAt).toBe(hourOld300Iso);
+    expect(afterHealthDuringReplay.poseIngestedLive).toBe(false);
+    expect(afterHealthDuringReplay.poseIngestedAtMs).toBeLessThan(0);
+
+    // Genuinely new observation advancing past the high-water mark (rev 9) restores live freshness!
+    browserNowMs += 100;
+    const newLiveReceiptMs = browserNowMs;
+    const newLiveIso = new Date(browserNowMs).toISOString();
+    const live35Payload = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 35 },
+      { observedAt: newLiveIso, updatedAt: newLiveIso },
+    );
+    store.ingestRawFrame(putFrame(live35Payload.id, 9, live35Payload));
+    const afterRecoveredLive = store.getCommandableVehicle(live35Payload.id)!;
+    expect(afterRecoveredLive.headingDeg).toBe(35);
+    expect(afterRecoveredLive.poseObservedAt).toBe(newLiveIso);
+    expect(afterRecoveredLive.poseIngestedLive).toBe(true);
+    expect(afterRecoveredLive.poseIngestedAtMs).toBe(newLiveReceiptMs);
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("tracks measured heading -> invalidated unknown heading (confidence=0 at obsTS) -> health-only update -> measured North (0°) without resurrecting stale heading", () => {
+    let browserNowMs = Date.parse("2026-11-24T13:20:00.000Z");
+    const store = createSkgStore({ now: () => browserNowMs });
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.1";
+
+    const buildStepPayload = (opts: {
+      hdgObj: number;
+      hdgConf: number;
+      hdgCtx?: string;
+      hdgTs: string;
+      geoTs: string;
+      healthTs: string;
+      armed: boolean;
+    }) => {
+      const base = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.attitude.quaternion": [0, 0, 0, 0],
+          "uxs.attitude.rates": [0, 0, 0],
+          "uxs.kinematics.ned": [0, 0, 0],
+          "uxs.kinematics.vx": 0,
+          "uxs.kinematics.vy": 0,
+          "uxs.kinematics.vz": 0,
+          "uxs.kinematics.headingdeg": opts.hdgObj,
+          "uxs.health.armed": opts.armed,
+        },
+        { observedAt: opts.healthTs, updatedAt: opts.healthTs },
+      );
+      return {
+        ...base,
+        triples: base.triples.map((tr) => {
+          if (
+            tr.predicate.startsWith("uxs.attitude.") ||
+            (tr.predicate.startsWith("uxs.kinematics.") &&
+              tr.predicate !== "uxs.kinematics.headingdeg")
+          ) {
+            return {
+              ...tr,
+              confidence: 0,
+              timestamp: "1970-01-01T00:00:00Z",
+            };
+          }
+          if (tr.predicate === "uxs.kinematics.headingdeg") {
+            return {
+              subject: entityId,
+              predicate: tr.predicate,
+              object: opts.hdgObj,
+              source: tr.source,
+              timestamp: opts.hdgTs,
+              confidence: opts.hdgConf,
+              ...(opts.hdgCtx ? { context: opts.hdgCtx } : {}),
+            };
+          }
+          if (tr.predicate.startsWith("geo.location.")) {
+            return {
+              ...tr,
+              confidence: 1,
+              context: "measured",
+              timestamp: opts.geoTs,
+            };
+          }
+          return tr;
+        }),
+      };
+    };
+
+    // 1. Measured fallback heading 274.5° at t1.
+    const t1Iso = "2026-11-24T13:20:00.000Z";
+    store.ingestRawFrame(
+      putFrame(
+        entityId,
+        1,
+        buildStepPayload({
+          hdgObj: 274.5,
+          hdgConf: 1,
+          hdgCtx: "measured",
+          hdgTs: t1Iso,
+          geoTs: t1Iso,
+          healthTs: t1Iso,
+          armed: false,
+        }),
+      ),
+    );
+    store.ingestRawFrame(syncedFrame(1));
+    expect(store.getCommandableVehicle(entityId)?.hasHeading).toBe(true);
+    expect(store.getCommandableVehicle(entityId)?.headingDeg).toBe(274.5);
+
+    // 2. Direct telemetry reports unknown heading (UINT16_MAX) at t2 -> ReplaceBySource stores confidence=0 at t2.
+    browserNowMs += 250;
+    const t2ReceiptMs = browserNowMs;
+    const t2Iso = "2026-11-24T13:20:00.250Z";
+    store.ingestRawFrame(
+      putFrame(
+        entityId,
+        2,
+        buildStepPayload({
+          hdgObj: 0,
+          hdgConf: 0,
+          hdgTs: t2Iso,
+          geoTs: t2Iso,
+          healthTs: t2Iso,
+          armed: false,
+        }),
+      ),
+    );
+    const afterUnknown = store.getCommandableVehicle(entityId)!;
+    expect(afterUnknown.hasHeading).toBe(false);
+    expect(afterUnknown.headingDeg).toBe(0);
+    expect(afterUnknown.poseObservedAt).toBe(t2Iso);
+    expect(afterUnknown.poseIngestedAtMs).toBe(t2ReceiptMs);
+
+    // 3. Health-only update at t3 while heading remains unknown -> heading stays unavailable and poseObservedAt stays at t2.
+    browserNowMs += 250;
+    const t3Iso = "2026-11-24T13:20:00.500Z";
+    store.ingestRawFrame(
+      putFrame(
+        entityId,
+        3,
+        buildStepPayload({
+          hdgObj: 0,
+          hdgConf: 0,
+          hdgTs: t2Iso,
+          geoTs: t2Iso,
+          healthTs: t3Iso,
+          armed: true,
+        }),
+      ),
+    );
+    const afterHealthWhileUnknown = store.getCommandableVehicle(entityId)!;
+    expect(afterHealthWhileUnknown.armed).toBe(true);
+    expect(afterHealthWhileUnknown.hasHeading).toBe(false);
+    expect(afterHealthWhileUnknown.poseObservedAt).toBe(t2Iso);
+    expect(afterHealthWhileUnknown.poseIngestedAtMs).toBe(t2ReceiptMs);
+
+    // 4. Measured North (0°) at t4 restores hasHeading=true, headingDeg=0.
+    browserNowMs += 250;
+    const t4Iso = "2026-11-24T13:20:00.750Z";
+    store.ingestRawFrame(
+      putFrame(
+        entityId,
+        4,
+        buildStepPayload({
+          hdgObj: 0,
+          hdgConf: 1,
+          hdgCtx: "measured",
+          hdgTs: t4Iso,
+          geoTs: t4Iso,
+          healthTs: t4Iso,
+          armed: true,
+        }),
+      ),
+    );
+    const afterNorth = store.getCommandableVehicle(entityId)!;
+    expect(afterNorth.hasHeading).toBe(true);
+    expect(afterNorth.headingDeg).toBe(0);
+    expect(afterNorth.poseObservedAt).toBe(t4Iso);
   });
 });

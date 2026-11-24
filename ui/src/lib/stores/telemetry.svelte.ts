@@ -152,6 +152,7 @@ function parseTelemetryPayload(
   payload: unknown,
   expectedSysId: number,
   receivedAtMs: number,
+  priorLegacyAttitudeLatched: boolean,
 ): VehicleKinematics | null {
   if (!isRecord(payload)) {
     return null;
@@ -166,6 +167,8 @@ function parseTelemetryPayload(
       typeof payload.has_attitude !== "boolean") ||
     (payload.has_local_pos !== undefined &&
       typeof payload.has_local_pos !== "boolean") ||
+    (payload.has_heading !== undefined &&
+      typeof payload.has_heading !== "boolean") ||
     typeof payload.has_global_pos !== "boolean" ||
     !isValidHeadingDeg(payload.hdg_deg) ||
     !isFiniteNumber(payload.timestamp)
@@ -197,7 +200,8 @@ function parseTelemetryPayload(
     Math.abs(quat[1]) < 1e-9 &&
     Math.abs(quat[2]) < 1e-9 &&
     Math.abs(quat[3]) < 1e-9 &&
-    (hdgDistFromNorth > 0.5 || !hasNonZeroRates);
+    (hdgDistFromNorth > 0.5 ||
+      (!hasNonZeroRates && !priorLegacyAttitudeLatched));
   const hasAttitude =
     typeof payload.has_attitude === "boolean"
       ? payload.has_attitude && quatNormSq >= 1e-6
@@ -362,6 +366,8 @@ export function createTelemetryStore(
   // D1 Option A: non-reactive Map mutated in place so 20 Hz frames never trigger DOM $state thrash.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const kinematicsBySysId = new Map<number, VehicleKinematics>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const legacyAttitudeLatchedBySysId = new Set<number>();
   const eventRing = new Array<TransitionEvent | undefined>(maxEvents);
   let ringWriteIdx = 0;
   let ringSize = 0;
@@ -429,17 +435,27 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
-      const frame = parseTelemetryPayload(parsed.payload, sysid, receivedAtMs);
+      const frame = parseTelemetryPayload(
+        parsed.payload,
+        sysid,
+        receivedAtMs,
+        legacyAttitudeLatchedBySysId.has(sysid),
+      );
       if (!frame) {
         malformedFrames += 1;
         return;
       }
       const existing = kinematicsBySysId.get(sysid);
+      if (existing !== undefined && frame.timestamp < existing.timestamp) {
+        droppedOutOfOrder += 1;
+        return;
+      }
+      if (frame.has_attitude) {
+        legacyAttitudeLatchedBySysId.add(sysid);
+      } else {
+        legacyAttitudeLatchedBySysId.delete(sysid);
+      }
       if (existing !== undefined) {
-        if (frame.timestamp < existing.timestamp) {
-          droppedOutOfOrder += 1;
-          return;
-        }
         overwriteKinematicsInPlace(existing, frame);
         return;
       }
@@ -459,6 +475,15 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
+      if (transition.kind === "link_lost") {
+        const existing = kinematicsBySysId.get(sysid);
+        if (
+          existing === undefined ||
+          transition.timestamp >= existing.timestamp
+        ) {
+          legacyAttitudeLatchedBySysId.delete(sysid);
+        }
+      }
       pushTransitionEvent(transition);
       return;
     }
@@ -468,6 +493,7 @@ export function createTelemetryStore(
 
   function clearFeedState(): void {
     kinematicsBySysId.clear();
+    legacyAttitudeLatchedBySysId.clear();
     eventRing.fill(undefined);
     ringWriteIdx = 0;
     ringSize = 0;
@@ -493,6 +519,7 @@ export function createTelemetryStore(
       status = nextStatus;
     },
     onOpen() {
+      legacyAttitudeLatchedBySysId.clear();
       if (hasEstablishedOnce) {
         reconnectCount += 1;
       }
@@ -500,6 +527,7 @@ export function createTelemetryStore(
     },
     onMessage: ingestRawFrame,
     onDisconnect(info) {
+      legacyAttitudeLatchedBySysId.clear();
       if (info.wasConnected) {
         lastDisconnectedAt = info.timestamp;
       }
@@ -539,6 +567,7 @@ export function createTelemetryStore(
     },
     disconnect() {
       wsClient.disconnect();
+      legacyAttitudeLatchedBySysId.clear();
     },
     getKinematics(sysid: number) {
       return kinematicsBySysId.get(sysid);

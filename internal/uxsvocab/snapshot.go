@@ -338,12 +338,16 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 	poseTriple := func(predicate string, obj any, hasDomain bool, observedUnixNs int64, legacyPresent bool) message.Triple {
 		if hasPoseMeta {
 			if !hasDomain {
+				unmeasuredTS := epochZero
+				if observedUnixNs > 0 {
+					unmeasuredTS = time.Unix(0, observedUnixNs).UTC()
+				}
 				return message.Triple{
 					Subject:    entityID,
 					Predicate:  predicate,
 					Object:     obj,
 					Source:     TripleSource,
-					Timestamp:  epochZero,
+					Timestamp:  unmeasuredTS,
 					Confidence: 0.0,
 				}
 			}

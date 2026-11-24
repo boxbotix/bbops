@@ -530,7 +530,7 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		} else {
 			next.HeadingDeg = 0
 			next.HasHeading = false
-			next.HeadingObservedUnixNs = 0
+			next.HeadingObservedUnixNs = obsNs
 		}
 	}
 	next.ObservedAt = now

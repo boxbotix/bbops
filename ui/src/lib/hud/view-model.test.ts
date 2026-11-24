@@ -1995,7 +1995,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(drawnTexts).toContain("R -- P -- HDG ---");
       expect(drawnTexts).not.toContain("N");
 
-      // 7. Modern positive control on WS1: genuine #31 level-North attitude clears both NO ATT and NO HDG!
+      // 7. Unannotated legacy #31 level-North attitude clears both NO ATT and NO HDG,
+      // and subsequent unannotated #32 and #33 position frames 50 ms later MUST keep both measured!
       nowMs += 50;
       ws1Socket!.onmessage?.({
         data: JSON.stringify({
@@ -2008,15 +2009,12 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
             seq: 11,
             msg_id: 31,
             quat_wxyz: [1, 0, 0, 0],
-            has_attitude: true,
             body_rates: [0, 0, 0],
             ned_xyz: [0, 0, 0],
-            has_local_pos: true,
             ned_vel: [0, 0, 0],
             lat_lon_alt: [30.2672, -97.7431, 150],
             has_global_pos: true,
             hdg_deg: 0,
-            has_heading: true,
             timestamp: nowMs,
           },
         }),
@@ -2034,6 +2032,95 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       ).toBeNull();
       expect(drawnTexts).toContain("N");
       expect(drawnTexts).toContain("R 0° P 0° Y 0°");
+
+      // 8. 50 ms later, unannotated #32 local-position carrying fused [1,0,0,0] keeps attitude + heading measured!
+      nowMs += 50;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 12,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [2, -1, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [30.2672, -97.7431, 150],
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+      drawnTexts.length = 0;
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+      expect(drawnTexts).toContain("N");
+      expect(drawnTexts).toContain("R 0° P 0° Y 0°");
+
+      // 9. Another 50 ms later, unannotated #33 global-position carrying fused [1,0,0,0] also stays measured!
+      nowMs += 50;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 13,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [2, -1, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [30.2673, -97.7432, 150],
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+      drawnTexts.length = 0;
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+
+      // 10. End WS1 session and open a new session: unannotated #33 resets back to NO ATT + NO HDG!
+      telemetryStore.disconnect();
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Socket!.onopen?.(new Event("open") as never);
+      nowMs += 50;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 14,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [30.2673, -97.7432, 150],
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+      drawnTexts.length = 0;
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
+      expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
     } finally {
       if (hudApp) unmount(hudApp);
       telemetryStore.disconnect();
@@ -2042,5 +2129,116 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       rafSpy.mockRestore();
       cafSpy.mockRestore();
     }
+  });
+
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("keeps resolveLiveVehiclePose stale across multi-step historical SKG replay updates until an observation catches up or advances", () => {
+    let browserNowMs = Date.parse("2026-11-24T12:00:00.000Z");
+    const skgStore = createSkgStore({ now: () => browserNowMs });
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.1";
+
+    const mkPut = (rev: number, poseIso: string, hdgDeg: number): string => {
+      const mk = (predicate: string, object: unknown): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: poseIso,
+        confidence: 1,
+        context: "measured",
+      });
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: rev,
+        payload: {
+          id: entityId,
+          updated_at: new Date(browserNowMs).toISOString(),
+          triples: [
+            mk("uxs.domain.kind", "rover"),
+            mk("uxs.authority.state", "companion-teleop"),
+            mk("uxs.mode.companion", "teleop-velocity"),
+            mk("uxs.link.tier", "mesh-high-rate"),
+            mk("uxs.health.armed", true),
+            mk("uxs.health.flags", {
+              clock_sync_locked: true,
+              teleop_deadman_clamped: false,
+              crsf_link_healthy: true,
+              companion_trunk_healthy: true,
+            }),
+            mk("uxs.health.failsafes", 0),
+            mk("uxs.health.crcerrors", 0),
+            mk("uxs.health.loopdtus", 1000),
+            mk("uxs.health.maxloopdtus", 1200),
+            mk("uxs.health.rttus", 400),
+            mk("uxs.attitude.quaternion", [0, 0, 0, 0]),
+            mk("uxs.attitude.rates", [0, 0, 0]),
+            mk("uxs.kinematics.ned", [5, 0, 0]),
+            mk("uxs.kinematics.vx", 0),
+            mk("uxs.kinematics.vy", 0),
+            mk("uxs.kinematics.vz", 0),
+            mk("uxs.kinematics.headingdeg", hdgDeg),
+            mk("geo.location.latitude", 30.2672),
+            mk("geo.location.longitude", -97.7431),
+            mk("geo.location.altitude", 150),
+          ],
+        },
+      });
+    };
+
+    skgStore.ingestRawFrame(mkPut(1, "2026-11-24T11:59:59.500Z", 15));
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+
+    // Live 12:00:00.000Z observation -> fresh.
+    skgStore.ingestRawFrame(mkPut(2, "2026-11-24T12:00:00.000Z", 20));
+    expect(
+      resolveLiveVehiclePose(skgStore.getCommandableVehicle(entityId)!, {
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs: browserNowMs,
+      }).stale,
+    ).toBe(false);
+
+    // First 11:00 replay update -> stale.
+    browserNowMs += 100;
+    skgStore.ingestRawFrame(mkPut(3, "2026-11-24T11:00:00.100Z", 30));
+    expect(
+      resolveLiveVehiclePose(skgStore.getCommandableVehicle(entityId)!, {
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs: browserNowMs,
+      }).stale,
+    ).toBe(true);
+
+    // Second 11:00 replay update 100 ms newer than the first -> MUST remain stale!
+    browserNowMs += 100;
+    skgStore.ingestRawFrame(mkPut(4, "2026-11-24T11:00:00.200Z", 31));
+    const afterSecondReplay = resolveLiveVehiclePose(
+      skgStore.getCommandableVehicle(entityId)!,
+      {
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs: browserNowMs,
+      },
+    );
+    expect(afterSecondReplay.stale).toBe(true);
+    expect(afterSecondReplay.headingDeg).toBe(31);
+
+    // Genuinely new observation advancing past 12:00:00.000Z -> fresh again!
+    browserNowMs += 300;
+    skgStore.ingestRawFrame(mkPut(5, "2026-11-24T12:00:00.500Z", 35));
+    const afterCatchUp = resolveLiveVehiclePose(
+      skgStore.getCommandableVehicle(entityId)!,
+      {
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs: browserNowMs,
+      },
+    );
+    expect(afterCatchUp.stale).toBe(false);
+    expect(afterCatchUp.headingDeg).toBe(35);
   });
 });
