@@ -221,6 +221,76 @@ function parseFeedStatus(value: unknown): CopFeedStatus {
   return "unknown";
 }
 
+const GO_ZERO_TIME_NS = -62_135_596_800_000_000_000n; // 0001-01-01T00:00:00Z
+const RFC3339_NANO_RE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/i;
+const utf8Encoder = new TextEncoder();
+
+function parseTripleInstantNs(raw: string): bigint {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return GO_ZERO_TIME_NS;
+  }
+  const match = RFC3339_NANO_RE.exec(trimmed);
+  if (match) {
+    const frac = (match[7] ?? "").padEnd(9, "0");
+    const tz = match[8]!.toUpperCase();
+    const wholeSecIso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${tz}`;
+    const utcMs = Date.parse(wholeSecIso);
+    if (Number.isNaN(utcMs)) {
+      return GO_ZERO_TIME_NS;
+    }
+    return BigInt(utcMs) * 1_000_000n + BigInt(frac);
+  }
+  const fallbackMs = Date.parse(trimmed);
+  if (Number.isNaN(fallbackMs)) {
+    return GO_ZERO_TIME_NS;
+  }
+  return BigInt(fallbackMs) * 1_000_000n;
+}
+
+function compareUtf8Lexicographic(a: string, b: string): number {
+  if (a === b) {
+    return 0;
+  }
+  const bytesA = utf8Encoder.encode(a);
+  const bytesB = utf8Encoder.encode(b);
+  const limit = Math.min(bytesA.length, bytesB.length);
+  for (let i = 0; i < limit; i += 1) {
+    const diff = bytesA[i]! - bytesB[i]!;
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+  return bytesA.length - bytesB.length;
+}
+
+/**
+ * Mirrors SemEngine alpha.7 `graph.EntityState.GetTriple` (`pickLatest`):
+ * latest Timestamp wins; on equal Timestamp, lexicographically smaller Source
+ * wins; on equal Timestamp and Source, the first stored assertion wins.
+ */
+function selectWinningTriple(
+  incumbent: SkgTriple | undefined,
+  candidate: SkgTriple,
+): SkgTriple {
+  if (incumbent === undefined) {
+    return candidate;
+  }
+  const candTs = parseTripleInstantNs(candidate.timestamp);
+  const bestTs = parseTripleInstantNs(incumbent.timestamp);
+  if (candTs > bestTs) {
+    return candidate;
+  }
+  if (
+    candTs === bestTs &&
+    compareUtf8Lexicographic(candidate.source, incumbent.source) < 0
+  ) {
+    return candidate;
+  }
+  return incumbent;
+}
+
 function parseSkgTriple(raw: unknown): SkgTriple | null {
   if (!isRecord(raw)) {
     return null;
@@ -283,16 +353,17 @@ function extractCommonMetadata(
     normalizeNonEmptyString(byPredicate["prov.wasAttributedTo"]?.object);
   let inferredTripleSource: string | null = null;
   if (!explicitSource) {
+    let bestSourceTriple: SkgTriple | undefined;
     for (const triple of triples) {
-      if (triple.predicate === "entity.indexing.profile") {
+      if (
+        triple.predicate === "entity.indexing.profile" ||
+        normalizeNonEmptyString(triple.source) === null
+      ) {
         continue;
       }
-      const candidate = normalizeNonEmptyString(triple.source);
-      if (candidate !== null) {
-        inferredTripleSource = candidate;
-        break;
-      }
+      bestSourceTriple = selectWinningTriple(bestSourceTriple, triple);
     }
+    inferredTripleSource = normalizeNonEmptyString(bestSourceTriple?.source);
   }
 
   const explicitObserved =
@@ -379,7 +450,10 @@ export function parseCopEntityState(
       return null;
     }
     triples.push(parsed);
-    byPredicate[parsed.predicate] = parsed;
+    byPredicate[parsed.predicate] = selectWinningTriple(
+      byPredicate[parsed.predicate],
+      parsed,
+    );
   }
 
   const base = extractCommonMetadata(
@@ -442,9 +516,14 @@ export function parseCopEntityState(
       isValidLatLon(lat, lon) &&
       isFiniteNumber(alt)
     ) {
+      let latestUxsTriple: SkgTriple | undefined;
+      for (const triple of triples) {
+        if (triple.predicate.startsWith("uxs.")) {
+          latestUxsTriple = selectWinningTriple(latestUxsTriple, triple);
+        }
+      }
       const vehicleObservedAt =
-        base.observedAt ??
-        normalizeKnownTimestamp(byPredicate["uxs.domain.kind"]?.timestamp);
+        base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
       return {
         ...base,
         observedAt: vehicleObservedAt,
@@ -665,6 +744,10 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
 
     if (parsed.type === "delete") {
       if (!synced) {
+        const prevStaged = stagedSnapshot.get(key);
+        if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
+          return;
+        }
         stagedSnapshot.delete(key);
         return;
       }
@@ -682,13 +765,14 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           ? parsed.error
           : "entity state decode error";
       if (!synced) {
-        const prior = stagedSnapshot.get(key) ?? entities.get(key);
-        if (prior && revision > 0 && revision < prior.kvRevision) {
+        const prevStaged = stagedSnapshot.get(key);
+        if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
           return;
         }
+        const diagnosticPrior = prevStaged ?? entities.get(key);
         stagedSnapshot.set(
           key,
-          buildPoisonedEntity(key, prior, revision, errorMsg),
+          buildPoisonedEntity(key, diagnosticPrior, revision, errorMsg),
         );
         return;
       }

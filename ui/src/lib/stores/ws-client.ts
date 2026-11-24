@@ -127,21 +127,57 @@ export class ManagedWebSocketClient {
   }
 
   connect(overrideUrl?: string): void {
-    if (overrideUrl !== undefined) {
-      this.resolvedUrl = resolveWebSocketUrl(
-        overrideUrl,
-        this.options.envUrl,
-        this.options.defaultPath,
-      );
-    }
+    const nextUrl =
+      overrideUrl !== undefined
+        ? resolveWebSocketUrl(
+            overrideUrl,
+            this.options.envUrl,
+            this.options.defaultPath,
+          )
+        : this.resolvedUrl;
+    const urlChanged = nextUrl !== this.resolvedUrl;
+
     if (
+      !urlChanged &&
       this.socket !== null &&
       (this.socket.readyState === WS_CONNECTING ||
         this.socket.readyState === WS_OPEN)
     ) {
       return;
     }
+
+    this.clearKeepaliveTimer();
     this.clearReconnectTimer();
+
+    if (this.socket !== null) {
+      const previous = this.socket;
+      const wasConnected = this.activeConnectionEstablished;
+      this.socket = null;
+      this.activeConnectionEstablished = false;
+      previous.onopen = null;
+      previous.onmessage = null;
+      previous.onerror = null;
+      previous.onclose = null;
+      if (
+        previous.readyState === WS_CONNECTING ||
+        previous.readyState === WS_OPEN
+      ) {
+        previous.close(1000, "endpoint override");
+      }
+      if (wasConnected) {
+        this.options.onDisconnect?.({
+          wasConnected: true,
+          code: 1000,
+          timestamp: this.now(),
+        });
+      }
+    }
+
+    if (urlChanged) {
+      this.resolvedUrl = nextUrl;
+      this.reconnectAttempt = 0;
+    }
+
     this.shouldReconnect = true;
     this.openSocket(this.reconnectAttempt > 0 ? "reconnecting" : "connecting");
   }

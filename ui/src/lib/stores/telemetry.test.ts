@@ -486,4 +486,68 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     expect(sawRingEviction).toBe(true);
     expect(sawBoundarySysIds).toBe(true);
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  it("keeps connect() idempotent on the active URL and switches sockets, reported URL, and retry target atomically on connect(overrideUrl)", () => {
+    const rig = new MockWebSocketRig();
+    const urlA = "ws://127.0.0.1:8081/ws-a";
+    const urlB = "ws://127.0.0.1:8091/ws-b";
+    const store = createTelemetryStore({
+      url: urlA,
+      createSocket: rig.createSocket,
+    });
+
+    store.connect();
+    const socketA = rig.latest;
+    socketA.serverOpen();
+    expect(store.url).toBe(urlA);
+    expect(store.status).toBe("connected");
+    expect(rig.sockets).toHaveLength(1);
+
+    // Calling connect() or connect(urlA) while active on urlA is idempotent.
+    store.connect();
+    store.connect(`  ${urlA}  `);
+    expect(rig.sockets).toHaveLength(1);
+    expect(store.url).toBe(urlA);
+
+    // Switching to urlB while connected to urlA closes socketA, updates store.url, and opens socketB.
+    store.connect(urlB);
+    expect(store.url).toBe(urlB);
+    expect(socketA.closeCalls).toEqual([
+      {
+        code: 1000,
+        reason: "endpoint override",
+      },
+    ]);
+    expect(rig.sockets).toHaveLength(2);
+    const socketB = rig.latest;
+    expect(socketB.url).toBe(urlB);
+
+    // Any late message from detached socketA is ignored; socketB delivers frames cleanly.
+    socketA.serverMessage(
+      buildKinematicEnvelope(1, {
+        ned_xyz: [99, 99, 99],
+        timestamp: 5_000,
+      }),
+    );
+    expect(store.getKinematics(1)).toBeUndefined();
+
+    socketB.serverOpen();
+    socketB.serverMessage(
+      buildKinematicEnvelope(1, {
+        ned_xyz: [12, 34, -5],
+        timestamp: 5_100,
+      }),
+    );
+    expect(store.getKinematics(1)?.ned_xyz).toEqual([12, 34, -5]);
+
+    // When socketB drops, automatic reconnect targets urlB (never urlA).
+    socketB.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    expect(rig.sockets).toHaveLength(3);
+    expect(rig.latest.url).toBe(urlB);
+    expect(store.url).toBe(urlB);
+
+    store.disconnect();
+  });
 });

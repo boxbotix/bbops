@@ -143,14 +143,40 @@ describe("viewport.svelte.ts — deterministic COP controller verbs & URL hash c
     expect(hydrated.snapshot()).toEqual(source.snapshot());
 
     // Malformed fragments sanitize safely to canonical defaults without throwing:
-    // - chase=1 without tether -> chaseLock false
-    // - control char in sel -> null
+    // - chase=1 without tether or with malformed tether -> chaseLock false
+    // - incomplete / non-6-part / forbidden-character / >256-byte IDs -> null
     // - unknown domain/layer tokens -> defaults
     // - unknown declutter -> "none"
-    const sanitized = parseViewportHash(
+    const malformedHashes = [
       "#sel=bad%00id&chase=1&domains=submarine,spaceship&layers=radar&declutter=ultra&extra=ignored",
+      "#sel=incomplete&tether=incomplete&chase=1",
+      "#sel=a.b.c.d.e._leading&tether=a.b.c.d.e.-dash&chase=1",
+      "#sel=a.b.c.d.e.bad$char&tether=a.b.c.d.e.bad%2Fslash&chase=1",
+      "#sel=a.b.c.d.e&tether=a.b.c.d.e.f.g&chase=1",
+      `#sel=${"a".repeat(250)}.b.c.d.e.f&tether=${"x".repeat(250)}.b.c.d.e.f&chase=1`,
+    ];
+    for (const badHash of malformedHashes) {
+      expect(parseViewportHash(badHash)).toEqual(defaultViewportSnapshot());
+    }
+
+    // Programmatic verbs likewise reject malformed ADR-102 IDs and keep chaseLock false.
+    const guarded = createViewportStore();
+    guarded.selectEntity("incomplete");
+    guarded.tetherEntity("a.b.c.d.e._bad");
+    guarded.setChaseLock(true);
+    expect(guarded.selectedEntityId).toBeNull();
+    expect(guarded.tetheredEntityId).toBeNull();
+    expect(guarded.chaseLock).toBe(false);
+
+    // Valid 6-part external contact IDs with underscores and hyphens round-trip cleanly.
+    const validContactId =
+      "boxbotix.local_1.tak-bridge.cop.responder_track.bravo-2";
+    const contactHydrated = parseViewportHash(
+      `#sel=${validContactId}&tether=${validContactId}&chase=1`,
     );
-    expect(sanitized).toEqual(defaultViewportSnapshot());
+    expect(contactHydrated.selectedEntityId).toBe(validContactId);
+    expect(contactHydrated.tetheredEntityId).toBe(validContactId);
+    expect(contactHydrated.chaseLock).toBe(true);
 
     // Mixed valid + unknown tokens retain only the valid subset in canonical order.
     const mixed = parseViewportHash(

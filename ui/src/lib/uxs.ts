@@ -50,17 +50,8 @@ export interface ParsedVehicleEntityId {
 }
 
 const CANONICAL_DECIMAL_RE = /^(?:[1-9]\d*)$/;
-const utf8Encoder = new TextEncoder();
-
-function hasAsciiControlChar(value: string): boolean {
-  for (let i = 0; i < value.length; i += 1) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f) {
-      return true;
-    }
-  }
-  return false;
-}
+const ENTITY_ID_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const CANONICAL_ENTITY_ID_PARTS = 6;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -96,33 +87,29 @@ export function parseCanonicalSysIdSegment(segment: string): number | null {
   return isValidVehicleSysId(parsed) ? parsed : null;
 }
 
-export function isValidEntityIdString(value: unknown): value is string {
-  if (typeof value !== "string") {
-    return false;
+export function parseSixPartEntityId(
+  id: unknown,
+): [string, string, string, string, string, string] | null {
+  if (typeof id !== "string") {
+    return null;
   }
-  if (value.length === 0 || hasAsciiControlChar(value)) {
-    return false;
-  }
-  if (utf8Encoder.encode(value).byteLength > MAX_ENTITY_ID_BYTES) {
-    return false;
-  }
-  return true;
-}
-
-export function parseSixPartEntityId(id: string): string[] | null {
-  if (!isValidEntityIdString(id)) {
+  if (id.length === 0 || id.length > MAX_ENTITY_ID_BYTES) {
     return null;
   }
   const parts = id.split(".");
-  if (parts.length !== 6) {
+  if (parts.length !== CANONICAL_ENTITY_ID_PARTS) {
     return null;
   }
   for (const part of parts) {
-    if (part.length === 0 || part.trim() !== part) {
+    if (!ENTITY_ID_SEGMENT_RE.test(part)) {
       return null;
     }
   }
-  return parts;
+  return parts as [string, string, string, string, string, string];
+}
+
+export function isValidEntityIdString(value: unknown): value is string {
+  return parseSixPartEntityId(value) !== null;
 }
 
 export function parseVehicleEntityId(id: string): ParsedVehicleEntityId | null {

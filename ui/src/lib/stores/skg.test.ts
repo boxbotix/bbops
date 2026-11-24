@@ -524,12 +524,15 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
           refSynced = true;
         }
       } else {
-        // drop + reconnect
+        // drop + reconnect (half the time simulating bucket recreation resetting KV revisions to 1)
         rig.latest.serverDrop(1006);
         vi.advanceTimersByTime(500);
         rig.latest.serverOpen();
         refSynced = false;
         refStaged = new Map();
+        if (rng() < 0.5) {
+          nextRev = 1;
+        }
       }
 
       expect(store.synced).toBe(refSynced);
@@ -551,6 +554,142 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
     expect(sawReconnectPrune).toBe(true);
     expect(sawPoisonAndHeal).toBe(true);
+    store.disconnect();
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("projects multi-source scalar triples using SemEngine GetTriple rules across array orders and equal timestamps", () => {
+    const store = createSkgStore();
+    const base = buildVehicleStoredPayload(7);
+    const nonArmedTriples = base.triples.filter(
+      (t) => t.predicate !== "uxs.health.armed",
+    );
+
+    const newerArmedTrue = makeTriple(base.id, "uxs.health.armed", true, {
+      source: "source_z",
+      timestamp: "2026-11-24T11:30:02.000000200Z",
+    });
+    const olderArmedFalse = makeTriple(base.id, "uxs.health.armed", false, {
+      source: "source_a",
+      timestamp: "2026-11-24T11:30:02.000000100Z",
+    });
+
+    // Order 1: newer armed=true followed by older armed=false from an alphabetically earlier source.
+    store.ingestRawFrame(
+      putFrame(base.id, 1, {
+        ...base,
+        triples: [...nonArmedTriples, newerArmedTrue, olderArmedFalse],
+      }),
+    );
+    store.ingestRawFrame(syncedFrame(1));
+    expect(store.getCommandableVehicle(base.id)?.armed).toBe(true);
+
+    // Order 2: older armed=false followed by newer armed=true (expressed with +01:00 offset = 11:30:02.000000200Z).
+    const newerWithOffset = makeTriple(base.id, "uxs.health.armed", true, {
+      source: "source_z",
+      timestamp: "2026-11-24T12:30:02.000000200+01:00",
+    });
+    store.ingestRawFrame(
+      putFrame(base.id, 2, {
+        ...base,
+        triples: [...nonArmedTriples, olderArmedFalse, newerWithOffset],
+      }),
+    );
+    expect(store.getCommandableVehicle(base.id)?.armed).toBe(true);
+
+    // Equal timestamps, different sources -> ascending UTF-8 source ("alpha_src" < "zeta_src") wins in both array orders!
+    const tieAlphaTrue = makeTriple(base.id, "uxs.health.armed", true, {
+      source: "alpha_src",
+      timestamp: "2026-11-24T11:35:00.000Z",
+    });
+    const tieZetaFalse = makeTriple(base.id, "uxs.health.armed", false, {
+      source: "zeta_src",
+      timestamp: "2026-11-24T11:35:00.000Z",
+    });
+
+    store.ingestRawFrame(
+      putFrame(base.id, 3, {
+        ...base,
+        triples: [...nonArmedTriples, tieAlphaTrue, tieZetaFalse],
+      }),
+    );
+    expect(store.getCommandableVehicle(base.id)?.armed).toBe(true);
+
+    store.ingestRawFrame(
+      putFrame(base.id, 4, {
+        ...base,
+        triples: [...nonArmedTriples, tieZetaFalse, tieAlphaTrue],
+      }),
+    );
+    expect(store.getCommandableVehicle(base.id)?.armed).toBe(true);
+
+    // Equal timestamps AND equal sources -> first stored assertion wins.
+    const sameSourceFirstFalse = makeTriple(
+      base.id,
+      "uxs.health.armed",
+      false,
+      {
+        source: "same_src",
+        timestamp: "2026-11-24T11:40:00.000Z",
+      },
+    );
+    const sameSourceSecondTrue = makeTriple(base.id, "uxs.health.armed", true, {
+      source: "same_src",
+      timestamp: "2026-11-24T11:40:00.000Z",
+    });
+    store.ingestRawFrame(
+      putFrame(base.id, 5, {
+        ...base,
+        triples: [
+          ...nonArmedTriples,
+          sameSourceFirstFalse,
+          sameSourceSecondTrue,
+        ],
+      }),
+    );
+    expect(store.getCommandableVehicle(base.id)?.armed).toBe(false);
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("retains a visible poisoned entity excluded from command selectors when reconnect snapshot resets revisions to 1", () => {
+    const rig = new MockWebSocketRig();
+    const store = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: rig.createSocket,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    const v1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "uxs.authority.state": "companion-teleop",
+    });
+    rig.latest.serverMessage(putFrame(v1.id, 100, v1));
+    rig.latest.serverMessage(syncedFrame(100));
+    expect(store.getCommandableVehicle(v1.id)?.kvRevision).toBe(100);
+    expect(store.commandableVehicles).toHaveLength(1);
+
+    // Disconnect and simulate ENTITY_STATES bucket recreation where the key is poisoned at revision 1.
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    rig.latest.serverOpen();
+
+    rig.latest.serverMessage(
+      poisonedFrame(v1.id, 1, "recreated bucket corrupt entry"),
+    );
+    rig.latest.serverMessage(syncedFrame(1));
+
+    const retained = store.getVehicle(v1.id);
+    expect(retained).not.toBeNull();
+    expect(retained?.poisoned).toBe(true);
+    expect(retained?.kvRevision).toBe(1);
+    expect(retained?.poisonError).toBe("recreated bucket corrupt entry");
+    expect(retained?.domain).toBe("quadcopter");
+    expect(store.entities.has(v1.id)).toBe(true);
+    expect(store.getCommandableVehicle(v1.id)).toBeNull();
+    expect(store.commandableVehicles).toHaveLength(0);
+
     store.disconnect();
   });
 });
