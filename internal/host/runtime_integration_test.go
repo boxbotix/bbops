@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,12 +21,17 @@ import (
 
 	"github.com/boxbotix/bbops/configs"
 	"github.com/boxbotix/bbops/internal/host"
+	"github.com/boxbotix/bbops/internal/mavcodec"
+	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
+	"github.com/c360studio/semengine/config"
 	"github.com/c360studio/semengine/graph"
 	"github.com/c360studio/semengine/message"
+	"github.com/c360studio/semengine/natsclient"
 	"github.com/c360studio/semengine/payloadregistry"
 	"github.com/c360studio/semengine/vocabulary"
 	"github.com/gorilla/websocket"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -504,8 +512,12 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 	if err != nil {
 		t.Fatalf("allocate boot-1 ports: %v", err)
 	}
+	udpA, err := host.AllocateLoopbackUDPPorts(1)
+	if err != nil {
+		t.Fatalf("allocate boot-1 UDP port: %v", err)
+	}
 
-	// Boot 1: cold start on dataDir with explicit listener overrides portsA.
+	// Boot 1: cold start on dataDir with explicit listener overrides portsA + udpA.
 	rt1, err := host.Start(ctx, host.Options{
 		DataDir: dataDir,
 		UIDir:   uiDir,
@@ -516,6 +528,7 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 			TelemetryWSPort: portsA[1],
 			GraphWSPort:     portsA[2],
 			MetricsPort:     portsA[3],
+			MAVLinkUDPPort:  udpA[0],
 		},
 	})
 	if err != nil {
@@ -540,7 +553,7 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 		t.Fatalf("Boot 1 Stop: %v", err)
 	}
 
-	// Allocate distinct port set B for Boot 2 on the same persisted JetStream KV store.
+	// Allocate distinct port set B + udpB for Boot 2 on the same persisted JetStream KV store.
 	var portsB []int
 	for range 10 {
 		cand, allocErr := host.AllocateLoopbackPorts(4)
@@ -563,6 +576,20 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 	if len(portsB) != 4 {
 		t.Fatalf("failed to allocate 4 ports distinct from %v", portsA)
 	}
+	var udpB int
+	for range 10 {
+		candUDP, allocErr := host.AllocateLoopbackUDPPorts(1)
+		if allocErr != nil {
+			t.Fatalf("allocate boot-2 UDP port: %v", allocErr)
+		}
+		if candUDP[0] != udpA[0] {
+			udpB = candUDP[0]
+			break
+		}
+	}
+	if udpB == 0 {
+		t.Fatalf("failed to allocate UDP port distinct from %d", udpA[0])
+	}
 
 	// Boot 2: warm restart against same dataDir (equal config version triggers syncFromKV).
 	rt2, err := host.Start(ctx, host.Options{
@@ -575,6 +602,7 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 			TelemetryWSPort: portsB[1],
 			GraphWSPort:     portsB[2],
 			MetricsPort:     portsB[3],
+			MAVLinkUDPPort:  udpB,
 		},
 	})
 	if err != nil {
@@ -596,9 +624,10 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 
 	ep2 := rt2.Endpoints()
 	if ep2.HTTPPort != portsB[0] || ep2.MetricsPort != portsB[3] ||
+		ep2.MAVLinkUDPPort != udpB || ep2.MAVLinkUDPAddr != fmt.Sprintf("127.0.0.1:%d", udpB) ||
 		ep2.TelemetryWS != fmt.Sprintf("ws://127.0.0.1:%d/ws", portsB[1]) ||
 		ep2.GraphWS != fmt.Sprintf("ws://127.0.0.1:%d/ws", portsB[2]) {
-		t.Fatalf("Boot 2 advertised endpoints = %+v, want portsB %v", ep2, portsB)
+		t.Fatalf("Boot 2 advertised endpoints = %+v, want portsB %v udpB %d", ep2, portsB, udpB)
 	}
 
 	// Verify every requested Boot 2 listener answers on portsB.
@@ -610,7 +639,7 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 	wsGraph2 := dialWebSocketWithRetry(ctx, t, ep2.GraphWS)
 	_ = wsGraph2.Close()
 
-	// Verify every Boot 1 listener on portsA is gone.
+	// Verify every Boot 1 TCP listener on portsA and UDP listener on udpA[0] is released.
 	for _, oldPort := range portsA {
 		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(oldPort))
 		conn, dialErr := net.DialTimeout("tcp", addr, 250*time.Millisecond)
@@ -619,6 +648,11 @@ func TestRuntimeWarmRestartAppliesOverridesAndReleasesOldListeners(t *testing.T)
 			t.Fatalf("stale Boot 1 listener still accepting connections on %s", addr)
 		}
 	}
+	reboundUDP, reboundErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: udpA[0]})
+	if reboundErr != nil {
+		t.Fatalf("stale Boot 1 UDP socket still holding 127.0.0.1:%d: %v", udpA[0], reboundErr)
+	}
+	_ = reboundUDP.Close()
 }
 
 func assertMetricsReachable(t *testing.T, port int) {
@@ -924,5 +958,663 @@ func TestHostIngestsUXSVehicleSnapshotWithSignalIndexingProfile(t *testing.T) {
 			t.Fatalf("PREDICATE_INDEX %s.%s revision = %d, want %d (unexpected rewrite)",
 				pred, entityID, entry.Revision(), initialRevs[pred])
 		}
+	}
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: t.TempDir(),
+		UIDir:   t.TempDir(),
+		Version: "v0.1.0-m12-test",
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	endpoints := rt.Endpoints()
+	ingestComp := rt.MAVLinkIngest()
+	if ingestComp == nil || !ingestComp.BoundAddr().IsValid() {
+		t.Fatalf("MAVLinkIngest = %v, expected active bound UDP component", ingestComp)
+	}
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", endpoints.MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", endpoints.MAVLinkUDPAddr, err)
+	}
+
+	// Connect WS #1 (bbops.telemetry.>) and WS #2 (ENTITY_STATES kv-watch) before sending UDP datagrams.
+	telWS := dialWebSocketWithRetry(ctx, t, endpoints.TelemetryWS)
+	defer func() { _ = telWS.Close() }()
+
+	graphWS := dialWebSocketWithRetry(ctx, t, endpoints.GraphWS)
+	defer func() { _ = graphWS.Close() }()
+	// Drain initial empty-snapshot `synced` barrier on WS #2.
+	for {
+		f := readWSFrame(t, graphWS, 10*time.Second)
+		if f.Type == "synced" {
+			break
+		}
+	}
+
+	openUDPClient := func() *net.UDPConn {
+		c, listenErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+		if listenErr != nil {
+			t.Fatalf("ListenUDP client: %v", listenErr)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	sendFrame := func(conn *net.UDPConn, sysid, compid, seq uint8, msg mavcodec.Message) {
+		t.Helper()
+		raw, encErr := mavcodec.EncodeFrame(mavcodec.Frame{
+			Sequence:    seq,
+			SystemID:    sysid,
+			ComponentID: compid,
+			Message:     msg,
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeFrame: %v", encErr)
+		}
+		if _, wErr := conn.WriteToUDP(raw, serverUDPAddr); wErr != nil {
+			t.Fatalf("WriteToUDP: %v", wErr)
+		}
+	}
+
+	noiseClient := openUDPClient()
+	// 1. Send benign GCS HEARTBEAT (sysid=255), pre-admission kinematics (sysid=9), and corrupted datagram;
+	// verify /readyz stays 200 READY and no ghost peer is admitted.
+	sendFrame(noiseClient, 255, 190, 0, mavcodec.Heartbeat{Type: 6, Autopilot: 8})
+	sendFrame(noiseClient, 9, 1, 1, mavcodec.LocalPositionNED{X: 42})
+	if _, err := noiseClient.WriteToUDP([]byte{0xFD, 0x09, 0x00, 0x00, 0x01, 0x01, 0x01, 0xFF}, serverUDPAddr); err != nil {
+		t.Fatalf("WriteToUDP corrupt: %v", err)
+	}
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+	if peers := ingestComp.Peers(); len(peers) != 0 {
+		t.Fatalf("unexpected ghost peers admitted from noise traffic: %+v", peers)
+	}
+
+	// 2. Open 3 vehicle UDP sockets: sysid=1 (Quadcopter), sysid=2 (Rover), sysid=3 (SurfaceBoat).
+	s45 := float32(math.Sqrt2 / 2)
+	vehicles := []struct {
+		sysid   uint8
+		domain  mavcodec.VehicleDomain
+		domName string
+		quat    [4]float32
+		wantYaw float64
+		latE7   int32
+		lonE7   int32
+		conn    *net.UDPConn
+	}{
+		{
+			sysid: 1, domain: mavcodec.DomainQuadcopter, domName: uxsvocab.DomainQuadcopter,
+			quat: [4]float32{s45, 0, 0, s45}, wantYaw: 90.0,
+			latE7: 377749000, lonE7: -1224194000, conn: openUDPClient(),
+		},
+		{
+			sysid: 2, domain: mavcodec.DomainRover, domName: uxsvocab.DomainRover,
+			quat: [4]float32{0, 0, 0, 1}, wantYaw: 180.0,
+			latE7: 377750000, lonE7: -1224195000, conn: openUDPClient(),
+		},
+		{
+			sysid: 3, domain: mavcodec.DomainSurfaceBoat, domName: uxsvocab.DomainSurfaceBoat,
+			quat: [4]float32{s45, 0, 0, -s45}, wantYaw: 270.0,
+			latE7: 377751000, lonE7: -1224196000, conn: openUDPClient(),
+		},
+	}
+
+	for _, v := range vehicles {
+		hb, hbErr := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+			Armed: true,
+			Custom: mavcodec.CustomMode{
+				Domain:           v.domain,
+				ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+				CompanionMode:    mavcodec.ModeTeleopVelocity,
+				LinkTier:         mavcodec.LinkTierSITLLocal,
+				HealthFlags:      uxsvocab.HealthFlags{ClockSyncLocked: true, CompanionTrunkHealthy: true},
+			},
+		})
+		if hbErr != nil {
+			t.Fatalf("EncodeVehicleHeartbeat(%d): %v", v.sysid, hbErr)
+		}
+		sendFrame(v.conn, v.sysid, 1, 1, hb)
+	}
+
+	waitForCondition(t, 5*time.Second, "all 3 vehicle UDP peer endpoints recorded", func() bool {
+		for _, v := range vehicles {
+			gotPeer, ok := ingestComp.PeerAddr(v.sysid)
+			wantPeer := v.conn.LocalAddr().(*net.UDPAddr).AddrPort()
+			if !ok || gotPeer != wantPeer {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Stream #1 SYS_STATUS (with nonzero historical failsafe count on join to verify no false baseline alert),
+	// #31 ATTITUDE_QUATERNION, #32 LOCAL_POSITION_NED, and #33 GLOBAL_POSITION_INT
+	// (with Hdg=4500 which must NOT override #31's quaternion yaw!).
+	for _, v := range vehicles {
+		sendFrame(v.conn, v.sysid, 1, 2, mavcodec.SysStatus{
+			Load: 950, ErrorsComm: 1, ErrorsCount1: uint16(v.sysid), ErrorsCount2: 1400, ErrorsCount3: 600,
+		})
+		sendFrame(v.conn, v.sysid, 1, 3, mavcodec.AttitudeQuaternion{
+			Q1: v.quat[0], Q2: v.quat[1], Q3: v.quat[2], Q4: v.quat[3], Yawspeed: 0.15,
+		})
+		sendFrame(v.conn, v.sysid, 1, 4, mavcodec.LocalPositionNED{
+			X: float32(v.sysid) * 10, Y: -5, Z: -20, Vx: 2.5, Vy: -0.5, Vz: 0,
+		})
+		sendFrame(v.conn, v.sysid, 1, 5, mavcodec.GlobalPositionInt{
+			Lat: v.latE7, Lon: v.lonE7, Alt: 15000, Hdg: 4500,
+		})
+	}
+
+	// Inject sanitized-out bad packets (NaN #31 and out-of-bounds #33) from noiseClient for sysid=1;
+	// verify /readyz stays 200 READY and sysid=1's PeerAddr is preserved.
+	sendFrame(noiseClient, 1, 1, 90, mavcodec.AttitudeQuaternion{Q1: float32(math.NaN())})
+	sendFrame(noiseClient, 1, 1, 91, mavcodec.GlobalPositionInt{Lat: 900_000_001, Lon: 0, Hdg: 0})
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+
+	// Verify Lane 1: WS #1 receives all 9 uncoalesced TelemetryFrames (#31 seq=3, #32 seq=4, #33 seq=5)
+	// on exact concrete subjects bbops.telemetry.{1,2,3} without any spurious baseline TransitionEvent.
+	type receivedTelemetry struct {
+		subject string
+		frame   mavlink.TelemetryFrame
+	}
+	gotTelemetry := make(map[uint8][]receivedTelemetry, 3)
+	seenFinalSeq := make(map[uint8]bool, len(vehicles))
+	totalFrames := 0
+	for totalFrames < 9 && len(seenFinalSeq) < len(vehicles) {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" {
+			continue
+		}
+		if strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			t.Fatalf("unexpected pre-transition Lane 3 event on %s: %s", wsFrame.Subject, string(wsFrame.Payload))
+		}
+		var tf mavlink.TelemetryFrame
+		if err := json.Unmarshal(wsFrame.Payload, &tf); err != nil {
+			t.Fatalf("unmarshal WS #1 TelemetryFrame (%s): %v", wsFrame.Subject, err)
+		}
+		gotTelemetry[tf.SysID] = append(gotTelemetry[tf.SysID], receivedTelemetry{
+			subject: wsFrame.Subject,
+			frame:   tf,
+		})
+		if tf.Seq == 5 {
+			seenFinalSeq[tf.SysID] = true
+		}
+		totalFrames++
+	}
+	type seqMsgPair struct {
+		seq   uint8
+		msgID uint32
+	}
+	wantSeqMsgs := []seqMsgPair{
+		{seq: 3, msgID: mavcodec.MsgIDAttitudeQuaternion},
+		{seq: 4, msgID: mavcodec.MsgIDLocalPositionNED},
+		{seq: 5, msgID: mavcodec.MsgIDGlobalPositionInt},
+	}
+	for _, v := range vehicles {
+		frames := gotTelemetry[v.sysid]
+		if len(frames) != len(wantSeqMsgs) {
+			t.Fatalf("sysid=%d WS #1 frame count = %d (%+v), want %d (#31, #32, #33)",
+				v.sysid, len(frames), frames, len(wantSeqMsgs))
+		}
+		wantSubject := fmt.Sprintf("bbops.telemetry.%d", v.sysid)
+		gotPairs := make([]seqMsgPair, 0, len(frames))
+		for _, rec := range frames {
+			if rec.subject != wantSubject {
+				t.Fatalf("sysid=%d WS #1 subject = %q, want %q", v.sysid, rec.subject, wantSubject)
+			}
+			gotPairs = append(gotPairs, seqMsgPair{seq: rec.frame.Seq, msgID: rec.frame.MsgID})
+		}
+		if !slices.Equal(gotPairs, wantSeqMsgs) {
+			t.Fatalf("sysid=%d WS #1 (seq, msg_id) sequence = %+v, want %+v", v.sysid, gotPairs, wantSeqMsgs)
+		}
+		tf := frames[len(frames)-1].frame
+		if tf.Domain != v.domName || !tf.HasGlobalPos || tf.NEDXYZ[0] != float64(v.sysid)*10 || math.Abs(tf.HdgDeg-v.wantYaw) > 1e-2 {
+			t.Fatalf("sysid=%d fused WS #1 TelemetryFrame = %+v, want domain=%s nedX=%v yaw=%v HasGlobalPos=true",
+				v.sysid, tf, v.domName, float64(v.sysid)*10, v.wantYaw)
+		}
+		wantPeer := v.conn.LocalAddr().(*net.UDPAddr).AddrPort()
+		if gotPeer, ok := ingestComp.PeerAddr(v.sysid); !ok || gotPeer != wantPeer {
+			t.Fatalf("sysid=%d PeerAddr = (%v, %v), want (%v, true)", v.sysid, gotPeer, ok, wantPeer)
+		}
+	}
+
+	// Verify Lane 2: 1 Hz periodic coalesced batch materializes all 3 vehicle entities in ENTITY_STATES + WS #2.
+	platform := rt.Platform()
+	wantEntities := make(map[string]bool, 3)
+	for _, v := range vehicles {
+		eid, idErr := uxsvocab.VehicleEntityID(platform.Org, platform.Platform, v.sysid)
+		if idErr != nil {
+			t.Fatalf("VehicleEntityID(%d): %v", v.sysid, idErr)
+		}
+		wantEntities[eid] = false
+	}
+	seenCount := 0
+	for seenCount < 3 {
+		wsFrame := readWSFrame(t, graphWS, 5*time.Second)
+		if wsFrame.Type == "put" && wsFrame.Bucket == graph.BucketEntityStates {
+			if seen, tracked := wantEntities[wsFrame.Key]; tracked && !seen {
+				wantEntities[wsFrame.Key] = true
+				seenCount++
+			}
+		}
+	}
+
+	// 3. Verify Lane 3 instant edge dual-route (< 1 Hz periodic cadence):
+	//    - sysid=1: HEARTBEAT authority preemption CompanionTeleop -> DirectCRSFOverride + TeleopDeadmanClamped
+	//    - sysid=2: #1 SYS_STATUS failsafe increment 2 -> 3
+	//    - sysid=3: #253 STATUSTEXT "USV HOLD ENGAGED"
+	edgeStart := time.Now()
+	crsfHB, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainQuadcopter,
+			ControlAuthority: mavcodec.AuthorityDirectCRSFOverride,
+			CompanionMode:    mavcodec.ModeHoldPosition,
+			LinkTier:         mavcodec.LinkTierMeshHighRate,
+			HealthFlags:      uxsvocab.HealthFlags{ClockSyncLocked: true, TeleopDeadmanClamped: true, CRSFLinkHealthy: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat CRSF override: %v", err)
+	}
+	sendFrame(vehicles[0].conn, 1, 1, 50, crsfHB)
+	sendFrame(vehicles[1].conn, 2, 1, 50, mavcodec.SysStatus{Load: 1100, ErrorsCount1: 3})
+	sendFrame(vehicles[2].conn, 3, 1, 50, mavcodec.StatusText{Severity: 3, Text: "USV HOLD ENGAGED"})
+
+	gotEvents := make(map[uint8]mavlink.TransitionEvent, 3)
+	for len(gotEvents) < 3 {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if err := json.Unmarshal(wsFrame.Payload, &ev); err != nil {
+			t.Fatalf("unmarshal WS #1 TransitionEvent (%s): %v", wsFrame.Subject, err)
+		}
+		gotEvents[ev.SysID] = ev
+	}
+	if ev1 := gotEvents[1]; ev1.Kind != mavlink.EventKindHeartbeatEdge ||
+		ev1.Authority != uxsvocab.AuthorityDirectCRSFOverride ||
+		ev1.PrevAuthority != uxsvocab.AuthorityCompanionTeleop ||
+		!ev1.Flags.TeleopDeadmanClamped {
+		t.Fatalf("sysid=1 Lane 3 TransitionEvent = %+v", ev1)
+	}
+	if ev2 := gotEvents[2]; ev2.Kind != mavlink.EventKindFailsafeIncrement || ev2.Failsafes != 3 {
+		t.Fatalf("sysid=2 Lane 3 TransitionEvent = %+v", ev2)
+	}
+	if ev3 := gotEvents[3]; ev3.Kind != mavlink.EventKindStatusText || ev3.StatusText == nil || ev3.StatusText.Text != "USV HOLD ENGAGED" {
+		t.Fatalf("sysid=3 Lane 3 TransitionEvent = %+v", ev3)
+	}
+
+	// Verify out-of-band SKG upsert converges in GraphQL / ENTITY_STATES without waiting for the 1000ms periodic tick!
+	vehicle1ID, _ := uxsvocab.VehicleEntityID(platform.Org, platform.Platform, 1)
+	gqlURL := endpoints.HTTPBaseURL + "/graph-gateway/graphql"
+	waitForCondition(t, 5*time.Second, "GraphQL reflects urgent DirectCRSFOverride edge on vehicle.1", func() bool {
+		reqBody, _ := json.Marshal(map[string]any{
+			"query":     `query($id: String!) { entity(id: $id) { entity { triples { predicate object } } } }`,
+			"variables": map[string]any{"id": vehicle1ID},
+		})
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, gqlURL, bytes.NewReader(reqBody))
+		if reqErr != nil {
+			return false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			return false
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+		var decoded struct {
+			Data struct {
+				Entity *struct {
+					Entity struct {
+						Triples []struct {
+							Predicate string `json:"predicate"`
+							Object    any    `json:"object"`
+						} `json:"triples"`
+					} `json:"entity"`
+				} `json:"entity"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(raw, &decoded) != nil || decoded.Data.Entity == nil {
+			return false
+		}
+		byPred := make(map[string]any, len(decoded.Data.Entity.Entity.Triples))
+		for _, tr := range decoded.Data.Entity.Entity.Triples {
+			byPred[tr.Predicate] = tr.Object
+		}
+		return len(byPred) == 23 &&
+			byPred[vocabulary.EntityIndexingProfile] == vocabulary.IndexingProfileSignal &&
+			byPred[uxsvocab.PredicateAuthorityState] == uxsvocab.AuthorityDirectCRSFOverride
+	})
+	if edgeElapsed := time.Since(edgeStart); edgeElapsed >= 850*time.Millisecond {
+		t.Fatalf("urgent Lane 3 edge + SKG GraphQL convergence took %v, expected out-of-band flush well below 1s periodic tick", edgeElapsed)
+	}
+}
+
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestRuntimeUpgradeFromM02PersistedFlowPreservesOperatorSettings(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	seedLegacyKV := func(t *testing.T, dataDir string, mutate func(*config.Config)) {
+		t.Helper()
+		legacyCfg, err := config.NewLoader().LoadFromBytes(configs.DefaultFlowJSON)
+		if err != nil {
+			t.Fatalf("LoadFromBytes: %v", err)
+		}
+		delete(legacyCfg.Components, host.MAVLinkIngestComponent)
+		if len(legacyCfg.Components) != 7 || legacyCfg.Version != "1.0.0" {
+			t.Fatalf("legacy flow = (%d components, version %q), want (7, \"1.0.0\")", len(legacyCfg.Components), legacyCfg.Version)
+		}
+		if mutate != nil {
+			mutate(legacyCfg)
+		}
+
+		srv, err := natsserver.NewServer(&natsserver.Options{
+			Host:      "127.0.0.1",
+			Port:      -1,
+			NoLog:     true,
+			NoSigs:    true,
+			JetStream: true,
+			StoreDir:  filepath.Join(dataDir, "jetstream"),
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		srv.Start()
+		if !srv.ReadyForConnections(10 * time.Second) {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+			t.Fatal("legacy embedded NATS did not become ready")
+		}
+		defer func() {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+		}()
+
+		discardLogger := slog.New(slog.DiscardHandler)
+		legacyCfg.NATS.URLs = []string{srv.ClientURL()}
+		client, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithLogger(discardLogger))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		if err := client.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer func() { _ = client.Close(context.Background()) }()
+		if err := client.WaitForConnection(ctx); err != nil {
+			t.Fatalf("WaitForConnection: %v", err)
+		}
+
+		if err := config.NewStreamsManager(client, discardLogger).EnsureStreams(ctx, legacyCfg); err != nil {
+			t.Fatalf("EnsureStreams: %v", err)
+		}
+		cfgMgr, err := config.NewConfigManager(legacyCfg, client, discardLogger)
+		if err != nil {
+			t.Fatalf("NewConfigManager: %v", err)
+		}
+		if err := cfgMgr.Start(ctx); err != nil {
+			t.Fatalf("cfgMgr.Start: %v", err)
+		}
+		if _, hasMAV := cfgMgr.GetConfig().Get().Components[host.MAVLinkIngestComponent]; hasMAV {
+			t.Fatal("legacy KV unexpectedly contained mavlink-ingest")
+		}
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := cfgMgr.Stop(stopCtx); err != nil {
+			t.Fatalf("cfgMgr.Stop: %v", err)
+		}
+	}
+
+	// 1. Seed a pre-M1.2 (7-component, version 1.0.0) JetStream directory with operator customizations:
+	//    - metrics.config.path = "/operator-custom-metrics" (default "/metrics")
+	//    - telemetry-websocket output path = "/operator-tel-ws" (default "/ws")
+	//    - graph-index.config.coalesce_ms = 225 (default 500)
+	dataDir := t.TempDir()
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>upgraded-cop</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+	seedLegacyKV(t, dataDir, func(c *config.Config) {
+		metricsSvc := c.Services["metrics"]
+		metricsSvc.Config = json.RawMessage(`{"port":9090,"path":"/operator-custom-metrics"}`)
+		c.Services["metrics"] = metricsSvc
+
+		giComp := c.Components["graph-index"]
+		var giDoc map[string]any
+		if err := json.Unmarshal(giComp.Config, &giDoc); err != nil {
+			t.Fatalf("decode graph-index config: %v", err)
+		}
+		giDoc["coalesce_ms"] = 225
+		rawGI, err := json.Marshal(giDoc)
+		if err != nil {
+			t.Fatalf("encode graph-index config: %v", err)
+		}
+		giComp.Config = rawGI
+		c.Components["graph-index"] = giComp
+
+		telComp := c.Components[host.TelemetryWSComponent]
+		var telDoc map[string]any
+		if err := json.Unmarshal(telComp.Config, &telDoc); err != nil {
+			t.Fatalf("decode telemetry-websocket config: %v", err)
+		}
+		telDoc["path"] = "/operator-tel-ws"
+		rawTel, err := json.Marshal(telDoc)
+		if err != nil {
+			t.Fatalf("encode telemetry-websocket config: %v", err)
+		}
+		telComp.Config = rawTel
+		c.Components[host.TelemetryWSComponent] = telComp
+	})
+
+	// 2. Boot the upgraded M1.2 runtime against the pre-M1.2 dataDir using the default embedded flow.
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: dataDir,
+		UIDir:   uiDir,
+		Version: "v0.3.0-m1.2",
+	}, 3)
+	if err != nil {
+		t.Fatalf("upgrade StartEphemeral failed: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("upgraded Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("upgraded WaitReady: %v", err)
+	}
+
+	ep := rt.Endpoints()
+	assertHTTPGet(t, ep.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+
+	// 3. Verify existing customized operator settings were preserved (not wiped out by file push).
+	if !strings.HasSuffix(ep.TelemetryWS, "/operator-tel-ws") {
+		t.Fatalf("upgraded TelemetryWS = %q, want preserved /operator-tel-ws suffix", ep.TelemetryWS)
+	}
+	customMetricsURL := fmt.Sprintf("http://127.0.0.1:%d/operator-custom-metrics", ep.MetricsPort)
+	respCustom, err := http.Get(customMetricsURL) //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET %s: %v", customMetricsURL, err)
+	}
+	metricsBody, _ := io.ReadAll(respCustom.Body)
+	_ = respCustom.Body.Close()
+	if respCustom.StatusCode != http.StatusOK || !bytes.Contains(metricsBody, []byte("go_goroutines")) {
+		t.Fatalf("GET %s = (%d, %d bytes), want 200 Prometheus payload on preserved operator metrics path",
+			customMetricsURL, respCustom.StatusCode, len(metricsBody))
+	}
+	defaultTelWSURL := strings.TrimSuffix(ep.TelemetryWS, "/operator-tel-ws") + "/ws"
+	if badConn, badResp, badErr := websocket.DefaultDialer.DialContext(ctx, defaultTelWSURL, nil); badErr == nil {
+		_ = badConn.Close()
+		t.Fatalf("dial %s unexpectedly succeeded when operator customized path to /operator-tel-ws", defaultTelWSURL)
+	} else if badResp != nil && badResp.Body != nil {
+		_ = badResp.Body.Close()
+	}
+
+	js, err := rt.NATSClient().JetStream()
+	if err != nil {
+		t.Fatalf("JetStream: %v", err)
+	}
+	bucketName, err := config.BucketName("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("BucketName: %v", err)
+	}
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("KeyValue(%q): %v", bucketName, err)
+	}
+	giEntry, err := kv.Get(ctx, "components.graph-index")
+	if err != nil {
+		t.Fatalf("kv.Get components.graph-index: %v", err)
+	}
+	var persistedGI struct {
+		Config struct {
+			CoalesceMS int `json:"coalesce_ms"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(giEntry.Value(), &persistedGI); err != nil {
+		t.Fatalf("decode persisted graph-index: %v", err)
+	}
+	if persistedGI.Config.CoalesceMS != 225 {
+		t.Fatalf("persisted graph-index coalesce_ms = %d, want preserved 225", persistedGI.Config.CoalesceMS)
+	}
+	mavEntry, err := kv.Get(ctx, "components."+host.MAVLinkIngestComponent)
+	if err != nil {
+		t.Fatalf("kv.Get components.%s: %v", host.MAVLinkIngestComponent, err)
+	}
+	if !bytes.Contains(mavEntry.Value(), []byte(`"mavlink-udp"`)) || !bytes.Contains(mavEntry.Value(), []byte(`14550`)) {
+		t.Fatalf("persisted %s = %s, want factory mavlink-udp with un-overridden port 14550", host.MAVLinkIngestComponent, string(mavEntry.Value()))
+	}
+
+	// 4. Verify the migrated MAVLink UDP listener is bound and streams live telemetry onto the customized WS #1 path.
+	ingestComp := rt.MAVLinkIngest()
+	if ingestComp == nil || ingestComp.BoundAddr().String() != ep.MAVLinkUDPAddr {
+		t.Fatalf("upgraded MAVLinkIngest = %v, want bound %s", ingestComp, ep.MAVLinkUDPAddr)
+	}
+	telWS := dialWebSocketWithRetry(ctx, t, ep.TelemetryWS)
+	defer func() { _ = telWS.Close() }()
+
+	udpDst, err := net.ResolveUDPAddr("udp", ep.MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", ep.MAVLinkUDPAddr, err)
+	}
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+
+	hbMsg, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainRover,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+			CompanionMode:    mavcodec.ModeTeleopVelocity,
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat: %v", err)
+	}
+	for i, msg := range []mavcodec.Message{
+		hbMsg,
+		mavcodec.LocalPositionNED{X: 77, Y: -3, Z: 0},
+	} {
+		raw, encErr := mavcodec.EncodeFrame(mavcodec.Frame{
+			Sequence: uint8(i + 1), SystemID: 1, ComponentID: 1, Message: msg,
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeFrame: %v", encErr)
+		}
+		if _, wErr := udpClient.WriteToUDP(raw, udpDst); wErr != nil {
+			t.Fatalf("WriteToUDP: %v", wErr)
+		}
+	}
+
+	wsFrame := readWSFrame(t, telWS, 5*time.Second)
+	var tf mavlink.TelemetryFrame
+	if err := json.Unmarshal(wsFrame.Payload, &tf); err != nil {
+		t.Fatalf("unmarshal upgraded WS #1 frame: %v", err)
+	}
+	if wsFrame.Subject != "bbops.telemetry.1" || tf.SysID != 1 || tf.MsgID != mavcodec.MsgIDLocalPositionNED || tf.NEDXYZ[0] != 77 {
+		t.Fatalf("upgraded UDP -> custom WS #1 frame = (%q, %+v), want subject=bbops.telemetry.1 NEDXYZ[0]=77", wsFrame.Subject, tf)
+	}
+
+	// 5. Verify a corrupt pre-M1.2 KV store (missing required graph-ingest) fails closed WITHOUT mutating KV.
+	corruptDir := t.TempDir()
+	seedLegacyKV(t, corruptDir, func(c *config.Config) {
+		delete(c.Components, "graph-ingest")
+	})
+	if _, corruptErr := host.StartEphemeral(ctx, host.Options{
+		DataDir: corruptDir,
+		UIDir:   uiDir,
+	}, 1); corruptErr == nil || !strings.Contains(corruptErr.Error(), `required component "graph-ingest" is missing`) {
+		t.Fatalf("corrupt KV StartEphemeral err = %v, want missing graph-ingest error", corruptErr)
+	}
+	verifySrv, err := natsserver.NewServer(&natsserver.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, JetStream: true,
+		StoreDir: filepath.Join(corruptDir, "jetstream"),
+	})
+	if err != nil {
+		t.Fatalf("verifySrv NewServer: %v", err)
+	}
+	verifySrv.Start()
+	defer func() {
+		verifySrv.Shutdown()
+		verifySrv.WaitForShutdown()
+	}()
+	if !verifySrv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("verifySrv not ready")
+	}
+	verifyClient, err := natsclient.NewClient(verifySrv.ClientURL(), natsclient.WithLogger(slog.New(slog.DiscardHandler)))
+	if err != nil {
+		t.Fatalf("verifyClient NewClient: %v", err)
+	}
+	if err := verifyClient.Connect(ctx); err != nil {
+		t.Fatalf("verifyClient Connect: %v", err)
+	}
+	defer func() { _ = verifyClient.Close(context.Background()) }()
+	verifyJS, err := verifyClient.JetStream()
+	if err != nil {
+		t.Fatalf("verifyClient JetStream: %v", err)
+	}
+	corruptKV, err := verifyJS.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("verifyJS KeyValue: %v", err)
+	}
+	if _, getErr := corruptKV.Get(ctx, "components."+host.MAVLinkIngestComponent); !errors.Is(getErr, jetstream.ErrKeyNotFound) {
+		t.Fatalf("corrupt KV unexpectedly mutated with components.%s (err=%v)", host.MAVLinkIngestComponent, getErr)
 	}
 }

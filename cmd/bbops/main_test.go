@@ -80,6 +80,13 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if !strings.Contains(stderr.String(), "http-port") {
 			t.Fatalf("stderr = %q, want diagnostic naming http-port", stderr.String())
 		}
+
+		stdout.Reset()
+		stderr.Reset()
+		code = run([]string{"-validate", "-mavlink-udp-port", "80"}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
+		if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "mavlink-udp-port") {
+			t.Fatalf("mavlink-udp-port=80: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
 	})
 
 	t.Run("validate flag rejects disabled mandatory component-manager or missing graph-gateway", func(t *testing.T) {
@@ -115,6 +122,149 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		}
 		if !strings.Contains(stderr.String(), "graph-gateway") {
 			t.Fatalf("stderr = %q, want graph-gateway diagnostic", stderr.String())
+		}
+	})
+
+	t.Run("validate and boot accept explicit legacy M0.2 flow file in memory while preserving operator settings and file on disk", func(t *testing.T) {
+		legacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			telWS := components[host.TelemetryWSComponent].(map[string]any)
+			telWS["config"].(map[string]any)["path"] = "/legacy-file-ws"
+		})
+		diskBefore, err := os.ReadFile(legacyPath)
+		if err != nil {
+			t.Fatalf("ReadFile before: %v", err)
+		}
+
+		var valStdout, valStderr bytes.Buffer
+		if code := run([]string{"-validate", "-config", legacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		// Customized valid legacy files (bumped operator version 1.0.1, and extra disabled graph-index instance) also pass -validate.
+		bumpedLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			doc["version"] = "1.0.1"
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+		})
+		valStdout.Reset()
+		valStderr.Reset()
+		if code := run([]string{"-validate", "-config", bumpedLegacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("bumped 1.0.1 legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		extraDisabledLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			components["graph-index-canary"] = map[string]any{
+				"type":    "processor",
+				"name":    "graph-index",
+				"enabled": false,
+				"config":  map[string]any{},
+			}
+		})
+		valStdout.Reset()
+		valStderr.Reset()
+		if code := run([]string{"-validate", "-config", extraDisabledLegacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("extra disabled legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		// Malformed legacy flows (missing graph-ingest, or rogue enabled component) still fail closed.
+		malformedLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			delete(components, "graph-ingest")
+		})
+		var badStdout, badStderr bytes.Buffer
+		if code := run([]string{"-validate", "-config", malformedLegacyPath}, &badStdout, &badStderr, "v0.3.0", "abc1234"); code != 1 || !strings.Contains(badStderr.String(), "graph-ingest") {
+			t.Fatalf("malformed legacy -validate: code=%d stdout=%q stderr=%q, want exit 1 naming graph-ingest", code, badStdout.String(), badStderr.String())
+		}
+
+		rogueLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			components["rogue-extra"] = map[string]any{"type": "input", "name": "websocket", "enabled": true, "config": map[string]any{}}
+		})
+		badStdout.Reset()
+		badStderr.Reset()
+		if code := run([]string{"-validate", "-config", rogueLegacyPath}, &badStdout, &badStderr, "v0.3.0", "abc1234"); code != 1 || !strings.Contains(badStderr.String(), "rogue-extra") {
+			t.Fatalf("rogue legacy -validate: code=%d stdout=%q stderr=%q, want exit 1 naming rogue-extra", code, badStdout.String(), badStderr.String())
+		}
+
+		ports, err := host.AllocateLoopbackPorts(4)
+		if err != nil {
+			t.Fatalf("AllocateLoopbackPorts: %v", err)
+		}
+		udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+		if err != nil {
+			t.Fatalf("AllocateLoopbackUDPPorts: %v", err)
+		}
+		uiDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>legacy-cfg</html>"), 0o600); err != nil {
+			t.Fatalf("write index.html: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		var runStdout, runStderr syncBuffer
+		done := make(chan int, 1)
+		go func() {
+			done <- runContext(ctx, []string{
+				"-config", legacyPath,
+				"-data-dir", filepath.Join(t.TempDir(), "data"),
+				"-ui-dir", uiDir,
+				"-bind-host", "127.0.0.1",
+				"-http-port", strconv.Itoa(ports[0]),
+				"-telemetry-ws-port", strconv.Itoa(ports[1]),
+				"-graph-ws-port", strconv.Itoa(ports[2]),
+				"-metrics-port", strconv.Itoa(ports[3]),
+				"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
+			}, &runStdout, &runStderr, "v0.3.0", "abc1234")
+		}()
+
+		deadline := time.Now().Add(15 * time.Second)
+		ready := false
+		for time.Now().Before(deadline) {
+			if strings.Contains(runStderr.String(), "bbops host ready") {
+				ready = true
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !ready {
+			cancel()
+			<-done
+			t.Fatalf("legacy -config daemon did not reach ready; stderr=%s", runStderr.String())
+		}
+		if !strings.Contains(runStderr.String(), "/legacy-file-ws") ||
+			!strings.Contains(runStderr.String(), "mavlink_udp=127.0.0.1:"+strconv.Itoa(udpPorts[0])) {
+			cancel()
+			<-done
+			t.Fatalf("legacy -config ready log missing preserved /legacy-file-ws or mavlink_udp: %s", runStderr.String())
+		}
+		resp, getErr := http.Get("http://127.0.0.1:" + strconv.Itoa(ports[0]) + "/readyz") //nolint:noctx
+		if getErr != nil {
+			cancel()
+			<-done
+			t.Fatalf("GET /readyz: %v", getErr)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			cancel()
+			<-done
+			t.Fatalf("/readyz status = %d, want 200", resp.StatusCode)
+		}
+		cancel()
+		if exitCode := <-done; exitCode != 0 {
+			t.Fatalf("legacy -config daemon exit = %d, want 0", exitCode)
+		}
+
+		diskAfter, err := os.ReadFile(legacyPath)
+		if err != nil {
+			t.Fatalf("ReadFile after: %v", err)
+		}
+		if !bytes.Equal(diskAfter, diskBefore) {
+			t.Fatal("legacy flow file on disk was modified")
 		}
 	})
 
@@ -244,6 +394,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("allocate loopback ports: %v", err)
 		}
+		udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+		if err != nil {
+			t.Fatalf("allocate loopback UDP port: %v", err)
+		}
 		uiDir := t.TempDir()
 		const wantIndex = "<html>cli-cop</html>"
 		if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte(wantIndex), 0o600); err != nil {
@@ -264,6 +418,7 @@ func TestRunCLIEntrypoint(t *testing.T) {
 				"-telemetry-ws-port", strconv.Itoa(ports[1]),
 				"-graph-ws-port", strconv.Itoa(ports[2]),
 				"-metrics-port", strconv.Itoa(ports[3]),
+				"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
 			}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
 		}()
 
@@ -332,6 +487,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		if !ready {
 			cancel()
 			t.Fatalf("CLI daemon never transitioned to /readyz 200 + ready log (stderr=%s)", stderr.String())
+		}
+		wantUDPField := "mavlink_udp=127.0.0.1:" + strconv.Itoa(udpPorts[0])
+		if !strings.Contains(stderr.String(), wantUDPField) {
+			t.Fatalf("expected %s in ready stderr, got:\n%s", wantUDPField, stderr.String())
 		}
 
 		rootResp2, err := http.Get(baseURL + "/") //nolint:noctx
@@ -425,6 +584,10 @@ func TestRunCLIEntrypoint(t *testing.T) {
 				if err != nil {
 					t.Fatalf("allocate loopback ports: %v", err)
 				}
+				udpPorts, err := host.AllocateLoopbackUDPPorts(1)
+				if err != nil {
+					t.Fatalf("allocate loopback UDP port: %v", err)
+				}
 
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -440,6 +603,7 @@ func TestRunCLIEntrypoint(t *testing.T) {
 						"-telemetry-ws-port", strconv.Itoa(ports[1]),
 						"-graph-ws-port", strconv.Itoa(ports[2]),
 						"-metrics-port", strconv.Itoa(ports[3]),
+						"-mavlink-udp-port", strconv.Itoa(udpPorts[0]),
 					}, &stdout, &stderr, "v0.1.0-dev", "abc1234")
 				}()
 

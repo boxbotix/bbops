@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/composition"
@@ -34,6 +35,8 @@ import (
 )
 
 const (
+	// MAVLinkIngestComponent is the external 0xB1 MAVLink v2 UDP 3-lane ingest adapter.
+	MAVLinkIngestComponent = mavlink.DefaultInstanceName
 	// TelemetryWSComponent is output/websocket instance #1 (core NATS bbops.telemetry.>).
 	TelemetryWSComponent = "telemetry-websocket"
 	// GraphWSComponent is output/websocket instance #2 (kv-watch ENTITY_STATES).
@@ -67,22 +70,31 @@ type PortOverrides struct {
 	// MetricsPort overrides the Prometheus metrics listener when > 0, keeps the
 	// flow config value when 0, and disables the metrics service when < 0.
 	MetricsPort int
-	// BindHost overrides output/websocket bind hosts when non-empty (e.g. "127.0.0.1").
+	// MAVLinkUDPPort overrides the mavlink-ingest UDP listener when > 0, keeps
+	// the flow config value when 0, and disables mavlink-ingest when < 0.
+	MAVLinkUDPPort int
+	// BindHost overrides output/websocket and UDP bind hosts when non-empty (e.g. "127.0.0.1").
 	BindHost string
 }
 
-// ResolvedEndpoints holds the effective local URLs for a configured bbops runtime.
+// ResolvedEndpoints holds the effective local URLs and UDP bind address for a configured bbops runtime.
 type ResolvedEndpoints struct {
-	HTTPPort    int
-	MetricsPort int
-	HTTPBaseURL string
-	TelemetryWS string
-	GraphWS     string
+	HTTPPort       int
+	MetricsPort    int
+	MAVLinkUDPPort int
+	HTTPBaseURL    string
+	TelemetryWS    string
+	GraphWS        string
+	MAVLinkUDPAddr string
 }
 
 // RegisterComponents registers the SemEngine v0.1.0-alpha.7 SKG, GraphQL gateway,
-// and dual-WebSocket component factories used by bbops.
+// dual-WebSocket, and bbops MAVLink v2 UDP ingest component factories.
 func RegisterComponents(registry *component.Registry) error {
+	return registerComponentsWithHook(registry, nil)
+}
+
+func registerComponentsWithHook(registry *component.Registry, onMAVLink func(*mavlink.Component)) error {
 	if registry == nil {
 		return errors.New("host: nil component registry")
 	}
@@ -90,6 +102,12 @@ func RegisterComponents(registry *component.Registry) error {
 		name string
 		fn   func(*component.Registry) error
 	}{
+		{
+			name: mavlink.FactoryName,
+			fn: func(reg *component.Registry) error {
+				return mavlink.RegisterWithHook(reg, onMAVLink)
+			},
+		},
 		{name: "graph-ingest", fn: graphingest.Register},
 		{name: "graph-index", fn: graphindex.Register},
 		{name: "graph-lexical", fn: graphlexical.Register},
@@ -115,7 +133,10 @@ type PreparedConfig struct {
 }
 
 // LoadConfig reads path (or the embedded configs/bbops.json default when path is
-// empty), parses it via SemEngine's loader, and applies any PortOverrides.
+// empty), parses it via SemEngine's loader, applies the additive pre-M1.2
+// mavlink-ingest upgrade in memory when loading a recognized legacy flow file
+// (preserving explicit operator values and leaving path untouched on disk), and
+// applies any PortOverrides.
 func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
 	var data []byte
 	var err error
@@ -131,10 +152,43 @@ func LoadConfig(path string, overrides PortOverrides) (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if path != "" {
+		if err := upgradeLegacyFlowInMemory(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if err := ApplyPortOverrides(cfg, overrides); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func upgradeLegacyFlowInMemory(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if _, hasMAV := cfg.Components[MAVLinkIngestComponent]; hasMAV {
+		return nil
+	}
+	for _, req := range requiredM02Components {
+		comp, exists := cfg.Components[req.instance]
+		if !exists || !comp.Enabled || comp.Name != req.factory {
+			return nil
+		}
+	}
+	defaultCfg, err := config.NewLoader().LoadFromBytes(configs.DefaultFlowJSON)
+	if err != nil {
+		return fmt.Errorf("parse embedded default config: %w", err)
+	}
+	mavComp, ok := defaultCfg.Components[MAVLinkIngestComponent]
+	if !ok {
+		return fmt.Errorf("embedded default config missing %q", MAVLinkIngestComponent)
+	}
+	if cfg.Components == nil {
+		cfg.Components = make(config.ComponentConfigs)
+	}
+	cfg.Components[MAVLinkIngestComponent] = mavComp
+	return nil
 }
 
 // PrepareConfig reads path once, validates the un-overridden base flow that
@@ -225,11 +279,29 @@ func ApplyPortOverrides(cfg *config.Config, overrides PortOverrides) error {
 		}
 	}
 
+	if overrides.MAVLinkUDPPort < 0 {
+		comp, ok := cfg.Components[MAVLinkIngestComponent]
+		if !ok {
+			return fmt.Errorf("missing required component %q", MAVLinkIngestComponent)
+		}
+		comp.Enabled = false
+		cfg.Components[MAVLinkIngestComponent] = comp
+	} else if overrides.MAVLinkUDPPort > 0 || overrides.BindHost != "" {
+		if overrides.MAVLinkUDPPort > 0 {
+			if err := validateUserPort("mavlink-udp-port", overrides.MAVLinkUDPPort); err != nil {
+				return err
+			}
+		}
+		if err := patchMAVLinkUDPEndpoint(cfg, overrides.BindHost, overrides.MAVLinkUDPPort); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 // ValidateOffline validates the SemEngine config document, ENTITY stream retention
-// invariants, mandatory SemEngine services, required bbops SKG/GraphQL/WebSocket
+// invariants, mandatory SemEngine services, required bbops SKG/GraphQL/WebSocket/MAVLink
 // components, listener port uniqueness, and offline component composition graph.
 func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	if cfg == nil {
@@ -263,6 +335,14 @@ func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 		if comp.Name != req.factory {
 			return nil, fmt.Errorf("required component %q must use factory %q, got %q", req.instance, req.factory, comp.Name)
 		}
+	}
+
+	mavComp, hasMAV := cfg.Components[MAVLinkIngestComponent]
+	if !hasMAV {
+		return nil, fmt.Errorf("required component %q is missing", MAVLinkIngestComponent)
+	}
+	if mavComp.Name != mavlink.FactoryName {
+		return nil, fmt.Errorf("required component %q must use factory %q, got %q", MAVLinkIngestComponent, mavlink.FactoryName, mavComp.Name)
 	}
 
 	if _, err := ResolveEndpoints(cfg); err != nil {
@@ -338,8 +418,8 @@ func validateServiceCompositionOffline(cfg *config.Config) error {
 	return nil
 }
 
-// ResolveEndpoints extracts the effective HTTP and WebSocket URLs from cfg and
-// verifies that no two active listeners claim the same TCP port.
+// ResolveEndpoints extracts the effective HTTP, WebSocket, and MAVLink UDP endpoints
+// from cfg and verifies that no two active TCP listeners claim the same port.
 func ResolveEndpoints(cfg *config.Config) (ResolvedEndpoints, error) {
 	if cfg == nil {
 		return ResolvedEndpoints{}, errors.New("host: nil configuration")
@@ -410,12 +490,19 @@ func ResolveEndpoints(cfg *config.Config) (ResolvedEndpoints, error) {
 		return ResolvedEndpoints{}, fmt.Errorf("port %d claimed by both %s and %s", graphPort, holder, GraphWSComponent)
 	}
 
+	mavlinkAddr, mavlinkPort, err := extractMAVLinkUDPEndpoint(cfg)
+	if err != nil {
+		return ResolvedEndpoints{}, err
+	}
+
 	return ResolvedEndpoints{
-		HTTPPort:    httpPort,
-		MetricsPort: metricsPort,
-		HTTPBaseURL: fmt.Sprintf("http://127.0.0.1:%d", httpPort),
-		TelemetryWS: telemetryURL,
-		GraphWS:     graphURL,
+		HTTPPort:       httpPort,
+		MetricsPort:    metricsPort,
+		MAVLinkUDPPort: mavlinkPort,
+		HTTPBaseURL:    fmt.Sprintf("http://127.0.0.1:%d", httpPort),
+		TelemetryWS:    telemetryURL,
+		GraphWS:        graphURL,
+		MAVLinkUDPAddr: mavlinkAddr,
 	}, nil
 }
 
@@ -508,6 +595,49 @@ func patchWebSocketEndpoint(cfg *config.Config, componentName, host string, port
 	return nil
 }
 
+func patchMAVLinkUDPEndpoint(cfg *config.Config, host string, port int) error {
+	comp, ok := cfg.Components[MAVLinkIngestComponent]
+	if !ok {
+		return fmt.Errorf("missing required component %q", MAVLinkIngestComponent)
+	}
+	if !comp.Enabled {
+		return nil
+	}
+	if isEmptyOrNullJSON(comp.Config) {
+		return fmt.Errorf("%s config missing ports block", MAVLinkIngestComponent)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(comp.Config, &doc); err != nil {
+		return fmt.Errorf("decode %s config: %w", MAVLinkIngestComponent, err)
+	}
+	portsMap, _ := doc["ports"].(map[string]any)
+	if portsMap == nil {
+		return fmt.Errorf("%s config missing ports block", MAVLinkIngestComponent)
+	}
+	inputs, _ := portsMap["inputs"].([]any)
+	if len(inputs) != 1 {
+		return fmt.Errorf("%s expected 1 input port, got %d", MAVLinkIngestComponent, len(inputs))
+	}
+	inDef, _ := inputs[0].(map[string]any)
+	inCfg, _ := inDef["config"].(map[string]any)
+	if inCfg == nil {
+		return fmt.Errorf("%s input port missing config object", MAVLinkIngestComponent)
+	}
+	if host != "" {
+		inCfg["host"] = host
+	}
+	if port > 0 {
+		inCfg["port"] = port
+	}
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("encode %s config: %w", MAVLinkIngestComponent, err)
+	}
+	comp.Config = encoded
+	cfg.Components[MAVLinkIngestComponent] = comp
+	return nil
+}
+
 func extractWebSocketURL(cfg *config.Config, componentName string) (string, int, error) {
 	comp, ok := cfg.Components[componentName]
 	if !ok || !comp.Enabled {
@@ -543,6 +673,42 @@ func extractWebSocketURL(cfg *config.Config, componentName string) (string, int,
 		dialHost = "127.0.0.1"
 	}
 	return "ws://" + net.JoinHostPort(dialHost, strconv.Itoa(port)) + wsPath, port, nil
+}
+
+func extractMAVLinkUDPEndpoint(cfg *config.Config) (string, int, error) {
+	comp, ok := cfg.Components[MAVLinkIngestComponent]
+	if !ok || !comp.Enabled {
+		return "", 0, nil
+	}
+	var parsed struct {
+		Ports struct {
+			Inputs []struct {
+				Config struct {
+					Protocol string `json:"protocol"`
+					Host     string `json:"host"`
+					Port     int    `json:"port"`
+				} `json:"config"`
+			} `json:"inputs"`
+		} `json:"ports"`
+	}
+	if err := json.Unmarshal(comp.Config, &parsed); err != nil {
+		return "", 0, fmt.Errorf("decode %s config: %w", MAVLinkIngestComponent, err)
+	}
+	if len(parsed.Ports.Inputs) != 1 {
+		return "", 0, fmt.Errorf("%s must declare exactly 1 input port", MAVLinkIngestComponent)
+	}
+	inCfg := parsed.Ports.Inputs[0].Config
+	if !strings.EqualFold(inCfg.Protocol, "udp") {
+		return "", 0, fmt.Errorf("%s input port protocol must be \"udp\", got %q", MAVLinkIngestComponent, inCfg.Protocol)
+	}
+	if err := validateUserPort(MAVLinkIngestComponent+".port", inCfg.Port); err != nil {
+		return "", 0, err
+	}
+	dialHost := inCfg.Host
+	if dialHost == "" || dialHost == "0.0.0.0" || dialHost == "::" {
+		dialHost = "127.0.0.1"
+	}
+	return net.JoinHostPort(dialHost, strconv.Itoa(inCfg.Port)), inCfg.Port, nil
 }
 
 // RedactNATSURL strips userinfo, query parameters, fragments, and paths from one

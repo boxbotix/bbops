@@ -1,14 +1,19 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,13 +21,21 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/boxbotix/bbops/internal/mavcodec"
+	"github.com/boxbotix/bbops/internal/mavlink"
+	"github.com/c360studio/semengine/composition"
+	"github.com/c360studio/semengine/config"
+	"github.com/c360studio/semengine/natsclient"
+	"github.com/c360studio/semengine/types"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 )
 
 // spec: host-runtime / Host CLI version and flag entrypoint
 // spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
 // spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
 func TestValidateOfflineAndPortOverrides(t *testing.T) {
-	t.Run("embedded default flow validates all seven components and endpoints", func(t *testing.T) {
+	t.Run("embedded default flow validates all eight components, flow paths, and endpoints", func(t *testing.T) {
 		cfg, err := LoadConfig("", PortOverrides{})
 		if err != nil {
 			t.Fatalf("LoadConfig default: %v", err)
@@ -31,8 +44,12 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ValidateOffline default: %v", err)
 		}
-		if got, want := len(res.Graph.Nodes), 7; got != want {
+		if got, want := len(res.Graph.Nodes), 8; got != want {
 			t.Fatalf("admitted component nodes = %d, want %d", got, want)
+		}
+		paths := composition.FlowPaths(res.Graph)[MAVLinkIngestComponent]
+		if !slices.Contains(paths, TelemetryWSComponent) || !slices.Contains(paths, "graph-ingest") {
+			t.Fatalf("mavlink-ingest flow paths = %v, want reachability to %s and graph-ingest", paths, TelemetryWSComponent)
 		}
 		endpoints, err := ResolveEndpoints(cfg)
 		if err != nil {
@@ -49,6 +66,9 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		}
 		if endpoints.MetricsPort != 9090 {
 			t.Fatalf("MetricsPort = %d, want 9090", endpoints.MetricsPort)
+		}
+		if endpoints.MAVLinkUDPPort != 14550 || endpoints.MAVLinkUDPAddr != "127.0.0.1:14550" {
+			t.Fatalf("MAVLinkUDP = (%d, %q), want (14550, 127.0.0.1:14550)", endpoints.MAVLinkUDPPort, endpoints.MAVLinkUDPAddr)
 		}
 	})
 
@@ -223,6 +243,12 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		if _, err := LoadConfig("", PortOverrides{TelemetryWSPort: 65536}); err == nil {
 			t.Fatal("expected error for TelemetryWSPort > 65535")
 		}
+		if _, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: 1023}); err == nil {
+			t.Fatal("expected error for MAVLinkUDPPort < 1024")
+		}
+		if _, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: 65536}); err == nil {
+			t.Fatal("expected error for MAVLinkUDPPort > 65535")
+		}
 
 		colliding, err := LoadConfig("", PortOverrides{
 			HTTPPort:        18080,
@@ -240,6 +266,7 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 			TelemetryWSPort: 18081,
 			GraphWSPort:     18082,
 			MetricsPort:     -1,
+			MAVLinkUDPPort:  14555,
 			BindHost:        "127.0.0.1",
 		})
 		if err != nil {
@@ -254,6 +281,39 @@ func TestValidateOfflineAndPortOverrides(t *testing.T) {
 		}
 		if endpoints.TelemetryWS != "ws://127.0.0.1:18081/ws" || endpoints.GraphWS != "ws://127.0.0.1:18082/ws" {
 			t.Fatalf("unexpected WS endpoints: %+v", endpoints)
+		}
+		if endpoints.MAVLinkUDPPort != 14555 || endpoints.MAVLinkUDPAddr != "127.0.0.1:14555" {
+			t.Fatalf("unexpected MAVLinkUDP endpoints: %+v", endpoints)
+		}
+
+		disabledUDP, err := LoadConfig("", PortOverrides{MAVLinkUDPPort: -1})
+		if err != nil {
+			t.Fatalf("LoadConfig MAVLinkUDPPort=-1: %v", err)
+		}
+		resDisabled, err := ValidateOffline(disabledUDP)
+		if err != nil {
+			t.Fatalf("ValidateOffline MAVLinkUDPPort=-1: %v", err)
+		}
+		if got, want := len(resDisabled.Graph.Nodes), 7; got != want {
+			t.Fatalf("admitted nodes with MAVLinkUDPPort=-1 = %d, want %d", got, want)
+		}
+		epDisabled, err := ResolveEndpoints(disabledUDP)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints MAVLinkUDPPort=-1: %v", err)
+		}
+		if epDisabled.MAVLinkUDPPort != 0 || epDisabled.MAVLinkUDPAddr != "" {
+			t.Fatalf("disabled MAVLinkUDP endpoints = (%d, %q), want (0, empty)", epDisabled.MAVLinkUDPPort, epDisabled.MAVLinkUDPAddr)
+		}
+
+		wrongFactory, err := LoadConfig("", PortOverrides{})
+		if err != nil {
+			t.Fatalf("LoadConfig wrong factory: %v", err)
+		}
+		mv := wrongFactory.Components[MAVLinkIngestComponent]
+		mv.Name = "websocket"
+		wrongFactory.Components[MAVLinkIngestComponent] = mv
+		if _, err := ValidateOffline(wrongFactory); err == nil || !strings.Contains(err.Error(), MAVLinkIngestComponent) {
+			t.Fatalf("expected wrong mavlink-ingest factory error, got %v", err)
 		}
 	})
 }
@@ -717,5 +777,464 @@ func TestRuntimeStopDoesNotDeadlockInFlightPreReadyUIRequest(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("in-flight pre-ready GET / did not complete after Stop")
+	}
+}
+
+// spec: host-runtime / Host CLI version and flag entrypoint
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestLegacyFlowFileUpgradeAndConcurrentKVMigration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// 1. Construct the exact pre-M1.2 base configs/bbops.json (7 components, no mavlink-ingest)
+	// and verify both PrepareConfig and live runtime boot succeed in memory without touching disk.
+	mavStart := bytes.Index(configs.DefaultFlowJSON, []byte(`    "mavlink-ingest": {`))
+	giStart := bytes.Index(configs.DefaultFlowJSON, []byte(`    "graph-ingest": {`))
+	if mavStart < 0 || giStart <= mavStart {
+		t.Fatalf("unexpected DefaultFlowJSON layout (mavStart=%d giStart=%d)", mavStart, giStart)
+	}
+	legacyRaw := append([]byte{}, configs.DefaultFlowJSON[:mavStart]...)
+	legacyRaw = append(legacyRaw, configs.DefaultFlowJSON[giStart:]...)
+
+	parsedCheck, err := config.NewLoader().LoadFromBytes(legacyRaw)
+	if err != nil {
+		t.Fatalf("LoadFromBytes(legacyRaw): %v", err)
+	}
+	if len(parsedCheck.Components) != 7 || parsedCheck.Version != "1.0.0" {
+		t.Fatalf("legacyRaw = (%d components, version %q), want (7, \"1.0.0\")", len(parsedCheck.Components), parsedCheck.Version)
+	}
+
+	baseLegacyPath := filepath.Join(t.TempDir(), "legacy-m02-bbops.json")
+	if err := os.WriteFile(baseLegacyPath, legacyRaw, 0o600); err != nil {
+		t.Fatalf("WriteFile(baseLegacyPath): %v", err)
+	}
+
+	prepared, err := PrepareConfig(baseLegacyPath, PortOverrides{}, "v0.3.0")
+	if err != nil {
+		t.Fatalf("PrepareConfig(baseLegacyPath) failed: %v", err)
+	}
+	if got, want := len(prepared.Composition.Graph.Nodes), 8; got != want {
+		t.Fatalf("legacy PrepareConfig admitted %d nodes, want %d", got, want)
+	}
+	baseEP, err := ResolveEndpoints(prepared.Base)
+	if err != nil {
+		t.Fatalf("ResolveEndpoints(prepared.Base): %v", err)
+	}
+	if baseEP.MAVLinkUDPPort != 14550 || baseEP.MAVLinkUDPAddr != "127.0.0.1:14550" {
+		t.Fatalf("legacy prepared Base MAVLink endpoint = (%d, %q), want (14550, 127.0.0.1:14550)",
+			baseEP.MAVLinkUDPPort, baseEP.MAVLinkUDPAddr)
+	}
+
+	// 1b. Customized valid legacy flows (bumped operator version 1.0.1, or additional
+	// disabled graph-index instance) preserve operator revision and entries while passing validation;
+	// malformed flows (missing required M0.2 component, empty semver, or broken enabled extra component) fail closed.
+	writeFlow := func(name string, mutate func(doc map[string]any)) string {
+		var doc map[string]any
+		if uErr := json.Unmarshal(legacyRaw, &doc); uErr != nil {
+			t.Fatalf("Unmarshal legacyRaw: %v", uErr)
+		}
+		mutate(doc)
+		raw, mErr := json.Marshal(doc)
+		if mErr != nil {
+			t.Fatalf("Marshal %s: %v", name, mErr)
+		}
+		p := filepath.Join(t.TempDir(), name)
+		if wErr := os.WriteFile(p, raw, 0o600); wErr != nil {
+			t.Fatalf("WriteFile %s: %v", name, wErr)
+		}
+		return p
+	}
+
+	bumpedVersionPath := writeFlow("legacy-v101.json", func(doc map[string]any) {
+		doc["version"] = "1.0.1"
+	})
+	bumpedBeforeBytes, err := os.ReadFile(bumpedVersionPath)
+	if err != nil {
+		t.Fatalf("ReadFile(bumpedVersionPath): %v", err)
+	}
+	preparedBumped, err := PrepareConfig(bumpedVersionPath, PortOverrides{}, "v0.3.0")
+	if err != nil {
+		t.Fatalf("PrepareConfig(bumpedVersionPath) failed: %v", err)
+	}
+	if preparedBumped.Base.Version != "1.0.1" || len(preparedBumped.Composition.Graph.Nodes) != 8 {
+		t.Fatalf("preparedBumped = (version %q, %d nodes), want (\"1.0.1\", 8)",
+			preparedBumped.Base.Version, len(preparedBumped.Composition.Graph.Nodes))
+	}
+
+	extraDisabledPath := writeFlow("legacy-extra-disabled.json", func(doc map[string]any) {
+		comps := doc["components"].(map[string]any)
+		comps["graph-index-spare"] = map[string]any{
+			"type":    "processor",
+			"name":    "graph-index",
+			"enabled": false,
+			"config":  map[string]any{},
+		}
+	})
+	preparedExtra, err := PrepareConfig(extraDisabledPath, PortOverrides{}, "v0.3.0")
+	if err != nil {
+		t.Fatalf("PrepareConfig(extraDisabledPath) failed: %v", err)
+	}
+	spareComp, hasSpare := preparedExtra.Base.Components["graph-index-spare"]
+	if !hasSpare || spareComp.Enabled || len(preparedExtra.Composition.Graph.Nodes) != 8 {
+		t.Fatalf("preparedExtra spare=(%v, enabled=%v), nodes=%d, want preserved disabled entry and 8 nodes",
+			hasSpare, spareComp.Enabled, len(preparedExtra.Composition.Graph.Nodes))
+	}
+
+	invalidPlatformPath := writeFlow("invalid-platform.json", func(doc map[string]any) {
+		doc["platform"] = map[string]any{"org": "invalid org!", "id": "bbops-node-1"}
+	})
+	if _, bErr := PrepareConfig(invalidPlatformPath, PortOverrides{}, "v0.3.0"); bErr == nil {
+		t.Fatal("PrepareConfig(invalidPlatformPath) unexpectedly succeeded")
+	}
+
+	missingM02Path := writeFlow("missing-m02.json", func(doc map[string]any) {
+		comps := doc["components"].(map[string]any)
+		delete(comps, "graph-index")
+	})
+	if _, mErr := PrepareConfig(missingM02Path, PortOverrides{}, "v0.3.0"); mErr == nil || !strings.Contains(mErr.Error(), "graph-index") {
+		t.Fatalf("PrepareConfig(missingM02Path) = %v, want missing graph-index error", mErr)
+	}
+
+	rogueEnabledPath := writeFlow("rogue-enabled.json", func(doc map[string]any) {
+		comps := doc["components"].(map[string]any)
+		comps["rogue-extra"] = map[string]any{"type": "input", "name": "websocket", "enabled": true, "config": map[string]any{}}
+	})
+	if _, eErr := PrepareConfig(rogueEnabledPath, PortOverrides{}, "v0.3.0"); eErr == nil || !strings.Contains(eErr.Error(), "rogue-extra") {
+		t.Fatalf("PrepareConfig(rogueEnabledPath) = %v, want composition error naming rogue-extra", eErr)
+	}
+
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>legacy-file</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+
+	seedLegacyM02KV := func(dataDir string) {
+		srv, sErr := natsserver.NewServer(&natsserver.Options{
+			Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, JetStream: true,
+			StoreDir: filepath.Join(dataDir, "jetstream"),
+		})
+		if sErr != nil {
+			t.Fatalf("NewServer: %v", sErr)
+		}
+		srv.Start()
+		if !srv.ReadyForConnections(10 * time.Second) {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+			t.Fatal("seed NATS server not ready")
+		}
+		defer func() {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+		}()
+		discardLogger := slog.New(slog.DiscardHandler)
+		seedCfg := parsedCheck.Clone()
+		seedCfg.NATS.URLs = []string{srv.ClientURL()}
+		seedClient, cErr := natsclient.NewClient(srv.ClientURL(), natsclient.WithLogger(discardLogger))
+		if cErr != nil {
+			t.Fatalf("NewClient: %v", cErr)
+		}
+		if cErr := seedClient.Connect(ctx); cErr != nil {
+			t.Fatalf("seedClient.Connect: %v", cErr)
+		}
+		defer func() { _ = seedClient.Close(context.Background()) }()
+		if eErr := config.NewStreamsManager(seedClient, discardLogger).EnsureStreams(ctx, seedCfg); eErr != nil {
+			t.Fatalf("EnsureStreams: %v", eErr)
+		}
+		seedMgr, mErr := config.NewConfigManager(seedCfg, seedClient, discardLogger)
+		if mErr != nil {
+			t.Fatalf("NewConfigManager: %v", mErr)
+		}
+		if stErr := seedMgr.Start(ctx); stErr != nil {
+			t.Fatalf("seedMgr.Start: %v", stErr)
+		}
+		_ = seedMgr.Stop(context.Background())
+	}
+
+	// Boot bumpedVersionPath (1.0.1) over an existing 1.0.0 KV store and verify 1.0.1 supersedes KV while leaving disk untouched.
+	bumpedDataDir := t.TempDir()
+	seedLegacyM02KV(bumpedDataDir)
+	rtFile, err := StartEphemeral(ctx, Options{
+		ConfigPath: bumpedVersionPath,
+		DataDir:    bumpedDataDir,
+		UIDir:      uiDir,
+		Version:    "v0.3.0",
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral(bumpedVersionPath): %v", err)
+	}
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := rtFile.WaitReady(readyCtx); err != nil {
+		readyCancel()
+		_ = rtFile.Stop(context.Background())
+		t.Fatalf("rtFile.WaitReady: %v", err)
+	}
+	readyCancel()
+	if rtFile.MAVLinkIngest() == nil || rtFile.Endpoints().MAVLinkUDPPort == 0 {
+		_ = rtFile.Stop(context.Background())
+		t.Fatalf("rtFile MAVLinkIngest = %v, endpoints = %+v, want active UDP listener", rtFile.MAVLinkIngest(), rtFile.Endpoints())
+	}
+	stopFileCtx, stopFileCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := rtFile.Stop(stopFileCtx); err != nil {
+		stopFileCancel()
+		t.Fatalf("rtFile.Stop: %v", err)
+	}
+	stopFileCancel()
+
+	afterBytes, err := os.ReadFile(baseLegacyPath)
+	if err != nil {
+		t.Fatalf("ReadFile(baseLegacyPath): %v", err)
+	}
+	afterBumpedBytes, err := os.ReadFile(bumpedVersionPath)
+	if err != nil {
+		t.Fatalf("ReadFile(bumpedVersionPath): %v", err)
+	}
+	if !bytes.Equal(afterBytes, legacyRaw) || !bytes.Equal(afterBumpedBytes, bumpedBeforeBytes) {
+		t.Fatal("explicit legacy flow file on disk was modified")
+	}
+
+	// 2. Synchronized concurrent operator write between KV snapshot lookup and conditional kv.Create:
+	// seed a 7-component M0.2 KV store, then create components.mavlink-ingest (enabled: false)
+	// inside beforeMigrationCreate and assert both KV and effective listener state honor the operator winner.
+	raceDataDir := t.TempDir()
+	seedLegacyM02KV(raceDataDir)
+
+	var hookFired atomic.Bool
+	var operatorRev atomic.Uint64
+	rtRace, err := StartEphemeral(ctx, Options{
+		DataDir: raceDataDir,
+		UIDir:   uiDir,
+		Version: "v0.3.0-race",
+		beforeMigrationCreate: func(hookCtx context.Context, client *natsclient.Client) error {
+			hookFired.Store(true)
+			js, jsErr := client.JetStream()
+			if jsErr != nil {
+				return jsErr
+			}
+			bucketName, bErr := config.BucketName("boxbotix", "bbops")
+			if bErr != nil {
+				return bErr
+			}
+			kv, kvErr := js.KeyValue(hookCtx, bucketName)
+			if kvErr != nil {
+				return kvErr
+			}
+			operatorWinner := types.ComponentConfig{
+				Type:    types.ComponentTypeInput,
+				Name:    mavlink.FactoryName,
+				Enabled: false,
+			}
+			rawWinner, mErr := json.Marshal(operatorWinner)
+			if mErr != nil {
+				return mErr
+			}
+			rev, cErr := kv.Create(hookCtx, "components."+MAVLinkIngestComponent, rawWinner)
+			if cErr != nil {
+				return fmt.Errorf("operator concurrent kv.Create: %w", cErr)
+			}
+			operatorRev.Store(rev)
+			return nil
+		},
+	}, 1)
+	if err != nil {
+		t.Fatalf("StartEphemeral concurrent migration race failed: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = rtRace.Stop(stopCtx)
+	})
+	if !hookFired.Load() || operatorRev.Load() == 0 {
+		t.Fatal("beforeMigrationCreate hook did not fire")
+	}
+
+	raceReadyCtx, raceReadyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer raceReadyCancel()
+	if err := rtRace.WaitReady(raceReadyCtx); err != nil {
+		t.Fatalf("rtRace.WaitReady: %v", err)
+	}
+
+	// Assert the concurrent operator write (enabled: false, exact KV revision) was NOT overwritten in KV.
+	js, err := rtRace.NATSClient().JetStream()
+	if err != nil {
+		t.Fatalf("rtRace JetStream: %v", err)
+	}
+	bucketName, err := config.BucketName("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("BucketName: %v", err)
+	}
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("KeyValue: %v", err)
+	}
+	entry, err := kv.Get(ctx, "components."+MAVLinkIngestComponent)
+	if err != nil {
+		t.Fatalf("kv.Get components.%s: %v", MAVLinkIngestComponent, err)
+	}
+	var stored types.ComponentConfig
+	if err := json.Unmarshal(entry.Value(), &stored); err != nil {
+		t.Fatalf("Unmarshal stored %s: %v", MAVLinkIngestComponent, err)
+	}
+	if entry.Revision() != operatorRev.Load() || stored.Enabled {
+		t.Fatalf("concurrent operator write overwritten: rev=%d (want %d) stored=%+v, want enabled=false",
+			entry.Revision(), operatorRev.Load(), stored)
+	}
+
+	// Assert effective runtime listener state honors enabled: false (no UDP listener started).
+	if rtRace.MAVLinkIngest() != nil || rtRace.Endpoints().MAVLinkUDPPort != 0 || rtRace.Endpoints().MAVLinkUDPAddr != "" {
+		t.Fatalf("effective runtime ignored concurrent operator enabled=false: ingest=%v endpoints=%+v",
+			rtRace.MAVLinkIngest(), rtRace.Endpoints())
+	}
+
+	// 3. Synchronized delayed-watcher test during upgrade with an explicit UDP port override:
+	// deliver real KV watcher updates carrying distinct stale stored ports on BOTH sides of
+	// boot snapshot capture (before SafeConfig.Mutate, immediately after Mutate before
+	// ValidateOffline/ResolveEndpoints, and after ResolveEndpoints before ComponentManager
+	// construction), then verify both the advertised endpoint and bound UDP socket match the
+	// requested override and receive live MAVLink traffic.
+	watcherDataDir := t.TempDir()
+	seedLegacyM02KV(watcherDataDir)
+
+	tcpPorts, err := AllocateLoopbackPorts(4)
+	if err != nil {
+		t.Fatalf("AllocateLoopbackPorts: %v", err)
+	}
+	udpPorts, err := AllocateLoopbackUDPPorts(4)
+	if err != nil {
+		t.Fatalf("AllocateLoopbackUDPPorts: %v", err)
+	}
+	requestedUDPPort := udpPorts[0]
+	preCaptureStalePort := udpPorts[1]
+	postMutateStalePort := udpPorts[2]
+	postEndpointStalePort := udpPorts[3]
+
+	injectAndAwaitWatcherPort := func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager, stalePort int, done *atomic.Bool) error {
+		staleCfg, lErr := LoadConfig("", PortOverrides{BindHost: "127.0.0.1", MAVLinkUDPPort: stalePort})
+		if lErr != nil {
+			return lErr
+		}
+		staleComp := staleCfg.Components[MAVLinkIngestComponent]
+		rawStale, mErr := json.Marshal(staleComp)
+		if mErr != nil {
+			return mErr
+		}
+		hookJS, jsErr := client.JetStream()
+		if jsErr != nil {
+			return jsErr
+		}
+		hookKV, kvErr := hookJS.KeyValue(hookCtx, bucketName)
+		if kvErr != nil {
+			return kvErr
+		}
+		if _, pErr := hookKV.Put(hookCtx, "components."+MAVLinkIngestComponent, rawStale); pErr != nil {
+			return pErr
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			_, portNow, eErr := extractMAVLinkUDPEndpoint(liveMgr.GetConfig().Get())
+			if eErr == nil && portNow == stalePort {
+				done.Store(true)
+				return nil
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return fmt.Errorf("timed out waiting for ConfigManager watcher to apply stale port %d", stalePort)
+	}
+
+	var preSnapshotReplayed, postMutateReplayed, postEndpointReplayed atomic.Bool
+	rtDelayed, err := Start(ctx, Options{
+		DataDir: watcherDataDir,
+		UIDir:   uiDir,
+		Version: "v0.3.0-delayed-watcher",
+		Overrides: PortOverrides{
+			BindHost:        "127.0.0.1",
+			HTTPPort:        tcpPorts[0],
+			TelemetryWSPort: tcpPorts[1],
+			GraphWSPort:     tcpPorts[2],
+			MetricsPort:     tcpPorts[3],
+			MAVLinkUDPPort:  requestedUDPPort,
+		},
+		beforeOverrideSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, preCaptureStalePort, &preSnapshotReplayed)
+		},
+		afterOverrideSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, postMutateStalePort, &postMutateReplayed)
+		},
+		afterEndpointSnapshot: func(hookCtx context.Context, client *natsclient.Client, liveMgr *config.Manager) error {
+			return injectAndAwaitWatcherPort(hookCtx, client, liveMgr, postEndpointStalePort, &postEndpointReplayed)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start(delayed watcher): %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = rtDelayed.Stop(stopCtx)
+	})
+	if !preSnapshotReplayed.Load() || !postMutateReplayed.Load() || !postEndpointReplayed.Load() {
+		t.Fatalf("watcher replay hooks incomplete: pre=%v postMutate=%v postEndpoint=%v",
+			preSnapshotReplayed.Load(), postMutateReplayed.Load(), postEndpointReplayed.Load())
+	}
+
+	delayedReadyCtx, delayedReadyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer delayedReadyCancel()
+	if err := rtDelayed.WaitReady(delayedReadyCtx); err != nil {
+		t.Fatalf("rtDelayed.WaitReady: %v", err)
+	}
+
+	wantUDPAddr := fmt.Sprintf("127.0.0.1:%d", requestedUDPPort)
+	gotAdvAddr := rtDelayed.Endpoints().MAVLinkUDPAddr
+	if rtDelayed.MAVLinkIngest() == nil || !rtDelayed.MAVLinkIngest().BoundAddr().IsValid() {
+		t.Fatal("rtDelayed MAVLinkIngest bound address is invalid")
+	}
+	gotBoundAddr := rtDelayed.MAVLinkIngest().BoundAddr().String()
+	if gotAdvAddr != wantUDPAddr || gotBoundAddr != wantUDPAddr {
+		t.Fatalf("requested UDP %d, advertised %s, actually bound %s",
+			requestedUDPPort, gotAdvAddr, gotBoundAddr)
+	}
+
+	// Confirm telemetry sent to the advertised override endpoint actually reaches the listener.
+	hbMsg, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainQuadcopter,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+			CompanionMode:    mavcodec.ModeHoldPosition,
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat: %v", err)
+	}
+	rawFrame, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence: 1, SystemID: 1, ComponentID: 1, Message: hbMsg,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame: %v", err)
+	}
+	udpDst, err := net.ResolveUDPAddr("udp", gotAdvAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", gotAdvAddr, err)
+	}
+	sender, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+	if _, err := sender.WriteToUDP(rawFrame, udpDst); err != nil {
+		t.Fatalf("WriteToUDP(%s): %v", gotAdvAddr, err)
+	}
+	peerDeadline := time.Now().Add(3 * time.Second)
+	admitted := false
+	for time.Now().Before(peerDeadline) {
+		if _, ok := rtDelayed.MAVLinkIngest().PeerAddr(1); ok {
+			admitted = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !admitted {
+		t.Fatalf("telemetry sent to advertised UDP %s was not received by bound listener %s", gotAdvAddr, gotBoundAddr)
 	}
 }
