@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -23,11 +24,14 @@ import (
 	"github.com/boxbotix/bbops/internal/mavcodec"
 	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
+	"github.com/c360studio/semengine/config"
 	"github.com/c360studio/semengine/graph"
 	"github.com/c360studio/semengine/message"
+	"github.com/c360studio/semengine/natsclient"
 	"github.com/c360studio/semengine/payloadregistry"
 	"github.com/c360studio/semengine/vocabulary"
 	"github.com/gorilla/websocket"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -1310,5 +1314,307 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 	})
 	if edgeElapsed := time.Since(edgeStart); edgeElapsed >= 850*time.Millisecond {
 		t.Fatalf("urgent Lane 3 edge + SKG GraphQL convergence took %v, expected out-of-band flush well below 1s periodic tick", edgeElapsed)
+	}
+}
+
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestRuntimeUpgradeFromM02PersistedFlowPreservesOperatorSettings(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	seedLegacyKV := func(t *testing.T, dataDir string, mutate func(*config.Config)) {
+		t.Helper()
+		legacyCfg, err := config.NewLoader().LoadFromBytes(configs.DefaultFlowJSON)
+		if err != nil {
+			t.Fatalf("LoadFromBytes: %v", err)
+		}
+		delete(legacyCfg.Components, host.MAVLinkIngestComponent)
+		if len(legacyCfg.Components) != 7 || legacyCfg.Version != "1.0.0" {
+			t.Fatalf("legacy flow = (%d components, version %q), want (7, \"1.0.0\")", len(legacyCfg.Components), legacyCfg.Version)
+		}
+		if mutate != nil {
+			mutate(legacyCfg)
+		}
+
+		srv, err := natsserver.NewServer(&natsserver.Options{
+			Host:      "127.0.0.1",
+			Port:      -1,
+			NoLog:     true,
+			NoSigs:    true,
+			JetStream: true,
+			StoreDir:  filepath.Join(dataDir, "jetstream"),
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		srv.Start()
+		if !srv.ReadyForConnections(10 * time.Second) {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+			t.Fatal("legacy embedded NATS did not become ready")
+		}
+		defer func() {
+			srv.Shutdown()
+			srv.WaitForShutdown()
+		}()
+
+		discardLogger := slog.New(slog.DiscardHandler)
+		legacyCfg.NATS.URLs = []string{srv.ClientURL()}
+		client, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithLogger(discardLogger))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		if err := client.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer func() { _ = client.Close(context.Background()) }()
+		if err := client.WaitForConnection(ctx); err != nil {
+			t.Fatalf("WaitForConnection: %v", err)
+		}
+
+		if err := config.NewStreamsManager(client, discardLogger).EnsureStreams(ctx, legacyCfg); err != nil {
+			t.Fatalf("EnsureStreams: %v", err)
+		}
+		cfgMgr, err := config.NewConfigManager(legacyCfg, client, discardLogger)
+		if err != nil {
+			t.Fatalf("NewConfigManager: %v", err)
+		}
+		if err := cfgMgr.Start(ctx); err != nil {
+			t.Fatalf("cfgMgr.Start: %v", err)
+		}
+		if _, hasMAV := cfgMgr.GetConfig().Get().Components[host.MAVLinkIngestComponent]; hasMAV {
+			t.Fatal("legacy KV unexpectedly contained mavlink-ingest")
+		}
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := cfgMgr.Stop(stopCtx); err != nil {
+			t.Fatalf("cfgMgr.Stop: %v", err)
+		}
+	}
+
+	// 1. Seed a pre-M1.2 (7-component, version 1.0.0) JetStream directory with operator customizations:
+	//    - metrics.config.path = "/operator-custom-metrics" (default "/metrics")
+	//    - telemetry-websocket output path = "/operator-tel-ws" (default "/ws")
+	//    - graph-index.config.coalesce_ms = 225 (default 500)
+	dataDir := t.TempDir()
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<html>upgraded-cop</html>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+	seedLegacyKV(t, dataDir, func(c *config.Config) {
+		metricsSvc := c.Services["metrics"]
+		metricsSvc.Config = json.RawMessage(`{"port":9090,"path":"/operator-custom-metrics"}`)
+		c.Services["metrics"] = metricsSvc
+
+		giComp := c.Components["graph-index"]
+		var giDoc map[string]any
+		if err := json.Unmarshal(giComp.Config, &giDoc); err != nil {
+			t.Fatalf("decode graph-index config: %v", err)
+		}
+		giDoc["coalesce_ms"] = 225
+		rawGI, err := json.Marshal(giDoc)
+		if err != nil {
+			t.Fatalf("encode graph-index config: %v", err)
+		}
+		giComp.Config = rawGI
+		c.Components["graph-index"] = giComp
+
+		telComp := c.Components[host.TelemetryWSComponent]
+		var telDoc map[string]any
+		if err := json.Unmarshal(telComp.Config, &telDoc); err != nil {
+			t.Fatalf("decode telemetry-websocket config: %v", err)
+		}
+		telDoc["path"] = "/operator-tel-ws"
+		rawTel, err := json.Marshal(telDoc)
+		if err != nil {
+			t.Fatalf("encode telemetry-websocket config: %v", err)
+		}
+		telComp.Config = rawTel
+		c.Components[host.TelemetryWSComponent] = telComp
+	})
+
+	// 2. Boot the upgraded M1.2 runtime against the pre-M1.2 dataDir using the default embedded flow.
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: dataDir,
+		UIDir:   uiDir,
+		Version: "v0.3.0-m1.2",
+	}, 3)
+	if err != nil {
+		t.Fatalf("upgrade StartEphemeral failed: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("upgraded Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("upgraded WaitReady: %v", err)
+	}
+
+	ep := rt.Endpoints()
+	assertHTTPGet(t, ep.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
+
+	// 3. Verify existing customized operator settings were preserved (not wiped out by file push).
+	if !strings.HasSuffix(ep.TelemetryWS, "/operator-tel-ws") {
+		t.Fatalf("upgraded TelemetryWS = %q, want preserved /operator-tel-ws suffix", ep.TelemetryWS)
+	}
+	customMetricsURL := fmt.Sprintf("http://127.0.0.1:%d/operator-custom-metrics", ep.MetricsPort)
+	respCustom, err := http.Get(customMetricsURL) //nolint:noctx
+	if err != nil {
+		t.Fatalf("GET %s: %v", customMetricsURL, err)
+	}
+	metricsBody, _ := io.ReadAll(respCustom.Body)
+	_ = respCustom.Body.Close()
+	if respCustom.StatusCode != http.StatusOK || !bytes.Contains(metricsBody, []byte("go_goroutines")) {
+		t.Fatalf("GET %s = (%d, %d bytes), want 200 Prometheus payload on preserved operator metrics path",
+			customMetricsURL, respCustom.StatusCode, len(metricsBody))
+	}
+	defaultTelWSURL := strings.TrimSuffix(ep.TelemetryWS, "/operator-tel-ws") + "/ws"
+	if badConn, badResp, badErr := websocket.DefaultDialer.DialContext(ctx, defaultTelWSURL, nil); badErr == nil {
+		_ = badConn.Close()
+		t.Fatalf("dial %s unexpectedly succeeded when operator customized path to /operator-tel-ws", defaultTelWSURL)
+	} else if badResp != nil && badResp.Body != nil {
+		_ = badResp.Body.Close()
+	}
+
+	js, err := rt.NATSClient().JetStream()
+	if err != nil {
+		t.Fatalf("JetStream: %v", err)
+	}
+	bucketName, err := config.BucketName("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("BucketName: %v", err)
+	}
+	kv, err := js.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("KeyValue(%q): %v", bucketName, err)
+	}
+	giEntry, err := kv.Get(ctx, "components.graph-index")
+	if err != nil {
+		t.Fatalf("kv.Get components.graph-index: %v", err)
+	}
+	var persistedGI struct {
+		Config struct {
+			CoalesceMS int `json:"coalesce_ms"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(giEntry.Value(), &persistedGI); err != nil {
+		t.Fatalf("decode persisted graph-index: %v", err)
+	}
+	if persistedGI.Config.CoalesceMS != 225 {
+		t.Fatalf("persisted graph-index coalesce_ms = %d, want preserved 225", persistedGI.Config.CoalesceMS)
+	}
+	mavEntry, err := kv.Get(ctx, "components."+host.MAVLinkIngestComponent)
+	if err != nil {
+		t.Fatalf("kv.Get components.%s: %v", host.MAVLinkIngestComponent, err)
+	}
+	if !bytes.Contains(mavEntry.Value(), []byte(`"mavlink-udp"`)) || !bytes.Contains(mavEntry.Value(), []byte(`14550`)) {
+		t.Fatalf("persisted %s = %s, want factory mavlink-udp with un-overridden port 14550", host.MAVLinkIngestComponent, string(mavEntry.Value()))
+	}
+
+	// 4. Verify the migrated MAVLink UDP listener is bound and streams live telemetry onto the customized WS #1 path.
+	ingestComp := rt.MAVLinkIngest()
+	if ingestComp == nil || ingestComp.BoundAddr().String() != ep.MAVLinkUDPAddr {
+		t.Fatalf("upgraded MAVLinkIngest = %v, want bound %s", ingestComp, ep.MAVLinkUDPAddr)
+	}
+	telWS := dialWebSocketWithRetry(ctx, t, ep.TelemetryWS)
+	defer func() { _ = telWS.Close() }()
+
+	udpDst, err := net.ResolveUDPAddr("udp", ep.MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", ep.MAVLinkUDPAddr, err)
+	}
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+
+	hbMsg, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainRover,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+			CompanionMode:    mavcodec.ModeTeleopVelocity,
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat: %v", err)
+	}
+	for i, msg := range []mavcodec.Message{
+		hbMsg,
+		mavcodec.LocalPositionNED{X: 77, Y: -3, Z: 0},
+	} {
+		raw, encErr := mavcodec.EncodeFrame(mavcodec.Frame{
+			Sequence: uint8(i + 1), SystemID: 1, ComponentID: 1, Message: msg,
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeFrame: %v", encErr)
+		}
+		if _, wErr := udpClient.WriteToUDP(raw, udpDst); wErr != nil {
+			t.Fatalf("WriteToUDP: %v", wErr)
+		}
+	}
+
+	wsFrame := readWSFrame(t, telWS, 5*time.Second)
+	var tf mavlink.TelemetryFrame
+	if err := json.Unmarshal(wsFrame.Payload, &tf); err != nil {
+		t.Fatalf("unmarshal upgraded WS #1 frame: %v", err)
+	}
+	if wsFrame.Subject != "bbops.telemetry.1" || tf.SysID != 1 || tf.MsgID != mavcodec.MsgIDLocalPositionNED || tf.NEDXYZ[0] != 77 {
+		t.Fatalf("upgraded UDP -> custom WS #1 frame = (%q, %+v), want subject=bbops.telemetry.1 NEDXYZ[0]=77", wsFrame.Subject, tf)
+	}
+
+	// 5. Verify a corrupt pre-M1.2 KV store (missing required graph-ingest) fails closed WITHOUT mutating KV.
+	corruptDir := t.TempDir()
+	seedLegacyKV(t, corruptDir, func(c *config.Config) {
+		delete(c.Components, "graph-ingest")
+	})
+	if _, corruptErr := host.StartEphemeral(ctx, host.Options{
+		DataDir: corruptDir,
+		UIDir:   uiDir,
+	}, 1); corruptErr == nil || !strings.Contains(corruptErr.Error(), `required component "graph-ingest" is missing`) {
+		t.Fatalf("corrupt KV StartEphemeral err = %v, want missing graph-ingest error", corruptErr)
+	}
+	verifySrv, err := natsserver.NewServer(&natsserver.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, JetStream: true,
+		StoreDir: filepath.Join(corruptDir, "jetstream"),
+	})
+	if err != nil {
+		t.Fatalf("verifySrv NewServer: %v", err)
+	}
+	verifySrv.Start()
+	defer func() {
+		verifySrv.Shutdown()
+		verifySrv.WaitForShutdown()
+	}()
+	if !verifySrv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("verifySrv not ready")
+	}
+	verifyClient, err := natsclient.NewClient(verifySrv.ClientURL(), natsclient.WithLogger(slog.New(slog.DiscardHandler)))
+	if err != nil {
+		t.Fatalf("verifyClient NewClient: %v", err)
+	}
+	if err := verifyClient.Connect(ctx); err != nil {
+		t.Fatalf("verifyClient Connect: %v", err)
+	}
+	defer func() { _ = verifyClient.Close(context.Background()) }()
+	verifyJS, err := verifyClient.JetStream()
+	if err != nil {
+		t.Fatalf("verifyClient JetStream: %v", err)
+	}
+	corruptKV, err := verifyJS.KeyValue(ctx, bucketName)
+	if err != nil {
+		t.Fatalf("verifyJS KeyValue: %v", err)
+	}
+	if _, getErr := corruptKV.Get(ctx, "components."+host.MAVLinkIngestComponent); !errors.Is(getErr, jetstream.ErrKeyNotFound) {
+		t.Fatalf("corrupt KV unexpectedly mutated with components.%s (err=%v)", host.MAVLinkIngestComponent, getErr)
 	}
 }

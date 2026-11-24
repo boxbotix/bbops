@@ -140,6 +140,13 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.configManager = cfgMgr
 
+	// Migrate valid pre-M1.2 (7-component, version 1.0.0) persisted KV flows by
+	// adding the missing mavlink-ingest component before endpoint overrides and
+	// effective validation while preserving all existing operator customizations.
+	if err := migratePersistedFlow(ctx, cfgMgr, baseCfg, opts.Overrides, opts.Version); err != nil {
+		return cleanup(fmt.Errorf("migrate persisted configuration: %w", err))
+	}
+
 	// Apply explicit process listener overrides and server version AFTER KV
 	// arbitration so warm restarts honor CLI/ephemeral overrides instead of
 	// silently binding stale KV ports.
@@ -684,5 +691,50 @@ func setServerVersion(cfg *config.Config, ver string) error {
 	}
 	svc.Config = encoded
 	cfg.Services["service-manager"] = svc
+	return nil
+}
+
+func migratePersistedFlow(
+	ctx context.Context,
+	cfgMgr *config.Manager,
+	baseCfg *config.Config,
+	overrides PortOverrides,
+	version string,
+) error {
+	if cfgMgr == nil || baseCfg == nil {
+		return errors.New("host: nil config manager or base configuration")
+	}
+	current := cfgMgr.GetConfig().Get()
+	if _, exists := current.Components[MAVLinkIngestComponent]; exists {
+		return nil
+	}
+
+	mavComp, ok := baseCfg.Clone().Components[MAVLinkIngestComponent]
+	if !ok {
+		return fmt.Errorf("base configuration missing %q", MAVLinkIngestComponent)
+	}
+
+	// Validate the migrated candidate (preserving existing KV settings + overrides)
+	// before mutating KV so corrupt or foreign KV stores fail closed untouched.
+	candidate := current.Clone()
+	if candidate.Components == nil {
+		candidate.Components = make(config.ComponentConfigs)
+	}
+	candidate.Components[MAVLinkIngestComponent] = mavComp
+	if err := ApplyPortOverrides(candidate, overrides); err != nil {
+		return err
+	}
+	if version != "" {
+		if err := setServerVersion(candidate, version); err != nil {
+			return err
+		}
+	}
+	if _, err := ValidateOffline(candidate); err != nil {
+		return err
+	}
+
+	if err := cfgMgr.PutComponentToKV(ctx, MAVLinkIngestComponent, mavComp); err != nil {
+		return fmt.Errorf("persist %s component during upgrade: %w", MAVLinkIngestComponent, err)
+	}
 	return nil
 }
