@@ -1092,17 +1092,19 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       stagedSnapshot.clear();
       stagedMaxPoseByKey.clear();
     },
-    onEndpointChange() {
+    onEndpointChange(nextUrl) {
+      currentUrl = nextUrl;
       clearFeedState();
     },
   });
+  let currentUrl = $state(wsClient.url);
 
   return {
     get status() {
       return status;
     },
     get url() {
-      return wsClient.url;
+      return currentUrl;
     },
     get synced() {
       return synced;

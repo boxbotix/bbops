@@ -256,7 +256,16 @@ interface VerifiedOriginBaseline {
   readonly globalPosObservedAtMs: number | null | undefined;
 }
 
+export interface SharedFrameOriginOptions {
+  readonly sessionKey?: string;
+}
+
+interface VerifiedOriginCandidate extends VerifiedOriginBaseline {
+  readonly originLla: [number, number, number];
+}
+
 interface AdapterOriginState {
+  sessionKey: string | null;
   consistentMaxLocalMs: number | null;
   consistentMaxGlobalMs: number | null;
   consistentSnapshots: VerifiedOriginBaseline[];
@@ -272,6 +281,7 @@ const adapterOriginStates = new WeakMap<ViewportAdapter, AdapterOriginState>();
 
 function createEmptyOriginState(): AdapterOriginState {
   return {
+    sessionKey: null,
     consistentMaxLocalMs: null,
     consistentMaxGlobalMs: null,
     consistentSnapshots: [],
@@ -303,6 +313,21 @@ function resetOriginState(state: AdapterOriginState): void {
   state.holdMaxGlobalMs = null;
   state.holdOriginSnapshots = [];
   state.holdSnapshots = [];
+}
+
+/**
+ * Clears cached shared-frame origin watermarks, hold state, and camera origin
+ * for an adapter when switching feeds or tearing down an active session.
+ */
+export function resetSharedFrameOrigin(adapter: ViewportAdapter): void {
+  const state = adapterOriginStates.get(adapter);
+  if (state) {
+    resetOriginState(state);
+    state.sessionKey = null;
+  }
+  if (adapter.getCamera().originLla !== null) {
+    adapter.setCamera({ originLla: null });
+  }
 }
 
 function tuple3Equals(
@@ -385,6 +410,66 @@ function poseAgreesWithOrigin(
   return originDisagreementMeters(ned, lla, originLla) <= maxDriftM;
 }
 
+function compareOriginCandidates(
+  a: VerifiedOriginCandidate,
+  b: VerifiedOriginCandidate,
+): number {
+  const aHasTs =
+    isFiniteNumber(a.localPosObservedAtMs) &&
+    isFiniteNumber(a.globalPosObservedAtMs);
+  const bHasTs =
+    isFiniteNumber(b.localPosObservedAtMs) &&
+    isFiniteNumber(b.globalPosObservedAtMs);
+  if (aHasTs !== bHasTs) {
+    return aHasTs ? -1 : 1;
+  }
+  if (aHasTs && bHasTs) {
+    const aPairMin = Math.min(
+      a.localPosObservedAtMs!,
+      a.globalPosObservedAtMs!,
+    );
+    const bPairMin = Math.min(
+      b.localPosObservedAtMs!,
+      b.globalPosObservedAtMs!,
+    );
+    if (aPairMin !== bPairMin) {
+      return bPairMin - aPairMin;
+    }
+    const aSkew = Math.abs(a.localPosObservedAtMs! - a.globalPosObservedAtMs!);
+    const bSkew = Math.abs(b.localPosObservedAtMs! - b.globalPosObservedAtMs!);
+    if (aSkew !== bSkew) {
+      return aSkew - bSkew;
+    }
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (a.originLla[i] !== b.originLla[i]) {
+      return a.originLla[i]! - b.originLla[i]!;
+    }
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (a.ned[i] !== b.ned[i]) {
+      return a.ned[i]! - b.ned[i]!;
+    }
+  }
+  return 0;
+}
+
+function selectCanonicalOriginCandidate(
+  candidates: readonly VerifiedOriginCandidate[],
+): VerifiedOriginCandidate | null {
+  if (candidates.length === 0) {
+    return null;
+  }
+  let best = candidates[0]!;
+  for (let i = 1; i < candidates.length; i += 1) {
+    const candidate = candidates[i]!;
+    if (compareOriginCandidates(candidate, best) < 0) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 function hasAdvancedPastWatermarks(
   candidate: VerifiedOriginBaseline,
   maxLocalMs: number | null,
@@ -421,6 +506,9 @@ function isConfirmedRelocation(
   maxGlobalMs: number | null,
   referenceSnapshots: readonly VerifiedOriginBaseline[],
 ): boolean {
+  if (poseAgreesWithOrigin(candidate.ned, candidate.lla, referenceOriginLla)) {
+    return false;
+  }
   if (
     !hasContemporaneousObservations(
       candidate.localPosObservedAtMs,
@@ -493,14 +581,19 @@ function recordConsistentPoses(
   poses: readonly VerifiedOriginBaseline[],
 ): void {
   for (const pose of poses) {
-    state.consistentMaxLocalMs = maxObservedMs(
-      state.consistentMaxLocalMs,
-      pose.localPosObservedAtMs,
-    );
-    state.consistentMaxGlobalMs = maxObservedMs(
-      state.consistentMaxGlobalMs,
-      pose.globalPosObservedAtMs,
-    );
+    if (
+      isFiniteNumber(pose.localPosObservedAtMs) &&
+      isFiniteNumber(pose.globalPosObservedAtMs)
+    ) {
+      state.consistentMaxLocalMs = maxObservedMs(
+        state.consistentMaxLocalMs,
+        pose.localPosObservedAtMs,
+      );
+      state.consistentMaxGlobalMs = maxObservedMs(
+        state.consistentMaxGlobalMs,
+        pose.globalPosObservedAtMs,
+      );
+    }
   }
   state.consistentSnapshots = poses.map(toOriginBaseline);
   state.isWithheld = false;
@@ -548,9 +641,12 @@ function enterHoldState(
 
 function enterDivergenceHoldState(
   state: AdapterOriginState,
-  divergedPoses: readonly VerifiedOriginBaseline[],
+  candidatePoses: readonly VerifiedOriginBaseline[],
   priorOriginLla: readonly [number, number, number],
 ): void {
+  const divergedOnly = candidatePoses.filter(
+    (pose) => !poseAgreesWithOrigin(pose.ned, pose.lla, priorOriginLla),
+  );
   state.isWithheld = true;
   state.withheldFromOriginLla = [
     priorOriginLla[0],
@@ -568,25 +664,38 @@ function enterDivergenceHoldState(
   state.holdOriginSnapshots = [...state.consistentSnapshots];
   state.holdSnapshots = [
     ...state.consistentSnapshots,
-    ...divergedPoses.map(toOriginBaseline),
+    ...divergedOnly.map(toOriginBaseline),
   ].slice(-16);
   state.consistentMaxLocalMs = null;
   state.consistentMaxGlobalMs = null;
   state.consistentSnapshots = [];
 }
 
-function canLiftHold(
+function canRestorePriorOrigin(
   candidate: VerifiedOriginBaseline,
+  priorOriginLla: readonly [number, number, number],
   state: AdapterOriginState,
 ): boolean {
-  if (
-    !hasContemporaneousObservations(
+  return (
+    poseAgreesWithOrigin(candidate.ned, candidate.lla, priorOriginLla) &&
+    hasContemporaneousObservations(
       candidate.localPosObservedAtMs,
       candidate.globalPosObservedAtMs,
+    ) &&
+    hasAdvancedPastWatermarks(
+      candidate,
+      state.holdMaxLocalMs,
+      state.holdMaxGlobalMs,
+      state.holdSnapshots,
     )
-  ) {
-    return false;
-  }
+  );
+}
+
+function canRelocateFromPriorHold(
+  candidate: VerifiedOriginBaseline,
+  priorOriginLla: readonly [number, number, number],
+  state: AdapterOriginState,
+): boolean {
   if (
     !hasAdvancedPastWatermarks(
       candidate,
@@ -597,25 +706,31 @@ function canLiftHold(
   ) {
     return false;
   }
-  if (state.withheldFromOriginLla !== null) {
-    if (
-      poseAgreesWithOrigin(
-        candidate.ned,
-        candidate.lla,
-        state.withheldFromOriginLla,
-      )
-    ) {
-      return true;
-    }
-    return isConfirmedRelocation(
+  return isConfirmedRelocation(
+    candidate,
+    priorOriginLla,
+    state.holdMaxLocalMs,
+    state.holdMaxGlobalMs,
+    state.holdOriginSnapshots,
+  );
+}
+
+function canLiftConflictHold(
+  candidate: VerifiedOriginBaseline,
+  state: AdapterOriginState,
+): boolean {
+  return (
+    hasContemporaneousObservations(
+      candidate.localPosObservedAtMs,
+      candidate.globalPosObservedAtMs,
+    ) &&
+    hasAdvancedPastWatermarks(
       candidate,
-      state.withheldFromOriginLla,
       state.holdMaxLocalMs,
       state.holdMaxGlobalMs,
-      state.holdOriginSnapshots,
-    );
-  }
-  return true;
+      state.holdSnapshots,
+    )
+  );
 }
 
 function collectVerifiedBaselines(
@@ -627,10 +742,8 @@ function collectVerifiedBaselines(
     readonly localPosObservedAtMs?: number | null;
     readonly globalPosObservedAtMs?: number | null;
   }>,
-): Array<VerifiedOriginBaseline & { originLla: [number, number, number] }> {
-  const out: Array<
-    VerifiedOriginBaseline & { originLla: [number, number, number] }
-  > = [];
+): VerifiedOriginCandidate[] {
+  const out: VerifiedOriginCandidate[] = [];
   for (const pose of poses) {
     if (
       pose.hasVerifiedFrameReference === false ||
@@ -657,10 +770,10 @@ function collectVerifiedBaselines(
  * Reconciles the viewport's shared NED<->LLA reference against live vehicle
  * poses that carry both local NED and a verified geographic fix.
  * Keeps an established reference steady across ordinary asynchronous local or
- * global updates, withholds mixed-frame placement when divergence can be
- * explained by asynchronous motion or when vehicles conflict, and preserves
- * holds across staggered or complete timeouts until new confirming observations
- * arrive.
+ * global updates, requires the candidate supplying any displayed reference to
+ * qualify individually in deterministic order, clears session state when the
+ * entity set is empty or the endpoint changes, and preserves holds across
+ * timeouts when entities remain present until new confirming observations arrive.
  */
 export function anchorSharedFrameOrigin(
   adapter: ViewportAdapter,
@@ -673,9 +786,21 @@ export function anchorSharedFrameOrigin(
       readonly globalPosObservedAtMs?: number | null;
     }
   >,
+  options?: SharedFrameOriginOptions,
 ): boolean {
   const state = getOrCreateOriginState(adapter);
-  const currentOrigin = adapter.getCamera().originLla;
+  let currentOrigin = adapter.getCamera().originLla;
+  if (options?.sessionKey !== undefined) {
+    if (state.sessionKey !== null && state.sessionKey !== options.sessionKey) {
+      if (currentOrigin !== null) {
+        adapter.setCamera({ originLla: null });
+        currentOrigin = null;
+      }
+      resetOriginState(state);
+    }
+    state.sessionKey = options.sessionKey;
+  }
+
   if (
     currentOrigin === null &&
     (state.consistentMaxLocalMs !== null ||
@@ -696,15 +821,18 @@ export function anchorSharedFrameOrigin(
   }
 
   const allPoses = Array.from(vehiclePoses);
+  if (allPoses.length === 0) {
+    if (currentOrigin !== null) {
+      adapter.setCamera({ originLla: null });
+    }
+    resetOriginState(state);
+    return false;
+  }
+
   const livePoses = allPoses.filter((pose) => pose.stale !== true);
 
   if (livePoses.length === 0) {
     if (currentOrigin === null) {
-      return false;
-    }
-    if (allPoses.length === 0) {
-      adapter.setCamera({ originLla: null });
-      resetOriginState(state);
       return false;
     }
     const staleStillConsistent = allPoses.every(
@@ -735,15 +863,20 @@ export function anchorSharedFrameOrigin(
     return false;
   }
 
-  const primary = verified[0]!;
-  for (let i = 1; i < verified.length; i += 1) {
-    const peer = verified[i]!;
-    if (!poseAgreesWithOrigin(peer.ned, peer.lla, primary.originLla)) {
-      if (currentOrigin !== null) {
-        adapter.setCamera({ originLla: null });
+  for (let i = 0; i < verified.length; i += 1) {
+    const base = verified[i]!;
+    for (let j = i + 1; j < verified.length; j += 1) {
+      const peer = verified[j]!;
+      if (
+        !poseAgreesWithOrigin(peer.ned, peer.lla, base.originLla) ||
+        !poseAgreesWithOrigin(base.ned, base.lla, peer.originLla)
+      ) {
+        if (currentOrigin !== null) {
+          adapter.setCamera({ originLla: null });
+        }
+        enterHoldState(state, verified);
+        return false;
       }
-      enterHoldState(state, verified);
-      return false;
     }
   }
 
@@ -756,7 +889,7 @@ export function anchorSharedFrameOrigin(
       return true;
     }
 
-    const confirmedRelocation = verified.some((item) =>
+    const relocatingCandidates = verified.filter((item) =>
       isConfirmedRelocation(
         item,
         currentOrigin,
@@ -765,46 +898,76 @@ export function anchorSharedFrameOrigin(
         state.consistentSnapshots,
       ),
     );
-    if (!confirmedRelocation) {
+    const chosenRelocation =
+      selectCanonicalOriginCandidate(relocatingCandidates);
+    if (chosenRelocation === null) {
       adapter.setCamera({ originLla: null });
       enterDivergenceHoldState(state, verified, currentOrigin);
       return false;
     }
 
-    adapter.setCamera({ originLla: primary.originLla });
+    adapter.setCamera({ originLla: chosenRelocation.originLla });
     recordConsistentPoses(state, verified);
     return true;
   }
 
   if (state.isWithheld) {
-    const liftConfirmed = verified.some((item) => canLiftHold(item, state));
-    if (!liftConfirmed) {
+    if (state.withheldFromOriginLla !== null) {
+      const priorOrigin = state.withheldFromOriginLla;
+      const allAgreeWithPrior = verified.every((item) =>
+        poseAgreesWithOrigin(item.ned, item.lla, priorOrigin),
+      );
+      if (allAgreeWithPrior) {
+        const restoreConfirmed = verified.some((item) =>
+          canRestorePriorOrigin(item, priorOrigin, state),
+        );
+        if (!restoreConfirmed) {
+          return false;
+        }
+        adapter.setCamera({ originLla: priorOrigin });
+        recordConsistentPoses(state, verified);
+        return true;
+      }
+
+      const relocatingFromHold = verified.filter((item) =>
+        canRelocateFromPriorHold(item, priorOrigin, state),
+      );
+      const chosenHoldRelocation =
+        selectCanonicalOriginCandidate(relocatingFromHold);
+      if (chosenHoldRelocation === null) {
+        return false;
+      }
+      adapter.setCamera({ originLla: chosenHoldRelocation.originLla });
+      recordConsistentPoses(state, verified);
+      return true;
+    }
+
+    const conflictRecoveryCandidates = verified.filter((item) =>
+      canLiftConflictHold(item, state),
+    );
+    const chosenRecovery = selectCanonicalOriginCandidate(
+      conflictRecoveryCandidates,
+    );
+    if (chosenRecovery === null) {
       return false;
     }
-    const restorePriorOrigin =
-      state.withheldFromOriginLla !== null &&
-      verified.every((item) =>
-        poseAgreesWithOrigin(item.ned, item.lla, state.withheldFromOriginLla!),
-      );
-    const nextOrigin = restorePriorOrigin
-      ? state.withheldFromOriginLla!
-      : primary.originLla;
-    adapter.setCamera({ originLla: nextOrigin });
+    adapter.setCamera({ originLla: chosenRecovery.originLla });
     recordConsistentPoses(state, verified);
     return true;
   }
 
-  const initialConfirmed = verified.some((item) =>
+  const initialCandidates = verified.filter((item) =>
     hasContemporaneousObservations(
       item.localPosObservedAtMs,
       item.globalPosObservedAtMs,
     ),
   );
-  if (!initialConfirmed) {
+  const chosenInitial = selectCanonicalOriginCandidate(initialCandidates);
+  if (chosenInitial === null) {
     return false;
   }
 
-  adapter.setCamera({ originLla: primary.originLla });
+  adapter.setCamera({ originLla: chosenInitial.originLla });
   recordConsistentPoses(state, verified);
   return true;
 }

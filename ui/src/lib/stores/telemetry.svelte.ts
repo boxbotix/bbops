@@ -622,17 +622,19 @@ export function createTelemetryStore(
         lastDisconnectedAt = info.timestamp;
       }
     },
-    onEndpointChange() {
+    onEndpointChange(nextUrl) {
+      currentUrl = nextUrl;
       clearFeedState();
     },
   });
+  let currentUrl = $state(wsClient.url);
 
   return {
     get status() {
       return status;
     },
     get url() {
-      return wsClient.url;
+      return currentUrl;
     },
     get vehicleCount() {
       return vehicleCount;

@@ -85,10 +85,17 @@
     });
   }
 
+  let lastSessionKey: string | null = null;
+
   function reconcileSharedOriginAndStatuses(
     vehicles: readonly VehicleEntityState[],
     nowMs = now(),
   ): Map<string, ResolvedVehiclePose> {
+    const sessionKey = `${skgStore.url}|${telemetryStore.url}`;
+    if (lastSessionKey !== null && lastSessionKey !== sessionKey) {
+      wakeTrails.clear();
+    }
+    lastSessionKey = sessionKey;
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const poses = new Map<string, ResolvedVehiclePose>();
     const staleIds: string[] = [];
@@ -99,7 +106,9 @@
         staleIds.push(v.id);
       }
     }
-    const anchored = anchorSharedFrameOrigin(adapter, poses.values());
+    const anchored = anchorSharedFrameOrigin(adapter, poses.values(), {
+      sessionKey,
+    });
     if (originAnchored !== anchored) {
       originAnchored = anchored;
     }

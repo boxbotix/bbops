@@ -22,6 +22,7 @@ import {
   deriveNedOriginLla,
   llaToLocalNed,
   localNedToLla,
+  resetSharedFrameOrigin,
   resolveContactPalette,
   resolveDomainGlyphKind,
   resolveVehicleSafetyTone,
@@ -2455,5 +2456,825 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       ]),
     ).toBe(true);
     expect(directAdapter.getCamera().originLla).not.toBeNull();
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("requires the candidate supplying a reference to qualify individually in both [A, B] and [B, A] orders across initial placement, relocation, and recovery", () => {
+    const t0 = Date.parse("2026-11-24T18:00:00.000Z");
+    const sfBeaconLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const sfOriginLla = deriveNedOriginLla([0, 0, -2], sfBeaconLla)!;
+    const austinBeaconLla: [number, number, number] = [30.2672, -97.7431, 150];
+    const austinOriginLla = deriveNedOriginLla([0, 0, -2], austinBeaconLla)!;
+
+    // Fixed camera 800x600 at 4 px/m (stationary sfBeaconLla projects to x = 400 when anchored at sfOriginLla).
+    // Candidate A: no global observation timestamp (fails confirmation alone), shifted +30 m East (120 px at 4 px/m).
+    // Candidate B: confirmed pair at t0 + 1000, shifted +10 m East (40 px at 4 px/m; 10 m <= 25 m from sfOriginLla, 20 m <= 25 m from A).
+    const llaShifted30mEast = localNedToLla([0, 30, -2], sfOriginLla)!;
+    const llaShifted15mEast = localNedToLla([0, 15, -2], sfOriginLla)!;
+    const llaShifted10mEast = localNedToLla([0, 10, -2], sfOriginLla)!;
+    const austinShifted20mEast = localNedToLla([0, 20, -2], austinOriginLla)!;
+
+    const makeCandidateA = (tsMs: number) => ({
+      ned: [0, 0, -2] as [number, number, number],
+      lla: llaShifted30mEast,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: tsMs,
+      globalPosObservedAtMs: null,
+    });
+    const makeCandidateAMild = (tsMs: number) => ({
+      ned: [0, 0, -2] as [number, number, number],
+      lla: llaShifted15mEast,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: tsMs,
+      globalPosObservedAtMs: null,
+    });
+    const makeCandidateB = (tsMs: number) => ({
+      ned: [0, 0, -2] as [number, number, number],
+      lla: llaShifted10mEast,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: tsMs,
+      globalPosObservedAtMs: tsMs,
+    });
+    const makeCandidateC = (tsMs: number) => ({
+      ned: [0, 0, -2] as [number, number, number],
+      lla: austinBeaconLla,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: tsMs,
+      globalPosObservedAtMs: tsMs,
+    });
+    const makeCandidateAAustin = (tsMs: number) => ({
+      ned: [0, 0, -2] as [number, number, number],
+      lla: austinShifted20mEast,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: tsMs,
+      globalPosObservedAtMs: null,
+    });
+
+    // 1. INITIAL PLACEMENT: [A] withholds; [B], [A, B], and [B, A] all install B's origin (x = 360, never A's x = 280).
+    const initAOnly = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    expect(anchorSharedFrameOrigin(initAOnly, [makeCandidateA(t0)])).toBe(
+      false,
+    );
+    expect(initAOnly.getCamera().originLla).toBeNull();
+
+    const initBOnly = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    expect(anchorSharedFrameOrigin(initBOnly, [makeCandidateB(t0)])).toBe(true);
+    const expectedBProjX = initBOnly.project({ lla: sfBeaconLla }).x;
+    expect(expectedBProjX).toBeCloseTo(360, 2);
+
+    for (const pair of [
+      [makeCandidateA(t0), makeCandidateB(t0)],
+      [makeCandidateB(t0), makeCandidateA(t0)],
+    ]) {
+      const initPair = new NedGridAdapter({
+        widthPx: 800,
+        heightPx: 600,
+        zoomPxPerM: 4,
+      });
+      expect(anchorSharedFrameOrigin(initPair, pair)).toBe(true);
+      expect(initPair.getCamera().originLla).toEqual(
+        initBOnly.getCamera().originLla,
+      );
+      expect(initPair.project({ lla: sfBeaconLla }).x).toBeCloseTo(
+        expectedBProjX,
+        6,
+      );
+    }
+
+    // 2. RELOCATION (established sfOriginLla -> x = 400):
+    // [A] alone withholds; [B] alone causes 0 px movement; [A, B] and [B, A] both withhold (never shifting 120 px or 40 px).
+    const makeEstablishedAdapter = () => {
+      const a = new NedGridAdapter({
+        widthPx: 800,
+        heightPx: 600,
+        zoomPxPerM: 4,
+      });
+      expect(
+        anchorSharedFrameOrigin(a, [
+          {
+            ned: [0, 0, -2],
+            lla: sfBeaconLla,
+            hasLocalPos: true,
+            hasVerifiedFrameReference: true,
+            stale: false,
+            localPosObservedAtMs: t0,
+            globalPosObservedAtMs: t0,
+          },
+        ]),
+      ).toBe(true);
+      expect(a.project({ lla: sfBeaconLla }).x).toBeCloseTo(400, 6);
+      return a;
+    };
+
+    const relocAOnly = makeEstablishedAdapter();
+    expect(
+      anchorSharedFrameOrigin(relocAOnly, [makeCandidateA(t0 + 1_000)]),
+    ).toBe(false);
+    expect(relocAOnly.getCamera().originLla).toBeNull();
+
+    const relocBOnly = makeEstablishedAdapter();
+    expect(
+      anchorSharedFrameOrigin(relocBOnly, [makeCandidateB(t0 + 1_000)]),
+    ).toBe(true);
+    expect(relocBOnly.project({ lla: sfBeaconLla }).x).toBeCloseTo(400, 6);
+
+    for (const pair of [
+      [makeCandidateA(t0 + 1_000), makeCandidateB(t0 + 1_000)],
+      [makeCandidateB(t0 + 1_000), makeCandidateA(t0 + 1_000)],
+    ]) {
+      const relocPair = makeEstablishedAdapter();
+      expect(anchorSharedFrameOrigin(relocPair, pair)).toBe(false);
+      expect(relocPair.getCamera().originLla).toBeNull();
+      expect(relocPair.project({ lla: sfBeaconLla }).visible).toBe(false);
+    }
+
+    // When both agree with established origin ([A_mild, B] and [B, A_mild]), both retain sfOriginLla (0 px movement).
+    for (const pair of [
+      [makeCandidateAMild(t0 + 1_000), makeCandidateB(t0 + 1_000)],
+      [makeCandidateB(t0 + 1_000), makeCandidateAMild(t0 + 1_000)],
+    ]) {
+      const retainPair = makeEstablishedAdapter();
+      expect(anchorSharedFrameOrigin(retainPair, pair)).toBe(true);
+      expect(retainPair.project({ lla: sfBeaconLla }).x).toBeCloseTo(400, 6);
+    }
+
+    // When C confirms relocation to Austin alongside unconfirmed A_austin, both [A_austin, C] and [C, A_austin] install C's origin.
+    for (const pair of [
+      [makeCandidateAAustin(t0 + 1_000), makeCandidateC(t0 + 1_000)],
+      [makeCandidateC(t0 + 1_000), makeCandidateAAustin(t0 + 1_000)],
+    ]) {
+      const austinPair = makeEstablishedAdapter();
+      expect(anchorSharedFrameOrigin(austinPair, pair)).toBe(true);
+      expect(austinPair.project({ lla: austinBeaconLla }).x).toBeCloseTo(
+        400,
+        4,
+      );
+    }
+
+    // 3. RECOVERY (both divergence-hold and conflict-hold in both [A, B] and [B, A] orders):
+    const makeDivergenceHeldAdapter = () => {
+      const a = makeEstablishedAdapter();
+      expect(anchorSharedFrameOrigin(a, [makeCandidateA(t0 + 500)])).toBe(
+        false,
+      );
+      expect(a.getCamera().originLla).toBeNull();
+      return a;
+    };
+
+    for (const pair of [
+      [makeCandidateA(t0 + 1_500), makeCandidateB(t0 + 1_500)],
+      [makeCandidateB(t0 + 1_500), makeCandidateA(t0 + 1_500)],
+    ]) {
+      const heldPair = makeDivergenceHeldAdapter();
+      expect(anchorSharedFrameOrigin(heldPair, pair)).toBe(false);
+      expect(heldPair.getCamera().originLla).toBeNull();
+    }
+
+    for (const pair of [
+      [makeCandidateAMild(t0 + 1_500), makeCandidateB(t0 + 1_500)],
+      [makeCandidateB(t0 + 1_500), makeCandidateAMild(t0 + 1_500)],
+    ]) {
+      const restoredPair = makeDivergenceHeldAdapter();
+      expect(anchorSharedFrameOrigin(restoredPair, pair)).toBe(true);
+      expect(restoredPair.project({ lla: sfBeaconLla }).x).toBeCloseTo(400, 6);
+    }
+
+    for (const pair of [
+      [makeCandidateAAustin(t0 + 1_500), makeCandidateC(t0 + 1_500)],
+      [makeCandidateC(t0 + 1_500), makeCandidateAAustin(t0 + 1_500)],
+    ]) {
+      const relocatedHoldPair = makeDivergenceHeldAdapter();
+      expect(anchorSharedFrameOrigin(relocatedHoldPair, pair)).toBe(true);
+      expect(relocatedHoldPair.project({ lla: austinBeaconLla }).x).toBeCloseTo(
+        400,
+        4,
+      );
+    }
+
+    const makeConflictHeldAdapter = () => {
+      const a = new NedGridAdapter({
+        widthPx: 800,
+        heightPx: 600,
+        zoomPxPerM: 4,
+      });
+      expect(
+        anchorSharedFrameOrigin(a, [
+          makeCandidateB(t0),
+          makeCandidateC(t0 + 100),
+        ]),
+      ).toBe(false);
+      expect(a.getCamera().originLla).toBeNull();
+      return a;
+    };
+
+    for (const pair of [
+      [makeCandidateA(t0 + 1_500), makeCandidateB(t0 + 1_500)],
+      [makeCandidateB(t0 + 1_500), makeCandidateA(t0 + 1_500)],
+    ]) {
+      const recoveredConflict = makeConflictHeldAdapter();
+      expect(anchorSharedFrameOrigin(recoveredConflict, pair)).toBe(true);
+      expect(recoveredConflict.getCamera().originLla).toEqual(
+        initBOnly.getCamera().originLla,
+      );
+      expect(recoveredConflict.project({ lla: sfBeaconLla }).x).toBeCloseTo(
+        expectedBProjX,
+        6,
+      );
+    }
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("enforces order-invariant multi-vehicle origin selection and individual candidate qualification across generated histories", () => {
+    const rand = createXorShift32(0x6d32_32f1);
+    const t0 = Date.parse("2026-11-24T19:00:00.000Z");
+    const baseBeaconLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const baseOriginLla = deriveNedOriginLla([0, 0, -2], baseBeaconLla)!;
+    const offsetsM = [0, 10, 24.5, 25.5, 30, 80, 250];
+
+    let initialCount = 0;
+    let retainedCount = 0;
+    let relocatedCount = 0;
+    let withheldCount = 0;
+    let restoredPriorCount = 0;
+    let recoveredConflictCount = 0;
+
+    const genCandidate = (baseTsMs: number) => {
+      const eastOffsetM = offsetsM[Math.floor(rand() * offsetsM.length)]!;
+      const northOffsetM = (rand() - 0.5) * 8;
+      const ned: [number, number, number] = [2, -3, -4];
+      const targetOrigin = localNedToLla(
+        [northOffsetM, eastOffsetM, 0],
+        baseOriginLla,
+      )!;
+      const lla = localNedToLla(ned, targetOrigin)!;
+      const tsKind = Math.floor(rand() * 5);
+      let localPosObservedAtMs: number | null = baseTsMs;
+      let globalPosObservedAtMs: number | null = baseTsMs;
+      if (tsKind === 1) {
+        globalPosObservedAtMs = null;
+      } else if (tsKind === 2) {
+        localPosObservedAtMs = null;
+      } else if (tsKind === 3) {
+        globalPosObservedAtMs = baseTsMs - 700; // > 500ms skew
+      } else if (tsKind === 4) {
+        localPosObservedAtMs = baseTsMs + Math.floor(rand() * 200);
+      }
+      return {
+        ned,
+        lla,
+        hasLocalPos: true,
+        hasVerifiedFrameReference: true,
+        stale: false,
+        localPosObservedAtMs,
+        globalPosObservedAtMs,
+      };
+    };
+
+    const prepareModeAdapter = (
+      mode: "initial" | "established" | "divergence-hold" | "conflict-hold",
+    ) => {
+      const a = new NedGridAdapter({
+        widthPx: 800,
+        heightPx: 600,
+        zoomPxPerM: 4,
+      });
+      if (mode === "initial") {
+        return a;
+      }
+      anchorSharedFrameOrigin(a, [
+        {
+          ned: [0, 0, -2],
+          lla: baseBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+      ]);
+      if (mode === "established") {
+        return a;
+      }
+      if (mode === "divergence-hold") {
+        anchorSharedFrameOrigin(a, [
+          {
+            ned: [0, 0, -2],
+            lla: localNedToLla([0, 40, -2], baseOriginLla)!,
+            hasLocalPos: true,
+            hasVerifiedFrameReference: true,
+            stale: false,
+            localPosObservedAtMs: t0 + 200,
+            globalPosObservedAtMs: null,
+          },
+        ]);
+        return a;
+      }
+      anchorSharedFrameOrigin(a, [
+        {
+          ned: [0, 0, -2],
+          lla: baseBeaconLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 200,
+          globalPosObservedAtMs: t0 + 200,
+        },
+        {
+          ned: [0, 0, -2],
+          lla: localNedToLla([0, 200, -2], baseOriginLla)!,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 200,
+          globalPosObservedAtMs: t0 + 200,
+        },
+      ]);
+      return a;
+    };
+
+    const modes = [
+      "initial",
+      "established",
+      "divergence-hold",
+      "conflict-hold",
+    ] as const;
+
+    for (let trial = 0; trial < 240; trial += 1) {
+      const mode = modes[trial % modes.length]!;
+      const c1 = genCandidate(t0 + 1_000);
+      const c2 = genCandidate(t0 + 1_000);
+
+      const forwardAdapter = prepareModeAdapter(mode);
+      const reverseAdapter = prepareModeAdapter(mode);
+      const priorOrigin = forwardAdapter.getCamera().originLla;
+
+      const anchoredForward = anchorSharedFrameOrigin(forwardAdapter, [c1, c2]);
+      const anchoredReverse = anchorSharedFrameOrigin(reverseAdapter, [c2, c1]);
+
+      expect(anchoredForward).toBe(anchoredReverse);
+      expect(forwardAdapter.getCamera().originLla).toEqual(
+        reverseAdapter.getCamera().originLla,
+      );
+
+      const nextOrigin = forwardAdapter.getCamera().originLla;
+      if (nextOrigin === null) {
+        withheldCount += 1;
+        continue;
+      }
+
+      if (
+        mode === "established" &&
+        nextOrigin[0] === priorOrigin?.[0] &&
+        nextOrigin[1] === priorOrigin?.[1]
+      ) {
+        retainedCount += 1;
+        continue;
+      }
+      if (
+        mode === "divergence-hold" &&
+        Math.abs(nextOrigin[0] - baseOriginLla[0]) < 1e-9 &&
+        Math.abs(nextOrigin[1] - baseOriginLla[1]) < 1e-9
+      ) {
+        restoredPriorCount += 1;
+        continue;
+      }
+
+      // Any newly installed origin MUST come from a candidate that itself anchors that exact origin alone.
+      const solo1 = prepareModeAdapter(mode);
+      const solo2 = prepareModeAdapter(mode);
+      const ok1 = anchorSharedFrameOrigin(solo1, [c1]);
+      const ok2 = anchorSharedFrameOrigin(solo2, [c2]);
+      const matchesSolo1 =
+        ok1 &&
+        JSON.stringify(solo1.getCamera().originLla) ===
+          JSON.stringify(nextOrigin);
+      const matchesSolo2 =
+        ok2 &&
+        JSON.stringify(solo2.getCamera().originLla) ===
+          JSON.stringify(nextOrigin);
+      expect(matchesSolo1 || matchesSolo2).toBe(true);
+
+      if (mode === "initial") {
+        initialCount += 1;
+      } else if (mode === "established") {
+        relocatedCount += 1;
+      } else if (mode === "conflict-hold") {
+        recoveredConflictCount += 1;
+      }
+    }
+
+    expect(initialCount).toBeGreaterThan(0);
+    expect(retainedCount).toBeGreaterThan(0);
+    expect(relocatedCount).toBeGreaterThan(0);
+    expect(withheldCount).toBeGreaterThan(0);
+    expect(restoredPriorCount).toBeGreaterThan(0);
+    expect(recoveredConflictCount).toBeGreaterThan(0);
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("clears conflict hold state when the entity set becomes empty or the WebSocket endpoint switches, accepting a replacement feed whose clock is one hour behind", () => {
+    const t0 = Date.parse("2026-11-24T20:00:00.000Z");
+    const oneHourBehindMs = t0 - 3_600_000;
+    const sfLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const austinLla: [number, number, number] = [30.2672, -97.7431, 150];
+    const seattleLla: [number, number, number] = [47.6062, -122.3321, 40];
+
+    // 1. Direct adapter transition: conflict -> empty entity list -> replacement feed 1h behind matches a brand-new adapter.
+    const reusedAdapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    const freshAdapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+
+    expect(
+      anchorSharedFrameOrigin(reusedAdapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 500,
+          globalPosObservedAtMs: t0 + 500,
+        },
+      ]),
+    ).toBe(false);
+    expect(reusedAdapter.getCamera().originLla).toBeNull();
+
+    // Emptying the entity list clears session state even though originLla is already null.
+    expect(anchorSharedFrameOrigin(reusedAdapter, [])).toBe(false);
+
+    const replacementPose = {
+      ned: [5, -3, -2] as [number, number, number],
+      lla: seattleLla,
+      hasLocalPos: true,
+      hasVerifiedFrameReference: true,
+      stale: false,
+      localPosObservedAtMs: oneHourBehindMs,
+      globalPosObservedAtMs: oneHourBehindMs,
+    };
+    expect(anchorSharedFrameOrigin(reusedAdapter, [replacementPose])).toBe(
+      true,
+    );
+    expect(anchorSharedFrameOrigin(freshAdapter, [replacementPose])).toBe(true);
+    expect(reusedAdapter.getCamera().originLla).toEqual(
+      freshAdapter.getCamera().originLla,
+    );
+
+    // Explicit resetSharedFrameOrigin helper also clears an active conflict hold without requiring an intermediate empty tick.
+    expect(
+      anchorSharedFrameOrigin(reusedAdapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+      ]),
+    ).toBe(false);
+    resetSharedFrameOrigin(reusedAdapter);
+    expect(anchorSharedFrameOrigin(reusedAdapter, [replacementPose])).toBe(
+      true,
+    );
+
+    // 2. Mounted TacticalCanvas endpoint switch: conflict on host-a -> connect(host-b) with synchronous snapshot 1h behind before flushSync().
+    let simNowMs = t0;
+    const sockets: Array<{
+      url: string;
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    }> = [];
+    const telemetryStore = createTelemetryStore({ now: () => simNowMs });
+    const skgStore = createSkgStore({
+      url: "ws://host-a.local:8080/ws/graph",
+      now: () => simNowMs,
+      createSocket: (url) => {
+        const sock = {
+          url,
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        sockets.push(sock);
+        return sock;
+      },
+    });
+    skgStore.connect();
+    sockets[0]!.onopen?.(new Event("open") as never);
+
+    const buildWireVehicle = (
+      id: string,
+      lla: [number, number, number],
+      observedMs: number,
+    ) => {
+      const iso = new Date(observedMs).toISOString();
+      const triple = (
+        predicate: string,
+        object: unknown,
+        context = "measured",
+      ) => ({
+        subject: id,
+        predicate,
+        object,
+        source: "mavlink",
+        timestamp: iso,
+        confidence: 1,
+        context,
+      });
+      return {
+        id,
+        updated_at: iso,
+        triples: [
+          triple("uxs.domain.kind", "quadcopter"),
+          triple("uxs.authority.state", "companion-teleop"),
+          triple("uxs.mode.companion", "teleop-velocity"),
+          triple("uxs.link.tier", "mesh-high-rate"),
+          triple("uxs.health.armed", true),
+          triple("uxs.health.flags", {
+            clock_sync_locked: true,
+            teleop_deadman_clamped: false,
+            crsf_link_healthy: true,
+            companion_trunk_healthy: true,
+          }),
+          triple("uxs.health.failsafes", 0),
+          triple("uxs.health.crcerrors", 0),
+          triple("uxs.health.loopdtus", 1000),
+          triple("uxs.health.maxloopdtus", 1200),
+          triple("uxs.health.rttus", 400),
+          triple("uxs.attitude.quaternion", [1, 0, 0, 0]),
+          triple("uxs.attitude.rates", [0, 0, 0]),
+          triple("uxs.kinematics.ned", [0, 0, -2]),
+          triple("uxs.kinematics.vx", 0),
+          triple("uxs.kinematics.vy", 0),
+          triple("uxs.kinematics.vz", 0),
+          triple("uxs.kinematics.headingdeg", 0),
+          triple("geo.location.latitude", lla[0]),
+          triple("geo.location.longitude", lla[1]),
+          triple("geo.location.altitude", lla[2]),
+        ],
+      };
+    };
+
+    const viewportStore = createViewportStore({ skgStore });
+    const mountedAdapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(TacticalCanvas, {
+      target: host,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        adapter: mountedAdapter,
+        now: () => simNowMs,
+      },
+    });
+
+    // Deliver conflict on host-a and sync.
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: "boxbotix.local.robotics.uxs.vehicle.1",
+        revision: 1,
+        payload: buildWireVehicle(
+          "boxbotix.local.robotics.uxs.vehicle.1",
+          sfLla,
+          t0,
+        ),
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: "boxbotix.local.robotics.uxs.vehicle.2",
+        revision: 2,
+        payload: buildWireVehicle(
+          "boxbotix.local.robotics.uxs.vehicle.2",
+          austinLla,
+          t0 + 500,
+        ),
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 2,
+      }),
+    );
+    flushSync();
+
+    expect(skgStore.vehicles.length).toBe(2);
+    expect(mountedAdapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+
+    // Synchronously switch to host-b AND deliver replacement synced + live update 1h behind BEFORE flushSync() runs.
+    skgStore.connect("ws://host-b.local:8080/ws/graph");
+    expect(sockets.length).toBe(2);
+    sockets[1]!.onopen?.(new Event("open") as never);
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 1,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: "boxbotix.remote.robotics.uxs.vehicle.7",
+        revision: 2,
+        payload: buildWireVehicle(
+          "boxbotix.remote.robotics.uxs.vehicle.7",
+          seattleLla,
+          oneHourBehindMs,
+        ),
+      }),
+    );
+    flushSync();
+
+    expect(skgStore.vehicles.length).toBe(1);
+    expect(mountedAdapter.getCamera().originLla).not.toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("true");
+    expect(mountedAdapter.project({ lla: seattleLla }).visible).toBe(true);
+
+    unmount(app);
+    skgStore.disconnect();
+    host.remove();
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("preserves an active conflict hold when the same entities remain present in the store after timing out", () => {
+    const t0 = Date.parse("2026-11-24T21:00:00.000Z");
+    const oneHourBehindMs = t0 - 3_600_000;
+    const sfLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const austinLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    const adapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+
+    // 1. Supply conflict at t0 / t0 + 500.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 500,
+          globalPosObservedAtMs: t0 + 500,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+
+    // 2. Both entities time out (stale: true) while remaining present in the store -> hold MUST survive.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: true,
+          localPosObservedAtMs: t0,
+          globalPosObservedAtMs: t0,
+        },
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: true,
+          localPosObservedAtMs: t0 + 500,
+          globalPosObservedAtMs: t0 + 500,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+
+    // 3. Replaying an older (1h behind) or unadvanced (t0 + 500) pair without clearing entities MUST remain withheld.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: sfLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: oneHourBehindMs,
+          globalPosObservedAtMs: oneHourBehindMs,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 500,
+          globalPosObservedAtMs: t0 + 500,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+
+    // 4. Only a post-conflict confirming pair (> t0 + 500) lifts the preserved hold.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, -2],
+          lla: austinLla,
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+          localPosObservedAtMs: t0 + 1_000,
+          globalPosObservedAtMs: t0 + 1_000,
+        },
+      ]),
+    ).toBe(true);
+    expect(adapter.getCamera().originLla).not.toBeNull();
   });
 });
