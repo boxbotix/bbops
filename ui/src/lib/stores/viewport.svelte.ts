@@ -13,6 +13,12 @@ import type {
   VehicleEntityState,
 } from "./skg.svelte";
 
+export const WORKSPACE_MODES = ["cop", "pilot", "bench", "cortex"] as const;
+export type WorkspaceMode = (typeof WORKSPACE_MODES)[number];
+
+export const PILOT_LAYOUTS = ["map", "split"] as const;
+export type PilotLayout = (typeof PILOT_LAYOUTS)[number];
+
 export const COP_LAYERS = [
   "vehicles",
   "contacts",
@@ -26,6 +32,9 @@ export const DECLUTTER_LEVELS = ["none", "minimal", "tactical"] as const;
 export type DeclutterLevel = (typeof DECLUTTER_LEVELS)[number];
 
 export interface ViewportSnapshot {
+  workspace: WorkspaceMode;
+  pilotLayout: PilotLayout;
+  lightsOut: boolean;
   selectedEntityId: string | null;
   tetheredEntityId: string | null;
   chaseLock: boolean;
@@ -40,6 +49,9 @@ export interface ViewportStoreOptions {
 }
 
 export interface ViewportStore {
+  readonly workspace: WorkspaceMode;
+  readonly pilotLayout: PilotLayout;
+  readonly lightsOut: boolean;
   readonly selectedEntityId: string | null;
   readonly tetheredEntityId: string | null;
   readonly chaseLock: boolean;
@@ -48,6 +60,10 @@ export interface ViewportStore {
   readonly declutter: DeclutterLevel;
   readonly selectedEntity: CopEntityState | null;
   readonly selectedCommandableVehicle: VehicleEntityState | null;
+  setWorkspace(mode: WorkspaceMode): void;
+  setPilotLayout(layout: PilotLayout): void;
+  togglePilotLayout(): void;
+  setLightsOut(enabled?: boolean): void;
   selectEntity(entityId: string | null): void;
   tetherEntity(entityId: string | null): void;
   setChaseLock(enabled: boolean): void;
@@ -63,6 +79,21 @@ export interface ViewportStore {
 }
 
 const EMPTY_SET_SENTINEL = "none";
+const LIGHTS_OUT_CHROME_TOKEN = "lights-out";
+
+export function isWorkspaceMode(value: unknown): value is WorkspaceMode {
+  return (
+    typeof value === "string" &&
+    (WORKSPACE_MODES as readonly string[]).includes(value)
+  );
+}
+
+export function isPilotLayout(value: unknown): value is PilotLayout {
+  return (
+    typeof value === "string" &&
+    (PILOT_LAYOUTS as readonly string[]).includes(value)
+  );
+}
 
 export function isCopLayer(value: unknown): value is CopLayer {
   return (
@@ -114,6 +145,9 @@ function sameOrderedList<T>(a: readonly T[], b: readonly T[]): boolean {
 
 export function defaultViewportSnapshot(): ViewportSnapshot {
   return {
+    workspace: "cop",
+    pilotLayout: "map",
+    lightsOut: false,
     selectedEntityId: null,
     tetheredEntityId: null,
     chaseLock: false,
@@ -126,6 +160,17 @@ export function defaultViewportSnapshot(): ViewportSnapshot {
 export function serializeViewportHash(state: ViewportSnapshot): string {
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const params = new URLSearchParams();
+
+  if (isWorkspaceMode(state.workspace) && state.workspace !== "cop") {
+    params.set("mode", state.workspace);
+  }
+  if (isPilotLayout(state.pilotLayout) && state.pilotLayout !== "map") {
+    params.set("pilot", state.pilotLayout);
+  }
+  if (state.lightsOut === true) {
+    params.set("chrome", LIGHTS_OUT_CHROME_TOKEN);
+  }
+
   const sel = sanitizeEntityIdInput(state.selectedEntityId);
   const tether = sanitizeEntityIdInput(state.tetheredEntityId);
 
@@ -175,6 +220,16 @@ export function parseViewportHash(hash: string): ViewportSnapshot {
 
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const params = new URLSearchParams(stripped);
+
+  const rawMode = params.get("mode")?.trim();
+  const workspace: WorkspaceMode = isWorkspaceMode(rawMode) ? rawMode : "cop";
+
+  const rawPilot = params.get("pilot")?.trim();
+  const pilotLayout: PilotLayout = isPilotLayout(rawPilot) ? rawPilot : "map";
+
+  const rawChrome = params.get("chrome")?.trim();
+  const lightsOut = rawChrome === LIGHTS_OUT_CHROME_TOKEN || rawChrome === "1";
+
   const selectedEntityId = sanitizeEntityIdInput(params.get("sel"));
   const tetheredEntityId = sanitizeEntityIdInput(params.get("tether"));
 
@@ -222,6 +277,9 @@ export function parseViewportHash(hash: string): ViewportSnapshot {
     : "none";
 
   return {
+    workspace,
+    pilotLayout,
+    lightsOut,
     selectedEntityId,
     tetheredEntityId,
     chaseLock,
@@ -239,6 +297,9 @@ export function createViewportStore(
       ? parseViewportHash(options.initialHash)
       : defaultViewportSnapshot();
 
+  let workspace = $state<WorkspaceMode>(initial.workspace);
+  let pilotLayout = $state<PilotLayout>(initial.pilotLayout);
+  let lightsOut = $state<boolean>(initial.lightsOut);
   let selectedEntityId = $state<string | null>(initial.selectedEntityId);
   let tetheredEntityId = $state<string | null>(initial.tetheredEntityId);
   let chaseLock = $state(initial.chaseLock);
@@ -257,6 +318,9 @@ export function createViewportStore(
   );
 
   function applySnapshot(next: ViewportSnapshot): void {
+    workspace = isWorkspaceMode(next.workspace) ? next.workspace : "cop";
+    pilotLayout = isPilotLayout(next.pilotLayout) ? next.pilotLayout : "map";
+    lightsOut = Boolean(next.lightsOut);
     selectedEntityId = next.selectedEntityId;
     tetheredEntityId = next.tetheredEntityId;
     chaseLock = next.tetheredEntityId !== null ? next.chaseLock : false;
@@ -267,6 +331,9 @@ export function createViewportStore(
 
   function snapshot(): ViewportSnapshot {
     return {
+      workspace,
+      pilotLayout,
+      lightsOut,
       selectedEntityId,
       tetheredEntityId,
       chaseLock,
@@ -277,6 +344,15 @@ export function createViewportStore(
   }
 
   return {
+    get workspace() {
+      return workspace;
+    },
+    get pilotLayout() {
+      return pilotLayout;
+    },
+    get lightsOut() {
+      return lightsOut;
+    },
     get selectedEntityId() {
       return selectedEntityId;
     },
@@ -300,6 +376,26 @@ export function createViewportStore(
     },
     get selectedCommandableVehicle() {
       return selectedCommandableVehicle;
+    },
+
+    setWorkspace(mode: WorkspaceMode) {
+      if (isWorkspaceMode(mode)) {
+        workspace = mode;
+      }
+    },
+
+    setPilotLayout(layout: PilotLayout) {
+      if (isPilotLayout(layout)) {
+        pilotLayout = layout;
+      }
+    },
+
+    togglePilotLayout() {
+      pilotLayout = pilotLayout === "map" ? "split" : "map";
+    },
+
+    setLightsOut(enabled?: boolean) {
+      lightsOut = enabled !== undefined ? Boolean(enabled) : !lightsOut;
     },
 
     selectEntity(entityId: string | null) {

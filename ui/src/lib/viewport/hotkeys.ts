@@ -60,19 +60,27 @@ export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
 }
 
 /**
- * Handles COP tactical viewport hotkeys:
+ * Handles view-only workspace and COP tactical viewport hotkeys:
+ * - G: switch to COP workspace ("cop")
+ * - D: switch to Pilot workspace ("pilot")
+ * - B: switch to Bench workspace ("bench")
+ * - K: switch to Cortex workspace ("cortex")
+ * - M: toggle Pilot layout ("map" <-> "split") when in Pilot workspace
+ * - Tab: toggle Lights-Out chrome mode
+ * - 1..9: select nth entity in FleetFilmstrip
  * - T: toggle tether on selected entity (or untether when already tethered)
  * - C: toggle chase heading lock (auto-tethers selected entity if untethered)
  * - H: cycle declutter level (none -> minimal -> tactical -> none)
  * - Escape: untether camera and clear chase lock
  *
  * Ignores editable form/contenteditable targets, repeated keydowns, and
- * Ctrl/Meta/Alt/Shift modifier chords. Returns true when handled.
+ * Ctrl/Meta/Alt/Shift modifier chords. Never triggers vehicle actuation.
  */
 export function handleViewportHotkey(
   event: HotkeyEventLike,
   viewport: ViewportStore,
   onSyncHash?: (hash: string) => void,
+  filmstripEntityIds?: readonly string[],
 ): boolean {
   if (
     event.defaultPrevented ||
@@ -93,6 +101,57 @@ export function handleViewportHotkey(
   let mutated = false;
 
   switch (normalizedKey) {
+    case "g": {
+      viewport.setWorkspace("cop");
+      mutated = true;
+      break;
+    }
+    case "d": {
+      viewport.setWorkspace("pilot");
+      mutated = true;
+      break;
+    }
+    case "b": {
+      viewport.setWorkspace("bench");
+      mutated = true;
+      break;
+    }
+    case "k": {
+      viewport.setWorkspace("cortex");
+      mutated = true;
+      break;
+    }
+    case "m": {
+      if (viewport.workspace === "pilot") {
+        viewport.togglePilotLayout();
+        mutated = true;
+      }
+      break;
+    }
+    case "Tab": {
+      viewport.setLightsOut(!viewport.lightsOut);
+      mutated = true;
+      break;
+    }
+    case "1":
+    case "2":
+    case "3":
+    case "4":
+    case "5":
+    case "6":
+    case "7":
+    case "8":
+    case "9": {
+      if (filmstripEntityIds && filmstripEntityIds.length > 0) {
+        const index = Number(normalizedKey) - 1;
+        const entityId = filmstripEntityIds[index];
+        if (typeof entityId === "string" && entityId.length > 0) {
+          viewport.selectEntity(entityId);
+          mutated = true;
+        }
+      }
+      break;
+    }
     case "t": {
       if (viewport.tetheredEntityId !== null) {
         viewport.tetherEntity(null);

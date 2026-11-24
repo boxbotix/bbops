@@ -799,3 +799,141 @@ export function selectBannerPresentation(
   }
   return null;
 }
+
+export interface FleetFaultSummary {
+  readonly totalVehicles: number;
+  readonly faultedCount: number;
+  readonly errorCount: number;
+  readonly warningCount: number;
+  readonly firstFaultEntityId: string | null;
+  readonly firstFaultLabel: string | null;
+}
+
+/**
+ * Aggregates active safety faults across all ownship UXS vehicles in deterministic
+ * ascending sysid order so off-screen or unselected vehicle faults remain visible
+ * in the invariant topbar across COP, Pilot, Bench, and Cortex.
+ */
+export function summarizeFleetFaults(
+  vehicles: Iterable<VehicleEntityState>,
+): FleetFaultSummary {
+  const ordered = Array.from(vehicles).sort((a, b) => a.sysid - b.sysid);
+  let errorCount = 0;
+  let warningCount = 0;
+  let firstErrorVehicle: VehicleEntityState | null = null;
+  let firstWarningVehicle: VehicleEntityState | null = null;
+
+  for (const vehicle of ordered) {
+    const severity = evaluateVehicleSafetySeverity(vehicle);
+    if (severity === "error") {
+      errorCount += 1;
+      if (firstErrorVehicle === null) {
+        firstErrorVehicle = vehicle;
+      }
+    } else if (severity === "warning") {
+      warningCount += 1;
+      if (firstWarningVehicle === null) {
+        firstWarningVehicle = vehicle;
+      }
+    }
+  }
+
+  const primary = firstErrorVehicle ?? firstWarningVehicle;
+  let firstFaultLabel: string | null = null;
+  if (primary !== null) {
+    const reason = primary.poisoned
+      ? "POISONED"
+      : formatAuthorityBadge(primary.authority).code;
+    firstFaultLabel = `UXS #${primary.sysid} · ${reason}`;
+  }
+
+  return {
+    totalVehicles: ordered.length,
+    faultedCount: errorCount + warningCount,
+    errorCount,
+    warningCount,
+    firstFaultEntityId: primary?.id ?? null,
+    firstFaultLabel,
+  };
+}
+
+/**
+ * Filters a vehicle's 0xB1 health strip down to ISA-101 abnormal exceptions
+ * (error first, then warning) for Pilot cockpit promotion.
+ */
+export function extractAbnormalHealthChips(
+  strip: readonly HealthChipView[],
+): readonly HealthChipView[] {
+  const errors = strip.filter((chip) => chip.severity === "error");
+  const warnings = strip.filter((chip) => chip.severity === "warning");
+  return [...errors, ...warnings];
+}
+
+export interface FilmstripItemView {
+  readonly entityId: string;
+  readonly shortcutKey: string | null;
+  readonly kind: "uxs-vehicle" | "external-contact";
+  readonly primaryLabel: string;
+  readonly secondaryLabel: string;
+  readonly safetySeverity: SafetyBadgeSeverity | null;
+  readonly contactFeedStatus: CopFeedStatus | null;
+}
+
+/**
+ * Builds deterministic FleetFilmstrip items (ownship vehicles sorted by sysid,
+ * followed by external contacts sorted by entity ID), assigning 1..9 hotkeys
+ * and keeping reserved safety severities strictly null on external contacts.
+ */
+export function buildFilmstripItems(
+  vehicles: Iterable<VehicleEntityState>,
+  contacts: Iterable<ExternalContactEntityState>,
+): readonly FilmstripItemView[] {
+  const orderedVehicles = Array.from(vehicles).sort(
+    (a, b) => a.sysid - b.sysid,
+  );
+  const orderedContacts = Array.from(contacts).sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
+
+  const items: FilmstripItemView[] = [];
+  for (const vehicle of orderedVehicles) {
+    const shortcutKey = items.length < 9 ? String(items.length + 1) : null;
+    const authCode = formatAuthorityBadge(vehicle.authority).code;
+    items.push({
+      entityId: vehicle.id,
+      shortcutKey,
+      kind: "uxs-vehicle",
+      primaryLabel: vehicle.title ?? `UXS #${vehicle.sysid}`,
+      secondaryLabel: `#${vehicle.sysid} · ${authCode} · ${vehicle.armed ? "ARMED" : "SAFE"}`,
+      safetySeverity: evaluateVehicleSafetySeverity(vehicle),
+      contactFeedStatus: null,
+    });
+  }
+
+  for (const contact of orderedContacts) {
+    const shortcutKey = items.length < 9 ? String(items.length + 1) : null;
+    items.push({
+      entityId: contact.id,
+      shortcutKey,
+      kind: "external-contact",
+      primaryLabel: contact.title ?? contact.id,
+      secondaryLabel: `EXT · ${contact.source ?? "unknown"} · ${contact.feedStatus}`,
+      safetySeverity: null,
+      contactFeedStatus: contact.feedStatus,
+    });
+  }
+
+  return items;
+}
+
+export const COP_SOLO_SECTIONS = ["summary", "alerts", "skg"] as const;
+export type CopSoloSection = (typeof COP_SOLO_SECTIONS)[number];
+
+export function selectCopSoloSection(
+  current: CopSoloSection,
+  requested: string,
+): CopSoloSection {
+  return (COP_SOLO_SECTIONS as readonly string[]).includes(requested)
+    ? (requested as CopSoloSection)
+    : current;
+}

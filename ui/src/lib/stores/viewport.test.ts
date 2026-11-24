@@ -13,8 +13,12 @@ import {
   type DeclutterLevel,
   defaultViewportSnapshot,
   parseViewportHash,
+  PILOT_LAYOUTS,
+  type PilotLayout,
   serializeViewportHash,
   type ViewportSnapshot,
+  WORKSPACE_MODES,
+  type WorkspaceMode,
 } from "./viewport.svelte";
 
 describe("viewport.svelte.ts — deterministic COP controller verbs & URL hash codec", () => {
@@ -288,5 +292,96 @@ describe("viewport.svelte.ts — deterministic COP controller verbs & URL hash c
     expect(sawEmptyDomains).toBe(true);
     expect(sawChaseAutoTether).toBe(true);
     expect(sawUntetherClearsChase).toBe(true);
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("preserves default #sel=... URL hashes while round-tripping workspace, pilotLayout, and lightsOut across seeded histories", () => {
+    const store = createViewportStore();
+    store.selectEntity("boxbotix.local.robotics.uxs.vehicle.2");
+    expect(store.workspace).toBe("cop");
+    expect(store.pilotLayout).toBe("map");
+    expect(store.lightsOut).toBe(false);
+    expect(store.toUrlHash()).toBe(
+      "#sel=boxbotix.local.robotics.uxs.vehicle.2",
+    );
+
+    store.setWorkspace("pilot");
+    store.togglePilotLayout();
+    store.setLightsOut(true);
+    expect(store.toUrlHash()).toBe(
+      "#mode=pilot&pilot=split&chrome=lights-out&sel=boxbotix.local.robotics.uxs.vehicle.2",
+    );
+
+    const hydrated = createViewportStore({ initialHash: store.toUrlHash() });
+    expect(hydrated.snapshot()).toEqual(store.snapshot());
+
+    // Malformed mode, pilot, and chrome tokens fall back safely to cop / map / false.
+    const sanitized = parseViewportHash(
+      "#mode=spacedock&pilot=vr&chrome=neon&sel=boxbotix.local.robotics.uxs.vehicle.2",
+    );
+    expect(sanitized.workspace).toBe("cop");
+    expect(sanitized.pilotLayout).toBe("map");
+    expect(sanitized.lightsOut).toBe(false);
+    expect(sanitized.selectedEntityId).toBe(
+      "boxbotix.local.robotics.uxs.vehicle.2",
+    );
+
+    // Seeded property check across workspace, pilotLayout, and lightsOut transitions.
+    const rng = createSeededRng(0x524d3234);
+    let ref: ViewportSnapshot = defaultViewportSnapshot();
+    store.reset();
+    let sawAllModes = new Set<WorkspaceMode>();
+    let sawSplit = false;
+    let sawLightsOut = false;
+
+    for (let step = 0; step < 160; step += 1) {
+      const pick = rng();
+      if (pick < 0.45) {
+        const mode = WORKSPACE_MODES[
+          Math.floor(rng() * WORKSPACE_MODES.length)
+        ] as WorkspaceMode;
+        sawAllModes.add(mode);
+        store.setWorkspace(mode);
+        ref = { ...ref, workspace: mode };
+      } else if (pick < 0.75) {
+        if (rng() < 0.5) {
+          store.togglePilotLayout();
+          const nextLayout: PilotLayout =
+            ref.pilotLayout === "map" ? "split" : "map";
+          if (nextLayout === "split") {
+            sawSplit = true;
+          }
+          ref = { ...ref, pilotLayout: nextLayout };
+        } else {
+          const layout = PILOT_LAYOUTS[
+            Math.floor(rng() * PILOT_LAYOUTS.length)
+          ] as PilotLayout;
+          if (layout === "split") {
+            sawSplit = true;
+          }
+          store.setPilotLayout(layout);
+          ref = { ...ref, pilotLayout: layout };
+        }
+      } else {
+        const explicit = rng() < 0.5 ? undefined : rng() < 0.5;
+        store.setLightsOut(explicit);
+        const nextLights = explicit !== undefined ? explicit : !ref.lightsOut;
+        if (nextLights) {
+          sawLightsOut = true;
+        }
+        ref = { ...ref, lightsOut: nextLights };
+      }
+
+      const snap = store.snapshot();
+      expect(snap).toEqual(ref);
+      const encoded = store.toUrlHash();
+      const decoded = parseViewportHash(encoded);
+      expect(decoded).toEqual(ref);
+      expect(serializeViewportHash(decoded)).toBe(encoded);
+    }
+
+    expect(sawAllModes.size).toBe(WORKSPACE_MODES.length);
+    expect(sawSplit).toBe(true);
+    expect(sawLightsOut).toBe(true);
   });
 });

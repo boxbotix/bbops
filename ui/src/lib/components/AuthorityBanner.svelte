@@ -8,9 +8,10 @@
 
   interface Props {
     entity: CopEntityState | null;
+    compact?: boolean;
   }
 
-  let { entity }: Props = $props();
+  let { entity, compact = false }: Props = $props();
 
   const presentation = $derived(selectBannerPresentation(entity));
 </script>
@@ -18,6 +19,7 @@
 {#if presentation?.kind === "uxs-vehicle"}
   <section
     class="banner vehicle-banner"
+    class:compact
     data-testid="vehicle-authority-banner"
     aria-label="UXS vehicle authority and safety health"
   >
@@ -54,21 +56,24 @@
       {/if}
     </div>
 
-    <div class="health-strip" data-testid="vehicle-health-strip">
-      {#each presentation.healthStrip as chip (chip.key)}
-        <span
-          class="health-chip severity-{chip.severity}"
-          data-chip-key={chip.key}
-        >
-          <span class="chip-label">{chip.label}:</span>
-          <strong>{chip.value}</strong>
-        </span>
-      {/each}
-    </div>
+    {#if !compact}
+      <div class="health-strip" data-testid="vehicle-health-strip">
+        {#each presentation.healthStrip as chip (chip.key)}
+          <span
+            class="health-chip severity-{chip.severity}"
+            data-chip-key={chip.key}
+          >
+            <span class="chip-label">{chip.label}:</span>
+            <strong>{chip.value}</strong>
+          </span>
+        {/each}
+      </div>
+    {/if}
   </section>
 {:else if presentation?.kind === "external-contact"}
   <section
     class="banner contact-banner"
+    class:compact
     data-testid="external-contact-banner"
     aria-label="External COP contact provenance"
   >
@@ -77,19 +82,27 @@
       <strong class="contact-title">{presentation.title}</strong>
       <span class="contact-pill">type: {presentation.contactType}</span>
       <span class="contact-pill">feed: {presentation.feedStatus}</span>
+      {#if compact}
+        <span class="contact-pill">source: {presentation.source}</span>
+      {/if}
     </div>
 
-    <div class="contact-meta">
-      <span>source: <strong>{presentation.source}</strong></span>
-      <span>observed: <strong>{presentation.observedAt}</strong></span>
-      <span>received: <strong>{presentation.receivedAt}</strong></span>
-      <span>expires: <strong>{presentation.expiresAt}</strong></span>
-      <span>uncertainty: <strong>{presentation.uncertaintyLabel}</strong></span>
-    </div>
+    {#if !compact}
+      <div class="contact-meta">
+        <span>source: <strong>{presentation.source}</strong></span>
+        <span>observed: <strong>{presentation.observedAt}</strong></span>
+        <span>received: <strong>{presentation.receivedAt}</strong></span>
+        <span>expires: <strong>{presentation.expiresAt}</strong></span>
+        <span
+          >uncertainty: <strong>{presentation.uncertaintyLabel}</strong></span
+        >
+      </div>
+    {/if}
   </section>
 {:else}
   <section
     class="banner standby-banner"
+    class:compact
     data-testid="authority-banner-standby"
     aria-label="Entity status banner"
   >
@@ -108,6 +121,11 @@
     border-radius: 6px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px;
+  }
+
+  .banner.compact {
+    padding: 4px 10px;
+    background: var(--ui-surface-elevated, #172033);
   }
 
   .banner-primary,
