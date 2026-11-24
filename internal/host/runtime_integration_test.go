@@ -152,6 +152,8 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 	}
 	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusServiceUnavailable, "NOT READY")
 	assertHTTPGet(t, endpoints.HTTPBaseURL+"/", http.StatusServiceUnavailable, "NOT READY")
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/ws/telemetry", http.StatusServiceUnavailable, "NOT READY")
+	assertHTTPGet(t, endpoints.HTTPBaseURL+"/ws/graph", http.StatusServiceUnavailable, "NOT READY")
 	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer readyCancel()
 	if err := rt.WaitReady(readyCtx); err != nil {
@@ -230,45 +232,52 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 		return getErr == nil
 	})
 
-	// 4. Dial output/websocket #2 (ENTITY_STATES kv-watch) and verify snapshot `put` + `synced`.
-	graphConn := dialWebSocketWithRetry(ctx, t, endpoints.GraphWS)
-	defer func() { _ = graphConn.Close() }()
-
-	sawPut := false
-	sawSynced := false
-	for !sawSynced {
-		frame := readWSFrame(t, graphConn, 10*time.Second)
-		switch frame.Type {
-		case "put":
-			if frame.Bucket == graph.BucketEntityStates && frame.Key == entityID {
-				var stored struct {
-					ID string `json:"id"`
+	// 4. Dial output/websocket #2 (ENTITY_STATES kv-watch) both directly and via same-origin /ws/graph.
+	frontDoorWSBase := strings.Replace(endpoints.HTTPBaseURL, "http://", "ws://", 1)
+	for _, graphWSURL := range []string{endpoints.GraphWS, frontDoorWSBase + "/ws/graph"} {
+		graphConn := dialWebSocketWithRetry(ctx, t, graphWSURL)
+		sawPut := false
+		sawSynced := false
+		for !sawSynced {
+			frame := readWSFrame(t, graphConn, 10*time.Second)
+			switch frame.Type {
+			case "put":
+				if frame.Bucket == graph.BucketEntityStates && frame.Key == entityID {
+					var stored struct {
+						ID string `json:"id"`
+					}
+					if err := json.Unmarshal(frame.Payload, &stored); err != nil {
+						_ = graphConn.Close()
+						t.Fatalf("decode WS #2 (%s) put payload: %v", graphWSURL, err)
+					}
+					if stored.ID != entityID {
+						_ = graphConn.Close()
+						t.Fatalf("WS #2 (%s) put payload id = %q, want %q", graphWSURL, stored.ID, entityID)
+					}
+					sawPut = true
 				}
-				if err := json.Unmarshal(frame.Payload, &stored); err != nil {
-					t.Fatalf("decode WS #2 put payload: %v", err)
+			case "synced":
+				if frame.Bucket != graph.BucketEntityStates {
+					_ = graphConn.Close()
+					t.Fatalf("WS #2 (%s) synced bucket = %q, want %s", graphWSURL, frame.Bucket, graph.BucketEntityStates)
 				}
-				if stored.ID != entityID {
-					t.Fatalf("WS #2 put payload id = %q, want %q", stored.ID, entityID)
-				}
-				sawPut = true
+				sawSynced = true
 			}
-		case "synced":
-			if frame.Bucket != graph.BucketEntityStates {
-				t.Fatalf("WS #2 synced bucket = %q, want %s", frame.Bucket, graph.BucketEntityStates)
-			}
-			sawSynced = true
 		}
-	}
-	if !sawPut {
-		t.Fatalf("WS #2 reached synced without delivering snapshot put for %s", entityID)
+		_ = graphConn.Close()
+		if !sawPut {
+			t.Fatalf("WS #2 (%s) reached synced without delivering snapshot put for %s", graphWSURL, entityID)
+		}
 	}
 
 	// 5. Query POST /graph-gateway/graphql for exact entity and prefix match (once graph-index coalesces).
 	queryVehicleGraphQL(ctx, t, endpoints.HTTPBaseURL+"/graph-gateway/graphql", entityID, entityPrefix)
 
-	// 6. Dial output/websocket #1 (bbops.telemetry.>) and verify rapid frames arrive uncoalesced in order.
+	// 6. Dial output/websocket #1 (bbops.telemetry.>) both directly and via same-origin /ws/telemetry.
 	telemetryConn := dialWebSocketWithRetry(ctx, t, endpoints.TelemetryWS)
 	defer func() { _ = telemetryConn.Close() }()
+	frontDoorTelemetryConn := dialWebSocketWithRetry(ctx, t, frontDoorWSBase+"/ws/telemetry")
+	defer func() { _ = frontDoorTelemetryConn.Close() }()
 
 	nc := rt.NATSClient().GetConnection()
 	if nc == nil {
@@ -284,19 +293,21 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 		t.Fatalf("flush telemetry publish: %v", err)
 	}
 
-	for wantSeq := 1; wantSeq <= 2; wantSeq++ {
-		frame := readWSFrame(t, telemetryConn, 5*time.Second)
-		if frame.Type != "data" || frame.Subject != "bbops.telemetry.test" {
-			t.Fatalf("WS #1 frame = %+v, want type=data subject=bbops.telemetry.test", frame)
-		}
-		var telemetry struct {
-			Seq int `json:"seq"`
-		}
-		if err := json.Unmarshal(frame.Payload, &telemetry); err != nil {
-			t.Fatalf("decode WS #1 telemetry payload: %v", err)
-		}
-		if telemetry.Seq != wantSeq {
-			t.Fatalf("WS #1 telemetry seq = %d, want %d (uncoalesced order)", telemetry.Seq, wantSeq)
+	for _, conn := range []*websocket.Conn{telemetryConn, frontDoorTelemetryConn} {
+		for wantSeq := 1; wantSeq <= 2; wantSeq++ {
+			frame := readWSFrame(t, conn, 5*time.Second)
+			if frame.Type != "data" || frame.Subject != "bbops.telemetry.test" {
+				t.Fatalf("WS #1 frame = %+v, want type=data subject=bbops.telemetry.test", frame)
+			}
+			var telemetry struct {
+				Seq int `json:"seq"`
+			}
+			if err := json.Unmarshal(frame.Payload, &telemetry); err != nil {
+				t.Fatalf("decode WS #1 telemetry payload: %v", err)
+			}
+			if telemetry.Seq != wantSeq {
+				t.Fatalf("WS #1 telemetry seq = %d, want %d (uncoalesced order)", telemetry.Seq, wantSeq)
+			}
 		}
 	}
 
@@ -310,6 +321,8 @@ func TestRuntimeEndToEndSKGAndDualWebSockets(t *testing.T) {
 		t.Fatalf("GET /health status = %d, want 200", resp.StatusCode)
 	}
 
+	// Keep frontDoorTelemetryConn open across rt.Stop to verify ShutdownCtx aborts
+	// active hijacked /ws/* ReverseProxy connections without blocking HTTP shutdown.
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer stopCancel()
 	if err := rt.Stop(stopCtx); err != nil {

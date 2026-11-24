@@ -16,22 +16,33 @@
 
 3. **SemBoids (`C360Studio/semboids`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
-   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, Caddy reverse-proxy rules, dual-WebSocket Svelte 5 Runes store lifecycle patterns (`ui/src/lib/stores/ws-client.ts`, `ui/src/lib/stores/telemetry.svelte.ts`, `ui/src/lib/stores/skg.svelte.ts` adapted from `ui/src/lib/stores/flock.svelte.ts` and `ui/src/lib/stores/graph.svelte.ts`), flow configuration patterns, and sentinel `ui/go.mod` boundary:
-     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/Caddyfile`, `ui/src/lib/stores/flock.svelte.ts`, `ui/src/lib/stores/graph.svelte.ts`, `configs/flock.json` (adapted in `configs/bbops.json`), `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
+   - Svelte 5 Runes ESLint flat configuration, Vite/Vitest config, TypeScript config, Caddy reverse-proxy rules, dual-WebSocket Svelte 5 Runes store lifecycle patterns (`ui/src/lib/stores/ws-client.ts`, `ui/src/lib/stores/telemetry.svelte.ts`, `ui/src/lib/stores/skg.svelte.ts` adapted from `ui/src/lib/stores/flock.svelte.ts` and `ui/src/lib/stores/graph.svelte.ts`), tactical dark-mode CSS tokens (`ui/src/styles/colors.css` adapted from `ui/src/styles/colors.css`), imperative DPR-aware `requestAnimationFrame` 2D canvas lifecycle (`ui/src/lib/components/TacticalCanvas.svelte` adapted from `ui/src/lib/components/FlockCanvas.svelte`), flow configuration patterns, and sentinel `ui/go.mod` boundary:
+     `C360Studio/semboids` `ui/eslint.config.js`, `ui/vite.config.ts`, `ui/tsconfig.json`, `ui/Caddyfile`, `ui/src/styles/colors.css`, `ui/src/lib/components/FlockCanvas.svelte`, `ui/src/lib/stores/flock.svelte.ts`, `ui/src/lib/stores/graph.svelte.ts`, `configs/flock.json` (adapted in `configs/bbops.json`), `ui/go.mod` @ `37dbdb088438a2601c8556d012ab2c33bec85da2`
 
 4. **SemEngine (`C360Studio/semengine`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
    - Embedded Semantic Knowledge Graph (SKG) runtime dependency (`github.com/c360studio/semengine v0.1.0-alpha.7`) and component port configuration schema (`configs/bbops.json` adapted from `config/example_config.json`):
      `C360Studio/semengine` `config/example_config.json` @ `3d89a31775219e7f7aaa44ab10892bbc804ae08e` (`v0.1.0-alpha.7`)
 
-5. **gomavlib (`bluenviron/gomavlib`) — MIT License**
+5. **SemStreams UI (`C360Studio/semstreams-ui`) — MIT License**
+   Copyright (c) 2026 Complete 360 Studio
+   - Sigma.js v3 WebGL SKG topology canvas, neighborhood focus reducers, Graphology incremental synchronization, and ForceAtlas2 Web Worker lifecycle (`ui/src/lib/components/SkgPane.svelte`, `ui/src/lib/skg/graphology-adapter.ts`, and `ui/src/lib/skg/sigma-layout.ts` adapted from `src/lib/components/runtime/SigmaCanvas.svelte`, `src/lib/utils/graphology-adapter.ts`, and `src/lib/utils/sigma-layout.ts`):
+     `C360Studio/semstreams-ui` `src/lib/components/runtime/SigmaCanvas.svelte`, `src/lib/utils/graphology-adapter.ts`, `src/lib/utils/sigma-layout.ts` @ `3814b3d59dab7136011429cad99a8148aeceb0cc`
+
+6. **gomavlib (`bluenviron/gomavlib`) — MIT License**
    Copyright (c) 2019 aler9
    - MAVLink v2 (`0xFD`) packet framing, X.25 CRC, and MIT `minimal.xml` / `standard.xml` / `common.xml` generated dialect structs (`github.com/bluenviron/gomavlib/v3 v3.3.5`, restricted strictly to `pkg/dialect`, `pkg/dialects/{common,minimal,standard}`, `pkg/frame`, `pkg/message`, and `pkg/x25` with zero vendor dialect imports):
      `bluenviron/gomavlib` @ `33ff3fce8d7f2e832e08e08cf02b946de821208e` (`v3.3.5`)
 
+7. **Sigma.js & Graphology UI Runtime Dependencies — MIT License**
+   - `sigma` (`^3.0.3`, Copyright (c) Alexis Jacomy & OuestWare, MIT)
+   - `graphology` (`^0.26.0`, Copyright (c) Guillaume Plique, MIT)
+   - `graphology-types` (`^0.24.8`, Copyright (c) Guillaume Plique, MIT)
+   - `graphology-layout-forceatlas2` (`^0.10.1`, Copyright (c) Guillaume Plique, MIT)
+
 ---
 
-### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, `C360Studio/semengine`, and `bluenviron/gomavlib`)
+### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, `C360Studio/semengine`, `C360Studio/semstreams-ui`, `bluenviron/gomavlib`, `sigma`, and `graphology*`)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

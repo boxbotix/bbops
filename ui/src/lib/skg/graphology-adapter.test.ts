@@ -1,0 +1,356 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 boxbotix
+
+import MultiDirectedGraph from "graphology";
+import { flushSync, mount, unmount } from "svelte";
+import { describe, expect, it, vi } from "vitest";
+import SkgPane from "../components/SkgPane.svelte";
+import type { GraphQLClient, PathSearchResult } from "../graphql";
+import {
+  type CopEntityState,
+  type VehicleEntityState,
+  createSkgStore,
+} from "../stores/skg.svelte";
+import {
+  type TransitionEvent,
+  createTelemetryStore,
+} from "../stores/telemetry.svelte";
+import { createViewportStore } from "../stores/viewport.svelte";
+import {
+  SKG_EDGE_PALETTE,
+  SKG_NODE_PALETTE,
+  buildSkgTopologyModel,
+  formatEntityTriples,
+  formatTransitionEvent,
+  syncTopologyToGraph,
+} from "./graphology-adapter";
+
+function parseHexRgb(hex: string): [number, number, number] {
+  const clean = hex.replace(/^#/, "");
+  expect(clean).toHaveLength(6);
+  return [
+    Number.parseInt(clean.slice(0, 2), 16),
+    Number.parseInt(clean.slice(2, 4), 16),
+    Number.parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function isReservedSafetyHue(hex: string): boolean {
+  const [r, g, b] = parseHexRgb(hex);
+  const isRed = r > g + 40 && r > b + 40;
+  const isAmber = r > 200 && g > 110 && b < 70;
+  const isGreen = g > b + 25 && g > r + 40;
+  return isRed || isAmber || isGreen;
+}
+
+function makeVehicle(sysid: number, peerEntityId?: string): VehicleEntityState {
+  const id = `boxbotix.local.robotics.uxs.vehicle.${sysid}`;
+  return {
+    id,
+    kind: "uxs-vehicle",
+    title: `USV-${sysid}`,
+    org: "boxbotix",
+    platform: "local",
+    sysid,
+    domain: "surface-boat",
+    authority: "companion-autonomous",
+    companionMode: "autonomous-velocity",
+    linkTier: "mesh-high-rate",
+    armed: true,
+    healthFlags: {
+      clock_sync_locked: true,
+      teleop_deadman_clamped: false,
+      crsf_link_healthy: true,
+      companion_trunk_healthy: true,
+    },
+    sysStatus: {
+      failsafes: 0,
+      crcErrors: 0,
+      loopDtUs: 1000,
+      maxLoopDtUs: 1200,
+      rttUs: 350,
+    },
+    attitudeQuaternion: [1, 0, 0, 0],
+    attitudeRates: [0, 0, 0],
+    ned: [sysid * 10, sysid * 5, 0],
+    velocityNed: [1.2, 0.4, 0],
+    headingDeg: 45,
+    location: { latitude: 30.2672, longitude: -97.7431, altitude: 150 },
+    kvRevision: 1,
+    updatedAt: "2026-11-24T12:00:00Z",
+    poisoned: false,
+    poisonError: null,
+    indexingProfile: "full",
+    source: "mavlink-ingest",
+    observedAt: "2026-11-24T12:00:00Z",
+    receivedAt: "2026-11-24T12:00:00Z",
+    expiresAt: null,
+    uncertaintyMeters: null,
+    feedStatus: "live",
+    triples: [
+      {
+        subject: id,
+        predicate: "uxs.authority.state",
+        object: "companion-autonomous",
+        source: "mavlink-ingest",
+        timestamp: "2026-11-24T12:00:01Z",
+        confidence: 1,
+      },
+      ...(peerEntityId
+        ? [
+            {
+              subject: id,
+              predicate: "cop.mission.assigned_sector",
+              object: peerEntityId,
+              source: "mission-planner",
+              timestamp: "2026-11-24T12:00:00Z",
+              confidence: 0.95,
+            },
+          ]
+        : []),
+    ],
+  };
+}
+
+describe("SKG topology Graphology adapter, triple inspector, and transition timeline", () => {
+  // spec: cop-ui / Live SKG topology graph, triple inspector, and transition event timeline
+  it("projects SKG entities and pathSearch edges with non-safety palette tokens and position-preserving sync", () => {
+    for (const hex of [
+      ...Object.values(SKG_NODE_PALETTE),
+      ...Object.values(SKG_EDGE_PALETTE),
+    ]) {
+      expect(isReservedSafetyHue(hex)).toBe(false);
+    }
+
+    const sectorId = "boxbotix.local.cop.geo.sector.bravo";
+    const contactEntity: CopEntityState = {
+      id: "boxbotix.local.tak.cot.contact.c1",
+      kind: "external-contact",
+      title: "Track-C1",
+      contactType: "a-u-S",
+      location: { latitude: 30.27, longitude: -97.74, altitude: 0 },
+      kvRevision: 1,
+      updatedAt: null,
+      poisoned: false,
+      poisonError: null,
+      indexingProfile: null,
+      source: "tak-bridge",
+      observedAt: null,
+      receivedAt: null,
+      expiresAt: null,
+      uncertaintyMeters: 15,
+      feedStatus: "live",
+      triples: [],
+    };
+    const v1 = makeVehicle(1, sectorId);
+
+    const pathExpansion: PathSearchResult = {
+      entities: [
+        { id: v1.id, depth: 0 },
+        { id: sectorId, depth: 1 },
+        { id: contactEntity.id, depth: 2 },
+      ],
+      paths: [
+        [
+          {
+            from: v1.id,
+            predicate: "cop.mission.assigned_sector",
+            to: sectorId,
+          },
+          {
+            from: sectorId,
+            predicate: "cop.sector.contains_contact",
+            to: contactEntity.id,
+          },
+        ],
+      ],
+      truncated: false,
+    };
+
+    const model = buildSkgTopologyModel([v1, contactEntity], [pathExpansion]);
+    expect(model.nodes.map((n) => n.id)).toEqual([
+      sectorId,
+      v1.id,
+      contactEntity.id,
+    ]);
+    expect(model.edges).toHaveLength(2);
+    for (const node of model.nodes) {
+      expect(isReservedSafetyHue(node.color)).toBe(false);
+    }
+    for (const edge of model.edges) {
+      expect(isReservedSafetyHue(edge.color)).toBe(false);
+    }
+
+    // Sync into Graphology and verify existing (x, y) coordinates survive 4 Hz attribute refreshes.
+    const graph = new MultiDirectedGraph();
+    const firstSync = syncTopologyToGraph(graph, model);
+    expect(firstSync.structureChanged).toBe(true);
+    expect(graph.order).toBe(3);
+    expect(graph.size).toBe(2);
+
+    graph.setNodeAttribute(v1.id, "x", 42.5);
+    graph.setNodeAttribute(v1.id, "y", -19.25);
+
+    const secondSync = syncTopologyToGraph(graph, model);
+    expect(secondSync.structureChanged).toBe(false);
+    expect(graph.getNodeAttribute(v1.id, "x")).toBe(42.5);
+    expect(graph.getNodeAttribute(v1.id, "y")).toBe(-19.25);
+
+    // Expanding a brand-new neighbor seeds near v1's existing (42.5, -19.25) position.
+    const relayId = "boxbotix.local.mesh.halow.relay.node9";
+    const expandedModel = buildSkgTopologyModel(
+      [v1, contactEntity],
+      [
+        pathExpansion,
+        {
+          entities: [{ id: relayId, depth: 1 }],
+          paths: [
+            [{ from: v1.id, predicate: "uxs.link.via_relay", to: relayId }],
+          ],
+          truncated: false,
+        },
+      ],
+    );
+    const thirdSync = syncTopologyToGraph(graph, expandedModel);
+    expect(thirdSync.structureChanged).toBe(true);
+    const relayX = graph.getNodeAttribute(relayId, "x") as number;
+    const relayY = graph.getNodeAttribute(relayId, "y") as number;
+    expect(Math.hypot(relayX - 42.5, relayY - -19.25)).toBeCloseTo(4, 5);
+  });
+
+  // spec: cop-ui / Live SKG topology graph, triple inspector, and transition event timeline
+  it("formats sorted entity triples, Lane 3 transition events, and SkgPane jsdom node selection/2-hop expansion", async () => {
+    const sectorId = "boxbotix.local.cop.geo.sector.bravo";
+    const v1 = makeVehicle(1, sectorId);
+    const rows = formatEntityTriples(v1);
+    expect(rows.map((r) => r.predicate)).toEqual([
+      "cop.mission.assigned_sector",
+      "uxs.authority.state",
+    ]);
+    expect(rows[0]?.confidencePct).toBe("95%");
+    expect(rows[1]?.objectText).toBe("companion-autonomous");
+
+    const baseEv: TransitionEvent = {
+      sysid: 1,
+      entity_id: v1.id,
+      domain: "surface-boat",
+      seq: 12,
+      msg_id: 253,
+      kind: "statustext",
+      reasons: ["statustext"],
+      armed: true,
+      authority: "direct-crsf-override",
+      prev_authority: "companion-teleop",
+      companion_mode: "teleop-velocity",
+      link_tier: "mesh-high-rate",
+      flags: {
+        clock_sync_locked: true,
+        teleop_deadman_clamped: true,
+        crsf_link_healthy: true,
+        companion_trunk_healthy: true,
+      },
+      failsafes: 1,
+      status_text: {
+        severity: 2,
+        text: "EKF yaw reset",
+        id: 0,
+        chunk_seq: 0,
+      },
+      timestamp: 1700000000000,
+    };
+
+    const statusFmt = formatTransitionEvent(baseEv);
+    expect(statusFmt.severity).toBe("error");
+    expect(statusFmt.detail).toBe("EKF yaw reset");
+
+    const edgeFmt = formatTransitionEvent({
+      ...baseEv,
+      kind: "heartbeat_edge",
+      reasons: ["crsf_preempt"],
+    });
+    expect(edgeFmt.severity).toBe("warning");
+    expect(edgeFmt.detail).toContain(
+      "companion-teleop -> direct-crsf-override",
+    );
+
+    const failsafeFmt = formatTransitionEvent({
+      ...baseEv,
+      kind: "failsafe_increment",
+    });
+    expect(failsafeFmt.severity).toBe("error");
+    expect(failsafeFmt.headline).toContain("FAILSAFE #1");
+
+    // Mount SkgPane in jsdom and verify fallback node click + 2-hop GraphQL expansion.
+    const skgStore = createSkgStore();
+    skgStore.entities.set(v1.id, v1);
+    const telemetryStore = createTelemetryStore();
+    const viewportStore = createViewportStore({ skgStore });
+
+    const neighborId = "boxbotix.local.mesh.halow.relay.node3";
+    const pathSearchMock = vi.fn().mockResolvedValue({
+      data: {
+        entities: [
+          { id: v1.id, depth: 0 },
+          { id: neighborId, depth: 1 },
+        ],
+        paths: [
+          [{ from: v1.id, predicate: "uxs.link.via_relay", to: neighborId }],
+        ],
+        truncated: false,
+      },
+      damagedEntities: 0,
+    });
+    const graphqlClient: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: pathSearchMock,
+    };
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(SkgPane, {
+      target: host,
+      props: { skgStore, telemetryStore, viewportStore, graphqlClient },
+    });
+    flushSync();
+
+    const fallback = host.querySelector(
+      '[data-testid="skg-topology-fallback"]',
+    );
+    expect(fallback).not.toBeNull();
+    const nodeButtons = fallback!.querySelectorAll("button.node-item");
+    expect(nodeButtons.length).toBeGreaterThanOrEqual(2);
+
+    const v1Btn = Array.from(nodeButtons).find((btn) =>
+      btn.textContent?.includes("surface-boat#1"),
+    ) as HTMLButtonElement | undefined;
+    expect(v1Btn).toBeDefined();
+    v1Btn!.click();
+    flushSync();
+    expect(viewportStore.selectedEntityId).toBe(v1.id);
+    expect(
+      host.querySelector('[data-testid="skg-triple-inspector"]')?.textContent,
+    ).toContain("uxs.authority.state");
+
+    const expandBtn = Array.from(host.querySelectorAll("button.ctrl-btn")).find(
+      (btn) => btn.textContent?.includes("2-Hop"),
+    ) as HTMLButtonElement | undefined;
+    expect(expandBtn).toBeDefined();
+    expandBtn!.click();
+    await vi.waitFor(() => {
+      expect(pathSearchMock).toHaveBeenCalledWith({
+        startEntity: v1.id,
+        direction: "both",
+        maxDepth: 2,
+        maxNodes: 50,
+      });
+      flushSync();
+      expect(fallback!.textContent).toContain("relay:node3");
+    });
+
+    unmount(app);
+    host.remove();
+  });
+});
