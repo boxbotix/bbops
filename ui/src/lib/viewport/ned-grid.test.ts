@@ -4,7 +4,10 @@
 import { flushSync, mount, unmount } from "svelte";
 import { describe, expect, it, vi } from "vitest";
 import TacticalCanvas from "../components/TacticalCanvas.svelte";
-import { createSkgStore } from "../stores/skg.svelte";
+import {
+  type ExternalContactEntityState,
+  createSkgStore,
+} from "../stores/skg.svelte";
 import { createTelemetryStore } from "../stores/telemetry.svelte";
 import { createViewportStore } from "../stores/viewport.svelte";
 import { handleViewportHotkey, isEditableHotkeyTarget } from "./hotkeys";
@@ -480,7 +483,32 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       const host = document.createElement("div");
       document.body.appendChild(host);
       const telemetryStore = createTelemetryStore({ now: () => nowMs });
-      const skgStore = createSkgStore({ now: () => nowMs });
+      let ws2Socket: {
+        readyState: number;
+        onopen: ((event: never) => unknown) | null;
+        onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+        onerror: ((event: never) => unknown) | null;
+        onclose: ((event: CloseEvent) => unknown) | null;
+        send(data: string): void;
+        close(code?: number, reason?: string): void;
+      } | null = null;
+      const skgStore = createSkgStore({
+        now: () => nowMs,
+        createSocket: () => {
+          ws2Socket = {
+            readyState: 1,
+            onopen: null,
+            onmessage: null,
+            onerror: null,
+            onclose: null,
+            send: () => undefined,
+            close: () => undefined,
+          };
+          return ws2Socket;
+        },
+      });
+      skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+      ws2Socket!.onopen?.(new Event("open") as never);
       const viewportStore = createViewportStore({ skgStore });
       const adapter = new NedGridAdapter({
         widthPx: 640,
@@ -946,7 +974,32 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
     const originLla: [number, number, number] = [30.2672, -97.7431, 150];
 
     const telemetryStore = createTelemetryStore({ now: () => nowMs });
-    const skgStore = createSkgStore({ now: () => nowMs });
+    let ws2Socket: {
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    } | null = null;
+    const skgStore = createSkgStore({
+      now: () => nowMs,
+      createSocket: () => {
+        ws2Socket = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        return ws2Socket;
+      },
+    });
+    skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+    ws2Socket!.onopen?.(new Event("open") as never);
     const viewportStore = createViewportStore({ skgStore });
     const adapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
 
@@ -1094,6 +1147,8 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
           hasLocalPos: true,
           hasVerifiedFrameReference: true,
           stale: false,
+          localPosObservedAtMs: nowMs + 2_000,
+          globalPosObservedAtMs: nowMs + 2_050,
         },
       ]),
     ).toBe(true);
@@ -1113,6 +1168,8 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
           hasLocalPos: true,
           hasVerifiedFrameReference: true,
           stale: false,
+          localPosObservedAtMs: nowMs + 3_000,
+          globalPosObservedAtMs: nowMs + 3_000,
         },
         {
           ned: [0, 0, 0],
@@ -1120,12 +1177,839 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
           hasLocalPos: true,
           hasVerifiedFrameReference: true,
           stale: false,
+          localPosObservedAtMs: nowMs + 3_000,
+          globalPosObservedAtMs: nowMs + 3_000,
         },
       ]),
     ).toBe(false);
     expect(adapter.getCamera().originLla).toBeNull();
 
     unmount(app);
+    skgStore.disconnect();
+    host.remove();
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("keeps stationary geographic contacts motionless across asynchronous local updates with cached GPS fixes, withholds beyond drift tolerance, and re-anchors only on confirmed relocation", () => {
+    let simNowMs = Date.parse("2026-11-24T14:00:00.000Z");
+    let ws1Socket: {
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    } | null = null;
+    let ws2Socket: {
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    } | null = null;
+
+    const telemetryStore = createTelemetryStore({
+      now: () => simNowMs,
+      createSocket: () => {
+        ws1Socket = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        return ws1Socket;
+      },
+    });
+    const skgStore = createSkgStore({
+      now: () => simNowMs,
+      createSocket: () => {
+        ws2Socket = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        return ws2Socket;
+      },
+    });
+    telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+    ws1Socket!.onopen?.(new Event("open") as never);
+    skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+    ws2Socket!.onopen?.(new Event("open") as never);
+
+    const viewportStore = createViewportStore({ skgStore });
+    const adapter = new NedGridAdapter({
+      widthPx: 800,
+      heightPx: 600,
+      zoomPxPerM: 4,
+    });
+    const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const beaconId = "ais.uscg.cop.contact.vessel.sf-beacon";
+    const sfBeaconLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const sfTrueOriginLla = deriveNedOriginLla([0, 0, -2], sfBeaconLla)!;
+    const austinBeaconLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    const putVehicleEntity = (
+      ned: [number, number, number],
+      lla: [number, number, number],
+      localIso: string,
+      globalIso: string,
+      revision: number,
+    ) => {
+      const latestIso = localIso >= globalIso ? localIso : globalIso;
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision,
+          payload: {
+            id: vehicleId,
+            updated_at: latestIso,
+            triples: [
+              {
+                subject: vehicleId,
+                predicate: "uxs.domain.kind",
+                object: "rover",
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.authority.state",
+                object: "companion-teleop",
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.mode.companion",
+                object: "teleop-velocity",
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.link.tier",
+                object: "mesh-high-rate",
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.armed",
+                object: true,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.flags",
+                object: {
+                  clock_sync_locked: true,
+                  teleop_deadman_clamped: false,
+                  crsf_link_healthy: true,
+                  companion_trunk_healthy: true,
+                },
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.failsafes",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.crcerrors",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.loopdtus",
+                object: 1000,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.maxloopdtus",
+                object: 1200,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.rttus",
+                object: 400,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.attitude.quaternion",
+                object: [1, 0, 0, 0],
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.attitude.rates",
+                object: [0, 0, 0],
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.ned",
+                object: ned,
+                source: "mavlink_0xb1",
+                timestamp: localIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vx",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: localIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vy",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: localIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vz",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: localIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.headingdeg",
+                object: 0,
+                source: "mavlink_0xb1",
+                timestamp: latestIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.latitude",
+                object: lla[0],
+                source: "mavlink_0xb1",
+                timestamp: globalIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.longitude",
+                object: lla[1],
+                source: "mavlink_0xb1",
+                timestamp: globalIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.altitude",
+                object: lla[2],
+                source: "mavlink_0xb1",
+                timestamp: globalIso,
+                confidence: 1,
+                context: "measured",
+              },
+            ],
+          },
+        }),
+      );
+    };
+
+    const initialIso = new Date(simNowMs).toISOString();
+    putVehicleEntity([0, 0, -2], sfBeaconLla, initialIso, initialIso, 1);
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+    skgStore.entities.set(beaconId, {
+      id: beaconId,
+      kind: "external-contact",
+      kvRevision: 2,
+      poisoned: false,
+      poisonError: null,
+      title: "SF Beacon",
+      contactType: "a-f-G-U-C",
+      indexingProfile: null,
+      source: "tak-bridge",
+      observedAt: initialIso,
+      receivedAt: initialIso,
+      updatedAt: initialIso,
+      expiresAt: null,
+      feedStatus: "live",
+      uncertaintyMeters: 5,
+      location: {
+        latitude: sfBeaconLla[0],
+        longitude: sfBeaconLla[1],
+        altitude: sfBeaconLla[2],
+      },
+      triples: [],
+    });
+
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: simNowMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 1,
+          msg_id: 33,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [0, 0, -2],
+          has_local_pos: false,
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: sfBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: simNowMs,
+        },
+      }),
+    );
+    simNowMs += 20;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: simNowMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 2,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [0, 0, -2],
+          has_local_pos: true,
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: sfBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: simNowMs,
+        },
+      }),
+    );
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(TacticalCanvas, {
+      target: host,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        adapter,
+        now: () => simNowMs,
+      },
+    });
+    flushSync();
+
+    const beaconInitial = adapter.project({ lla: sfBeaconLla });
+    expect(beaconInitial.visible).toBe(true);
+    expect(beaconInitial.x).toBeCloseTo(320, 6);
+    expect(beaconInitial.y).toBeCloseTo(210, 6);
+
+    // 1. 4 seconds later, a fresh #32 local update [12.5, -4.25, -2] (52.81 px) arrives carrying the cached #33 fix from 4s ago.
+    simNowMs += 4_000;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: simNowMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 3,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [12.5, -4.25, -2],
+          has_local_pos: true,
+          ned_vel: [1, -0.3, 0],
+          lat_lon_alt: sfBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: simNowMs,
+        },
+      }),
+    );
+    putVehicleEntity(
+      [12.5, -4.25, -2],
+      sfBeaconLla,
+      new Date(simNowMs).toISOString(),
+      initialIso,
+      3,
+    );
+    flushSync();
+
+    const vehMoved = adapter.project({ ned: [12.5, -4.25, -2] });
+    const beaconAfterLocalMove = adapter.project({ lla: sfBeaconLla });
+    expect(
+      Math.hypot(vehMoved.x - beaconInitial.x, vehMoved.y - beaconInitial.y),
+    ).toBeCloseTo(Math.hypot(12.5, -4.25) * 4, 2);
+    expect(beaconAfterLocalMove.visible).toBe(true);
+    expect(beaconAfterLocalMove.x).toBe(beaconInitial.x);
+    expect(beaconAfterLocalMove.y).toBe(beaconInitial.y);
+
+    // 2. Large local-only step [60, -20, -2] (> 25 m) still paired with the old cached GPS fix withholds mixed-frame placement across ticks rather than moving SF Beacon!
+    simNowMs += 500;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: simNowMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 4,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [60, -20, -2],
+          has_local_pos: true,
+          ned_vel: [4, -1, 0],
+          lat_lon_alt: sfBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: simNowMs,
+        },
+      }),
+    );
+    const largeLocalIso = new Date(simNowMs).toISOString();
+    putVehicleEntity([60, -20, -2], sfBeaconLla, largeLocalIso, initialIso, 4);
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(adapter.project({ lla: sfBeaconLla }).visible).toBe(false);
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).not.toBeNull();
+
+    // Repeated tick with the same cached GPS fix remains withheld.
+    putVehicleEntity([60, -20, -2], sfBeaconLla, largeLocalIso, initialIso, 5);
+    flushSync();
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(adapter.project({ lla: sfBeaconLla }).visible).toBe(false);
+
+    // 3. Matching fresh #33 fix in the same frame restores originLla with 0 px stationary beacon shift.
+    simNowMs += 100;
+    const sfAt60mLla = localNedToLla([60, -20, -2], sfTrueOriginLla)!;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: simNowMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 5,
+          msg_id: 33,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [60, -20, -2],
+          has_local_pos: true,
+          ned_vel: [4, -1, 0],
+          lat_lon_alt: sfAt60mLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: simNowMs,
+        },
+      }),
+    );
+    putVehicleEntity(
+      [60, -20, -2],
+      sfAt60mLla,
+      largeLocalIso,
+      new Date(simNowMs).toISOString(),
+      6,
+    );
+    flushSync();
+
+    const beaconRestored = adapter.project({ lla: sfBeaconLla });
+    expect(beaconRestored.visible).toBe(true);
+    expect(beaconRestored.x).toBeCloseTo(beaconInitial.x, 4);
+    expect(beaconRestored.y).toBeCloseTo(beaconInitial.y, 4);
+
+    // 4. Confirmed relocation (both #33 and #32 freshly observed in Austin) updates originLla to Austin.
+    simNowMs += 2_000;
+    const austinGlobalMs = simNowMs;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: austinGlobalMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 6,
+          msg_id: 33,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [5, -3, -1],
+          has_local_pos: true,
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: austinBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: austinGlobalMs,
+        },
+      }),
+    );
+    simNowMs += 50;
+    const austinLocalMs = simNowMs;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: austinLocalMs,
+        payload: {
+          sysid: 1,
+          domain: "rover",
+          seq: 7,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [5, -3, -1],
+          has_local_pos: true,
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: austinBeaconLla,
+          has_global_pos: true,
+          hdg_deg: 0,
+          timestamp: austinLocalMs,
+        },
+      }),
+    );
+    putVehicleEntity(
+      [5, -3, -1],
+      austinBeaconLla,
+      new Date(austinLocalMs).toISOString(),
+      new Date(austinGlobalMs).toISOString(),
+      7,
+    );
+    flushSync();
+
+    const austinNedProj = adapter.project({ ned: [5, -3, -1] });
+    const austinGeoProj = adapter.project({ lla: austinBeaconLla });
+    expect(austinGeoProj.visible).toBe(true);
+    expect(austinGeoProj.x).toBeCloseTo(austinNedProj.x, 4);
+    expect(austinGeoProj.y).toBeCloseTo(austinNedProj.y, 4);
+
+    unmount(app);
+    telemetryStore.disconnect();
+    skgStore.disconnect();
+    host.remove();
+  });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("keeps a withheld reference cleared when live vehicles time out to stale and restores geographic overlays only on new live confirming evidence", () => {
+    let simNowMs = Date.parse("2026-11-24T15:00:00.000Z");
+    let ws2Socket: {
+      readyState: number;
+      onopen: ((event: never) => unknown) | null;
+      onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+      onerror: ((event: never) => unknown) | null;
+      onclose: ((event: CloseEvent) => unknown) | null;
+      send(data: string): void;
+      close(code?: number, reason?: string): void;
+    } | null = null;
+    const telemetryStore = createTelemetryStore({ now: () => simNowMs });
+    const skgStore = createSkgStore({
+      now: () => simNowMs,
+      createSocket: () => {
+        ws2Socket = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        return ws2Socket;
+      },
+    });
+    skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+    ws2Socket!.onopen?.(new Event("open") as never);
+
+    const viewportStore = createViewportStore({ skgStore });
+    const adapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    const vehAId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const vehBId = "boxbotix.local.robotics.uxs.vehicle.2";
+    const contactId = "ais.uscg.cop.contact.vessel.timeout-check";
+    const sfLla: [number, number, number] = [37.7749, -122.4194, 25];
+    const austinLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    const buildVehicleEntity = (opts: {
+      id: string;
+      sysid: number;
+      ned: [number, number, number];
+      lla: [number, number, number];
+      hasLocalPos: boolean;
+      observedMs: number;
+      revision: number;
+    }) => {
+      const iso = new Date(opts.observedMs).toISOString();
+      return {
+        id: opts.id,
+        kind: "uxs-vehicle" as const,
+        title: `Veh-${opts.sysid}`,
+        org: "boxbotix",
+        platform: "local",
+        sysid: opts.sysid,
+        domain: "quadcopter" as const,
+        authority: "companion-teleop" as const,
+        companionMode: "teleop-velocity" as const,
+        linkTier: "mesh-high-rate" as const,
+        armed: true,
+        healthFlags: {
+          clock_sync_locked: true,
+          teleop_deadman_clamped: false,
+          crsf_link_healthy: true,
+          companion_trunk_healthy: true,
+        },
+        sysStatus: {
+          failsafes: 0,
+          crcErrors: 0,
+          loopDtUs: 1000,
+          maxLoopDtUs: 1200,
+          rttUs: 400,
+        },
+        attitudeQuaternion: [1, 0, 0, 0] as [number, number, number, number],
+        attitudeRates: [0, 0, 0] as [number, number, number],
+        ned: opts.ned,
+        velocityNed: [0, 0, 0] as [number, number, number],
+        headingDeg: 0,
+        location: {
+          latitude: opts.lla[0],
+          longitude: opts.lla[1],
+          altitude: opts.lla[2],
+        },
+        hasAttitude: true,
+        hasLocalPos: opts.hasLocalPos,
+        hasGlobalPos: true,
+        hasHeading: true,
+        poseObservedAt: iso,
+        localPosObservedAt: opts.hasLocalPos ? iso : null,
+        globalPosObservedAt: iso,
+        poseIngestedAtMs: opts.observedMs,
+        poseIngestedLive: true,
+        kvRevision: opts.revision,
+        updatedAt: iso,
+        poisoned: false,
+        poisonError: null,
+        indexingProfile: "full",
+        source: "mavlink_0xb1",
+        observedAt: iso,
+        receivedAt: iso,
+        expiresAt: null,
+        uncertaintyMeters: null,
+        feedStatus: "live" as const,
+        ingestedAtMs: opts.observedMs,
+        triples: [],
+      };
+    };
+
+    const tA = simNowMs;
+    skgStore.entities.set(
+      vehAId,
+      buildVehicleEntity({
+        id: vehAId,
+        sysid: 1,
+        ned: [10, -5, -2],
+        lla: sfLla,
+        hasLocalPos: true,
+        observedMs: tA,
+        revision: 1,
+      }),
+    );
+    skgStore.entities.set(contactId, {
+      id: contactId,
+      kind: "external-contact",
+      kvRevision: 2,
+      poisoned: false,
+      poisonError: null,
+      title: "Harbor Marker",
+      contactType: "ais",
+      indexingProfile: null,
+      source: "ais-bridge",
+      observedAt: new Date(tA).toISOString(),
+      receivedAt: new Date(tA).toISOString(),
+      updatedAt: new Date(tA).toISOString(),
+      expiresAt: null,
+      feedStatus: "live",
+      uncertaintyMeters: 5,
+      location: {
+        latitude: sfLla[0],
+        longitude: sfLla[1],
+        altitude: sfLla[2],
+      },
+      triples: [],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(TacticalCanvas, {
+      target: host,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        adapter,
+        now: () => simNowMs,
+      },
+    });
+    flushSync();
+
+    // Step 1: Vehicle A establishes a verified reference.
+    expect(adapter.getCamera().originLla).not.toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("true");
+    expect(adapter.project({ lla: sfLla }).visible).toBe(true);
+
+    // Step 2: Advance time (+5s) so Vehicle A goes stale, and supply live Vehicle B without a verified pair -> clears originLla.
+    simNowMs += 5_000;
+    const tB = simNowMs;
+    skgStore.entities.set(
+      vehBId,
+      buildVehicleEntity({
+        id: vehBId,
+        sysid: 2,
+        ned: [0, 0, 0],
+        lla: austinLla,
+        hasLocalPos: false,
+        observedMs: tB,
+        revision: 3,
+      }),
+    );
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).not.toBeNull();
+    expect(adapter.project({ lla: sfLla }).visible).toBe(false);
+
+    // Step 3: Advance time (+5s) so Vehicle B ALSO times out to stale: true (no new data, only time passing).
+    // Stale Vehicle A's old reference MUST NOT be re-enabled by timeout!
+    simNowMs += 5_000;
+    // Trigger reactive re-render at the new timestamp without mutating vehicle A or B pose evidence.
+    skgStore.entities.set(contactId, {
+      ...(skgStore.entities.get(contactId)! as ExternalContactEntityState),
+      kvRevision: 4,
+    });
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).not.toBeNull();
+    expect(adapter.project({ lla: sfLla }).visible).toBe(false);
+
+    // Even removing timed-out Vehicle B while Vehicle A remains stale MUST NOT restore Vehicle A's old reference!
+    skgStore.entities.delete(vehBId);
+    flushSync();
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("false");
+
+    // Step 4: New live confirming evidence (Vehicle B or A reporting a fresh contemporaneous pair) restores geographic overlays.
+    simNowMs += 500;
+    skgStore.entities.set(
+      vehAId,
+      buildVehicleEntity({
+        id: vehAId,
+        sysid: 1,
+        ned: [10, -5, -2],
+        lla: sfLla,
+        hasLocalPos: true,
+        observedMs: simNowMs,
+        revision: 5,
+      }),
+    );
+    flushSync();
+
+    expect(adapter.getCamera().originLla).not.toBeNull();
+    expect(
+      host
+        .querySelector('[data-testid="tactical-viewport"]')
+        ?.getAttribute("data-origin-anchored"),
+    ).toBe("true");
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).toBeNull();
+    expect(adapter.project({ lla: sfLla }).visible).toBe(true);
+
+    unmount(app);
+    skgStore.disconnect();
     host.remove();
   });
 });

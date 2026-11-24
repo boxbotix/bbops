@@ -304,9 +304,11 @@ export interface LiveVehiclePoseOptions {
     readonly has_local_pos?: boolean;
     readonly has_explicit_local_pos?: boolean;
     readonly local_pos_confirmed_at_ms?: number | null;
+    readonly local_pos_observed_at_ms?: number | null;
     readonly ned_vel: readonly [number, number, number];
     readonly lat_lon_alt: readonly [number, number, number];
     readonly has_global_pos: boolean;
+    readonly global_pos_observed_at_ms?: number | null;
     readonly hdg_deg: number;
     readonly has_heading?: boolean;
     readonly timestamp: number;
@@ -330,6 +332,8 @@ export interface ResolvedVehiclePose {
   readonly headingDeg: number;
   readonly headingRad: number;
   readonly lla: [number, number, number] | null;
+  readonly localPosObservedAtMs?: number | null;
+  readonly globalPosObservedAtMs?: number | null;
 }
 
 function normalizeHeadingDeg360(deg: number): number {
@@ -491,6 +495,42 @@ export function resolveLiveVehiclePose(
 
   const stale = !(useFast ? ws1Fresh : skgFresh);
 
+  const skgLla: [number, number, number] | null =
+    (vehicle.hasGlobalPos ?? true) &&
+    isValidNonZeroLla(
+      vehicle.location.latitude,
+      vehicle.location.longitude,
+      vehicle.location.altitude,
+    )
+      ? [
+          vehicle.location.latitude,
+          vehicle.location.longitude,
+          vehicle.location.altitude,
+        ]
+      : null;
+  const hasNonZeroVehicleLocalKinematics =
+    vehicle.ned[0] !== 0 ||
+    vehicle.ned[1] !== 0 ||
+    vehicle.ned[2] !== 0 ||
+    vehicle.velocityNed[0] !== 0 ||
+    vehicle.velocityNed[1] !== 0 ||
+    vehicle.velocityNed[2] !== 0;
+  const skgHasConfirmedLocalPos =
+    vehicle.hasLocalPos === true ||
+    (vehicle.hasLocalPos === undefined && hasNonZeroVehicleLocalKinematics);
+  const skgLocalPosMs =
+    vehicle.localPosObservedAt !== undefined
+      ? parseIsoEpochMs(vehicle.localPosObservedAt)
+      : skgHasConfirmedLocalPos
+        ? skgPoseMs
+        : null;
+  const skgGlobalPosMs =
+    vehicle.globalPosObservedAt !== undefined
+      ? parseIsoEpochMs(vehicle.globalPosObservedAt)
+      : skgLla !== null
+        ? skgPoseMs
+        : null;
+
   if (useFast && fast !== undefined) {
     const quat: [number, number, number, number] = [
       fast.quat_wxyz[0],
@@ -551,6 +591,52 @@ export function resolveLiveVehiclePose(
             fast.ned_vel[1] !== 0 ||
             fast.ned_vel[2] !== 0;
     const hasLocalPos = fastHasLocalPos && !skgNewSessionInvalidatesLegacyLatch;
+    const nedTuple: [number, number, number] = hasLocalPos
+      ? [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]]
+      : [0, 0, 0];
+    const fastEpochComparable =
+      isFiniteNumber(fast.timestamp) &&
+      fast.timestamp >= MIN_COMPARABLE_EPOCH_MS;
+    const skgLocalFallbackMs =
+      fastEpochComparable &&
+      skgHasConfirmedLocalPos &&
+      skgLocalPosMs !== null &&
+      skgLocalPosMs >= MIN_COMPARABLE_EPOCH_MS &&
+      Math.abs(nedTuple[0] - vehicle.ned[0]) <= 1e-4 &&
+      Math.abs(nedTuple[1] - vehicle.ned[1]) <= 1e-4 &&
+      Math.abs(nedTuple[2] - vehicle.ned[2]) <= 1e-4
+        ? skgLocalPosMs
+        : null;
+    const skgGlobalFallbackMs =
+      fastEpochComparable &&
+      lla !== null &&
+      skgLla !== null &&
+      skgGlobalPosMs !== null &&
+      skgGlobalPosMs >= MIN_COMPARABLE_EPOCH_MS &&
+      Math.abs(lla[0] - skgLla[0]) <= 1e-7 &&
+      Math.abs(lla[1] - skgLla[1]) <= 1e-7 &&
+      Math.abs(lla[2] - skgLla[2]) <= 1e-3
+        ? skgGlobalPosMs
+        : null;
+    const localPosObservedAtMs = !hasLocalPos
+      ? null
+      : fast.local_pos_observed_at_ms !== undefined
+        ? (fast.local_pos_observed_at_ms ?? skgLocalFallbackMs)
+        : fast.msg_id === undefined || fast.msg_id === 32
+          ? isFiniteNumber(fast.timestamp)
+            ? fast.timestamp
+            : null
+          : skgLocalFallbackMs;
+    const globalPosObservedAtMs =
+      lla === null
+        ? null
+        : fast.global_pos_observed_at_ms !== undefined
+          ? (fast.global_pos_observed_at_ms ?? skgGlobalFallbackMs)
+          : fast.msg_id === undefined || fast.msg_id === 33
+            ? isFiniteNumber(fast.timestamp)
+              ? fast.timestamp
+              : null
+            : skgGlobalFallbackMs;
     return {
       source: "ws1",
       stale,
@@ -559,15 +645,15 @@ export function resolveLiveVehiclePose(
       hasLocalPos,
       hasVerifiedFrameReference: hasLocalPos && lla !== null,
       quat,
-      ned: hasLocalPos
-        ? [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]]
-        : [0, 0, 0],
+      ned: nedTuple,
       vel: hasLocalPos
         ? [fast.ned_vel[0], fast.ned_vel[1], fast.ned_vel[2]]
         : [0, 0, 0],
       headingDeg,
       headingRad: headingDeg * DEG_TO_RAD,
       lla,
+      localPosObservedAtMs,
+      globalPosObservedAtMs,
     };
   }
 
@@ -582,29 +668,6 @@ export function resolveLiveVehiclePose(
     (vehicle.hasAttitude ?? true) &&
     isMeasuredAttitudeQuaternion(quat, vehicle.headingDeg);
   const hasHeading = hasAttitude || (vehicle.hasHeading ?? headingDeg !== 0);
-  const lla: [number, number, number] | null =
-    (vehicle.hasGlobalPos ?? true) &&
-    isValidNonZeroLla(
-      vehicle.location.latitude,
-      vehicle.location.longitude,
-      vehicle.location.altitude,
-    )
-      ? [
-          vehicle.location.latitude,
-          vehicle.location.longitude,
-          vehicle.location.altitude,
-        ]
-      : null;
-  const hasNonZeroVehicleLocalKinematics =
-    vehicle.ned[0] !== 0 ||
-    vehicle.ned[1] !== 0 ||
-    vehicle.ned[2] !== 0 ||
-    vehicle.velocityNed[0] !== 0 ||
-    vehicle.velocityNed[1] !== 0 ||
-    vehicle.velocityNed[2] !== 0;
-  const skgHasConfirmedLocalPos =
-    vehicle.hasLocalPos === true ||
-    (vehicle.hasLocalPos === undefined && hasNonZeroVehicleLocalKinematics);
   const ws1ContradictsLocalPos =
     fast !== undefined &&
     fast.has_explicit_local_pos !== false &&
@@ -618,7 +681,7 @@ export function resolveLiveVehiclePose(
     hasAttitude,
     hasHeading,
     hasLocalPos,
-    hasVerifiedFrameReference: hasLocalPos && lla !== null,
+    hasVerifiedFrameReference: hasLocalPos && skgLla !== null,
     quat,
     ned: hasLocalPos
       ? [vehicle.ned[0], vehicle.ned[1], vehicle.ned[2]]
@@ -628,7 +691,9 @@ export function resolveLiveVehiclePose(
       : [0, 0, 0],
     headingDeg,
     headingRad: headingDeg * DEG_TO_RAD,
-    lla,
+    lla: skgLla,
+    localPosObservedAtMs: hasLocalPos ? skgLocalPosMs : null,
+    globalPosObservedAtMs: skgLla !== null ? skgGlobalPosMs : null,
   };
 }
 

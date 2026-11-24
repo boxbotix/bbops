@@ -57,9 +57,11 @@ export interface VehicleKinematics {
   has_local_pos: boolean;
   has_explicit_local_pos?: boolean;
   local_pos_confirmed_at_ms?: number | null;
+  local_pos_observed_at_ms?: number | null;
   ned_vel: [number, number, number];
   lat_lon_alt: [number, number, number];
   has_global_pos: boolean;
+  global_pos_observed_at_ms?: number | null;
   hdg_deg: number;
   has_heading: boolean;
   timestamp: number;
@@ -156,6 +158,8 @@ function parseTelemetryPayload(
   receivedAtMs: number,
   priorLegacyAttitudeLatched: boolean,
   priorLegacyLocalPosConfirmedAtMs: number | null,
+  priorLocalPosObservedAtMs: number | null,
+  priorGlobalPosObservedAtMs: number | null,
 ): VehicleKinematics | null {
   if (!isRecord(payload)) {
     return null;
@@ -220,6 +224,16 @@ function parseTelemetryPayload(
     : payload.msg_id === 32
       ? payload.timestamp
       : priorLegacyLocalPosConfirmedAtMs;
+  const localPosObservedAtMs = !hasLocalPos
+    ? null
+    : payload.msg_id === 32
+      ? payload.timestamp
+      : priorLocalPosObservedAtMs;
+  const globalPosObservedAtMs = !payload.has_global_pos
+    ? null
+    : payload.msg_id === 33
+      ? payload.timestamp
+      : priorGlobalPosObservedAtMs;
   const hasHeading =
     typeof payload.has_heading === "boolean"
       ? payload.has_heading || hasAttitude
@@ -236,9 +250,11 @@ function parseTelemetryPayload(
     has_local_pos: hasLocalPos,
     has_explicit_local_pos: hasExplicitLocalPos,
     local_pos_confirmed_at_ms: localPosConfirmedAtMs,
+    local_pos_observed_at_ms: localPosObservedAtMs,
     ned_vel: vel,
     lat_lon_alt: lla,
     has_global_pos: payload.has_global_pos,
+    global_pos_observed_at_ms: globalPosObservedAtMs,
     hdg_deg: payload.hdg_deg,
     has_heading: hasHeading,
     timestamp: payload.timestamp,
@@ -267,6 +283,7 @@ function overwriteKinematicsInPlace(
   target.has_local_pos = next.has_local_pos;
   target.has_explicit_local_pos = next.has_explicit_local_pos;
   target.local_pos_confirmed_at_ms = next.local_pos_confirmed_at_ms;
+  target.local_pos_observed_at_ms = next.local_pos_observed_at_ms;
   target.ned_vel[0] = next.ned_vel[0];
   target.ned_vel[1] = next.ned_vel[1];
   target.ned_vel[2] = next.ned_vel[2];
@@ -274,6 +291,7 @@ function overwriteKinematicsInPlace(
   target.lat_lon_alt[1] = next.lat_lon_alt[1];
   target.lat_lon_alt[2] = next.lat_lon_alt[2];
   target.has_global_pos = next.has_global_pos;
+  target.global_pos_observed_at_ms = next.global_pos_observed_at_ms;
   target.hdg_deg = next.hdg_deg;
   target.has_heading = next.has_heading;
   target.timestamp = next.timestamp;
@@ -386,6 +404,10 @@ export function createTelemetryStore(
   const legacyAttitudeLatchedBySysId = new Set<number>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const legacyLocalPosLatchedAtBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const localPosObservedAtBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const globalPosObservedAtBySysId = new Map<number, number>();
   const eventRing = new Array<TransitionEvent | undefined>(maxEvents);
   let ringWriteIdx = 0;
   let ringSize = 0;
@@ -398,6 +420,20 @@ export function createTelemetryStore(
   let events = $state.raw<readonly TransitionEvent[]>([]);
   let reconnectCount = $state(0);
   let lastDisconnectedAt = $state<number | null>(null);
+
+  function clearAllSessionLatches(): void {
+    legacyAttitudeLatchedBySysId.clear();
+    legacyLocalPosLatchedAtBySysId.clear();
+    localPosObservedAtBySysId.clear();
+    globalPosObservedAtBySysId.clear();
+  }
+
+  function clearSysIdSessionLatches(sysid: number): void {
+    legacyAttitudeLatchedBySysId.delete(sysid);
+    legacyLocalPosLatchedAtBySysId.delete(sysid);
+    localPosObservedAtBySysId.delete(sysid);
+    globalPosObservedAtBySysId.delete(sysid);
+  }
 
   function snapshotEventRing(): readonly TransitionEvent[] {
     if (ringSize === 0) {
@@ -459,6 +495,8 @@ export function createTelemetryStore(
         receivedAtMs,
         legacyAttitudeLatchedBySysId.has(sysid),
         legacyLocalPosLatchedAtBySysId.get(sysid) ?? null,
+        localPosObservedAtBySysId.get(sysid) ?? null,
+        globalPosObservedAtBySysId.get(sysid) ?? null,
       );
       if (!frame) {
         malformedFrames += 1;
@@ -485,6 +523,24 @@ export function createTelemetryStore(
         );
       } else {
         legacyLocalPosLatchedAtBySysId.delete(sysid);
+      }
+      if (
+        frame.has_local_pos &&
+        frame.local_pos_observed_at_ms !== null &&
+        frame.local_pos_observed_at_ms !== undefined
+      ) {
+        localPosObservedAtBySysId.set(sysid, frame.local_pos_observed_at_ms);
+      } else {
+        localPosObservedAtBySysId.delete(sysid);
+      }
+      if (
+        frame.has_global_pos &&
+        frame.global_pos_observed_at_ms !== null &&
+        frame.global_pos_observed_at_ms !== undefined
+      ) {
+        globalPosObservedAtBySysId.set(sysid, frame.global_pos_observed_at_ms);
+      } else {
+        globalPosObservedAtBySysId.delete(sysid);
       }
       if (existing !== undefined) {
         overwriteKinematicsInPlace(existing, frame);
@@ -515,8 +571,7 @@ export function createTelemetryStore(
           existing === undefined ||
           transition.timestamp >= existing.timestamp
         ) {
-          legacyAttitudeLatchedBySysId.delete(sysid);
-          legacyLocalPosLatchedAtBySysId.delete(sysid);
+          clearSysIdSessionLatches(sysid);
         }
       }
       pushTransitionEvent(transition);
@@ -528,8 +583,7 @@ export function createTelemetryStore(
 
   function clearFeedState(): void {
     kinematicsBySysId.clear();
-    legacyAttitudeLatchedBySysId.clear();
-    legacyLocalPosLatchedAtBySysId.clear();
+    clearAllSessionLatches();
     eventRing.fill(undefined);
     ringWriteIdx = 0;
     ringSize = 0;
@@ -555,8 +609,7 @@ export function createTelemetryStore(
       status = nextStatus;
     },
     onOpen() {
-      legacyAttitudeLatchedBySysId.clear();
-      legacyLocalPosLatchedAtBySysId.clear();
+      clearAllSessionLatches();
       if (hasEstablishedOnce) {
         reconnectCount += 1;
       }
@@ -564,8 +617,7 @@ export function createTelemetryStore(
     },
     onMessage: ingestRawFrame,
     onDisconnect(info) {
-      legacyAttitudeLatchedBySysId.clear();
-      legacyLocalPosLatchedAtBySysId.clear();
+      clearAllSessionLatches();
       if (info.wasConnected) {
         lastDisconnectedAt = info.timestamp;
       }
@@ -605,8 +657,7 @@ export function createTelemetryStore(
     },
     disconnect() {
       wsClient.disconnect();
-      legacyAttitudeLatchedBySysId.clear();
-      legacyLocalPosLatchedAtBySysId.clear();
+      clearAllSessionLatches();
     },
     getKinematics(sysid: number) {
       return kinematicsBySysId.get(sysid);

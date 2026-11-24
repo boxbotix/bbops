@@ -246,6 +246,92 @@ export function deriveNedOriginLla(
 }
 
 export const SHARED_ORIGIN_MAX_DRIFT_M = 25;
+export const MAX_FRAME_PAIR_SKEW_MS = 1_500;
+
+interface VerifiedOriginBaseline {
+  readonly ned: readonly [number, number, number];
+  readonly lla: readonly [number, number, number];
+  readonly localPosObservedAtMs: number | null | undefined;
+  readonly globalPosObservedAtMs: number | null | undefined;
+}
+
+interface AdapterOriginState {
+  activeBaseline: VerifiedOriginBaseline | null;
+  withheldBaseline: VerifiedOriginBaseline | null;
+}
+
+const adapterOriginStates = new WeakMap<ViewportAdapter, AdapterOriginState>();
+
+function getOrCreateOriginState(adapter: ViewportAdapter): AdapterOriginState {
+  let state = adapterOriginStates.get(adapter);
+  if (!state) {
+    state = { activeBaseline: null, withheldBaseline: null };
+    adapterOriginStates.set(adapter, state);
+  }
+  return state;
+}
+
+function tuple3Equals(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+  eps = 1e-9,
+): boolean {
+  return (
+    Math.abs(a[0] - b[0]) <= eps &&
+    Math.abs(a[1] - b[1]) <= eps &&
+    Math.abs(a[2] - b[2]) <= eps
+  );
+}
+
+function hasContemporaneousObservations(
+  localPosObservedAtMs: number | null | undefined,
+  globalPosObservedAtMs: number | null | undefined,
+): boolean {
+  if (
+    localPosObservedAtMs === undefined &&
+    globalPosObservedAtMs === undefined
+  ) {
+    return true;
+  }
+  if (
+    !isFiniteNumber(localPosObservedAtMs) ||
+    !isFiniteNumber(globalPosObservedAtMs)
+  ) {
+    return false;
+  }
+  return (
+    Math.abs(localPosObservedAtMs - globalPosObservedAtMs) <=
+    MAX_FRAME_PAIR_SKEW_MS
+  );
+}
+
+function hasBothDomainsAdvancedSince(
+  candidate: VerifiedOriginBaseline,
+  baseline: VerifiedOriginBaseline,
+): boolean {
+  const localAdvanced =
+    isFiniteNumber(candidate.localPosObservedAtMs) &&
+    isFiniteNumber(baseline.localPosObservedAtMs)
+      ? candidate.localPosObservedAtMs > baseline.localPosObservedAtMs
+      : !tuple3Equals(candidate.ned, baseline.ned);
+  const globalAdvanced =
+    isFiniteNumber(candidate.globalPosObservedAtMs) &&
+    isFiniteNumber(baseline.globalPosObservedAtMs)
+      ? candidate.globalPosObservedAtMs > baseline.globalPosObservedAtMs
+      : !tuple3Equals(candidate.lla, baseline.lla);
+  return localAdvanced && globalAdvanced;
+}
+
+function toOriginBaseline(
+  candidate: VerifiedOriginBaseline,
+): VerifiedOriginBaseline {
+  return {
+    ned: [candidate.ned[0], candidate.ned[1], candidate.ned[2]],
+    lla: [candidate.lla[0], candidate.lla[1], candidate.lla[2]],
+    localPosObservedAtMs: candidate.localPosObservedAtMs,
+    globalPosObservedAtMs: candidate.globalPosObservedAtMs,
+  };
+}
 
 function poseAgreesWithOrigin(
   ned: readonly [number, number, number],
@@ -267,11 +353,12 @@ function poseAgreesWithOrigin(
 }
 
 /**
- * Reconciles the viewport's shared NED<->LLA reference against the active
- * vehicle poses that carry both local NED and a verified geographic fix.
- * Clears any prior-session origin while no confirmed (ned, lla) reference is
- * active or when active confirmed vehicles report conflicting local frames,
- * and updates originLla whenever the active confirmed pair shifts local frame.
+ * Reconciles the viewport's shared NED<->LLA reference against live vehicle
+ * poses that carry both local NED and a verified geographic fix.
+ * Keeps an established reference steady across ordinary asynchronous local or
+ * global updates, withholds mixed-frame placement when divergence lacks fresh
+ * contemporaneous confirmation in both domains or when vehicles conflict, and
+ * never re-enables a cleared reference solely because live vehicles time out.
  */
 export function anchorSharedFrameOrigin(
   adapter: ViewportAdapter,
@@ -280,22 +367,53 @@ export function anchorSharedFrameOrigin(
       readonly hasLocalPos?: boolean;
       readonly hasVerifiedFrameReference?: boolean;
       readonly stale?: boolean;
+      readonly localPosObservedAtMs?: number | null;
+      readonly globalPosObservedAtMs?: number | null;
     }
   >,
 ): boolean {
+  const state = getOrCreateOriginState(adapter);
+  const currentOrigin = adapter.getCamera().originLla;
+  if (currentOrigin === null && state.activeBaseline !== null) {
+    state.activeBaseline = null;
+  }
+
   const allPoses = Array.from(vehiclePoses);
-  const hasLivePose = allPoses.some((pose) => pose.stale === false);
-  const activePool = hasLivePose
-    ? allPoses.filter((pose) => pose.stale === false)
-    : allPoses;
+  const livePoses = allPoses.filter((pose) => pose.stale !== true);
 
-  const verified: Array<{
-    ned: readonly [number, number, number];
-    lla: readonly [number, number, number];
-    originLla: [number, number, number];
-  }> = [];
+  if (livePoses.length === 0) {
+    if (currentOrigin === null) {
+      return false;
+    }
+    if (allPoses.length === 0) {
+      adapter.setCamera({ originLla: null });
+      state.activeBaseline = null;
+      state.withheldBaseline = null;
+      return false;
+    }
+    const staleStillConsistent = allPoses.every(
+      (pose) =>
+        pose.hasVerifiedFrameReference !== false &&
+        pose.hasLocalPos !== false &&
+        pose.lla !== null &&
+        poseAgreesWithOrigin(pose.ned, pose.lla, currentOrigin),
+    );
+    if (!staleStillConsistent) {
+      adapter.setCamera({ originLla: null });
+      state.activeBaseline = null;
+      state.withheldBaseline = null;
+      return false;
+    }
+    return true;
+  }
 
-  for (const pose of activePool) {
+  const verified: Array<
+    VerifiedOriginBaseline & {
+      originLla: [number, number, number];
+    }
+  > = [];
+
+  for (const pose of livePoses) {
     if (
       pose.hasVerifiedFrameReference === false ||
       pose.hasLocalPos === false ||
@@ -305,14 +423,22 @@ export function anchorSharedFrameOrigin(
     }
     const originLla = deriveNedOriginLla(pose.ned, pose.lla);
     if (originLla !== null) {
-      verified.push({ ned: pose.ned, lla: pose.lla, originLla });
+      verified.push({
+        ned: pose.ned,
+        lla: pose.lla,
+        localPosObservedAtMs: pose.localPosObservedAtMs,
+        globalPosObservedAtMs: pose.globalPosObservedAtMs,
+        originLla,
+      });
     }
   }
 
   if (verified.length === 0) {
-    if (adapter.getCamera().originLla !== null) {
+    if (currentOrigin !== null) {
       adapter.setCamera({ originLla: null });
     }
+    state.activeBaseline = null;
+    state.withheldBaseline = null;
     return false;
   }
 
@@ -320,23 +446,68 @@ export function anchorSharedFrameOrigin(
   for (let i = 1; i < verified.length; i += 1) {
     const peer = verified[i]!;
     if (!poseAgreesWithOrigin(peer.ned, peer.lla, primary.originLla)) {
-      if (adapter.getCamera().originLla !== null) {
+      if (currentOrigin !== null) {
         adapter.setCamera({ originLla: null });
       }
+      state.activeBaseline = null;
+      state.withheldBaseline = null;
       return false;
     }
   }
 
-  const currentOrigin = adapter.getCamera().originLla;
-  const currentOriginValid =
-    currentOrigin !== null &&
-    poseAgreesWithOrigin(primary.ned, primary.lla, currentOrigin, 1e-2) &&
-    verified.every((item) =>
+  if (currentOrigin !== null) {
+    const allAgreeWithCurrent = verified.every((item) =>
       poseAgreesWithOrigin(item.ned, item.lla, currentOrigin),
     );
-  if (!currentOriginValid) {
+    if (allAgreeWithCurrent) {
+      if (
+        hasContemporaneousObservations(
+          primary.localPosObservedAtMs,
+          primary.globalPosObservedAtMs,
+        ) &&
+        (state.activeBaseline === null ||
+          hasBothDomainsAdvancedSince(primary, state.activeBaseline))
+      ) {
+        state.activeBaseline = toOriginBaseline(primary);
+      }
+      state.withheldBaseline = null;
+      return true;
+    }
+
+    const confirmedRelocation =
+      hasContemporaneousObservations(
+        primary.localPosObservedAtMs,
+        primary.globalPosObservedAtMs,
+      ) &&
+      (state.activeBaseline === null ||
+        hasBothDomainsAdvancedSince(primary, state.activeBaseline));
+    if (!confirmedRelocation) {
+      adapter.setCamera({ originLla: null });
+      state.withheldBaseline = state.activeBaseline;
+      state.activeBaseline = null;
+      return false;
+    }
+
     adapter.setCamera({ originLla: primary.originLla });
+    state.activeBaseline = toOriginBaseline(primary);
+    state.withheldBaseline = null;
+    return true;
   }
+
+  const confirmedInitialOrRestored =
+    hasContemporaneousObservations(
+      primary.localPosObservedAtMs,
+      primary.globalPosObservedAtMs,
+    ) &&
+    (state.withheldBaseline === null ||
+      hasBothDomainsAdvancedSince(primary, state.withheldBaseline));
+  if (!confirmedInitialOrRestored) {
+    return false;
+  }
+
+  adapter.setCamera({ originLla: primary.originLla });
+  state.activeBaseline = toOriginBaseline(primary);
+  state.withheldBaseline = null;
   return true;
 }
 

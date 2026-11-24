@@ -2575,8 +2575,12 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         },
       });
       flushTicks();
+      const s1StepABeaconProj = adapter.project({
+        lla: [37.7749, -122.4194, 25],
+      });
+      expect(s1StepABeaconProj.visible).toBe(true);
 
-      // Session 1 step B (12:00:00.300Z): second local NED [12.5, -4.25, -2] builds a 2-point Session 1 wake trail.
+      // Session 1 step B (12:00:00.300Z): local NED advances to [12.5, -4.25, -2] while globalPos retains its cached 12:00:00.150Z fix; SF Beacon stays stationary.
       nowMs = Date.parse("2026-11-24T12:00:00.300Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
@@ -2600,7 +2604,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           globalPos: {
             value: [37.7749, -122.4194, 25],
             measured: true,
-            timestamp: "2026-11-24T12:00:00.300Z",
+            timestamp: "2026-11-24T12:00:00.150Z",
           },
         }),
       );
@@ -2628,8 +2632,14 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       const s1GeoProj = adapter.project({ lla: [37.7749, -122.4194, 25] });
       expect(s1NedProj.visible).toBe(true);
       expect(s1GeoProj.visible).toBe(true);
-      expect(s1GeoProj.x).toBeCloseTo(s1NedProj.x, 4);
-      expect(s1GeoProj.y).toBeCloseTo(s1NedProj.y, 4);
+      expect(
+        Math.hypot(
+          s1NedProj.x - s1StepABeaconProj.x,
+          s1NedProj.y - s1StepABeaconProj.y,
+        ),
+      ).toBeCloseTo(Math.hypot(12.5, -4.25) * 4, 2);
+      expect(s1GeoProj.x).toBe(s1StepABeaconProj.x);
+      expect(s1GeoProj.y).toBe(s1StepABeaconProj.y);
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 2.0m");
       expect(overlayTexts).toContain("SF Beacon");

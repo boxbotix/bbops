@@ -120,6 +120,8 @@ export interface VehicleEntityState extends CopEntityBase {
   hasGlobalPos?: boolean;
   hasHeading?: boolean;
   poseObservedAt?: string | null;
+  localPosObservedAt?: string | null;
+  globalPosObservedAt?: string | null;
   poseIngestedAtMs?: number | null;
   poseIngestedLive?: boolean;
 }
@@ -584,6 +586,16 @@ export function parseCopEntityState(
       const poseObservedAt = normalizeKnownTimestamp(
         latestPoseTriple?.timestamp,
       );
+      const localPosObservedAt = hasLocalPos
+        ? normalizeKnownTimestamp(nedTriple?.timestamp)
+        : null;
+      const latestGlobalPosTriple =
+        latTriple !== undefined && lonTriple !== undefined
+          ? selectWinningTriple(latTriple, lonTriple)
+          : (latTriple ?? lonTriple);
+      const globalPosObservedAt = hasGlobalPos
+        ? normalizeKnownTimestamp(latestGlobalPosTriple?.timestamp)
+        : null;
       const vehicleObservedAt =
         base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
       const vehicleSource =
@@ -593,6 +605,8 @@ export function parseCopEntityState(
         source: vehicleSource,
         observedAt: vehicleObservedAt,
         poseObservedAt,
+        localPosObservedAt,
+        globalPosObservedAt,
         hasAttitude,
         hasLocalPos,
         hasGlobalPos,
