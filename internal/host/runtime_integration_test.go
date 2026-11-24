@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1103,11 +1104,12 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 		return true
 	})
 
-	// Stream #1 SYS_STATUS, #31 ATTITUDE_QUATERNION, #32 LOCAL_POSITION_NED, and #33 GLOBAL_POSITION_INT
+	// Stream #1 SYS_STATUS (with nonzero historical failsafe count on join to verify no false baseline alert),
+	// #31 ATTITUDE_QUATERNION, #32 LOCAL_POSITION_NED, and #33 GLOBAL_POSITION_INT
 	// (with Hdg=4500 which must NOT override #31's quaternion yaw!).
 	for _, v := range vehicles {
 		sendFrame(v.conn, v.sysid, 1, 2, mavcodec.SysStatus{
-			Load: 950, ErrorsComm: 1, ErrorsCount1: 0, ErrorsCount2: 1400, ErrorsCount3: 600,
+			Load: 950, ErrorsComm: 1, ErrorsCount1: uint16(v.sysid), ErrorsCount2: 1400, ErrorsCount3: 600,
 		})
 		sendFrame(v.conn, v.sysid, 1, 3, mavcodec.AttitudeQuaternion{
 			Q1: v.quat[0], Q2: v.quat[1], Q3: v.quat[2], Q4: v.quat[3], Yawspeed: 0.15,
@@ -1126,37 +1128,66 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 	sendFrame(noiseClient, 1, 1, 91, mavcodec.GlobalPositionInt{Lat: 900_000_001, Lon: 0, Hdg: 0})
 	assertHTTPGet(t, endpoints.HTTPBaseURL+"/readyz", http.StatusOK, "READY")
 
-	// Verify Lane 1: WS #1 receives uncoalesced fused TelemetryFrames on bbops.telemetry.{1,2,3}.
-	gotTelemetry := make(map[uint8]mavlink.TelemetryFrame)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		allReady := len(gotTelemetry) == 3
-		for _, v := range vehicles {
-			if tf, ok := gotTelemetry[v.sysid]; !ok || !tf.HasGlobalPos || tf.NEDXYZ[0] == 0 {
-				allReady = false
-			}
-		}
-		if allReady {
-			break
-		}
+	// Verify Lane 1: WS #1 receives all 9 uncoalesced TelemetryFrames (#31 seq=3, #32 seq=4, #33 seq=5)
+	// on exact concrete subjects bbops.telemetry.{1,2,3} without any spurious baseline TransitionEvent.
+	type receivedTelemetry struct {
+		subject string
+		frame   mavlink.TelemetryFrame
+	}
+	gotTelemetry := make(map[uint8][]receivedTelemetry, 3)
+	seenFinalSeq := make(map[uint8]bool, len(vehicles))
+	totalFrames := 0
+	for totalFrames < 9 && len(seenFinalSeq) < len(vehicles) {
 		wsFrame := readWSFrame(t, telWS, 5*time.Second)
-		if wsFrame.Type != "data" || strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+		if wsFrame.Type != "data" {
 			continue
+		}
+		if strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			t.Fatalf("unexpected pre-transition Lane 3 event on %s: %s", wsFrame.Subject, string(wsFrame.Payload))
 		}
 		var tf mavlink.TelemetryFrame
 		if err := json.Unmarshal(wsFrame.Payload, &tf); err != nil {
 			t.Fatalf("unmarshal WS #1 TelemetryFrame (%s): %v", wsFrame.Subject, err)
 		}
-		gotTelemetry[tf.SysID] = tf
+		gotTelemetry[tf.SysID] = append(gotTelemetry[tf.SysID], receivedTelemetry{
+			subject: wsFrame.Subject,
+			frame:   tf,
+		})
+		if tf.Seq == 5 {
+			seenFinalSeq[tf.SysID] = true
+		}
+		totalFrames++
+	}
+	type seqMsgPair struct {
+		seq   uint8
+		msgID uint32
+	}
+	wantSeqMsgs := []seqMsgPair{
+		{seq: 3, msgID: mavcodec.MsgIDAttitudeQuaternion},
+		{seq: 4, msgID: mavcodec.MsgIDLocalPositionNED},
+		{seq: 5, msgID: mavcodec.MsgIDGlobalPositionInt},
 	}
 	for _, v := range vehicles {
-		tf, ok := gotTelemetry[v.sysid]
-		if !ok {
-			t.Fatalf("missing WS #1 telemetry for sysid=%d (got=%+v)", v.sysid, gotTelemetry)
+		frames := gotTelemetry[v.sysid]
+		if len(frames) != len(wantSeqMsgs) {
+			t.Fatalf("sysid=%d WS #1 frame count = %d (%+v), want %d (#31, #32, #33)",
+				v.sysid, len(frames), frames, len(wantSeqMsgs))
 		}
-		if tf.Domain != v.domName || !tf.HasGlobalPos || math.Abs(tf.HdgDeg-v.wantYaw) > 1e-2 {
-			t.Fatalf("sysid=%d WS #1 TelemetryFrame = %+v, want domain=%s yaw=%v HasGlobalPos=true",
-				v.sysid, tf, v.domName, v.wantYaw)
+		wantSubject := fmt.Sprintf("bbops.telemetry.%d", v.sysid)
+		gotPairs := make([]seqMsgPair, 0, len(frames))
+		for _, rec := range frames {
+			if rec.subject != wantSubject {
+				t.Fatalf("sysid=%d WS #1 subject = %q, want %q", v.sysid, rec.subject, wantSubject)
+			}
+			gotPairs = append(gotPairs, seqMsgPair{seq: rec.frame.Seq, msgID: rec.frame.MsgID})
+		}
+		if !slices.Equal(gotPairs, wantSeqMsgs) {
+			t.Fatalf("sysid=%d WS #1 (seq, msg_id) sequence = %+v, want %+v", v.sysid, gotPairs, wantSeqMsgs)
+		}
+		tf := frames[len(frames)-1].frame
+		if tf.Domain != v.domName || !tf.HasGlobalPos || tf.NEDXYZ[0] != float64(v.sysid)*10 || math.Abs(tf.HdgDeg-v.wantYaw) > 1e-2 {
+			t.Fatalf("sysid=%d fused WS #1 TelemetryFrame = %+v, want domain=%s nedX=%v yaw=%v HasGlobalPos=true",
+				v.sysid, tf, v.domName, float64(v.sysid)*10, v.wantYaw)
 		}
 		wantPeer := v.conn.LocalAddr().(*net.UDPAddr).AddrPort()
 		if gotPeer, ok := ingestComp.PeerAddr(v.sysid); !ok || gotPeer != wantPeer {
@@ -1187,7 +1218,7 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 
 	// 3. Verify Lane 3 instant edge dual-route (< 1 Hz periodic cadence):
 	//    - sysid=1: HEARTBEAT authority preemption CompanionTeleop -> DirectCRSFOverride + TeleopDeadmanClamped
-	//    - sysid=2: #1 SYS_STATUS failsafe increment 0 -> 1
+	//    - sysid=2: #1 SYS_STATUS failsafe increment 2 -> 3
 	//    - sysid=3: #253 STATUSTEXT "USV HOLD ENGAGED"
 	edgeStart := time.Now()
 	crsfHB, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
@@ -1204,7 +1235,7 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 		t.Fatalf("EncodeVehicleHeartbeat CRSF override: %v", err)
 	}
 	sendFrame(vehicles[0].conn, 1, 1, 50, crsfHB)
-	sendFrame(vehicles[1].conn, 2, 1, 50, mavcodec.SysStatus{Load: 1100, ErrorsCount1: 1})
+	sendFrame(vehicles[1].conn, 2, 1, 50, mavcodec.SysStatus{Load: 1100, ErrorsCount1: 3})
 	sendFrame(vehicles[2].conn, 3, 1, 50, mavcodec.StatusText{Severity: 3, Text: "USV HOLD ENGAGED"})
 
 	gotEvents := make(map[uint8]mavlink.TransitionEvent, 3)
@@ -1225,7 +1256,7 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 		!ev1.Flags.TeleopDeadmanClamped {
 		t.Fatalf("sysid=1 Lane 3 TransitionEvent = %+v", ev1)
 	}
-	if ev2 := gotEvents[2]; ev2.Kind != mavlink.EventKindFailsafeIncrement || ev2.Failsafes != 1 {
+	if ev2 := gotEvents[2]; ev2.Kind != mavlink.EventKindFailsafeIncrement || ev2.Failsafes != 3 {
 		t.Fatalf("sysid=2 Lane 3 TransitionEvent = %+v", ev2)
 	}
 	if ev3 := gotEvents[3]; ev3.Kind != mavlink.EventKindStatusText || ev3.StatusText == nil || ev3.StatusText.Text != "USV HOLD ENGAGED" {

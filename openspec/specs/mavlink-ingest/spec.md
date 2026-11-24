@@ -73,4 +73,3 @@ The `internal/mavlink` package SHALL operate as `bbops`'s clean-room MAVLink v2 
 #### Scenario: Non-0xB1 heartbeats, invalid sender IDs, and non-finite kinematic packets are rejected without poisoning vehicle state
 - **WHEN** the UDP listener receives a peer GCS `#0 HEARTBEAT` (`MAV_TYPE_GCS = 6`, `custom_mode = 0`), a packet with `sysid = 255` or `compid != 1`, a corrupted/non-v2 datagram, or a `#31/#32/#33` packet with `NaN`/`±Inf` or out-of-bounds coordinates
 - **THEN** the adapter drops the offending datagram without panicking, creating a bogus entity, or corrupting an existing `sysid`'s last valid `VehicleSnapshot`
-

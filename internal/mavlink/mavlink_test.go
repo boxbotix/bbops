@@ -616,41 +616,63 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		t.Fatalf("HEARTBEAT edge reasons = %v, want %v", hbEdge.Event.Reasons, wantReasons)
 	}
 
-	// #1 SYS_STATUS failsafe increment (0 -> 2) triggers Lane 3 edge; steady/decrement (2 -> 2, 2 -> 1) does not.
-	sysInc := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 41, mavcodec.SysStatus{
-		Load: 1200, ErrorsComm: 3, ErrorsCount1: 2, ErrorsCount2: 1850, ErrorsCount3: 900,
+	// #1 SYS_STATUS: initial nonzero baseline (7) and steady sample (7) update snapshot without a false alert;
+	// strict increment (7 -> 8) emits exactly one failsafe_increment edge; decrement (8 -> 6) updates without edge.
+	sysBaseline := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 41, mavcodec.SysStatus{
+		Load: 1200, ErrorsComm: 3, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 900,
 	}), peerB, t0.Add(9*time.Second))
-	if !sysInc.Accepted || !sysInc.UrgentSKGSync || sysInc.Event == nil || sysInc.Event.Kind != EventKindFailsafeIncrement || sysInc.Event.Failsafes != 2 {
-		t.Fatalf("SYS_STATUS increment outcome = %+v", sysInc)
+	if !sysBaseline.Accepted || sysBaseline.UrgentSKGSync || sysBaseline.Event != nil {
+		t.Fatalf("SYS_STATUS initial baseline(7) outcome = %+v, want no false failsafe alert", sysBaseline)
 	}
+	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 7 || snap.LoopDtUs != 1200 {
+		t.Fatalf("SYS_STATUS initial baseline(7) snapshot = %+v, want Failsafes=7 LoopDtUs=1200", snap)
+	}
+
 	sysSteady := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 42, mavcodec.SysStatus{
-		Load: 1100, ErrorsComm: 4, ErrorsCount1: 2, ErrorsCount2: 1850, ErrorsCount3: 850,
+		Load: 1100, ErrorsComm: 4, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 850,
 	}), peerB, t0.Add(10*time.Second))
 	if !sysSteady.Accepted || sysSteady.UrgentSKGSync || sysSteady.Event != nil {
-		t.Fatalf("SYS_STATUS steady outcome = %+v, want no edge event", sysSteady)
+		t.Fatalf("SYS_STATUS steady(7->7) outcome = %+v, want no edge event", sysSteady)
 	}
-	sysDec := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 43, mavcodec.SysStatus{
-		Load: 1000, ErrorsComm: 4, ErrorsCount1: 1, ErrorsCount2: 1850, ErrorsCount3: 800,
+	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 7 || snap.LoopDtUs != 1100 {
+		t.Fatalf("SYS_STATUS steady(7->7) snapshot = %+v, want Failsafes=7 LoopDtUs=1100", snap)
+	}
+
+	sysInc := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 43, mavcodec.SysStatus{
+		Load: 1050, ErrorsComm: 5, ErrorsCount1: 8, ErrorsCount2: 1900, ErrorsCount3: 820,
 	}), peerB, t0.Add(11*time.Second))
+	if !sysInc.Accepted || !sysInc.UrgentSKGSync || sysInc.Event == nil || sysInc.Event.Kind != EventKindFailsafeIncrement || sysInc.Event.Failsafes != 8 {
+		t.Fatalf("SYS_STATUS increment(7->8) outcome = %+v, want failsafe_increment(8)", sysInc)
+	}
+	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 8 || snap.LoopDtUs != 1050 {
+		t.Fatalf("SYS_STATUS increment(7->8) snapshot = %+v, want Failsafes=8 LoopDtUs=1050", snap)
+	}
+
+	sysDec := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 44, mavcodec.SysStatus{
+		Load: 1000, ErrorsComm: 5, ErrorsCount1: 6, ErrorsCount2: 1900, ErrorsCount3: 800,
+	}), peerB, t0.Add(12*time.Second))
 	if !sysDec.Accepted || sysDec.UrgentSKGSync || sysDec.Event != nil {
-		t.Fatalf("SYS_STATUS decrement outcome = %+v, want no edge event", sysDec)
+		t.Fatalf("SYS_STATUS decrement(8->6) outcome = %+v, want no edge event", sysDec)
+	}
+	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 6 || snap.LoopDtUs != 1000 {
+		t.Fatalf("SYS_STATUS decrement(8->6) snapshot = %+v, want Failsafes=6 LoopDtUs=1000", snap)
 	}
 
 	// #253 STATUSTEXT over wire + NUL-padded IngestFrame triggers immediate Lane 3 edge + SKG flush.
-	stOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 44, mavcodec.StatusText{
+	stOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 45, mavcodec.StatusText{
 		Severity: 2,
 		Text:     "CRSF OVERRIDE ENGAGED",
 		ID:       7,
 		ChunkSeq: 0,
-	}), peerB, t0.Add(12*time.Second))
+	}), peerB, t0.Add(13*time.Second))
 	if !stOut.Accepted || !stOut.UrgentSKGSync || stOut.Event == nil || stOut.Event.Kind != EventKindStatusText ||
 		stOut.Event.StatusText == nil || stOut.Event.StatusText.Text != "CRSF OVERRIDE ENGAGED" {
 		t.Fatalf("STATUSTEXT wire outcome = %+v", stOut)
 	}
 	stNulOut := tracker.IngestFrame(mavcodec.Frame{
-		SystemID: 2, ComponentID: 1, Sequence: 45,
+		SystemID: 2, ComponentID: 1, Sequence: 46,
 		Message: mavcodec.StatusText{Severity: 4, Text: "PADDED\x00\x00"},
-	}, peerB, t0.Add(13*time.Second))
+	}, peerB, t0.Add(14*time.Second))
 	if !stNulOut.Accepted || stNulOut.Event == nil || stNulOut.Event.StatusText.Text != "PADDED" {
 		t.Fatalf("STATUSTEXT NUL-trim outcome = %+v", stNulOut)
 	}
@@ -838,7 +860,7 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		t.Fatalf("final sysid=2 LoopDtUs = %d, want 500 from newest retained periodic batch", latestBySysID[2].LoopDtUs)
 	}
 
-	// Verify publishBatch and buildUrgent errors invoke onError without panicking or advancing lastPublishedRev.
+	// Verify publishBatch and buildUrgent errors invoke onError without panicking.
 	var failCount atomic.Int32
 	failPub := NewPublisher(
 		DefaultEntitySubject,
@@ -867,6 +889,109 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 	if got := failCount.Load(); got != 2 {
 		t.Fatalf("onError count = %d, want 2 (1 urgent build error + 1 periodic publish error)", got)
 	}
+
+	// Verify partial urgent batch failure (`PublishBatchToStream` acknowledging item 0 and failing on item 1):
+	// 1. Acknowledged sysid=1 (rev=2) MUST NOT regress to [new, old] when a queued stale periodic batch (rev=1) drains.
+	// 2. Equal revisions (rev=2) MUST remain eligible for recovery so unacknowledged sysid=2 (rev=2) recovers on retry.
+	partialTracker, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker partial: %v", err)
+	}
+	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 1, Message: hb1}, peer, t0)
+	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 1, Message: hb2}, peer, t0)
+	staleRev1Batch, err := partialTracker.BuildPeriodicBatch()
+	if err != nil {
+		t.Fatalf("BuildPeriodicBatch staleRev1: %v", err)
+	}
+
+	edgeHB2 := makeVehicleHB(mavcodec.DomainRover, true, mavcodec.AuthorityDirectCRSFOverride, mavcodec.ModeHoldPosition, mavcodec.LinkTierMeshHighRate, uxsvocab.HealthFlags{TeleopDeadmanClamped: true})
+	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 2, Message: edgeHB}, peer, t0.Add(time.Second))
+	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 2, Message: edgeHB2}, peer, t0.Add(time.Second))
+
+	var partialMu sync.Mutex
+	deliveredArmedBySysID := map[uint8][]bool{}
+	var partialErrors atomic.Int32
+	var batchAttempt atomic.Int32
+	partialFailed := make(chan struct{})
+
+	partialPub := NewPublisher(
+		DefaultEntitySubject,
+		func(_ context.Context, _ string, msgs [][]byte) error {
+			snaps := decodeBatch(t, msgs)
+			attempt := batchAttempt.Add(1)
+			partialMu.Lock()
+			if attempt == 1 {
+				// Simulate SemEngine PublishBatchToStream acknowledging sysid=1 (msgs[0])
+				// before returning an error on sysid=2 (msgs[1]).
+				deliveredArmedBySysID[snaps[0].SysID] = append(deliveredArmedBySysID[snaps[0].SysID], snaps[0].Armed)
+				partialMu.Unlock()
+				close(partialFailed)
+				return errors.New("simulated JetStream ack failure on item 1")
+			}
+			for _, s := range snaps {
+				deliveredArmedBySysID[s.SysID] = append(deliveredArmedBySysID[s.SysID], s.Armed)
+			}
+			partialMu.Unlock()
+			return nil
+		},
+		partialTracker.BuildUrgentBatch,
+		func() { partialErrors.Add(1) },
+	)
+
+	// Queue stale rev=1 periodic batch BEFORE urgent rev=2 notifications, then start worker.
+	partialPub.EnqueuePeriodic(staleRev1Batch)
+	partialPub.NotifyUrgent(1)
+	partialPub.NotifyUrgent(2)
+
+	partialCtx, partialCancel := context.WithCancel(context.Background())
+	partialDone := make(chan struct{})
+	go func() {
+		defer close(partialDone)
+		partialPub.Run(partialCtx)
+	}()
+
+	select {
+	case <-partialFailed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for simulated partial urgent batch failure")
+	}
+	// Give worker time to drain staleRev1Batch from periodicCh after the failed urgent batch.
+	time.Sleep(25 * time.Millisecond)
+
+	// Now enqueue an equal-revision (rev=2) periodic batch to verify recovery of unacknowledged sysid=2.
+	recoveryRev2Batch, err := partialTracker.BuildPeriodicBatch()
+	if err != nil {
+		t.Fatalf("BuildPeriodicBatch recoveryRev2: %v", err)
+	}
+	partialPub.EnqueuePeriodic(recoveryRev2Batch)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		partialMu.Lock()
+		recovered := len(deliveredArmedBySysID[2]) >= 1
+		partialMu.Unlock()
+		if recovered {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	partialCancel()
+	<-partialDone
+
+	if partialErrors.Load() != 1 {
+		t.Fatalf("partialErrors = %d, want 1", partialErrors.Load())
+	}
+	partialMu.Lock()
+	sys1History := slices.Clone(deliveredArmedBySysID[1])
+	sys2History := slices.Clone(deliveredArmedBySysID[2])
+	partialMu.Unlock()
+
+	if len(sys1History) == 0 || slices.Contains(sys1History, false) {
+		t.Fatalf("sysid=1 publications after partial ack = %v, want only Armed=true (no [new old] regression)", sys1History)
+	}
+	if !slices.Equal(sys2History, []bool{true}) {
+		t.Fatalf("unacknowledged sysid=2 recovery publications = %v, want [true] from equal-rev retry", sys2History)
+	}
 }
 
 // spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
@@ -888,6 +1013,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		mode         string
 		tier         string
 		flags        uxsvocab.HealthFlags
+		hasSysStatus bool
 		failsafes    int
 		hasAttitude  bool
 		hasGlobalPos bool
@@ -919,14 +1045,15 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	// Boundary reach & assertion activation counters across generated histories.
 	var (
-		sawAdmission       int
-		sawQuatOverride    int
-		sawHdgFallback     int
-		sawHeartbeatEdge   int
-		sawFailsafeEdge    int
-		sawStatusText      int
-		sawSanitizedReject int
-		sawDroppedPeriodic int
+		sawAdmission         int
+		sawSysStatusBaseline int
+		sawQuatOverride      int
+		sawHdgFallback       int
+		sawHeartbeatEdge     int
+		sawFailsafeEdge      int
+		sawStatusText        int
+		sawSanitizedReject   int
+		sawDroppedPeriodic   int
 	)
 
 	for seed := uint64(1); seed <= 40; seed++ {
@@ -1016,14 +1143,18 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 			case 1: // #1 SYS_STATUS
 				var nextFS uint16
-				switch rng.IntN(3) {
-				case 0:
-					nextFS = uint16(rv.failsafes + 1)
-				case 1:
-					nextFS = uint16(rv.failsafes)
-				default:
-					if rv.failsafes > 0 {
-						nextFS = uint16(rv.failsafes - 1)
+				if !rv.hasSysStatus {
+					nextFS = uint16(rng.IntN(6))
+				} else {
+					switch rng.IntN(3) {
+					case 0:
+						nextFS = uint16(rv.failsafes + 1)
+					case 1:
+						nextFS = uint16(rv.failsafes)
+					default:
+						if rv.failsafes > 0 {
+							nextFS = uint16(rv.failsafes - 1)
+						}
 					}
 				}
 				out := tracker.IngestFrame(mavcodec.Frame{
@@ -1036,14 +1167,18 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
-				wantEdge := int(nextFS) > rv.failsafes
+				wantEdge := rv.hasSysStatus && int(nextFS) > rv.failsafes
 				if wantEdge != (out.Event != nil && out.UrgentSKGSync) {
 					t.Fatalf("seed %d step %d: SYS_STATUS edge mismatch want=%v out=%+v", seed, step, wantEdge, out)
+				}
+				if !rv.hasSysStatus && nextFS > 0 {
+					sawSysStatusBaseline++
 				}
 				if wantEdge {
 					sawFailsafeEdge++
 					pub.NotifyUrgent(sysid)
 				}
+				rv.hasSysStatus = true
 				rv.failsafes = int(nextFS)
 				rv.rev++
 
@@ -1204,11 +1339,11 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		publishedMu.Unlock()
 	}
 
-	if sawAdmission == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 ||
+	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 ||
 		sawHeartbeatEdge == 0 || sawFailsafeEdge == 0 || sawStatusText == 0 ||
 		sawSanitizedReject == 0 || sawDroppedPeriodic == 0 {
-		t.Fatalf("insufficient property boundary reach: admit=%d quatOverride=%d hdgFallback=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d",
-			sawAdmission, sawQuatOverride, sawHdgFallback, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic)
+		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d",
+			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic)
 	}
 }
 
@@ -1235,8 +1370,10 @@ func FuzzTrackerIngestDatagram(f *testing.F) {
 		mavcodec.Heartbeat{Type: 6, Autopilot: 8},
 		mavcodec.SysStatus{Load: 500, ErrorsCount1: 1},
 		mavcodec.AttitudeQuaternion{Q1: 1},
+		mavcodec.AttitudeQuaternion{Q1: float32(math.NaN())},
 		mavcodec.LocalPositionNED{X: 1, Y: 2, Z: -3},
 		mavcodec.GlobalPositionInt{Lat: 377749000, Lon: -1224194000, Alt: 10000, Hdg: 18000},
+		mavcodec.GlobalPositionInt{Lat: 900_000_001, Lon: 0, Hdg: 0},
 		mavcodec.StatusText{Severity: 4, Text: "FUZZ_SEED"},
 	}
 	for i, m := range seedMsgs {
@@ -1285,7 +1422,7 @@ func FuzzTrackerIngestDatagram(f *testing.F) {
 		if !ok {
 			t.Fatal("admitted sysid=1 disappeared")
 		}
-		if !outPost.Accepted && outPost.SysID == 1 && after != before {
+		if !outPost.Accepted && after != before {
 			t.Fatalf("rejected datagram mutated sysid=1 snapshot:\nbefore=%+v\nafter =%+v", before, after)
 		}
 		if err := after.Validate(); err != nil {

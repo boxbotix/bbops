@@ -32,7 +32,8 @@ type Publisher struct {
 	urgentSysIDs map[uint8]struct{}
 
 	droppedPeriodic  atomic.Uint64
-	lastPublishedRev map[uint8]uint64
+	maxAttemptedRev  map[uint8]uint64
+	lastConfirmedRev map[uint8]uint64
 }
 
 // NewPublisher creates a bounded non-blocking SKG batch publisher for subject.
@@ -53,7 +54,8 @@ func NewPublisher(
 		periodicCh:       make(chan []SnapshotBatchItem, PeriodicQueueCap),
 		urgentWake:       make(chan struct{}, 1),
 		urgentSysIDs:     make(map[uint8]struct{}),
-		lastPublishedRev: make(map[uint8]uint64),
+		maxAttemptedRev:  make(map[uint8]uint64),
+		lastConfirmedRev: make(map[uint8]uint64),
 	}
 }
 
@@ -171,17 +173,16 @@ func (p *Publisher) flushUrgent(ctx context.Context, sysids []uint8) map[uint8]s
 }
 
 func (p *Publisher) flushItems(ctx context.Context, items []SnapshotBatchItem, skipEqualSysIDs map[uint8]struct{}) bool {
-	if len(items) == 0 || p.publishBatch == nil {
+	if len(items) == 0 || p.publishBatch == nil || ctx.Err() != nil {
 		return false
 	}
 	filtered := make([]SnapshotBatchItem, 0, len(items))
 	msgs := make([][]byte, 0, len(items))
 	for _, it := range items {
-		lastRev := p.lastPublishedRev[it.SysID]
-		if it.Rev < lastRev {
+		if it.Rev < p.maxAttemptedRev[it.SysID] {
 			continue
 		}
-		if _, skipEq := skipEqualSysIDs[it.SysID]; skipEq && it.Rev == lastRev {
+		if _, skipEq := skipEqualSysIDs[it.SysID]; skipEq && it.Rev == p.lastConfirmedRev[it.SysID] {
 			continue
 		}
 		filtered = append(filtered, it)
@@ -190,6 +191,15 @@ func (p *Publisher) flushItems(ctx context.Context, items []SnapshotBatchItem, s
 	if len(msgs) == 0 {
 		return true
 	}
+	// Advance maxAttemptedRev BEFORE dispatch because PublishBatchToStream can
+	// acknowledge a prefix of msgs before returning an aggregate error; strictly
+	// older periodic revisions must never regress an already-acknowledged item,
+	// while equal revisions remain eligible for recovery retries.
+	for _, it := range filtered {
+		if it.Rev > p.maxAttemptedRev[it.SysID] {
+			p.maxAttemptedRev[it.SysID] = it.Rev
+		}
+	}
 	if err := p.publishBatch(ctx, p.subject, msgs); err != nil {
 		if ctx.Err() == nil {
 			p.onError()
@@ -197,8 +207,8 @@ func (p *Publisher) flushItems(ctx context.Context, items []SnapshotBatchItem, s
 		return false
 	}
 	for _, it := range filtered {
-		if it.Rev > p.lastPublishedRev[it.SysID] {
-			p.lastPublishedRev[it.SysID] = it.Rev
+		if it.Rev > p.lastConfirmedRev[it.SysID] {
+			p.lastConfirmedRev[it.SysID] = it.Rev
 		}
 	}
 	return true

@@ -106,6 +106,7 @@ type IngestOutcome struct {
 type vehicleSession struct {
 	snap         uxsvocab.VehicleSnapshot
 	rev          uint64
+	hasSysStatus bool
 	hasAttitude  bool
 	hasGlobalPos bool
 	peerAddr     netip.AddrPort
@@ -327,6 +328,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 		return IngestOutcome{}
 	}
 
+	hadSysStatus := sess.hasSysStatus
 	prevFailsafes := sess.snap.Failsafes
 	next := sess.snap
 	next.LoopDtUs = int(msg.Load)
@@ -340,6 +342,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	}
 
 	sess.snap = next
+	sess.hasSysStatus = true
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -349,7 +352,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 		Accepted: true,
 		SysID:    sysid,
 	}
-	if next.Failsafes > prevFailsafes {
+	if hadSysStatus && next.Failsafes > prevFailsafes {
 		out.Event = &TransitionEvent{
 			SysID:         sysid,
 			EntityID:      next.EntityID(),
