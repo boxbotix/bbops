@@ -1,5 +1,5 @@
 # Proposal: m2-1-cop-ui-stores
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-24) sha256:b6270bef9f98
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track
