@@ -170,9 +170,6 @@ func upgradeLegacyFlowInMemory(cfg *config.Config) error {
 	if _, hasMAV := cfg.Components[MAVLinkIngestComponent]; hasMAV {
 		return nil
 	}
-	if cfg.Version != "1.0.0" || len(cfg.Components) != len(requiredM02Components) {
-		return nil
-	}
 	for _, req := range requiredM02Components {
 		comp, exists := cfg.Components[req.instance]
 		if !exists || !comp.Enabled || comp.Name != req.factory {

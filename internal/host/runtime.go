@@ -48,6 +48,7 @@ type Options struct {
 	RegisterPayloads      func(*payloadregistry.Registry) error
 	Contracts             []projection.Contract
 	beforeMigrationCreate func(ctx context.Context, client *natsclient.Client) error
+	afterEndpointSnapshot func(ctx context.Context, client *natsclient.Client, cfgMgr *config.Manager) error
 }
 
 // Runtime owns a started bbops host instance (embedded NATS/JetStream,
@@ -133,7 +134,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		return cleanup(fmt.Errorf("ensure JetStream streams: %w", err))
 	}
 
-	cfgMgr, err := config.NewConfigManager(baseCfg, client, logger)
+	cfgMgr, err := config.NewConfigManager(baseCfg.Clone(), client, logger)
 	if err != nil {
 		return cleanup(fmt.Errorf("create config manager: %w", err))
 	}
@@ -142,11 +143,31 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	rt.configManager = cfgMgr
 
-	// Migrate valid pre-M1.2 (7-component, version 1.0.0) persisted KV flows by
-	// conditionally creating the missing mavlink-ingest component before endpoint
-	// overrides and effective validation while preserving existing operator writes.
-	if err := migratePersistedFlow(ctx, client, cfgMgr, baseCfg, opts.Overrides, opts.Version, opts.beforeMigrationCreate); err != nil {
+	// Migrate valid pre-M1.2 persisted KV flows by conditionally creating the
+	// missing mavlink-ingest component while preserving existing operator writes.
+	// When migration writes or adopts a KV entry, restart ConfigManager from
+	// baseCfg.Clone() so syncFromKV loads the migrated key before UpdatesOnly()
+	// watches open and no delayed migration watch replay can revert overrides.
+	migrated, err := migratePersistedFlow(ctx, client, cfgMgr, baseCfg, opts.Overrides, opts.Version, opts.beforeMigrationCreate)
+	if err != nil {
 		return cleanup(fmt.Errorf("migrate persisted configuration: %w", err))
+	}
+	if migrated {
+		stopMgrCtx, stopMgrCancel := context.WithTimeout(ctx, 5*time.Second)
+		stopMgrErr := cfgMgr.Stop(stopMgrCtx)
+		stopMgrCancel()
+		rt.configManager = nil
+		if stopMgrErr != nil {
+			return cleanup(fmt.Errorf("stop bootstrap config manager after migration: %w", stopMgrErr))
+		}
+		cfgMgr, err = config.NewConfigManager(baseCfg.Clone(), client, logger)
+		if err != nil {
+			return cleanup(fmt.Errorf("recreate config manager after migration: %w", err))
+		}
+		if err := cfgMgr.Start(ctx); err != nil {
+			return cleanup(fmt.Errorf("restart config manager after migration: %w", err))
+		}
+		rt.configManager = cfgMgr
 	}
 
 	// Apply explicit process listener overrides and server version AFTER KV
@@ -178,6 +199,12 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	rt.platform = types.PlatformMeta{
 		Org:      effectiveCfg.Platform.Org,
 		Platform: effectiveCfg.Platform.ID,
+	}
+
+	if opts.afterEndpointSnapshot != nil {
+		if err := opts.afterEndpointSnapshot(ctx, client, cfgMgr); err != nil {
+			return cleanup(fmt.Errorf("after endpoint snapshot hook: %w", err))
+		}
 	}
 
 	resolvedServices, err := service.ResolveServiceConfigs(effectiveCfg.Services)
@@ -217,8 +244,12 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 	}
 
-	svcReg := service.NewServiceRegistry()
-	if err := service.RegisterAll(svcReg); err != nil {
+	bootCfgMgr, err := config.NewConfigManager(effectiveCfg.Clone(), client, logger)
+	if err != nil {
+		return cleanup(fmt.Errorf("create immutable boot config manager: %w", err))
+	}
+	svcReg, err := newBootServiceRegistry(bootCfgMgr)
+	if err != nil {
 		return cleanup(fmt.Errorf("register framework services: %w", err))
 	}
 
@@ -704,18 +735,18 @@ func migratePersistedFlow(
 	overrides PortOverrides,
 	version string,
 	beforeCreate func(ctx context.Context, client *natsclient.Client) error,
-) error {
+) (bool, error) {
 	if client == nil || cfgMgr == nil || baseCfg == nil {
-		return errors.New("host: nil NATS client, config manager, or base configuration")
+		return false, errors.New("host: nil NATS client, config manager, or base configuration")
 	}
 	current := cfgMgr.GetConfig().Get()
 	if _, exists := current.Components[MAVLinkIngestComponent]; exists {
-		return nil
+		return false, nil
 	}
 
 	mavComp, ok := baseCfg.Clone().Components[MAVLinkIngestComponent]
 	if !ok {
-		return fmt.Errorf("base configuration missing %q", MAVLinkIngestComponent)
+		return false, fmt.Errorf("base configuration missing %q", MAVLinkIngestComponent)
 	}
 
 	// Validate the migrated candidate (preserving existing KV settings + overrides)
@@ -726,64 +757,77 @@ func migratePersistedFlow(
 	}
 	candidate.Components[MAVLinkIngestComponent] = mavComp
 	if err := ApplyPortOverrides(candidate, overrides); err != nil {
-		return err
+		return false, err
 	}
 	if version != "" {
 		if err := setServerVersion(candidate, version); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if _, err := ValidateOffline(candidate); err != nil {
-		return err
+		return false, err
 	}
 
 	if beforeCreate != nil {
 		if err := beforeCreate(ctx, client); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	js, err := client.JetStream()
 	if err != nil {
-		return fmt.Errorf("acquire JetStream for config migration: %w", err)
+		return false, fmt.Errorf("acquire JetStream for config migration: %w", err)
 	}
 	bucketName, err := config.BucketName(baseCfg.Platform.Org, baseCfg.Platform.ID)
 	if err != nil {
-		return fmt.Errorf("resolve config bucket name: %w", err)
+		return false, fmt.Errorf("resolve config bucket name: %w", err)
 	}
 	kv, err := js.KeyValue(ctx, bucketName)
 	if err != nil {
-		return fmt.Errorf("open config bucket %q: %w", bucketName, err)
+		return false, fmt.Errorf("open config bucket %q: %w", bucketName, err)
 	}
 	rawComp, err := json.Marshal(mavComp)
 	if err != nil {
-		return fmt.Errorf("encode %s component config: %w", MAVLinkIngestComponent, err)
+		return false, fmt.Errorf("encode %s component config: %w", MAVLinkIngestComponent, err)
 	}
 
 	kvKey := "components." + MAVLinkIngestComponent
-	chosen := mavComp
-	if _, createErr := kv.Create(ctx, kvKey, rawComp); createErr != nil {
-		if !errors.Is(createErr, jetstream.ErrKeyExists) {
-			return fmt.Errorf("conditionally create %s component during upgrade: %w", MAVLinkIngestComponent, createErr)
-		}
-		entry, getErr := kv.Get(ctx, kvKey)
-		if getErr != nil {
-			return fmt.Errorf("read winning %s component after concurrent create: %w", MAVLinkIngestComponent, getErr)
-		}
-		var winner types.ComponentConfig
-		if err := json.Unmarshal(entry.Value(), &winner); err != nil {
-			return fmt.Errorf("decode winning %s component config: %w", MAVLinkIngestComponent, err)
-		}
-		chosen = winner
+	if _, createErr := kv.Create(ctx, kvKey, rawComp); createErr != nil && !errors.Is(createErr, jetstream.ErrKeyExists) {
+		return false, fmt.Errorf("conditionally create %s component during upgrade: %w", MAVLinkIngestComponent, createErr)
 	}
+	return true, nil
+}
 
-	return cfgMgr.GetConfig().Mutate(func(c *config.Config) error {
-		if c.Components == nil {
-			c.Components = make(config.ComponentConfigs)
+func newBootServiceRegistry(bootCfgMgr *config.Manager) (*service.Registry, error) {
+	baseReg := service.NewServiceRegistry()
+	if err := service.RegisterAll(baseReg); err != nil {
+		return nil, err
+	}
+	reg := service.NewServiceRegistry()
+	for _, name := range []string{
+		"metrics",
+		"component-manager",
+		"message-logger",
+		service.StorageObservabilityServiceName,
+		"heartbeat",
+		"metrics-forwarder",
+		"log-forwarder",
+	} {
+		ctor, ok := baseReg.Constructor(name)
+		if !ok {
+			continue
 		}
-		if _, alreadyApplied := c.Components[MAVLinkIngestComponent]; !alreadyApplied {
-			c.Components[MAVLinkIngestComponent] = chosen
+		orig := ctor
+		if err := reg.Register(name, func(raw json.RawMessage, deps *service.Dependencies) (service.Service, error) {
+			if deps != nil && bootCfgMgr != nil {
+				frozen := *deps
+				frozen.Manager = bootCfgMgr
+				return orig(raw, &frozen)
+			}
+			return orig(raw, deps)
+		}); err != nil {
+			return nil, err
 		}
-		return nil
-	})
+	}
+	return reg, nil
 }

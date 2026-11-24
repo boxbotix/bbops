@@ -142,7 +142,35 @@ func TestRunCLIEntrypoint(t *testing.T) {
 			t.Fatalf("legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
 		}
 
-		// Malformed legacy flow (missing graph-ingest alongside missing mavlink-ingest) still fails closed.
+		// Customized valid legacy files (bumped operator version 1.0.1, and extra disabled graph-index instance) also pass -validate.
+		bumpedLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			doc["version"] = "1.0.1"
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+		})
+		valStdout.Reset()
+		valStderr.Reset()
+		if code := run([]string{"-validate", "-config", bumpedLegacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("bumped 1.0.1 legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		extraDisabledLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			components["graph-index-canary"] = map[string]any{
+				"type":    "processor",
+				"name":    "graph-index",
+				"enabled": false,
+				"config":  map[string]any{},
+			}
+		})
+		valStdout.Reset()
+		valStderr.Reset()
+		if code := run([]string{"-validate", "-config", extraDisabledLegacyPath}, &valStdout, &valStderr, "v0.3.0", "abc1234"); code != 0 || valStdout.String() != "bbops configuration valid\n" {
+			t.Fatalf("extra disabled legacy -validate: code=%d stdout=%q stderr=%q", code, valStdout.String(), valStderr.String())
+		}
+
+		// Malformed legacy flows (missing graph-ingest, or rogue enabled component) still fail closed.
 		malformedLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
 			components := doc["components"].(map[string]any)
 			delete(components, host.MAVLinkIngestComponent)
@@ -151,6 +179,17 @@ func TestRunCLIEntrypoint(t *testing.T) {
 		var badStdout, badStderr bytes.Buffer
 		if code := run([]string{"-validate", "-config", malformedLegacyPath}, &badStdout, &badStderr, "v0.3.0", "abc1234"); code != 1 || !strings.Contains(badStderr.String(), "graph-ingest") {
 			t.Fatalf("malformed legacy -validate: code=%d stdout=%q stderr=%q, want exit 1 naming graph-ingest", code, badStdout.String(), badStderr.String())
+		}
+
+		rogueLegacyPath := writeMutatedFlowFile(t, func(doc map[string]any) {
+			components := doc["components"].(map[string]any)
+			delete(components, host.MAVLinkIngestComponent)
+			components["rogue-extra"] = map[string]any{"type": "input", "name": "websocket", "enabled": true, "config": map[string]any{}}
+		})
+		badStdout.Reset()
+		badStderr.Reset()
+		if code := run([]string{"-validate", "-config", rogueLegacyPath}, &badStdout, &badStderr, "v0.3.0", "abc1234"); code != 1 || !strings.Contains(badStderr.String(), "rogue-extra") {
+			t.Fatalf("rogue legacy -validate: code=%d stdout=%q stderr=%q, want exit 1 naming rogue-extra", code, badStdout.String(), badStderr.String())
 		}
 
 		ports, err := host.AllocateLoopbackPorts(4)
