@@ -305,6 +305,7 @@ export interface LiveVehiclePoseOptions {
     readonly lat_lon_alt: readonly [number, number, number];
     readonly has_global_pos: boolean;
     readonly hdg_deg: number;
+    readonly has_heading?: boolean;
     readonly timestamp: number;
     readonly receivedAtMs: number;
   };
@@ -317,6 +318,7 @@ export interface ResolvedVehiclePose {
   readonly source: "ws1" | "skg";
   readonly stale: boolean;
   readonly hasAttitude: boolean;
+  readonly hasHeading: boolean;
   readonly hasVerifiedFrameReference: boolean;
   readonly quat: [number, number, number, number];
   readonly ned: [number, number, number];
@@ -438,15 +440,19 @@ export function resolveLiveVehiclePose(
     skgPoseReceiptMs !== null && isFiniteNumber(skgPoseReceiptMs)
       ? nowMs - skgPoseReceiptMs
       : null;
+  const skgReceiptFresh =
+    skgReceiptElapsedMs !== null &&
+    skgReceiptElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
+    skgReceiptElapsedMs <= SKG_VEHICLE_FRESH_MS;
+  const skgSnapshotAgeFresh =
+    skgObsElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
+    skgObsElapsedMs <= SKG_VEHICLE_FRESH_MS &&
+    (skgReceiptElapsedMs === null || skgReceiptFresh);
   const skgFresh =
     skgConnected &&
     vehicle.feedStatus !== "stale" &&
     vehicle.feedStatus !== "disconnected" &&
-    skgObsElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
-    skgObsElapsedMs <= SKG_VEHICLE_FRESH_MS &&
-    (skgReceiptElapsedMs === null ||
-      (skgReceiptElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
-        skgReceiptElapsedMs <= SKG_VEHICLE_FRESH_MS));
+    (vehicle.poseIngestedLive === true ? skgReceiptFresh : skgSnapshotAgeFresh);
 
   let useFast = false;
   if (fast !== undefined) {
@@ -468,7 +474,11 @@ export function resolveLiveVehiclePose(
       useFast = true;
     } else if (skgFresh && !ws1Fresh) {
       useFast = false;
-    } else if (skgPoseReceiptMs !== null && isFiniteNumber(skgPoseReceiptMs)) {
+    } else if (
+      (vehicle.poseIngestedLive === true || skgSnapshotAgeFresh) &&
+      skgPoseReceiptMs !== null &&
+      isFiniteNumber(skgPoseReceiptMs)
+    ) {
       useFast = fast.receivedAtMs >= skgPoseReceiptMs;
     } else {
       useFast = true;
@@ -487,6 +497,7 @@ export function resolveLiveVehiclePose(
     const headingDeg = normalizeHeadingDeg360(fast.hdg_deg);
     const hasAttitude =
       fast.has_attitude && isMeasuredAttitudeQuaternion(quat, fast.hdg_deg);
+    const hasHeading = hasAttitude || (fast.has_heading ?? headingDeg !== 0);
     const lla: [number, number, number] | null =
       fast.has_global_pos &&
       isFiniteNumber(fast.lat_lon_alt[0]) &&
@@ -503,6 +514,7 @@ export function resolveLiveVehiclePose(
       source: "ws1",
       stale,
       hasAttitude,
+      hasHeading,
       hasVerifiedFrameReference: hasLocalPos && lla !== null,
       quat,
       ned: [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]],
@@ -523,6 +535,7 @@ export function resolveLiveVehiclePose(
   const hasAttitude =
     (vehicle.hasAttitude ?? true) &&
     isMeasuredAttitudeQuaternion(quat, vehicle.headingDeg);
+  const hasHeading = hasAttitude || (vehicle.hasHeading ?? headingDeg !== 0);
   const lla: [number, number, number] | null =
     (vehicle.hasGlobalPos ?? true) &&
     isValidNonZeroLla(
@@ -555,6 +568,7 @@ export function resolveLiveVehiclePose(
     source: "skg",
     stale,
     hasAttitude,
+    hasHeading,
     hasVerifiedFrameReference:
       skgHasConfirmedLocalPos && !ws1ContradictsLocalPos && lla !== null,
     quat,

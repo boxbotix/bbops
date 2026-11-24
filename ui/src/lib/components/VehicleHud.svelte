@@ -33,6 +33,7 @@
   let poseSource = $state<"ws1" | "skg">("skg");
   let isStale = $state(false);
   let hasAttitude = $state(false);
+  let hasHeading = $state(false);
 
   const linkBadge = $derived(
     vehicle ? formatLinkTierBadge(vehicle.linkTier) : null,
@@ -48,12 +49,16 @@
     if (hasAttitude !== pose.hasAttitude) {
       hasAttitude = pose.hasAttitude;
     }
+    if (hasHeading !== pose.hasHeading) {
+      hasHeading = pose.hasHeading;
+    }
   }
 
   $effect(() => {
     if (!vehicle) {
       isStale = false;
       hasAttitude = false;
+      hasHeading = false;
       poseSource = "skg";
       return;
     }
@@ -183,7 +188,7 @@
     }
     ctx.restore();
 
-    // 2. Top scrolling heading tape (0..360 deg) driven by tracker-resolved heading.
+    // 2. Top scrolling heading tape (0..360 deg) when heading is measured; neutral unavailable banner otherwise.
     ctx.save();
     ctx.fillStyle = "#101726";
     ctx.fillRect(8, 4, widthPx - 16, tapeHeight - 4);
@@ -194,44 +199,51 @@
     ctx.rect(8, 4, widthPx - 16, tapeHeight - 4);
     ctx.clip();
 
-    const pxPerYawDeg = 2.2;
     const headingDeg = pose.headingDeg;
-    const baseTick = Math.floor(headingDeg / 15) * 15;
-    ctx.fillStyle = "#cbd5e1";
-    ctx.strokeStyle = "#64748b";
-    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.textAlign = "center";
+    if (pose.hasHeading) {
+      const pxPerYawDeg = 2.2;
+      const baseTick = Math.floor(headingDeg / 15) * 15;
+      ctx.fillStyle = "#cbd5e1";
+      ctx.strokeStyle = "#64748b";
+      ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "center";
 
-    for (let offset = -90; offset <= 90; offset += 15) {
-      const rawDeg = baseTick + offset;
-      const wrappedDeg = ((rawDeg % 360) + 360) % 360;
-      let delta = rawDeg - headingDeg;
-      if (delta > 180) delta -= 360;
-      if (delta < -180) delta += 360;
-      const tx = cx + delta * pxPerYawDeg;
+      for (let offset = -90; offset <= 90; offset += 15) {
+        const rawDeg = baseTick + offset;
+        const wrappedDeg = ((rawDeg % 360) + 360) % 360;
+        let delta = rawDeg - headingDeg;
+        if (delta > 180) delta -= 360;
+        if (delta < -180) delta += 360;
+        const tx = cx + delta * pxPerYawDeg;
+        ctx.beginPath();
+        ctx.moveTo(tx, 20);
+        ctx.lineTo(tx, 26);
+        ctx.stroke();
+
+        const label =
+          wrappedDeg === 0
+            ? "N"
+            : wrappedDeg === 90
+              ? "E"
+              : wrappedDeg === 180
+                ? "S"
+                : wrappedDeg === 270
+                  ? "W"
+                  : String(wrappedDeg).padStart(3, "0");
+        ctx.fillText(label, tx, 16);
+      }
+      // Center lubber bug.
+      ctx.strokeStyle = "#38bdf8";
       ctx.beginPath();
-      ctx.moveTo(tx, 20);
-      ctx.lineTo(tx, 26);
+      ctx.moveTo(cx, 4);
+      ctx.lineTo(cx, 28);
       ctx.stroke();
-
-      const label =
-        wrappedDeg === 0
-          ? "N"
-          : wrappedDeg === 90
-            ? "E"
-            : wrappedDeg === 180
-              ? "S"
-              : wrappedDeg === 270
-                ? "W"
-                : String(wrappedDeg).padStart(3, "0");
-      ctx.fillText(label, tx, 16);
+    } else {
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("HDG UNAVAILABLE", cx, 19);
     }
-    // Center lubber bug.
-    ctx.strokeStyle = "#38bdf8";
-    ctx.beginPath();
-    ctx.moveTo(cx, 4);
-    ctx.lineTo(cx, 28);
-    ctx.stroke();
     ctx.restore();
 
     // 3. Bottom telemetry readout bar (GS, VS, ALT, Roll/Pitch/Yaw or Heading).
@@ -252,9 +264,11 @@
         widthPx - 10,
         bottomY,
       );
-    } else {
+    } else if (pose.hasHeading) {
       const hdgLabel = String(Math.round(headingDeg) % 360).padStart(3, "0");
       ctx.fillText(`R -- P -- HDG ${hdgLabel}°`, widthPx - 10, bottomY);
+    } else {
+      ctx.fillText("R -- P -- HDG ---", widthPx - 10, bottomY);
     }
     ctx.restore();
   }
@@ -305,6 +319,7 @@
       ? "measured"
       : "unavailable"
     : undefined}
+  data-heading={vehicle ? (hasHeading ? "measured" : "unavailable") : undefined}
 >
   {#if vehicle && linkBadge}
     <header class="hud-header">
@@ -318,6 +333,11 @@
         {#if !hasAttitude}
           <span class="no-att-badge" data-testid="hud-attitude-unavailable">
             NO ATT
+          </span>
+        {/if}
+        {#if !hasHeading}
+          <span class="no-att-badge" data-testid="hud-heading-unavailable">
+            NO HDG
           </span>
         {/if}
         <span class="link-badge" data-testid="hud-link-tier">

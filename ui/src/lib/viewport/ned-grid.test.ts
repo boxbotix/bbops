@@ -936,4 +936,156 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       host.remove();
     }
   });
+
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("withholds map frame origin on legacy v1 global-only zero-NED SKG replays while anchoring genuinely measured local-zero [0,0,0] vehicles", () => {
+    const nowMs = Date.parse("2026-11-24T12:30:00.000Z");
+    const tsIso = new Date(nowMs).toISOString();
+    const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const contactId = "ais.uscg.marine.vessel.mmsi.367999111";
+    const originLla: [number, number, number] = [30.2672, -97.7431, 150];
+
+    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+    const skgStore = createSkgStore({ now: () => nowMs });
+    const viewportStore = createViewportStore({ skgStore });
+    const adapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+
+    const makeTriples = (measuredZeroContext: boolean) => {
+      const mk = (
+        predicate: string,
+        object: unknown,
+        context?: string,
+      ): {
+        subject: string;
+        predicate: string;
+        object: unknown;
+        source: string;
+        timestamp: string;
+        confidence: number;
+        context?: string;
+      } => ({
+        subject: vehicleId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: tsIso,
+        confidence: 1,
+        ...(context ? { context } : {}),
+      });
+      const ctx = measuredZeroContext ? "measured" : undefined;
+      return [
+        mk("uxs.domain.kind", "quadcopter"),
+        mk("uxs.authority.state", "companion-teleop"),
+        mk("uxs.mode.companion", "teleop-velocity"),
+        mk("uxs.link.tier", "mesh-high-rate"),
+        mk("uxs.health.armed", true),
+        mk("uxs.health.flags", {
+          clock_sync_locked: true,
+          teleop_deadman_clamped: false,
+          crsf_link_healthy: true,
+          companion_trunk_healthy: true,
+        }),
+        mk("uxs.health.failsafes", 0),
+        mk("uxs.health.crcerrors", 0),
+        mk("uxs.health.loopdtus", 1000),
+        mk("uxs.health.maxloopdtus", 1200),
+        mk("uxs.health.rttus", 400),
+        mk("uxs.attitude.quaternion", [1, 0, 0, 0], ctx),
+        mk("uxs.attitude.rates", [0, 0, 0]),
+        mk("uxs.kinematics.ned", [0, 0, 0], ctx),
+        mk("uxs.kinematics.vx", 0),
+        mk("uxs.kinematics.vy", 0),
+        mk("uxs.kinematics.vz", 0),
+        mk("uxs.kinematics.headingdeg", 0, ctx),
+        mk("geo.location.latitude", originLla[0], ctx),
+        mk("geo.location.longitude", originLla[1], ctx),
+        mk("geo.location.altitude", originLla[2], ctx),
+      ];
+    };
+
+    // 1. Ingest a retained legacy v1 global-only payload (confidence=1, no context on zero NED).
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: vehicleId,
+        revision: 1,
+        payload: {
+          id: vehicleId,
+          updated_at: tsIso,
+          triples: makeTriples(false),
+        },
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+    skgStore.entities.set(contactId, {
+      id: contactId,
+      kind: "external-contact",
+      kvRevision: 2,
+      poisoned: false,
+      poisonError: null,
+      title: "USCG Buoy",
+      contactType: "ais",
+      indexingProfile: "knowledge",
+      source: "ais-bridge",
+      observedAt: tsIso,
+      receivedAt: tsIso,
+      updatedAt: tsIso,
+      expiresAt: null,
+      feedStatus: "live",
+      uncertaintyMeters: null,
+      location: {
+        latitude: originLla[0],
+        longitude: originLla[1],
+        altitude: originLla[2],
+      },
+      triples: [],
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = mount(TacticalCanvas, {
+      target: host,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        adapter,
+        now: () => nowMs,
+      },
+    });
+    flushSync();
+
+    expect(adapter.getCamera().originLla).toBeNull();
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).not.toBeNull();
+
+    // 2. Ingest a modern vehicle genuinely measured at local origin [0, 0, 0] (context: "measured").
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: vehicleId,
+        revision: 3,
+        payload: {
+          id: vehicleId,
+          updated_at: tsIso,
+          triples: makeTriples(true),
+        },
+      }),
+    );
+    flushSync();
+
+    expect(adapter.getCamera().originLla?.[0]).toBeCloseTo(originLla[0], 8);
+    expect(adapter.getCamera().originLla?.[1]).toBeCloseTo(originLla[1], 8);
+    expect(
+      host.querySelector('[data-testid="mixed-frame-withheld"]'),
+    ).toBeNull();
+
+    unmount(app);
+    host.remove();
+  });
 });

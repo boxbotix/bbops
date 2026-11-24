@@ -118,8 +118,10 @@ export interface VehicleEntityState extends CopEntityBase {
   hasAttitude?: boolean;
   hasLocalPos?: boolean;
   hasGlobalPos?: boolean;
+  hasHeading?: boolean;
   poseObservedAt?: string | null;
   poseIngestedAtMs?: number | null;
+  poseIngestedLive?: boolean;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -532,6 +534,7 @@ export function parseCopEntityState(
 
       const quatTriple = byPredicate["uxs.attitude.quaternion"];
       const nedTriple = byPredicate["uxs.kinematics.ned"];
+      const hdgTriple = byPredicate["uxs.kinematics.headingdeg"];
       const latTriple = byPredicate["geo.location.latitude"];
       const lonTriple = byPredicate["geo.location.longitude"];
       const quatNormSq =
@@ -544,13 +547,15 @@ export function parseCopEntityState(
         wrappedHeading,
         360 - wrappedHeading,
       );
+      const hasNonZeroRates =
+        rates[0] !== 0 || rates[1] !== 0 || rates[2] !== 0;
       const isUnmeasuredIdentityQuat =
         quatTriple?.context !== "measured" &&
         Math.abs(quat[0] - 1) < 1e-9 &&
         Math.abs(quat[1]) < 1e-9 &&
         Math.abs(quat[2]) < 1e-9 &&
         Math.abs(quat[3]) < 1e-9 &&
-        headingDistFromNorth > 0.5;
+        (headingDistFromNorth > 0.5 || !hasNonZeroRates);
       const hasAttitude =
         isMeasuredAssertion(quatTriple) &&
         quatNormSq >= 1e-6 &&
@@ -572,6 +577,9 @@ export function parseCopEntityState(
           lat !== 0 ||
           lon !== 0 ||
           alt !== 0);
+      const hasHeading =
+        isMeasuredAssertion(hdgTriple) &&
+        (hdgTriple.context === "measured" || headingDeg !== 0 || hasAttitude);
 
       const poseObservedAt = normalizeKnownTimestamp(
         latestPoseTriple?.timestamp,
@@ -588,6 +596,7 @@ export function parseCopEntityState(
         hasAttitude,
         hasLocalPos,
         hasGlobalPos,
+        hasHeading,
         kind: "uxs-vehicle",
         org: vehicleIdentity.org,
         platform: vehicleIdentity.platform,
@@ -712,6 +721,8 @@ function tuplesEqual(a: readonly number[], b: readonly number[]): boolean {
   return true;
 }
 
+const EXPIRED_POSE_RECEIPT_MS = -1e15;
+
 function didVehiclePoseAdvance(
   prior: CopEntityState | undefined,
   next: VehicleEntityState,
@@ -738,6 +749,7 @@ function didVehiclePoseAdvance(
     next.hasAttitude !== prior.hasAttitude ||
     next.hasLocalPos !== prior.hasLocalPos ||
     next.hasGlobalPos !== prior.hasGlobalPos ||
+    next.hasHeading !== prior.hasHeading ||
     next.headingDeg !== prior.headingDeg ||
     next.location.latitude !== prior.location.latitude ||
     next.location.longitude !== prior.location.longitude ||
@@ -747,6 +759,37 @@ function didVehiclePoseAdvance(
     !tuplesEqual(next.ned, prior.ned) ||
     !tuplesEqual(next.velocityNed, prior.velocityNed)
   );
+}
+
+function assignPreSyncPoseReceipt(
+  prior: CopEntityState | undefined,
+  next: VehicleEntityState,
+  receiptMs: number,
+): void {
+  next.poseIngestedLive = false;
+  if (!next.poseObservedAt) {
+    next.poseIngestedAtMs = null;
+    return;
+  }
+  if (
+    prior === undefined ||
+    prior.kind !== "uxs-vehicle" ||
+    !prior.poseObservedAt
+  ) {
+    next.poseIngestedAtMs = receiptMs;
+    return;
+  }
+  const nextNs = parseTripleInstantNs(next.poseObservedAt);
+  const priorNs = parseTripleInstantNs(prior.poseObservedAt);
+  if (nextNs < priorNs) {
+    next.poseIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
+    return;
+  }
+  if (didVehiclePoseAdvance(prior, next)) {
+    next.poseIngestedAtMs = receiptMs;
+    return;
+  }
+  next.poseIngestedAtMs = prior.poseIngestedAtMs ?? EXPIRED_POSE_RECEIPT_MS;
 }
 
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
@@ -862,10 +905,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         }
         if (entity.kind === "uxs-vehicle") {
           const priorVehicle = prevStaged ?? entities.get(key);
-          entity.poseIngestedAtMs =
-            priorVehicle?.kind === "uxs-vehicle"
-              ? (priorVehicle.poseIngestedAtMs ?? null)
-              : null;
+          assignPreSyncPoseReceipt(priorVehicle, entity, receiptMs);
         }
         stagedSnapshot.set(key, entity);
         return;
@@ -875,11 +915,16 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         return;
       }
       if (entity.kind === "uxs-vehicle") {
-        entity.poseIngestedAtMs = didVehiclePoseAdvance(prevLive, entity)
-          ? receiptMs
-          : prevLive?.kind === "uxs-vehicle"
-            ? (prevLive.poseIngestedAtMs ?? null)
-            : null;
+        if (didVehiclePoseAdvance(prevLive, entity)) {
+          entity.poseIngestedAtMs = receiptMs;
+          entity.poseIngestedLive = true;
+        } else if (prevLive?.kind === "uxs-vehicle") {
+          entity.poseIngestedAtMs = prevLive.poseIngestedAtMs ?? null;
+          entity.poseIngestedLive = prevLive.poseIngestedLive ?? false;
+        } else {
+          entity.poseIngestedAtMs = null;
+          entity.poseIngestedLive = false;
+        }
       }
       entities.set(key, entity);
       return;

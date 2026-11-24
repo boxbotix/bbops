@@ -52,6 +52,7 @@ type TelemetryFrame struct {
 	LatLonAlt    [3]float64 `json:"lat_lon_alt"`
 	HasGlobalPos bool       `json:"has_global_pos"`
 	HdgDeg       float64    `json:"hdg_deg"`
+	HasHeading   bool       `json:"has_heading"`
 	Timestamp    int64      `json:"timestamp"`
 }
 
@@ -112,6 +113,7 @@ type vehicleSession struct {
 	hasAttitude  bool
 	hasLocalPos  bool
 	hasGlobalPos bool
+	hasHeading   bool
 	peerAddr     netip.AddrPort
 }
 
@@ -416,9 +418,10 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 	next.Quaternion = unitQ
 	next.BodyRates = rates
 	next.HeadingDeg = hdgDeg
-	next.UnmeasuredAttitude = false
+	next.PoseMetadata = true
+	next.HasAttitude = true
 	next.AttitudeObservedUnixNs = obsNs
-	next.UnmeasuredHeading = false
+	next.HasHeading = true
 	next.HeadingObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
@@ -427,6 +430,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 
 	sess.snap = next
 	sess.hasAttitude = true
+	sess.hasHeading = true
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -463,7 +467,8 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	next.Vx = vx
 	next.Vy = vy
 	next.Vz = vz
-	next.UnmeasuredLocalPos = false
+	next.PoseMetadata = true
+	next.HasLocalPos = true
 	next.LocalPosObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
@@ -513,11 +518,13 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	next.Latitude = lat
 	next.Longitude = lon
 	next.Altitude = alt
-	next.UnmeasuredGlobalPos = false
+	next.PoseMetadata = true
+	next.HasGlobalPos = true
 	next.GlobalPosObservedUnixNs = obsNs
-	if !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg {
+	validHdg := !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg
+	if validHdg {
 		next.HeadingDeg = float64(msg.Hdg) / 100.0
-		next.UnmeasuredHeading = false
+		next.HasHeading = true
 		next.HeadingObservedUnixNs = obsNs
 	}
 	next.ObservedAt = now
@@ -527,6 +534,9 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 
 	sess.snap = next
 	sess.hasGlobalPos = true
+	if validHdg {
+		sess.hasHeading = true
+	}
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -606,6 +616,7 @@ func buildTelemetryFrame(sess *vehicleSession, seq uint8, msgID uint32, now time
 		LatLonAlt:    [3]float64{sess.snap.Latitude, sess.snap.Longitude, sess.snap.Altitude},
 		HasGlobalPos: sess.hasGlobalPos,
 		HdgDeg:       sess.snap.HeadingDeg,
+		HasHeading:   sess.hasHeading,
 		Timestamp:    now.UnixMilli(),
 	}
 }

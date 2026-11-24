@@ -521,16 +521,32 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	}
 	gpOut1 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpUnknownHdg), peerB, t0.Add(2*time.Second))
 	if !gpOut1.Accepted || gpOut1.Telemetry == nil || !gpOut1.Telemetry.HasGlobalPos || gpOut1.Telemetry.HasLocalPos ||
-		gpOut1.Telemetry.HasAttitude || gpOut1.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || gpOut1.Telemetry.HdgDeg != 0 {
-		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535) outcome = %+v", gpOut1)
+		gpOut1.Telemetry.HasAttitude || gpOut1.Telemetry.HasHeading || gpOut1.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || gpOut1.Telemetry.HdgDeg != 0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535) outcome = %+v, want HasHeading=false", gpOut1)
+	}
+	snapUnknownHdg, _ := tracker.Snapshot(2)
+	if hdgTr := snapUnknownHdg.Triples()[17]; hdgTr.Confidence != 0 || hdgTr.Context != "" {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535) heading triple = %+v, want Confidence=0 Context=\"\"", hdgTr)
+	}
+
+	gpZeroNorthHdg := gpUnknownHdg
+	gpZeroNorthHdg.Hdg = 0 // measured 0.00 deg North before any #31
+	gpOutZero := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpZeroNorthHdg), peerB, t0.Add(2500*time.Millisecond))
+	if !gpOutZero.Accepted || gpOutZero.Telemetry == nil || gpOutZero.Telemetry.HasAttitude ||
+		!gpOutZero.Telemetry.HasHeading || gpOutZero.Telemetry.HdgDeg != 0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0) outcome = %+v, want HasHeading=true HdgDeg=0", gpOutZero.Telemetry)
+	}
+	snapZeroHdg, _ := tracker.Snapshot(2)
+	if hdgTr := snapZeroHdg.Triples()[17]; hdgTr.Confidence != 1.0 || hdgTr.Context != "measured" || hdgTr.Object != 0.0 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0) heading triple = %+v, want Confidence=1 Context=measured Object=0", hdgTr)
 	}
 
 	gpFallbackHdg := gpUnknownHdg
 	gpFallbackHdg.Hdg = 27450 // 274.50 deg before any #31
 	gpOut2 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpFallbackHdg), peerB, t0.Add(3*time.Second))
 	if !gpOut2.Accepted || gpOut2.Telemetry == nil || gpOut2.Telemetry.HasAttitude || gpOut2.Telemetry.HasLocalPos ||
-		gpOut2.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
-		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false", gpOut2.Telemetry)
+		!gpOut2.Telemetry.HasHeading || gpOut2.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
+		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false HasHeading=true", gpOut2.Telemetry)
 	}
 
 	// #31 arrives with 90 deg East yaw ([cos(45), 0, 0, sin(45)]).

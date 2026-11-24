@@ -132,7 +132,8 @@
       const snap = poses.get(vehicle.id) ?? resolveVehiclePose(vehicle);
       adapter.setCamera({
         centerNed: [snap.ned[0], snap.ned[1]],
-        bearingRad: viewportStore.chaseLock ? snap.headingRad : 0,
+        bearingRad:
+          viewportStore.chaseLock && snap.hasHeading ? snap.headingRad : 0,
       });
       return;
     }
@@ -245,11 +246,14 @@
     ctx: CanvasRenderingContext2D,
     kind: ReturnType<typeof resolveDomainGlyphKind>,
     screenHeadingRad: number,
+    hasHeading: boolean,
     strokeHex: string,
     fillHex: string,
   ): void {
     ctx.save();
-    ctx.rotate(screenHeadingRad);
+    if (hasHeading) {
+      ctx.rotate(screenHeadingRad);
+    }
     ctx.strokeStyle = strokeHex;
     ctx.fillStyle = fillHex;
     ctx.lineWidth = 2;
@@ -273,39 +277,50 @@
         ctx.fill();
         ctx.stroke();
       }
-      // Forward nose chevron.
-      ctx.beginPath();
-      ctx.moveTo(0, -15);
-      ctx.lineTo(4, -8);
-      ctx.lineTo(-4, -8);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
+      if (hasHeading) {
+        // Forward nose chevron.
+        ctx.beginPath();
+        ctx.moveTo(0, -15);
+        ctx.lineTo(4, -8);
+        ctx.lineTo(-4, -8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
     } else if (kind === "rover") {
       ctx.beginPath();
       ctx.rect(-8, -11, 16, 22);
       ctx.fill();
       ctx.stroke();
-      // Left & right treads + forward turret line.
+      // Left & right treads (+ forward turret line only when heading is measured).
       ctx.beginPath();
       ctx.moveTo(-11, -10);
       ctx.lineTo(-11, 10);
       ctx.moveTo(11, -10);
       ctx.lineTo(11, 10);
-      ctx.moveTo(0, 0);
-      ctx.lineTo(0, -16);
+      if (hasHeading) {
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, -16);
+      }
       ctx.stroke();
     } else if (kind === "surface-boat") {
-      // Pointed displacement hull (bow at -y).
-      ctx.beginPath();
-      ctx.moveTo(0, -15);
-      ctx.lineTo(8, -2);
-      ctx.lineTo(7, 12);
-      ctx.lineTo(-7, 12);
-      ctx.lineTo(-8, -2);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
+      if (hasHeading) {
+        // Pointed displacement hull (bow at -y).
+        ctx.beginPath();
+        ctx.moveTo(0, -15);
+        ctx.lineTo(8, -2);
+        ctx.lineTo(7, 12);
+        ctx.lineTo(-7, 12);
+        ctx.lineTo(-8, -2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(0, 0, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
     }
     ctx.restore();
   }
@@ -490,20 +505,23 @@
 
         // Bow heading solid vector + USV/cross-wind velocity-over-ground split vector.
         ctx.save();
-        const bowLenPx = 28;
-        ctx.strokeStyle = tone.strokeHex;
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        ctx.moveTo(proj.x, proj.y);
-        ctx.lineTo(
-          proj.x + Math.sin(bowScreenRad) * bowLenPx,
-          proj.y - Math.cos(bowScreenRad) * bowLenPx,
-        );
-        ctx.stroke();
+        if (snap.hasHeading) {
+          const bowLenPx = 28;
+          ctx.strokeStyle = tone.strokeHex;
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.moveTo(proj.x, proj.y);
+          ctx.lineTo(
+            proj.x + Math.sin(bowScreenRad) * bowLenPx,
+            proj.y - Math.cos(bowScreenRad) * bowLenPx,
+          );
+          ctx.stroke();
+        }
 
         if (
           crab.hasCourseSplit &&
-          (vehicle.domain === "surface-boat" ||
+          (!snap.hasHeading ||
+            vehicle.domain === "surface-boat" ||
             Math.abs(crab.crabAngleRad) > 0.05)
         ) {
           const cogScreenRad = adapter.screenCourseRad(
@@ -553,6 +571,7 @@
           ctx,
           resolveDomainGlyphKind(vehicle.domain),
           bowScreenRad,
+          snap.hasHeading,
           tone.strokeHex,
           tone.fillHex,
         );

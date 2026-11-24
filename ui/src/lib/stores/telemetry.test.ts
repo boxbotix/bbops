@@ -631,4 +631,56 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     expect(behind?.timestamp).toBe(browserNowMs - 60_000);
     expect(behind?.has_local_pos).toBe(true);
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  it("preserves explicit has_heading availability across unknown #33 heading and measured 0° North in-place updates", () => {
+    const store = createTelemetryStore();
+
+    // #33 GLOBAL_POSITION_INT with Hdg=65535 before #31 -> hdg_deg: 0, has_heading: false.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 1,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: false,
+        timestamp: 10_000,
+      }),
+    );
+    const first = store.getKinematics(1);
+    expect(first?.hdg_deg).toBe(0);
+    expect(first?.has_attitude).toBe(false);
+    expect(first?.has_heading).toBe(false);
+
+    // Measured 0° North #33 update overwrites in place with has_heading: true.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 2,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: true,
+        timestamp: 10_050,
+      }),
+    );
+    expect(store.getKinematics(1)).toBe(first);
+    expect(first?.hdg_deg).toBe(0);
+    expect(first?.has_heading).toBe(true);
+
+    // Subsequent unknown-heading #33 update clears has_heading back to false in place.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(1, {
+        seq: 3,
+        msg_id: 33,
+        quat_wxyz: [0, 0, 0, 0],
+        has_attitude: false,
+        hdg_deg: 0,
+        has_heading: false,
+        timestamp: 10_100,
+      }),
+    );
+    expect(first?.has_heading).toBe(false);
+  });
 });

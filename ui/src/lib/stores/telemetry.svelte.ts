@@ -59,6 +59,7 @@ export interface VehicleKinematics {
   lat_lon_alt: [number, number, number];
   has_global_pos: boolean;
   hdg_deg: number;
+  has_heading: boolean;
   timestamp: number;
   receivedAtMs: number;
 }
@@ -193,6 +194,10 @@ function parseTelemetryPayload(
       : quatNormSq >= 1e-6;
   const hasLocalPos =
     typeof payload.has_local_pos === "boolean" ? payload.has_local_pos : false;
+  const hasHeading =
+    typeof payload.has_heading === "boolean"
+      ? payload.has_heading || hasAttitude
+      : hasAttitude || payload.hdg_deg !== 0;
   return {
     sysid: expectedSysId,
     domain: payload.domain,
@@ -207,6 +212,7 @@ function parseTelemetryPayload(
     lat_lon_alt: lla,
     has_global_pos: payload.has_global_pos,
     hdg_deg: payload.hdg_deg,
+    has_heading: hasHeading,
     timestamp: payload.timestamp,
     receivedAtMs,
   };
@@ -239,6 +245,7 @@ function overwriteKinematicsInPlace(
   target.lat_lon_alt[2] = next.lat_lon_alt[2];
   target.has_global_pos = next.has_global_pos;
   target.hdg_deg = next.hdg_deg;
+  target.has_heading = next.has_heading;
   target.timestamp = next.timestamp;
   target.receivedAtMs = next.receivedAtMs;
 }

@@ -763,7 +763,8 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
   // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
   it("keeps poseObservedAt and poseIngestedAtMs unrefreshed across pre-synced snapshot replays and post-synced health-only updates", () => {
-    let browserNowMs = Date.parse("2026-11-24T12:00:00.000Z");
+    const initialReceiptMs = Date.parse("2026-11-24T12:00:00.000Z");
+    let browserNowMs = initialReceiptMs;
     const store = createSkgStore({ now: () => browserNowMs });
 
     const oldPoseIso = "2026-11-24T11:00:00.000Z";
@@ -787,7 +788,8 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
     const replayed = store.getCommandableVehicle(replayPayload.id);
     expect(replayed?.poseObservedAt).toBe(oldPoseIso);
-    expect(replayed?.poseIngestedAtMs).toBeNull();
+    expect(replayed?.poseIngestedAtMs).toBe(initialReceiptMs);
+    expect(replayed?.poseIngestedLive).toBe(false);
     expect(replayed?.hasLocalPos).toBe(false);
 
     // Live post-synced genuine pose update at +500ms with measured local NED.
@@ -807,6 +809,7 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     const afterLivePose = store.getCommandableVehicle(livePosePayload.id);
     expect(afterLivePose?.poseObservedAt).toBe(livePoseIso);
     expect(afterLivePose?.poseIngestedAtMs).toBe(browserNowMs);
+    expect(afterLivePose?.poseIngestedLive).toBe(true);
     expect(afterLivePose?.hasLocalPos).toBe(true);
 
     // Health-only post-synced update 4 seconds later (pose triples retain livePoseIso).
@@ -842,5 +845,210 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(afterHealthOnly?.observedAt).toBe(healthIso);
     expect(afterHealthOnly?.poseObservedAt).toBe(livePoseIso);
     expect(afterHealthOnly?.poseIngestedAtMs).toBe(poseReceiptAtLive);
+    expect(afterHealthOnly?.poseIngestedLive).toBe(true);
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("associates reconnect snapshot poseIngestedAtMs with each observation across newer, identical, older, and historical-replay snapshots", () => {
+    let browserNowMs = Date.parse("2026-11-24T12:10:00.000Z");
+    const rig = new MockWebSocketRig();
+    const store = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      now: () => browserNowMs,
+      createSocket: rig.createSocket,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    const t0Iso = new Date(browserNowMs).toISOString();
+    const oldReplayT0Iso = "2026-11-24T10:00:00.000Z";
+    const vNewer = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 45 },
+      { observedAt: t0Iso, updatedAt: t0Iso },
+    );
+    const vIdentical = buildVehicleStoredPayload(
+      2,
+      { "uxs.kinematics.headingdeg": 90 },
+      { observedAt: t0Iso, updatedAt: t0Iso },
+    );
+    const vOlder = buildVehicleStoredPayload(
+      3,
+      { "uxs.kinematics.headingdeg": 180 },
+      { observedAt: t0Iso, updatedAt: t0Iso },
+    );
+    const vReplay = buildVehicleStoredPayload(
+      4,
+      { "uxs.kinematics.headingdeg": 225 },
+      { observedAt: oldReplayT0Iso, updatedAt: t0Iso },
+    );
+
+    rig.latest.serverMessage(putFrame(vNewer.id, 1, vNewer));
+    rig.latest.serverMessage(putFrame(vIdentical.id, 2, vIdentical));
+    rig.latest.serverMessage(putFrame(vOlder.id, 3, vOlder));
+    rig.latest.serverMessage(putFrame(vReplay.id, 4, vReplay));
+    rig.latest.serverMessage(syncedFrame(4));
+
+    // Deliver a live post-synced advance at +500ms for v1, v2, v3.
+    browserNowMs += 500;
+    const liveReceiptMs = browserNowMs;
+    const liveIso = new Date(browserNowMs).toISOString();
+    for (const [sysid, hdg] of [
+      [1, 50],
+      [2, 95],
+      [3, 185],
+    ] as const) {
+      const livePayload = buildVehicleStoredPayload(
+        sysid,
+        { "uxs.kinematics.headingdeg": hdg },
+        { observedAt: liveIso, updatedAt: liveIso },
+      );
+      rig.latest.serverMessage(
+        putFrame(livePayload.id, 4 + sysid, livePayload),
+      );
+    }
+
+    // Disconnect WS #2 for 10 seconds, then reconnect and replay pre-synced snapshots.
+    browserNowMs += 10_000;
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    browserNowMs += 500;
+    const reconnectReceiptMs = browserNowMs;
+    rig.latest.serverOpen();
+
+    // (a) v1: genuinely newer current pose observed 100ms before reconnect.
+    const newerIso = new Date(reconnectReceiptMs - 100).toISOString();
+    const vNewerSnap = buildVehicleStoredPayload(
+      1,
+      { "uxs.kinematics.headingdeg": 120, "uxs.kinematics.ned": [30, -10, -8] },
+      { observedAt: newerIso, updatedAt: newerIso },
+    );
+    // (b) v2: identical pose from 10.5s ago.
+    const vIdenticalSnap = buildVehicleStoredPayload(
+      2,
+      { "uxs.kinematics.headingdeg": 95 },
+      { observedAt: liveIso, updatedAt: newerIso },
+    );
+    // (c) v3: older pose than prior live state.
+    const olderIso = new Date(liveReceiptMs - 2_000).toISOString();
+    const vOlderSnap = buildVehicleStoredPayload(
+      3,
+      { "uxs.kinematics.headingdeg": 170 },
+      { observedAt: olderIso, updatedAt: newerIso },
+    );
+    // (d) v4: newer than 2-hour-old prior, but still 1 hour old (replay).
+    const replayNewerIso = "2026-11-24T11:10:00.000Z";
+    const vReplaySnap = buildVehicleStoredPayload(
+      4,
+      { "uxs.kinematics.headingdeg": 240 },
+      { observedAt: replayNewerIso, updatedAt: newerIso },
+    );
+
+    rig.latest.serverMessage(putFrame(vNewerSnap.id, 10, vNewerSnap));
+    rig.latest.serverMessage(putFrame(vIdenticalSnap.id, 11, vIdenticalSnap));
+    rig.latest.serverMessage(putFrame(vOlderSnap.id, 12, vOlderSnap));
+    rig.latest.serverMessage(putFrame(vReplaySnap.id, 13, vReplaySnap));
+    rig.latest.serverMessage(syncedFrame(13));
+
+    const gotNewer = store.getCommandableVehicle(vNewer.id)!;
+    const gotIdentical = store.getCommandableVehicle(vIdentical.id)!;
+    const gotOlder = store.getCommandableVehicle(vOlder.id)!;
+    const gotReplay = store.getCommandableVehicle(vReplay.id)!;
+
+    expect(gotNewer.poseObservedAt).toBe(newerIso);
+    expect(gotNewer.poseIngestedAtMs).toBe(reconnectReceiptMs);
+    expect(gotNewer.poseIngestedLive).toBe(false);
+
+    expect(gotIdentical.poseObservedAt).toBe(liveIso);
+    expect(gotIdentical.poseIngestedAtMs).toBe(liveReceiptMs);
+    expect(gotIdentical.poseIngestedLive).toBe(false);
+
+    expect(gotOlder.poseObservedAt).toBe(olderIso);
+    expect(gotOlder.poseIngestedAtMs).toBeLessThan(0);
+    expect(gotOlder.poseIngestedLive).toBe(false);
+
+    expect(gotReplay.poseObservedAt).toBe(replayNewerIso);
+    expect(gotReplay.poseIngestedAtMs).toBe(reconnectReceiptMs);
+    expect(gotReplay.poseIngestedLive).toBe(false);
+
+    store.disconnect();
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("distinguishes legacy v1 unannotated zero-pose triples from measured local-zero NED and measured 0° North triples", () => {
+    const store = createSkgStore();
+    const tsIso = "2026-11-24T12:15:00.000Z";
+
+    // Legacy v1 global-only payload: confidence=1 with omitted context on zero-valued local NED, [1,0,0,0] quat, [0,0,0] rates, and 0° heading.
+    const legacyV1 = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.attitude.quaternion": [1, 0, 0, 0],
+        "uxs.attitude.rates": [0, 0, 0],
+        "uxs.kinematics.ned": [0, 0, 0],
+        "uxs.kinematics.vx": 0,
+        "uxs.kinematics.vy": 0,
+        "uxs.kinematics.vz": 0,
+        "uxs.kinematics.headingdeg": 0,
+      },
+      { observedAt: tsIso, updatedAt: tsIso },
+    );
+
+    // Modern payload at local origin [0, 0, 0] facing 0° North (#32 + #33 received, #31 still unmeasured).
+    const modernBase = buildVehicleStoredPayload(
+      2,
+      {
+        "uxs.attitude.quaternion": [0, 0, 0, 0],
+        "uxs.kinematics.ned": [0, 0, 0],
+        "uxs.kinematics.vx": 0,
+        "uxs.kinematics.vy": 0,
+        "uxs.kinematics.vz": 0,
+        "uxs.kinematics.headingdeg": 0,
+      },
+      { observedAt: tsIso, updatedAt: tsIso },
+    );
+    const modernMeasuredZero = {
+      ...modernBase,
+      triples: modernBase.triples.map((t) => {
+        if (t.predicate === "uxs.attitude.quaternion") {
+          return {
+            ...t,
+            confidence: 0,
+            timestamp: "1970-01-01T00:00:00Z",
+          };
+        }
+        if (
+          t.predicate === "uxs.kinematics.ned" ||
+          t.predicate === "uxs.kinematics.headingdeg" ||
+          t.predicate.startsWith("geo.location.")
+        ) {
+          return {
+            ...t,
+            confidence: 1,
+            context: "measured",
+          };
+        }
+        return t;
+      }),
+    };
+
+    store.ingestRawFrame(putFrame(legacyV1.id, 1, legacyV1));
+    store.ingestRawFrame(
+      putFrame(modernMeasuredZero.id, 2, modernMeasuredZero),
+    );
+    store.ingestRawFrame(syncedFrame(2));
+
+    const v1Parsed = store.getCommandableVehicle(legacyV1.id)!;
+    expect(v1Parsed.hasLocalPos).toBe(false);
+    expect(v1Parsed.hasAttitude).toBe(false);
+    expect(v1Parsed.hasHeading).toBe(false);
+    expect(v1Parsed.hasGlobalPos).toBe(true);
+
+    const v2Parsed = store.getCommandableVehicle(modernMeasuredZero.id)!;
+    expect(v2Parsed.hasLocalPos).toBe(true);
+    expect(v2Parsed.hasAttitude).toBe(false);
+    expect(v2Parsed.hasHeading).toBe(true);
+    expect(v2Parsed.hasGlobalPos).toBe(true);
   });
 });
