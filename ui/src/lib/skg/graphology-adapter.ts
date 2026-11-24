@@ -120,6 +120,7 @@ function resolveEntityNode(entity: CopEntityState): SkgTopologyNode {
         : 8;
   const nedHint: [number, number] | null =
     entity.kind === "uxs-vehicle" &&
+    entity.hasLocalPos !== false &&
     isFiniteNumber(entity.ned[0]) &&
     isFiniteNumber(entity.ned[1])
       ? [entity.ned[0], entity.ned[1]]

@@ -789,7 +789,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           has_attitude: false,
           body_rates: [0, 0, 0],
           ned_xyz: [0, 0, -15],
-          has_local_pos: false,
+          has_local_pos: true,
           ned_vel: [0, 5, 0],
           lat_lon_alt: [30.2672, -97.7431, 165],
           has_global_pos: true,
@@ -2246,8 +2246,16 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
   it("clears retained previous-session attitude, heading, and local position across an ingest restart while keeping a new global fix live and re-enabling each domain independently", () => {
     const entityId = "boxbotix.bbops.robotics.uxs.vehicle.1";
     let nowMs = Date.parse("2026-11-24T12:00:00.300Z");
-    const skgStore = createSkgStore({ now: () => nowMs });
-    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+    const ws2Rig = new MockWebSocketRig();
+    const ws1Rig = new MockWebSocketRig();
+    const skgStore = createSkgStore({
+      now: () => nowMs,
+      createSocket: ws2Rig.createSocket,
+    });
+    const telemetryStore = createTelemetryStore({
+      now: () => nowMs,
+      createSocket: ws1Rig.createSocket,
+    });
 
     interface DomainAssertion<T> {
       value: T;
@@ -2343,44 +2351,95 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       });
     };
 
-    const drawnTexts: string[] = [];
-    const mockCtx = {
-      clearRect: vi.fn(),
-      save: vi.fn(),
-      restore: vi.fn(),
-      beginPath: vi.fn(),
-      closePath: vi.fn(),
-      rect: vi.fn(),
-      clip: vi.fn(),
-      translate: vi.fn(),
-      rotate: vi.fn(),
-      setTransform: vi.fn(),
-      fillRect: vi.fn(),
-      strokeRect: vi.fn(),
-      moveTo: vi.fn(),
-      lineTo: vi.fn(),
-      arc: vi.fn(),
-      fill: vi.fn(),
-      stroke: vi.fn(),
-      setLineDash: vi.fn(),
-      fillText: vi.fn((text: string) => {
-        drawnTexts.push(text);
-      }),
-      fillStyle: "",
-      strokeStyle: "",
-      lineWidth: 1,
-      globalAlpha: 1,
-      font: "",
-      textAlign: "left",
-    } as unknown as CanvasRenderingContext2D;
+    const hudTexts: string[] = [];
+    const overlayTexts: string[] = [];
+    const overlayTrailSegments: Array<{
+      x0: number;
+      y0: number;
+      x1: number;
+      y1: number;
+    }> = [];
+
+    const makeMock2dCtx = (
+      kind: "hud" | "overlay" | "surface",
+    ): CanvasRenderingContext2D => {
+      let lastMoveX = 0;
+      let lastMoveY = 0;
+      const ctx = {
+        clearRect: vi.fn(),
+        save: vi.fn(),
+        restore: vi.fn(),
+        beginPath: vi.fn(),
+        closePath: vi.fn(),
+        rect: vi.fn(),
+        clip: vi.fn(),
+        translate: vi.fn(),
+        rotate: vi.fn(),
+        setTransform: vi.fn(),
+        fillRect: vi.fn(),
+        strokeRect: vi.fn(),
+        moveTo: vi.fn((x: number, y: number) => {
+          lastMoveX = x;
+          lastMoveY = y;
+        }),
+        lineTo: vi.fn((x: number, y: number) => {
+          if (
+            kind === "overlay" &&
+            ctx.strokeStyle === "rgba(96, 165, 250, 0.36)"
+          ) {
+            overlayTrailSegments.push({
+              x0: lastMoveX,
+              y0: lastMoveY,
+              x1: x,
+              y1: y,
+            });
+          }
+          lastMoveX = x;
+          lastMoveY = y;
+        }),
+        arc: vi.fn(),
+        fill: vi.fn(),
+        stroke: vi.fn(),
+        setLineDash: vi.fn(),
+        fillText: vi.fn((text: string) => {
+          if (kind === "hud") {
+            hudTexts.push(text);
+          } else if (kind === "overlay") {
+            overlayTexts.push(text);
+          }
+        }),
+        fillStyle: "",
+        strokeStyle: "",
+        lineWidth: 1,
+        globalAlpha: 1,
+        font: "",
+        textAlign: "left",
+      };
+      return ctx as unknown as CanvasRenderingContext2D;
+    };
+
+    const hudCtx = makeMock2dCtx("hud");
+    const overlayCtx = makeMock2dCtx("overlay");
+    const surfaceCtx = makeMock2dCtx("surface");
 
     const rafCallbacks: FrameRequestCallback[] = [];
     const getCtxSpy = vi
       .spyOn(HTMLCanvasElement.prototype, "getContext")
-      .mockImplementation(((contextId: string) =>
-        contextId === "2d"
-          ? mockCtx
-          : null) as typeof HTMLCanvasElement.prototype.getContext);
+      .mockImplementation(function (
+        this: HTMLCanvasElement,
+        contextId: string,
+      ) {
+        if (contextId !== "2d") {
+          return null;
+        }
+        if (this.classList.contains("hud-canvas")) {
+          return hudCtx;
+        }
+        if (this.classList.contains("safety-hud-canvas")) {
+          return overlayCtx;
+        }
+        return surfaceCtx;
+      } as typeof HTMLCanvasElement.prototype.getContext);
     const rafSpy = vi
       .spyOn(window, "requestAnimationFrame")
       .mockImplementation((cb: FrameRequestCallback) => {
@@ -2391,6 +2450,12 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       .spyOn(window, "cancelAnimationFrame")
       .mockImplementation(() => undefined);
 
+    const resetDrawn = (): void => {
+      hudTexts.length = 0;
+      overlayTexts.length = 0;
+      overlayTrailSegments.length = 0;
+    };
+
     const flushTicks = (): void => {
       flushSync();
       for (const cb of rafCallbacks.splice(0, rafCallbacks.length)) {
@@ -2400,14 +2465,80 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
     };
 
     const hudHost = document.createElement("div");
-    document.body.append(hudHost);
+    const canvasHost = document.createElement("div");
+    document.body.append(hudHost, canvasHost);
+    const adapter = new NedGridAdapter({ widthPx: 800, heightPx: 600 });
+    const viewportStore = createViewportStore({ skgStore });
     let hudApp: Record<string, unknown> | null = null;
+    let canvasApp: Record<string, unknown> | null = null;
 
     try {
-      // Session 1 (12:00:00Z): measured 90 deg East yaw, local NED, and global fix.
+      // Session 1 step A (12:00:00.150Z): initial local NED [0, 0, -2] + 90 deg East yaw + global fix.
+      nowMs = Date.parse("2026-11-24T12:00:00.150Z");
+      skgStore.connect("ws://127.0.0.1:8080/ws/graph");
+      ws2Rig.latest.serverOpen();
       skgStore.ingestRawFrame(
         buildMergedPut({
           revision: 1,
+          healthIso: "2026-11-24T12:00:00.150Z",
+          quat: {
+            value: eulerRadToQuaternionWxyz(0, 0, Math.PI / 2),
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.100Z",
+          },
+          ned: {
+            value: [0, 0, -2],
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.150Z",
+          },
+          heading: {
+            value: 90,
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.100Z",
+          },
+          globalPos: {
+            value: [37.7749, -122.4194, 25],
+            measured: true,
+            timestamp: "2026-11-24T12:00:00.150Z",
+          },
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      hudApp = mount(VehicleHud, {
+        target: hudHost,
+        props: {
+          telemetryStore,
+          get vehicle() {
+            return skgStore.getCommandableVehicle(entityId);
+          },
+          skgStatus: "connected",
+          now: () => nowMs,
+        },
+      });
+      canvasApp = mount(TacticalCanvas, {
+        target: canvasHost,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          adapter,
+          now: () => nowMs,
+        },
+      });
+      flushTicks();
+
+      // Session 1 step B (12:00:00.300Z): second local NED [12.5, -4.25, -2] builds a 2-point Session 1 wake trail.
+      nowMs = Date.parse("2026-11-24T12:00:00.300Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 2,
           healthIso: "2026-11-24T12:00:00.300Z",
           quat: {
             value: eulerRadToQuaternionWxyz(0, 0, Math.PI / 2),
@@ -2431,36 +2562,30 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
-      skgStore.ingestRawFrame(
-        JSON.stringify({
-          type: "synced",
-          bucket: "ENTITY_STATES",
-          revision: 1,
-        }),
-      );
-
-      hudApp = mount(VehicleHud, {
-        target: hudHost,
-        props: {
-          telemetryStore,
-          get vehicle() {
-            return skgStore.getCommandableVehicle(entityId);
-          },
-          skgStatus: "connected",
-          now: () => nowMs,
-        },
-      });
+      resetDrawn();
       flushTicks();
 
       const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(
+        hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]'),
+      ).toBeNull();
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 2.0m");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 2.0m");
+      expect(overlayTrailSegments).toHaveLength(1);
+
+      // Pan camera away from [0, 0] and tether to entityId before Session 2 restart to prove unmeasured [0, 0, 0] does not snap camera.
+      adapter.setCamera({ centerNed: [40, -25] });
+      viewportStore.tetherEntity(entityId);
 
       // Session 2 restarts 1 hour later (13:00:00.000Z admission) and receives #33 global fix with Hdg=65535 at 13:00:00.250Z.
       nowMs = Date.parse("2026-11-24T13:00:00.250Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
-          revision: 2,
+          revision: 3,
           healthIso: "2026-11-24T13:00:00.250Z",
           quat: {
             value: [0, 0, 0, 0],
@@ -2484,7 +2609,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
-      drawnTexts.length = 0;
+      resetDrawn();
       flushTicks();
 
       const afterRestartPose = resolveLiveVehiclePose(
@@ -2500,24 +2625,35 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(afterRestartPose.lla).toEqual([30.2672, -97.7431, 150]);
       expect(afterRestartPose.hasAttitude).toBe(false);
       expect(afterRestartPose.hasHeading).toBe(false);
+      expect(afterRestartPose.hasLocalPos).toBe(false);
       expect(afterRestartPose.hasVerifiedFrameReference).toBe(false);
       expect(afterRestartPose.quat).toEqual([0, 0, 0, 0]);
       expect(afterRestartPose.ned).toEqual([0, 0, 0]);
       expect(hudPanel?.getAttribute("data-stale")).toBe("false");
       expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
       expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
       expect(
         hudHost.querySelector('[data-testid="hud-heading-unavailable"]')
           ?.textContent,
       ).toContain("NO HDG");
-      expect(drawnTexts).toContain("ATTITUDE UNAVAILABLE");
-      expect(drawnTexts).toContain("HDG UNAVAILABLE");
+      expect(
+        hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]')
+          ?.textContent,
+      ).toContain("NO POS");
+      expect(hudTexts).toContain("ATTITUDE UNAVAILABLE");
+      expect(hudTexts).toContain("HDG UNAVAILABLE");
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudTexts).not.toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(overlayTexts).toEqual([]);
+      expect(overlayTrailSegments).toHaveLength(0);
+      expect(adapter.getCamera().centerNed).toEqual([40, -25]);
 
       // Health-only update at 13:00:00.500Z preserves per-domain pose timestamps and unavailability.
       nowMs = Date.parse("2026-11-24T13:00:00.500Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
-          revision: 3,
+          revision: 4,
           healthIso: "2026-11-24T13:00:00.500Z",
           crcErrors: 2,
           quat: {
@@ -2542,6 +2678,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
+      resetDrawn();
       flushTicks();
       const vehAfterHealth = skgStore.getCommandableVehicle(entityId)!;
       expect(vehAfterHealth.poseObservedAt).toBe("2026-11-24T13:00:00.250Z");
@@ -2549,12 +2686,14 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(vehAfterHealth.hasHeading).toBe(false);
       expect(vehAfterHealth.hasLocalPos).toBe(false);
       expect(vehAfterHealth.hasGlobalPos).toBe(true);
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toEqual([]);
 
       // Re-measure heading (#33 Hdg=180 deg) while attitude and local position remain unavailable.
       nowMs = Date.parse("2026-11-24T13:00:00.750Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
-          revision: 4,
+          revision: 5,
           healthIso: "2026-11-24T13:00:00.750Z",
           quat: {
             value: [0, 0, 0, 0],
@@ -2578,6 +2717,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
+      resetDrawn();
       flushTicks();
       const afterHdgPose = resolveLiveVehiclePose(
         skgStore.getCommandableVehicle(entityId)!,
@@ -2586,15 +2726,20 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(afterHdgPose.hasHeading).toBe(true);
       expect(afterHdgPose.headingDeg).toBe(180);
       expect(afterHdgPose.hasAttitude).toBe(false);
+      expect(afterHdgPose.hasLocalPos).toBe(false);
       expect(afterHdgPose.hasVerifiedFrameReference).toBe(false);
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toEqual([]);
+      expect(overlayTrailSegments).toHaveLength(0);
 
-      // Re-measure local position (#32) while attitude remains unavailable.
+      // Re-measure local position (#32 [15, -8, -4]) while attitude remains unavailable.
       nowMs = Date.parse("2026-11-24T13:00:01.000Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
-          revision: 5,
+          revision: 6,
           healthIso: "2026-11-24T13:00:01.000Z",
           quat: {
             value: [0, 0, 0, 0],
@@ -2618,20 +2763,33 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
+      resetDrawn();
       flushTicks();
       const afterNedPose = resolveLiveVehiclePose(
         skgStore.getCommandableVehicle(entityId)!,
         { telemetryStatus: "reconnecting", skgStatus: "connected", nowMs },
       );
+      expect(afterNedPose.hasLocalPos).toBe(true);
       expect(afterNedPose.hasVerifiedFrameReference).toBe(true);
       expect(afterNedPose.ned).toEqual([15, -8, -4]);
       expect(afterNedPose.hasAttitude).toBe(false);
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(
+        hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]'),
+      ).toBeNull();
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
+      expect(hudTexts).not.toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 4.0m");
+      // First post-restart local sample must NOT connect back to [0, 0, 0] or Session 1's trail.
+      expect(overlayTrailSegments).toHaveLength(0);
+      expect(adapter.getCamera().centerNed).toEqual([15, -8]);
 
-      // Re-measure attitude (#31 45 deg yaw) -> all domains measured again.
+      // Re-measure attitude (#31 45 deg yaw) + second post-restart NED [18, -6, -4] -> all domains measured & fresh Session 2 trail segment drawn.
       nowMs = Date.parse("2026-11-24T13:00:01.250Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
-          revision: 6,
+          revision: 7,
           healthIso: "2026-11-24T13:00:01.250Z",
           quat: {
             value: eulerRadToQuaternionWxyz(0, 0, Math.PI / 4),
@@ -2639,9 +2797,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
             timestamp: "2026-11-24T13:00:01.250Z",
           },
           ned: {
-            value: [15, -8, -4],
+            value: [18, -6, -4],
             measured: true,
-            timestamp: "2026-11-24T13:00:01.000Z",
+            timestamp: "2026-11-24T13:00:01.250Z",
           },
           heading: {
             value: 45,
@@ -2655,7 +2813,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
-      drawnTexts.length = 0;
+      resetDrawn();
       flushTicks();
       const afterAttPose = resolveLiveVehiclePose(
         skgStore.getCommandableVehicle(entityId)!,
@@ -2663,13 +2821,109 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       );
       expect(afterAttPose.hasAttitude).toBe(true);
       expect(afterAttPose.hasHeading).toBe(true);
+      expect(afterAttPose.hasLocalPos).toBe(true);
       expect(afterAttPose.headingDeg).toBeCloseTo(45, 5);
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
-      expect(drawnTexts).toContain("R 0° P 0° Y 45°");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(hudTexts).toContain("R 0° P 0° Y 45°");
+      expect(overlayTrailSegments).toHaveLength(1);
+
+      // Session 3 (14:00:00.200Z): genuine measured [0, 0, 0] local position & zero velocity WITHOUT any global fix (SKG + WS1).
+      nowMs = Date.parse("2026-11-24T14:00:00.200Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 8,
+          healthIso: "2026-11-24T14:00:00.200Z",
+          quat: {
+            value: eulerRadToQuaternionWxyz(0, 0, 0),
+            measured: true,
+            timestamp: "2026-11-24T14:00:00.200Z",
+          },
+          ned: {
+            value: [0, 0, 0],
+            measured: true,
+            timestamp: "2026-11-24T14:00:00.200Z",
+          },
+          heading: {
+            value: 0,
+            measured: true,
+            timestamp: "2026-11-24T14:00:00.200Z",
+          },
+          globalPos: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T14:00:00.000Z",
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      const zeroNoGpsSkgPose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        { telemetryStatus: "reconnecting", skgStatus: "connected", nowMs },
+      );
+      expect(zeroNoGpsSkgPose.source).toBe("skg");
+      expect(zeroNoGpsSkgPose.hasLocalPos).toBe(true);
+      expect(zeroNoGpsSkgPose.lla).toBeNull();
+      expect(zeroNoGpsSkgPose.hasVerifiedFrameReference).toBe(false);
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 0.0m");
+
+      nowMs = Date.parse("2026-11-24T14:00:00.250Z");
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Rig.latest.serverOpen();
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 1,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            has_local_pos: true,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            has_heading: true,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      const zeroNoGpsWs1Pose = resolveLiveVehiclePose(
+        skgStore.getCommandableVehicle(entityId)!,
+        {
+          fast: telemetryStore.getKinematics(1),
+          telemetryStatus: "connected",
+          skgStatus: "connected",
+          nowMs,
+        },
+      );
+      expect(zeroNoGpsWs1Pose.source).toBe("ws1");
+      expect(zeroNoGpsWs1Pose.hasLocalPos).toBe(true);
+      expect(zeroNoGpsWs1Pose.lla).toBeNull();
+      expect(zeroNoGpsWs1Pose.hasVerifiedFrameReference).toBe(false);
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 0.0m");
     } finally {
+      if (canvasApp) unmount(canvasApp);
       if (hudApp) unmount(hudApp);
       telemetryStore.disconnect();
+      skgStore.disconnect();
+      canvasHost.remove();
       hudHost.remove();
       getCtxSpy.mockRestore();
       rafSpy.mockRestore();

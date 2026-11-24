@@ -319,6 +319,7 @@ export interface ResolvedVehiclePose {
   readonly stale: boolean;
   readonly hasAttitude: boolean;
   readonly hasHeading: boolean;
+  readonly hasLocalPos: boolean;
   readonly hasVerifiedFrameReference: boolean;
   readonly quat: [number, number, number, number];
   readonly ned: [number, number, number];
@@ -515,10 +516,15 @@ export function resolveLiveVehiclePose(
       stale,
       hasAttitude,
       hasHeading,
+      hasLocalPos,
       hasVerifiedFrameReference: hasLocalPos && lla !== null,
       quat,
-      ned: [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]],
-      vel: [fast.ned_vel[0], fast.ned_vel[1], fast.ned_vel[2]],
+      ned: hasLocalPos
+        ? [fast.ned_xyz[0], fast.ned_xyz[1], fast.ned_xyz[2]]
+        : [0, 0, 0],
+      vel: hasLocalPos
+        ? [fast.ned_vel[0], fast.ned_vel[1], fast.ned_vel[2]]
+        : [0, 0, 0],
       headingDeg,
       headingRad: headingDeg * DEG_TO_RAD,
       lla,
@@ -563,21 +569,22 @@ export function resolveLiveVehiclePose(
     fast !== undefined &&
     fast.has_local_pos === false &&
     (skgPoseMs === null || fast.timestamp >= skgPoseMs);
+  const hasLocalPos = skgHasConfirmedLocalPos && !ws1ContradictsLocalPos;
 
   return {
     source: "skg",
     stale,
     hasAttitude,
     hasHeading,
-    hasVerifiedFrameReference:
-      skgHasConfirmedLocalPos && !ws1ContradictsLocalPos && lla !== null,
+    hasLocalPos,
+    hasVerifiedFrameReference: hasLocalPos && lla !== null,
     quat,
-    ned: [vehicle.ned[0], vehicle.ned[1], vehicle.ned[2]],
-    vel: [
-      vehicle.velocityNed[0],
-      vehicle.velocityNed[1],
-      vehicle.velocityNed[2],
-    ],
+    ned: hasLocalPos
+      ? [vehicle.ned[0], vehicle.ned[1], vehicle.ned[2]]
+      : [0, 0, 0],
+    vel: hasLocalPos
+      ? [vehicle.velocityNed[0], vehicle.velocityNed[1], vehicle.velocityNed[2]]
+      : [0, 0, 0],
     headingDeg,
     headingRad: headingDeg * DEG_TO_RAD,
     lla,

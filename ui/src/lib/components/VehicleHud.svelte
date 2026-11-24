@@ -34,6 +34,7 @@
   let isStale = $state(false);
   let hasAttitude = $state(false);
   let hasHeading = $state(false);
+  let hasLocalPos = $state(false);
 
   const linkBadge = $derived(
     vehicle ? formatLinkTierBadge(vehicle.linkTier) : null,
@@ -52,6 +53,9 @@
     if (hasHeading !== pose.hasHeading) {
       hasHeading = pose.hasHeading;
     }
+    if (hasLocalPos !== pose.hasLocalPos) {
+      hasLocalPos = pose.hasLocalPos;
+    }
   }
 
   $effect(() => {
@@ -59,6 +63,7 @@
       isStale = false;
       hasAttitude = false;
       hasHeading = false;
+      hasLocalPos = false;
       poseSource = "skg";
       return;
     }
@@ -95,7 +100,9 @@
     pose: ResolvedVehiclePose,
   ): void {
     const euler = pose.hasAttitude ? quaternionToEulerDeg(pose.quat) : null;
-    const flight = computeFlightMetrics(pose.ned, pose.vel);
+    const flight = pose.hasLocalPos
+      ? computeFlightMetrics(pose.ned, pose.vel)
+      : null;
 
     ctx.clearRect(0, 0, widthPx, heightPx);
 
@@ -248,14 +255,19 @@
 
     // 3. Bottom telemetry readout bar (GS, VS, ALT, Roll/Pitch/Yaw or Heading).
     ctx.save();
-    ctx.fillStyle = "#e2e8f0";
     ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
     const bottomY = heightPx - 10;
-    ctx.fillText(
-      `GS ${flight.groundspeedMps.toFixed(1)}m/s  VS ${flight.climbRateMps >= 0 ? "+" : ""}${flight.climbRateMps.toFixed(1)}m/s  ALT ${flight.altitudeRelM.toFixed(1)}m`,
-      10,
-      bottomY,
-    );
+    if (flight !== null) {
+      ctx.fillStyle = "#e2e8f0";
+      ctx.fillText(
+        `GS ${flight.groundspeedMps.toFixed(1)}m/s  VS ${flight.climbRateMps >= 0 ? "+" : ""}${flight.climbRateMps.toFixed(1)}m/s  ALT ${flight.altitudeRelM.toFixed(1)}m`,
+        10,
+        bottomY,
+      );
+    } else {
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("GS --  VS --  ALT --", 10, bottomY);
+    }
     ctx.textAlign = "right";
     ctx.fillStyle = "#94a3b8";
     if (euler !== null) {
@@ -320,6 +332,11 @@
       : "unavailable"
     : undefined}
   data-heading={vehicle ? (hasHeading ? "measured" : "unavailable") : undefined}
+  data-local-pos={vehicle
+    ? hasLocalPos
+      ? "measured"
+      : "unavailable"
+    : undefined}
 >
   {#if vehicle && linkBadge}
     <header class="hud-header">
@@ -338,6 +355,11 @@
         {#if !hasHeading}
           <span class="no-att-badge" data-testid="hud-heading-unavailable">
             NO HDG
+          </span>
+        {/if}
+        {#if !hasLocalPos}
+          <span class="no-att-badge" data-testid="hud-local-pos-unavailable">
+            NO POS
           </span>
         {/if}
         <span class="link-badge" data-testid="hud-link-tier">

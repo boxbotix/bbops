@@ -130,11 +130,18 @@
     const vehicle = vehicles.find((item) => item.id === tetherId);
     if (vehicle) {
       const snap = poses.get(vehicle.id) ?? resolveVehiclePose(vehicle);
-      adapter.setCamera({
-        centerNed: [snap.ned[0], snap.ned[1]],
-        bearingRad:
-          viewportStore.chaseLock && snap.hasHeading ? snap.headingRad : 0,
-      });
+      if (snap.hasLocalPos) {
+        adapter.setCamera({
+          centerNed: [snap.ned[0], snap.ned[1]],
+          bearingRad:
+            viewportStore.chaseLock && snap.hasHeading ? snap.headingRad : 0,
+        });
+      } else {
+        adapter.setCamera({
+          bearingRad:
+            viewportStore.chaseLock && snap.hasHeading ? snap.headingRad : 0,
+        });
+      }
       return;
     }
 
@@ -462,8 +469,11 @@
         if (!viewportStore.isDomainVisible(vehicle.domain)) {
           continue;
         }
-        activeIds.add(vehicle.id);
         const snap = poses.get(vehicle.id) ?? resolveVehiclePose(vehicle);
+        if (!snap.hasLocalPos) {
+          continue;
+        }
+        activeIds.add(vehicle.id);
         wakeTrails.record(vehicle.id, snap.ned);
 
         if (showTrails) {

@@ -1357,28 +1357,36 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		mergedTriples := map[uint8][]message.Triple{}
 		lastObservedAt := map[uint8]time.Time{}
 
+		materializedNotify := make(chan struct{}, 1)
 		newPub := func() *Publisher {
 			return NewPublisher(
 				DefaultEntitySubject,
 				func(_ context.Context, _ string, msgs [][]byte) error {
 					publishedMu.Lock()
-					defer publishedMu.Unlock()
 					for _, raw := range msgs {
 						bm, uErr := decoder.Decode(raw)
 						if uErr != nil {
+							publishedMu.Unlock()
 							t.Fatalf("seed %d: decoder.Decode: %v", seed, uErr)
 						}
 						snap := *bm.Payload().(*uxsvocab.VehicleSnapshot)
 						if prevTS, ok := lastObservedAt[snap.SysID]; ok && snap.ObservedAt.Before(prevTS) {
+							publishedMu.Unlock()
 							t.Fatalf("seed %d sysid=%d: monotonic ObservedAt regressed (%v < %v)", seed, snap.SysID, snap.ObservedAt, prevTS)
 						}
 						lastObservedAt[snap.SysID] = snap.ObservedAt
 						materialized[snap.SysID] = snap
 						rep := graph.ReplaceBySource(mergedTriples[snap.SysID], snap.Triples())
 						if len(rep.Stale) != 0 {
+							publishedMu.Unlock()
 							t.Fatalf("seed %d sysid=%d: ReplaceBySource rejected triples as stale: %+v", seed, snap.SysID, rep.Stale)
 						}
 						mergedTriples[snap.SysID] = rep.Triples
+					}
+					publishedMu.Unlock()
+					select {
+					case materializedNotify <- struct{}{}:
+					default:
 					}
 					return nil
 				},
@@ -1391,13 +1399,62 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		pub := newPub()
 
 		drainPub := func() {
+			wantObserved := make(map[uint8]time.Time, len(ref))
+			for sysid, rv := range ref {
+				if !rv.admitted {
+					continue
+				}
+				snap, ok := tracker.Snapshot(sysid)
+				if !ok {
+					t.Fatalf("seed %d: admitted sysid=%d missing from tracker", seed, sysid)
+				}
+				wantObserved[sysid] = snap.ObservedAt
+			}
+
+			converged := func() bool {
+				if len(pub.periodicCh) != 0 {
+					return false
+				}
+				pub.urgentMu.Lock()
+				pendingUrgent := len(pub.urgentSysIDs)
+				pub.urgentMu.Unlock()
+				if pendingUrgent != 0 {
+					return false
+				}
+				publishedMu.Lock()
+				defer publishedMu.Unlock()
+				for sysid, wantTS := range wantObserved {
+					got, ok := materialized[sysid]
+					if !ok || !got.ObservedAt.Equal(wantTS) {
+						return false
+					}
+				}
+				return true
+			}
+
 			runCtx, runCancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
 				pub.Run(runCtx)
 			}()
-			time.Sleep(10 * time.Millisecond)
+
+			deadline := time.NewTimer(2 * time.Second)
+			defer deadline.Stop()
+			poll := time.NewTicker(time.Millisecond)
+			defer poll.Stop()
+
+			for !converged() {
+				select {
+				case <-materializedNotify:
+				case <-poll.C:
+				case <-deadline.C:
+					runCancel()
+					<-done
+					t.Fatalf("seed %d: timed out waiting for publisher to materialize %d vehicle(s)", seed, len(wantObserved))
+				}
+			}
+
 			runCancel()
 			<-done
 		}
