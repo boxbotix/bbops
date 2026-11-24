@@ -192,7 +192,7 @@ function parseTelemetryPayload(
       ? payload.has_attitude && quatNormSq >= 1e-6
       : quatNormSq >= 1e-6;
   const hasLocalPos =
-    typeof payload.has_local_pos === "boolean" ? payload.has_local_pos : true;
+    typeof payload.has_local_pos === "boolean" ? payload.has_local_pos : false;
   return {
     sysid: expectedSysId,
     domain: payload.domain,
@@ -396,9 +396,10 @@ export function createTelemetryStore(
       return;
     }
 
-    const receivedAtMs = isFiniteNumber(parsed.timestamp)
-      ? parsed.timestamp
-      : now();
+    // Stamp local arrival time from the browser clock so WS1 staleness timeout
+    // never depends on server and browser clocks agreeing; producer timestamps
+    // on payload.timestamp remain authoritative for cross-lane ordering.
+    const receivedAtMs = now();
     const segments = parsed.subject.split(".");
     if (segments[0] !== "bbops" || segments[1] !== "telemetry") {
       malformedFrames += 1;

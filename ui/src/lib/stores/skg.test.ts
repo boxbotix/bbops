@@ -760,4 +760,87 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
     store.disconnect();
   });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("keeps poseObservedAt and poseIngestedAtMs unrefreshed across pre-synced snapshot replays and post-synced health-only updates", () => {
+    let browserNowMs = Date.parse("2026-11-24T12:00:00.000Z");
+    const store = createSkgStore({ now: () => browserNowMs });
+
+    const oldPoseIso = "2026-11-24T11:00:00.000Z";
+    const replayPayload = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.kinematics.ned": [0, 0, 0],
+        "uxs.kinematics.vx": 0,
+        "uxs.kinematics.vy": 0,
+        "uxs.kinematics.vz": 0,
+      },
+      {
+        observedAt: oldPoseIso,
+        updatedAt: new Date(browserNowMs).toISOString(),
+      },
+    );
+
+    // Pre-synced snapshot replay of an hour-old observation with default zero NED.
+    store.ingestRawFrame(putFrame(replayPayload.id, 1, replayPayload));
+    store.ingestRawFrame(syncedFrame(1));
+
+    const replayed = store.getCommandableVehicle(replayPayload.id);
+    expect(replayed?.poseObservedAt).toBe(oldPoseIso);
+    expect(replayed?.poseIngestedAtMs).toBeNull();
+    expect(replayed?.hasLocalPos).toBe(false);
+
+    // Live post-synced genuine pose update at +500ms with measured local NED.
+    browserNowMs += 500;
+    const livePoseIso = new Date(browserNowMs).toISOString();
+    const livePosePayload = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.kinematics.ned": [15, -8, -12],
+      },
+      {
+        observedAt: livePoseIso,
+        updatedAt: livePoseIso,
+      },
+    );
+    store.ingestRawFrame(putFrame(livePosePayload.id, 2, livePosePayload));
+    const afterLivePose = store.getCommandableVehicle(livePosePayload.id);
+    expect(afterLivePose?.poseObservedAt).toBe(livePoseIso);
+    expect(afterLivePose?.poseIngestedAtMs).toBe(browserNowMs);
+    expect(afterLivePose?.hasLocalPos).toBe(true);
+
+    // Health-only post-synced update 4 seconds later (pose triples retain livePoseIso).
+    const poseReceiptAtLive = browserNowMs;
+    browserNowMs += 4_000;
+    const healthIso = new Date(browserNowMs).toISOString();
+    const healthOnlyTriples = livePosePayload.triples.map((t) =>
+      t.predicate.startsWith("uxs.health.") ||
+      t.predicate === "uxs.authority.state"
+        ? {
+            ...t,
+            object:
+              t.predicate === "uxs.health.crcerrors"
+                ? 9
+                : t.predicate === "uxs.authority.state"
+                  ? "direct-crsf-override"
+                  : t.object,
+            timestamp: healthIso,
+          }
+        : t,
+    );
+    store.ingestRawFrame(
+      putFrame(livePosePayload.id, 3, {
+        id: livePosePayload.id,
+        updated_at: healthIso,
+        triples: healthOnlyTriples,
+      }),
+    );
+
+    const afterHealthOnly = store.getCommandableVehicle(livePosePayload.id);
+    expect(afterHealthOnly?.authority).toBe("direct-crsf-override");
+    expect(afterHealthOnly?.sysStatus.crcErrors).toBe(9);
+    expect(afterHealthOnly?.observedAt).toBe(healthIso);
+    expect(afterHealthOnly?.poseObservedAt).toBe(livePoseIso);
+    expect(afterHealthOnly?.poseIngestedAtMs).toBe(poseReceiptAtLive);
+  });
 });

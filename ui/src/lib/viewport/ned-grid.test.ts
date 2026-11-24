@@ -532,12 +532,44 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       host.remove();
     }
 
-    // Arrival Order 2: External contact arrives first -> withheld; #33-before-#32 vehicle -> still withheld; #32 arrives -> co-located!
+    // Arrival Order 2:
+    //  (a) External contact arrives first -> withheld;
+    //  (b) Snapshot-first SKG vehicle startup with global fix + default zero NED and zero WS1 samples -> STILL withheld (never locks [0,0,0] permanently!);
+    //  (c) Legacy WS1 frame omitting has_local_pos flag -> STILL withheld;
+    //  (d) Explicit #33-before-#32 WS1 frame (has_local_pos: false) -> STILL withheld;
+    //  (e) First confirmed #32 LOCAL_POSITION_NED -> anchors true NED=[0,0,0] origin and co-locates contact!
     {
+      let simNowMs = nowMs;
+      let ws1Socket: {
+        readyState: number;
+        onopen: ((event: never) => unknown) | null;
+        onmessage: ((event: MessageEvent<unknown>) => unknown) | null;
+        onerror: ((event: never) => unknown) | null;
+        onclose: ((event: CloseEvent) => unknown) | null;
+        send(data: string): void;
+        close(code?: number, reason?: string): void;
+      } | null = null;
       const host = document.createElement("div");
       document.body.appendChild(host);
-      const telemetryStore = createTelemetryStore({ now: () => nowMs });
-      const skgStore = createSkgStore({ now: () => nowMs });
+      const telemetryStore = createTelemetryStore({
+        now: () => simNowMs,
+        createSocket: () => {
+          ws1Socket = {
+            readyState: 1,
+            onopen: null,
+            onmessage: null,
+            onerror: null,
+            onclose: null,
+            send: () => undefined,
+            close: () => undefined,
+          };
+          return ws1Socket;
+        },
+      });
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Socket!.onopen?.(new Event("open") as never);
+
+      const skgStore = createSkgStore({ now: () => simNowMs });
       const viewportStore = createViewportStore({ skgStore });
       const adapter = new NedGridAdapter({
         widthPx: 640,
@@ -553,12 +585,12 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
           skgStore,
           viewportStore,
           adapter,
-          now: () => nowMs,
+          now: () => simNowMs,
         },
       });
       flushSync();
 
-      // Contact alone MUST NOT establish tactical origin.
+      // (a) Contact alone MUST NOT establish tactical origin.
       expect(adapter.getCamera().originLla).toBeNull();
       expect(adapter.project({ lla: vehicleLla }).visible).toBe(false);
       expect(
@@ -570,16 +602,261 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
         host.querySelector('[data-testid="mixed-frame-withheld"]'),
       ).not.toBeNull();
 
-      // Vehicle arrives with #33 global position only (has_local_pos: false -> ned_xyz still [0,0,0]).
+      // (b) Normal snapshot-first SKG startup: global fix present, default zero NED [0,0,0], no WS1 sample yet.
+      const startupIso = new Date(simNowMs).toISOString();
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision: 1,
+          payload: {
+            id: vehicleId,
+            updated_at: startupIso,
+            triples: [
+              {
+                subject: vehicleId,
+                predicate: "uxs.domain.kind",
+                object: "quadcopter",
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.authority.state",
+                object: "companion-teleop",
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.mode.companion",
+                object: "teleop-velocity",
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.link.tier",
+                object: "mesh-high-rate",
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.armed",
+                object: true,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.flags",
+                object: {
+                  clock_sync_locked: true,
+                  teleop_deadman_clamped: false,
+                  crsf_link_healthy: true,
+                  companion_trunk_healthy: true,
+                },
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.failsafes",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.crcerrors",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.loopdtus",
+                object: 1000,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.maxloopdtus",
+                object: 1200,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.health.rttus",
+                object: 400,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.attitude.quaternion",
+                object: [0, 0, 0, 0],
+                source: "bbops-mavlink-ingest",
+                timestamp: "1970-01-01T00:00:00Z",
+                confidence: 0,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.attitude.rates",
+                object: [0, 0, 0],
+                source: "bbops-mavlink-ingest",
+                timestamp: "1970-01-01T00:00:00Z",
+                confidence: 0,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.ned",
+                object: [0, 0, 0],
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vx",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vy",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.vz",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+              },
+              {
+                subject: vehicleId,
+                predicate: "uxs.kinematics.headingdeg",
+                object: 0,
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.latitude",
+                object: vehicleLla[0],
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.longitude",
+                object: vehicleLla[1],
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+                context: "measured",
+              },
+              {
+                subject: vehicleId,
+                predicate: "geo.location.altitude",
+                object: vehicleLla[2],
+                source: "bbops-mavlink-ingest",
+                timestamp: startupIso,
+                confidence: 1,
+                context: "measured",
+              },
+            ],
+          },
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      skgStore.entities.set(contactId, coLocatedContact);
+      flushSync();
+
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(
+        host.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
+
+      // (c) Legacy WS1 frame omitting has_local_pos flag -> STILL withheld!
+      simNowMs += 5;
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
           subject: "bbops.telemetry.1",
-          timestamp: nowMs + 10,
+          timestamp: simNowMs,
           payload: {
             sysid: 1,
             domain: "quadcopter",
             seq: 1,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [25, -10, -20],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: vehicleLla,
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: simNowMs,
+          },
+        }),
+      );
+      // Force reactive pass so TacticalCanvas re-evaluates anchorSharedFrameOrigin.
+      skgStore.entities.set(
+        vehicleId,
+        makeVehicleEntity([0, 0, 0], vehicleLla),
+      );
+      flushSync();
+
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(
+        host.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
+
+      // (d) Explicit #33-before-#32 WS1 frame (has_local_pos: false) -> STILL withheld.
+      simNowMs += 5;
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: simNowMs,
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 2,
             msg_id: 33,
             quat_wxyz: [0, 0, 0, 0],
             has_attitude: false,
@@ -590,13 +867,13 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
             lat_lon_alt: vehicleLla,
             has_global_pos: true,
             hdg_deg: 0,
-            timestamp: nowMs + 10,
+            timestamp: simNowMs,
           },
         }),
       );
       skgStore.entities.set(
         vehicleId,
-        makeVehicleEntity([0, 0, -20], vehicleLla),
+        makeVehicleEntity([0, 0, 0], vehicleLla),
       );
       flushSync();
 
@@ -605,16 +882,17 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
         host.querySelector('[data-testid="mixed-frame-withheld"]'),
       ).not.toBeNull();
 
-      // Now #32 LOCAL_POSITION_NED arrives with true offset [100, -45, -20] and has_local_pos: true.
+      // (e) First confirmed #32 LOCAL_POSITION_NED arrives with true offset [100, -45, -20] and has_local_pos: true.
+      simNowMs += 10;
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
           subject: "bbops.telemetry.1",
-          timestamp: nowMs + 20,
+          timestamp: simNowMs,
           payload: {
             sysid: 1,
             domain: "quadcopter",
-            seq: 2,
+            seq: 3,
             msg_id: 32,
             quat_wxyz: [1, 0, 0, 0],
             has_attitude: true,
@@ -625,7 +903,7 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
             lat_lon_alt: vehicleLla,
             has_global_pos: true,
             hdg_deg: 0,
-            timestamp: nowMs + 20,
+            timestamp: simNowMs,
           },
         }),
       );
@@ -654,6 +932,7 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       expect(contactScreen.y).toBeCloseTo(vehScreen.y, 4);
 
       unmount(app);
+      telemetryStore.disconnect();
       host.remove();
     }
   });

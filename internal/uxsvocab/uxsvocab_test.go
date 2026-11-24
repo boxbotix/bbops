@@ -285,6 +285,31 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			t.Fatalf("uxs.kinematics.ned Object type = %T, want [3]float64", popTriples[13].Object)
 		}
 
+		// Birth snapshot marks unmeasured pose triples [11..20] with Confidence=0 and epoch-0 timestamp,
+		// while populated snapshot marks measured pose triples with Confidence=1 and Context="measured".
+		epochZero := time.Unix(0, 0).UTC()
+		for idx := 11; idx <= 20; idx++ {
+			if initTriples[idx].Confidence != 0 || !initTriples[idx].Timestamp.Equal(epochZero) || initTriples[idx].Context != "" {
+				t.Fatalf("initial pose triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
+			}
+			if popTriples[idx].Confidence != 1.0 || popTriples[idx].Context != "measured" {
+				t.Fatalf("populated pose triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
+			}
+		}
+
+		// Health-only ObservedAt advancement must not overwrite earlier per-domain pose timestamps.
+		poseTS := time.Date(2026, 11, 23, 20, 55, 0, 0, time.UTC)
+		healthLater := *populated
+		healthLater.LocalPosObservedUnixNs = poseTS.UnixNano()
+		healthLater.ObservedAt = poseTS.Add(10 * time.Minute)
+		laterTriples := healthLater.Triples()
+		if !laterTriples[4].Timestamp.Equal(healthLater.ObservedAt) {
+			t.Fatalf("health triple timestamp = %v, want %v", laterTriples[4].Timestamp, healthLater.ObservedAt)
+		}
+		if !laterTriples[13].Timestamp.Equal(poseTS) {
+			t.Fatalf("uxs.kinematics.ned timestamp = %v, want preserved %v", laterTriples[13].Timestamp, poseTS)
+		}
+
 		// JSON Marshal/Unmarshal round-trip.
 		encoded, err := json.Marshal(populated)
 		if err != nil {

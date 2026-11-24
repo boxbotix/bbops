@@ -680,6 +680,26 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	if !stNulOut.Accepted || stNulOut.Event == nil || stNulOut.Event.StatusText.Text != "PADDED" {
 		t.Fatalf("STATUSTEXT NUL-trim outcome = %+v", stNulOut)
 	}
+
+	// Verify #0 HEARTBEAT (t0+8s), #1 SYS_STATUS (t0+9..12s), and #253 STATUSTEXT (t0+13..14s)
+	// advanced health/status ObservedAt to t0+14s WITHOUT advancing #32/#33 kinematic triple timestamps!
+	finalSnap, ok := tracker.Snapshot(2)
+	if !ok {
+		t.Fatal("missing final sysid=2 snapshot")
+	}
+	finalTriples := finalSnap.Triples()
+	byPred := make(map[string]message.Triple, len(finalTriples))
+	for _, tr := range finalTriples {
+		byPred[tr.Predicate] = tr
+	}
+	if !byPred[uxsvocab.PredicateHealthArmed].Timestamp.Equal(t0.Add(14 * time.Second)) {
+		t.Fatalf("health triple timestamp = %v, want %v", byPred[uxsvocab.PredicateHealthArmed].Timestamp, t0.Add(14*time.Second))
+	}
+	if !byPred[uxsvocab.PredicateKinematicsNED].Timestamp.Equal(t0.Add(6*time.Second)) ||
+		byPred[uxsvocab.PredicateKinematicsNED].Context != "measured" {
+		t.Fatalf("NED triple after health/status updates = %+v, want Timestamp=%v Context=measured",
+			byPred[uxsvocab.PredicateKinematicsNED], t0.Add(6*time.Second))
+	}
 }
 
 // spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component

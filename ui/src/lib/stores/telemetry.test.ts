@@ -589,4 +589,46 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
 
     store.disconnect();
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  it("stamps receivedAtMs from the local browser clock across +60s and -60s server skew while retaining producer timestamps and defaulting omitted has_local_pos to false", () => {
+    let browserNowMs = 1_732_400_100_000;
+    const store = createTelemetryStore({
+      now: () => browserNowMs,
+    });
+
+    // +60s ahead server envelope & producer timestamp, with legacy omitted has_local_pos.
+    store.ingestRawFrame(
+      buildKinematicEnvelope(
+        1,
+        {
+          seq: 1,
+          timestamp: browserNowMs + 60_000,
+        },
+        browserNowMs + 60_000,
+      ),
+    );
+    const ahead = store.getKinematics(1);
+    expect(ahead?.receivedAtMs).toBe(browserNowMs);
+    expect(ahead?.timestamp).toBe(browserNowMs + 60_000);
+    expect(ahead?.has_local_pos).toBe(false);
+
+    // -60s behind server envelope & producer timestamp on sysid 2, with explicit has_local_pos: true.
+    browserNowMs += 250;
+    store.ingestRawFrame(
+      buildKinematicEnvelope(
+        2,
+        {
+          seq: 1,
+          has_local_pos: true,
+          timestamp: browserNowMs - 60_000,
+        },
+        browserNowMs - 60_000,
+      ),
+    );
+    const behind = store.getKinematics(2);
+    expect(behind?.receivedAtMs).toBe(browserNowMs);
+    expect(behind?.timestamp).toBe(browserNowMs - 60_000);
+    expect(behind?.has_local_pos).toBe(true);
+  });
 });

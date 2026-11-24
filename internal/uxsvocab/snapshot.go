@@ -82,6 +82,15 @@ type VehicleSnapshot struct {
 	Altitude  float64 `json:"altitude"`
 
 	ObservedAt time.Time `json:"observed_at"`
+
+	AttitudeObservedUnixNs  int64 `json:"attitude_observed_unix_ns,omitempty"`
+	LocalPosObservedUnixNs  int64 `json:"local_pos_observed_unix_ns,omitempty"`
+	GlobalPosObservedUnixNs int64 `json:"global_pos_observed_unix_ns,omitempty"`
+	HeadingObservedUnixNs   int64 `json:"heading_observed_unix_ns,omitempty"`
+	UnmeasuredAttitude      bool  `json:"unmeasured_attitude,omitempty"`
+	UnmeasuredLocalPos      bool  `json:"unmeasured_local_pos,omitempty"`
+	UnmeasuredGlobalPos     bool  `json:"unmeasured_global_pos,omitempty"`
+	UnmeasuredHeading       bool  `json:"unmeasured_heading,omitempty"`
 }
 
 var (
@@ -92,10 +101,11 @@ var (
 
 // NewVehicleSnapshot constructs a VehicleSnapshot initialized with neutral
 // finite defaults (zero-norm quaternion [0, 0, 0, 0] sentinel indicating no #31
-// attitude measurement yet, zero kinematics/GPS/counters, disarmed mode,
-// mcu-failsafe authority, sitl-local link tier) so snapshots emitted before
-// SYS_STATUS (#1), ATTITUDE_QUATERNION (#31), or GLOBAL_POSITION_INT (#33)
-// arrive still carry the full 22-predicate set.
+// attitude measurement yet, unmeasured local/global/heading flags, zero
+// kinematics/GPS/counters, disarmed mode, mcu-failsafe authority, sitl-local
+// link tier) so snapshots emitted before SYS_STATUS (#1), ATTITUDE_QUATERNION
+// (#31), LOCAL_POSITION_NED (#32), or GLOBAL_POSITION_INT (#33) arrive still
+// carry the full 22-predicate set without claiming unverified pose fixes.
 func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*VehicleSnapshot, error) {
 	if _, err := VehicleEntityID(org, platform, sysid); err != nil {
 		return nil, err
@@ -104,14 +114,18 @@ func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*Vehi
 		return nil, fmt.Errorf("uxsvocab: invalid vehicle domain %q", domain)
 	}
 	return &VehicleSnapshot{
-		Org:           org,
-		Platform:      platform,
-		SysID:         sysid,
-		Title:         defaultVehicleTitle(sysid),
-		Domain:        domain,
-		Authority:     AuthorityMCUFailsafe,
-		CompanionMode: ModeDisarmed,
-		LinkTier:      LinkTierSITLLocal,
+		Org:                 org,
+		Platform:            platform,
+		SysID:               sysid,
+		Title:               defaultVehicleTitle(sysid),
+		Domain:              domain,
+		Authority:           AuthorityMCUFailsafe,
+		CompanionMode:       ModeDisarmed,
+		LinkTier:            LinkTierSITLLocal,
+		UnmeasuredAttitude:  true,
+		UnmeasuredLocalPos:  true,
+		UnmeasuredGlobalPos: true,
+		UnmeasuredHeading:   true,
 	}, nil
 }
 
@@ -153,6 +167,9 @@ func (s *VehicleSnapshot) Validate() error {
 	}
 	if s.Failsafes < 0 || s.CRCErrors < 0 || s.LoopDtUs < 0 || s.MaxLoopDtUs < 0 || s.RTTUs < 0 {
 		return errors.New("uxsvocab: health counters and durations must be non-negative")
+	}
+	if s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
+		return errors.New("uxsvocab: domain observation timestamps must be non-negative")
 	}
 
 	for i, v := range s.Quaternion {
@@ -277,9 +294,10 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 	if entityID == "" {
 		return nil
 	}
+	epochZero := time.Unix(0, 0).UTC()
 	ts := s.ObservedAt
 	if ts.IsZero() {
-		ts = time.Unix(0, 0).UTC()
+		ts = epochZero
 	} else {
 		ts = ts.UTC()
 	}
@@ -299,6 +317,32 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		}
 	}
 
+	poseTriple := func(predicate string, obj any, unmeasured bool, observedUnixNs int64) message.Triple {
+		if unmeasured {
+			return message.Triple{
+				Subject:    entityID,
+				Predicate:  predicate,
+				Object:     obj,
+				Source:     TripleSource,
+				Timestamp:  epochZero,
+				Confidence: 0.0,
+			}
+		}
+		obsTS := ts
+		if observedUnixNs > 0 {
+			obsTS = time.Unix(0, observedUnixNs).UTC()
+		}
+		return message.Triple{
+			Subject:    entityID,
+			Predicate:  predicate,
+			Object:     obj,
+			Source:     TripleSource,
+			Timestamp:  obsTS,
+			Confidence: 1.0,
+			Context:    "measured",
+		}
+	}
+
 	return []message.Triple{
 		triple(PredicateDomainKind, s.Domain),
 		triple(PredicateAuthorityState, s.Authority),
@@ -311,16 +355,16 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		triple(PredicateHealthLoopDtUs, s.LoopDtUs),
 		triple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs),
 		triple(PredicateHealthRTTUs, s.RTTUs),
-		triple(PredicateAttitudeQuaternion, s.Quaternion),
-		triple(PredicateAttitudeRates, s.BodyRates),
-		triple(PredicateKinematicsNED, s.NED),
-		triple(PredicateKinematicsVx, s.Vx),
-		triple(PredicateKinematicsVy, s.Vy),
-		triple(PredicateKinematicsVz, s.Vz),
-		triple(PredicateKinematicsHeadingDeg, s.HeadingDeg),
-		triple(vocabulary.GeoLocationLatitude, s.Latitude),
-		triple(vocabulary.GeoLocationLongitude, s.Longitude),
-		triple(vocabulary.GeoLocationAltitude, s.Altitude),
+		poseTriple(PredicateAttitudeQuaternion, s.Quaternion, s.UnmeasuredAttitude, s.AttitudeObservedUnixNs),
+		poseTriple(PredicateAttitudeRates, s.BodyRates, s.UnmeasuredAttitude, s.AttitudeObservedUnixNs),
+		poseTriple(PredicateKinematicsNED, s.NED, s.UnmeasuredLocalPos, s.LocalPosObservedUnixNs),
+		poseTriple(PredicateKinematicsVx, s.Vx, s.UnmeasuredLocalPos, s.LocalPosObservedUnixNs),
+		poseTriple(PredicateKinematicsVy, s.Vy, s.UnmeasuredLocalPos, s.LocalPosObservedUnixNs),
+		poseTriple(PredicateKinematicsVz, s.Vz, s.UnmeasuredLocalPos, s.LocalPosObservedUnixNs),
+		poseTriple(PredicateKinematicsHeadingDeg, s.HeadingDeg, s.UnmeasuredHeading, s.HeadingObservedUnixNs),
+		poseTriple(vocabulary.GeoLocationLatitude, s.Latitude, s.UnmeasuredGlobalPos, s.GlobalPosObservedUnixNs),
+		poseTriple(vocabulary.GeoLocationLongitude, s.Longitude, s.UnmeasuredGlobalPos, s.GlobalPosObservedUnixNs),
+		poseTriple(vocabulary.GeoLocationAltitude, s.Altitude, s.UnmeasuredGlobalPos, s.GlobalPosObservedUnixNs),
 		triple(vocabulary.DCTermsTitle, title),
 	}
 }

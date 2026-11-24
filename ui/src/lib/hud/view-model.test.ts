@@ -528,24 +528,19 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
     let canvasApp: Record<string, unknown> | null = null;
 
     try {
-      // Mount reactive wrapper driving VehicleHud from live skgStore vehicle lookup.
-      const mountHudForCurrentVehicle = (): void => {
-        if (hudApp) {
-          unmount(hudApp);
-        }
-        hudHost.innerHTML = "";
-        hudApp = mount(VehicleHud, {
-          target: hudHost,
-          props: {
-            telemetryStore,
-            vehicle: skgStore.getCommandableVehicle(entityId),
-            skgStatus: skgStore.status,
-            now: () => nowMs,
+      hudApp = mount(VehicleHud, {
+        target: hudHost,
+        props: {
+          telemetryStore,
+          get vehicle() {
+            return skgStore.getCommandableVehicle(entityId);
           },
-        });
-        flushSync();
-      };
-
+          get skgStatus() {
+            return skgStore.status;
+          },
+          now: () => nowMs,
+        },
+      });
       canvasApp = mount(TacticalCanvas, {
         target: canvasHost,
         props: {
@@ -556,9 +551,15 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           now: () => nowMs,
         },
       });
-      mountHudForCurrentVehicle();
+      flushSync();
+      flushAnimationTicks();
 
-      // Step 1: 1 WS1 frame arrives at +100ms -> WS1 wins on both HUD and canvas.
+      const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
+      expect(hudHost.querySelector('[data-testid="hud-readout"]')).toBeNull();
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+
+      // Step 1A: 1st WS1-only frame arrives at +100ms while WS2 is quiet and HUD stays mounted -> WS1 wins on both HUD and canvas.
       nowMs += 100;
       ws1Sockets[0]!.receive(
         JSON.stringify({
@@ -583,18 +584,51 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           },
         }),
       );
-      mountHudForCurrentVehicle();
       drawnTexts.length = 0;
       flushAnimationTicks();
 
-      const readout1 = hudHost.querySelector('[data-testid="hud-readout"]');
-      expect(readout1?.getAttribute("data-pose-source")).toBe("ws1");
-      expect(readout1?.getAttribute("data-stale")).toBe("false");
-      expect(readout1?.textContent).toContain("HDG 045°");
-      expect(readout1?.textContent).toContain("ALT 10.0m");
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+      expect(drawnTexts).toContain("045");
+      expect(drawnTexts).toContain("R 0° P 0° Y 45°");
+      expect(drawnTexts).toContain("GS 4.0m/s  VS +0.0m/s  ALT 10.0m");
       expect(adapter.getCamera().centerNed).toEqual([12, -6]);
 
-      // Step 2: WS1 disconnects while WS2 stays open and delivers 2 distinct newer poses.
+      // Step 1B: 2nd WS1-only frame arrives at +150ms while WS2 remains quiet and HUD stays mounted.
+      nowMs += 50;
+      ws1Sockets[0]!.receive(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 2,
+            msg_id: 32,
+            quat_wxyz: eulerRadToQuaternionWxyz(0, 0, (90 * Math.PI) / 180),
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [18, -9, -14],
+            has_local_pos: true,
+            ned_vel: [7.5, 0, 0],
+            lat_lon_alt: [30.2674, -97.7432, 164],
+            has_global_pos: true,
+            hdg_deg: 90,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      drawnTexts.length = 0;
+      flushAnimationTicks();
+
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(drawnTexts).toContain("R 0° P 0° Y 90°");
+      expect(drawnTexts).not.toContain("R 0° P 0° Y 45°");
+      expect(drawnTexts).toContain("GS 7.5m/s  VS +0.0m/s  ALT 14.0m");
+      expect(adapter.getCamera().centerNed).toEqual([18, -9]);
+
+      // Step 2: WS1 disconnects while WS2 stays open and delivers 2 distinct newer poses (HUD still never remounted).
       nowMs += 250;
       ws1Sockets[0]!.dropConnection();
       expect(telemetryStore.status).toBe("reconnecting");
@@ -612,15 +646,13 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         }),
       );
       flushSync();
-      mountHudForCurrentVehicle();
       drawnTexts.length = 0;
       flushAnimationTicks();
 
-      const readout2 = hudHost.querySelector('[data-testid="hud-readout"]');
-      expect(readout2?.getAttribute("data-pose-source")).toBe("skg");
-      expect(readout2?.getAttribute("data-stale")).toBe("false");
-      expect(readout2?.textContent).toContain("HDG 120°");
-      expect(readout2?.textContent).toContain("ALT 22.0m");
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+      expect(drawnTexts).toContain("R 0° P 0° Y 120°");
+      expect(drawnTexts).toContain("GS 5.0m/s  VS +0.0m/s  ALT 22.0m");
       expect(adapter.getCamera().centerNed).toEqual([30, 15]);
 
       nowMs += 250;
@@ -636,15 +668,13 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         }),
       );
       flushSync();
-      mountHudForCurrentVehicle();
       drawnTexts.length = 0;
       flushAnimationTicks();
 
-      const readout3 = hudHost.querySelector('[data-testid="hud-readout"]');
-      expect(readout3?.getAttribute("data-pose-source")).toBe("skg");
-      expect(readout3?.getAttribute("data-stale")).toBe("false");
-      expect(readout3?.textContent).toContain("HDG 215°");
-      expect(readout3?.textContent).toContain("ALT 34.0m");
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("false");
+      expect(drawnTexts).toContain("R 0° P 0° Y 215°");
+      expect(drawnTexts).toContain("GS 6.0m/s  VS +0.0m/s  ALT 34.0m");
       expect(adapter.getCamera().centerNed).toEqual([55, -20]);
 
       // Step 3: Neither feed updates past SKG_VEHICLE_FRESH_MS (and WS2 drops) -> STALE indicated on both HUD and canvas.
@@ -666,11 +696,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(
         hudHost.querySelector('[data-testid="hud-stale-badge"]')?.textContent,
       ).toBe("STALE");
-      expect(
-        hudHost
-          .querySelector('[data-testid="hud-readout"]')
-          ?.getAttribute("data-stale"),
-      ).toBe("true");
+      expect(hudPanel?.getAttribute("data-stale")).toBe("true");
       expect(drawnTexts).toContain("STALE TELEMETRY");
       expect(drawnTexts).toContain("#1 quadcopter · STALE");
       expect(
@@ -697,18 +723,40 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
   // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
   // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
-  it("preserves #33 GLOBAL_POSITION_INT heading before #31 ATTITUDE_QUATERNION arrives and shows attitude unavailable without false level flight", () => {
-    const nowMs = Date.parse("2026-11-24T12:05:00.000Z");
-    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+  it("preserves #33 GLOBAL_POSITION_INT heading before #31 ATTITUDE_QUATERNION arrives and clears NO ATT while keeping HUD mounted", () => {
+    let nowMs = Date.parse("2026-11-24T12:05:00.000Z");
+    let ws1Socket: WebSocketLike | null = null;
+    const telemetryStore = createTelemetryStore({
+      now: () => nowMs,
+      createSocket: () => {
+        const s: WebSocketLike = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: () => undefined,
+          close: () => undefined,
+        };
+        ws1Socket = s;
+        return s;
+      },
+    });
+    telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+    ws1Socket!.onopen?.(new Event("open") as never);
+
     const skgStore = createSkgStore({ now: () => nowMs });
 
     const preAttitudeVehicle = makeSampleVehicle({
       attitudeQuaternion: [0, 0, 0, 0],
+      hasAttitude: false,
       headingDeg: 90,
       ned: [0, 0, -15],
       velocityNed: [0, 5, 0],
       observedAt: new Date(nowMs).toISOString(),
+      poseObservedAt: new Date(nowMs).toISOString(),
       ingestedAtMs: nowMs,
+      poseIngestedAtMs: nowMs,
     });
     skgStore.entities.set(preAttitudeVehicle.id, preAttitudeVehicle);
 
@@ -717,6 +765,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       makeSampleVehicle({
         attitudeQuaternion: [1, 0, 0, 0],
         headingDeg: 90,
+        observedAt: new Date(nowMs).toISOString(),
         ingestedAtMs: nowMs,
       }),
       { nowMs },
@@ -751,7 +800,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
     const prePose = resolveLiveVehiclePose(preAttitudeVehicle, {
       fast: telemetryStore.getKinematics(1),
-      telemetryStatus: "connected",
+      telemetryStatus: telemetryStore.status,
       skgStatus: "connected",
       nowMs,
     });
@@ -836,7 +885,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         target: hudHost,
         props: {
           telemetryStore,
-          vehicle: preAttitudeVehicle,
+          get vehicle() {
+            return skgStore.getCommandableVehicle(preAttitudeVehicle.id);
+          },
           skgStatus: "connected",
           now: () => nowMs,
         },
@@ -857,14 +908,13 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       }
       flushSync();
 
+      const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
       // Pre-#31 assertions: 90 deg East heading honored; attitude marked unavailable.
       expect(
         hudHost.querySelector('[data-testid="hud-attitude-unavailable"]')
           ?.textContent,
       ).toContain("NO ATT");
-      const readout = hudHost.querySelector('[data-testid="hud-readout"]');
-      expect(readout?.getAttribute("data-attitude")).toBe("unavailable");
-      expect(readout?.textContent).toContain("HDG 090°");
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
       expect(drawnTexts.some((t) => t.text === "ATTITUDE UNAVAILABLE")).toBe(
         true,
       );
@@ -886,12 +936,13 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         ),
       ).toBe(true);
 
-      // Now deliver genuine #31 ATTITUDE_QUATERNION level North ([1, 0, 0, 0], has_attitude: true).
+      // Deliver genuine #31 ATTITUDE_QUATERNION on WS1 ONLY while WS2 stays untouched and VehicleHud stays mounted!
+      nowMs += 50;
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
           subject: "bbops.telemetry.1",
-          timestamp: nowMs + 50,
+          timestamp: nowMs,
           payload: {
             sysid: 1,
             domain: "quadcopter",
@@ -906,41 +957,24 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
             lat_lon_alt: [30.2672, -97.7431, 165],
             has_global_pos: true,
             hdg_deg: 0,
-            timestamp: nowMs + 50,
+            timestamp: nowMs,
           },
         }),
       );
-      unmount(hudApp);
-      hudHost.innerHTML = "";
       drawnTexts.length = 0;
-      hudApp = mount(VehicleHud, {
-        target: hudHost,
-        props: {
-          telemetryStore,
-          vehicle: makeSampleVehicle({
-            attitudeQuaternion: [1, 0, 0, 0],
-            headingDeg: 0,
-            ingestedAtMs: nowMs + 50,
-          }),
-          skgStatus: "connected",
-          now: () => nowMs + 50,
-        },
-      });
-      flushSync();
       for (const cb of rafCallbacks.splice(0, rafCallbacks.length)) {
-        cb(nowMs + 50);
+        cb(nowMs);
       }
       flushSync();
 
       expect(
         hudHost.querySelector('[data-testid="hud-attitude-unavailable"]'),
       ).toBeNull();
-      expect(
-        hudHost
-          .querySelector('[data-testid="hud-readout"]')
-          ?.getAttribute("data-attitude"),
-      ).toBe("measured");
+      expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
       expect(drawnTexts.some((t) => t.text === "R 0° P 0° Y 0°")).toBe(true);
+      const northTick = drawnTexts.find((t) => t.text === "N");
+      expect(northTick?.x).toBeCloseTo(150, 5);
     } finally {
       if (hudApp) {
         unmount(hudApp);
@@ -948,11 +982,275 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       if (canvasApp) {
         unmount(canvasApp);
       }
+      telemetryStore.disconnect();
       hudHost.remove();
       canvasHost.remove();
       getCtxSpy.mockRestore();
       rafSpy.mockRestore();
       cafSpy.mockRestore();
+    }
+  });
+
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("flags replayed old SKG snapshots stale, preserves newer cached WS1 pose across reconnects, accepts genuine new SKG pose, and ignores health-only updates for pose freshness", () => {
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.1";
+    let nowMs = Date.parse("2026-11-24T12:00:00.000Z");
+    const skgStore = createSkgStore({ now: () => nowMs });
+
+    const makePut = (
+      revision: number,
+      poseIso: string,
+      healthIso: string,
+      ned: [number, number, number],
+      headingDeg: number,
+      crcErrors = 0,
+    ): string => {
+      const mk = (
+        predicate: string,
+        object: unknown,
+        timestamp: string,
+      ): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "bbops-mavlink-ingest",
+        timestamp,
+        confidence: 1,
+        ...(predicate.startsWith("uxs.kinematics.") ||
+        predicate.startsWith("uxs.attitude.") ||
+        predicate.startsWith("geo.location.")
+          ? { context: "measured" }
+          : {}),
+      });
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision,
+        payload: {
+          id: entityId,
+          updated_at: healthIso,
+          triples: [
+            mk("uxs.domain.kind", "quadcopter", healthIso),
+            mk("uxs.authority.state", "companion-teleop", healthIso),
+            mk("uxs.mode.companion", "teleop-velocity", healthIso),
+            mk("uxs.link.tier", "mesh-high-rate", healthIso),
+            mk("uxs.health.armed", true, healthIso),
+            mk(
+              "uxs.health.flags",
+              {
+                clock_sync_locked: true,
+                teleop_deadman_clamped: false,
+                crsf_link_healthy: true,
+                companion_trunk_healthy: true,
+              },
+              healthIso,
+            ),
+            mk("uxs.health.failsafes", 0, healthIso),
+            mk("uxs.health.crcerrors", crcErrors, healthIso),
+            mk("uxs.health.loopdtus", 1000, healthIso),
+            mk("uxs.health.maxloopdtus", 1200, healthIso),
+            mk("uxs.health.rttus", 400, healthIso),
+            mk(
+              "uxs.attitude.quaternion",
+              eulerRadToQuaternionWxyz(0, 0, (headingDeg * Math.PI) / 180),
+              poseIso,
+            ),
+            mk("uxs.attitude.rates", [0, 0, 0], poseIso),
+            mk("uxs.kinematics.ned", ned, poseIso),
+            mk("uxs.kinematics.vx", 0, poseIso),
+            mk("uxs.kinematics.vy", 0, poseIso),
+            mk("uxs.kinematics.vz", 0, poseIso),
+            mk("uxs.kinematics.headingdeg", headingDeg, poseIso),
+            mk("geo.location.latitude", 30.2672, poseIso),
+            mk("geo.location.longitude", -97.7431, poseIso),
+            mk("geo.location.altitude", 160, poseIso),
+          ],
+        },
+      });
+    };
+
+    // 1. Hour-old observation delivered right now on WS2 must evaluate stale: true.
+    const hourOldIso = new Date(nowMs - 3_600_000).toISOString();
+    skgStore.ingestRawFrame(
+      makePut(1, hourOldIso, new Date(nowMs).toISOString(), [5, 5, -3], 45),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+    const replayedOld = skgStore.getCommandableVehicle(entityId)!;
+    const oldOnlyPose = resolveLiveVehiclePose(replayedOld, {
+      skgStatus: "connected",
+      nowMs,
+    });
+    expect(oldOnlyPose.source).toBe("skg");
+    expect(oldOnlyPose.stale).toBe(true);
+
+    // 2. With a newer cached WS1 observation and WS1 reconnecting, an older SKG replay MUST NOT displace WS1.
+    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+    nowMs += 5_000;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: nowMs,
+        payload: {
+          sysid: 1,
+          domain: "quadcopter",
+          seq: 8,
+          msg_id: 32,
+          quat_wxyz: eulerRadToQuaternionWxyz(0, 0, (270 * Math.PI) / 180),
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [42, -18, -12],
+          has_local_pos: true,
+          ned_vel: [0, -3, 0],
+          lat_lon_alt: [30.2675, -97.7435, 162],
+          has_global_pos: true,
+          hdg_deg: 270,
+          timestamp: nowMs,
+        },
+      }),
+    );
+
+    // WS1 drops to reconnecting and WS2 replays an older t0+1000ms snapshot at t0+6200ms.
+    const olderSkgIso = new Date(nowMs - 4_000).toISOString();
+    nowMs += 1_200;
+    skgStore.ingestRawFrame(
+      makePut(2, olderSkgIso, olderSkgIso, [8, 8, -4], 60),
+    );
+    const afterOlderReplay = resolveLiveVehiclePose(
+      skgStore.getCommandableVehicle(entityId)!,
+      {
+        fast: telemetryStore.getKinematics(1),
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs,
+      },
+    );
+    expect(afterOlderReplay.source).toBe("ws1");
+    expect(afterOlderReplay.ned).toEqual([42, -18, -12]);
+    expect(afterOlderReplay.headingDeg).toBe(270);
+    expect(afterOlderReplay.stale).toBe(true);
+
+    // 3. Genuine new SKG pose arrives at t0+6500ms -> displaces older cached WS1 and is live!
+    nowMs += 300;
+    const genuineNewPoseIso = new Date(nowMs).toISOString();
+    skgStore.ingestRawFrame(
+      makePut(3, genuineNewPoseIso, genuineNewPoseIso, [60, -22, -15], 300),
+    );
+    const afterGenuinePose = resolveLiveVehiclePose(
+      skgStore.getCommandableVehicle(entityId)!,
+      {
+        fast: telemetryStore.getKinematics(1),
+        telemetryStatus: "reconnecting",
+        skgStatus: "connected",
+        nowMs: nowMs + 100,
+      },
+    );
+    expect(afterGenuinePose.source).toBe("skg");
+    expect(afterGenuinePose.stale).toBe(false);
+    expect(afterGenuinePose.ned).toEqual([60, -22, -15]);
+    expect(afterGenuinePose.headingDeg).toBe(300);
+
+    // 4. Health-only update 3 seconds later (past SKG_VEHICLE_FRESH_MS) must NOT refresh pose age!
+    nowMs += SKG_VEHICLE_FRESH_MS + 500;
+    const healthOnlyIso = new Date(nowMs).toISOString();
+    skgStore.ingestRawFrame(
+      makePut(4, genuineNewPoseIso, healthOnlyIso, [60, -22, -15], 300, 4),
+    );
+    const vehAfterHealth = skgStore.getCommandableVehicle(entityId)!;
+    expect(vehAfterHealth.sysStatus.crcErrors).toBe(4);
+    const afterHealthUpdate = resolveLiveVehiclePose(vehAfterHealth, {
+      fast: telemetryStore.getKinematics(1),
+      telemetryStatus: "reconnecting",
+      skgStatus: "connected",
+      nowMs,
+    });
+    expect(afterHealthUpdate.source).toBe("skg");
+    expect(afterHealthUpdate.stale).toBe(true);
+  });
+
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("evaluates WS1 timeout on the local browser clock across both +60s and -60s server clock offsets while WS1 stays open and silent", () => {
+    for (const skewMs of [60_000, -60_000]) {
+      let browserNowMs = Date.parse("2026-11-24T12:20:00.000Z");
+      let ws1Socket: WebSocketLike | null = null;
+      const telemetryStore = createTelemetryStore({
+        now: () => browserNowMs,
+        createSocket: () => {
+          const s: WebSocketLike = {
+            readyState: 1,
+            onopen: null,
+            onmessage: null,
+            onerror: null,
+            onclose: null,
+            send: () => undefined,
+            close: () => undefined,
+          };
+          ws1Socket = s;
+          return s;
+        },
+      });
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Socket!.onopen?.(new Event("open") as never);
+      expect(telemetryStore.status).toBe("connected");
+
+      const initialServerMs = browserNowMs + skewMs - 5_000;
+      const vehicle = makeSampleVehicle({
+        observedAt: new Date(initialServerMs).toISOString(),
+        poseObservedAt: new Date(initialServerMs).toISOString(),
+      });
+
+      const serverFrameMs = browserNowMs + skewMs;
+      ws1Socket!.onmessage?.({
+        data: JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: serverFrameMs,
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 1,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [20, -10, -8],
+            has_local_pos: true,
+            ned_vel: [2, 0, 0],
+            lat_lon_alt: [30.2672, -97.7431, 158],
+            has_global_pos: true,
+            hdg_deg: 0,
+            timestamp: serverFrameMs,
+          },
+        }),
+      } as MessageEvent<unknown>);
+
+      // At +200ms on the browser clock with WS2 disconnected, both +60s and -60s server skews are live.
+      browserNowMs += 200;
+      const liveCheck = resolveLiveVehiclePose(vehicle, {
+        fast: telemetryStore.getKinematics(1),
+        telemetryStatus: telemetryStore.status,
+        skgStatus: "reconnecting",
+        nowMs: browserNowMs,
+      });
+      expect(liveCheck.source, `skew=${skewMs}`).toBe("ws1");
+      expect(liveCheck.stale, `skew=${skewMs}`).toBe(false);
+
+      // Keep WS1 open ("connected") and silent for 10 seconds -> MUST time out to stale: true!
+      browserNowMs += 9_800;
+      expect(telemetryStore.status).toBe("connected");
+      const silentCheck = resolveLiveVehiclePose(vehicle, {
+        fast: telemetryStore.getKinematics(1),
+        telemetryStatus: telemetryStore.status,
+        skgStatus: "reconnecting",
+        nowMs: browserNowMs,
+      });
+      expect(silentCheck.source, `skew=${skewMs}`).toBe("ws1");
+      expect(silentCheck.stale, `skew=${skewMs}`).toBe(true);
+
+      telemetryStore.disconnect();
     }
   });
 

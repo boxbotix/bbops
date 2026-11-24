@@ -410,51 +410,72 @@ export function resolveLiveVehiclePose(
   const fast = options.fast;
 
   const ws1Connected = options.telemetryStatus === "connected";
-  const ws1AgeMs =
-    fast !== undefined
-      ? Math.max(0, nowMs - fast.receivedAtMs)
+  const ws1ElapsedMs =
+    fast !== undefined && isFiniteNumber(fast.receivedAtMs)
+      ? nowMs - fast.receivedAtMs
       : Number.POSITIVE_INFINITY;
   const ws1Fresh =
-    fast !== undefined && ws1Connected && ws1AgeMs <= WS1_KINEMATICS_FRESH_MS;
+    fast !== undefined &&
+    ws1Connected &&
+    ws1ElapsedMs >= -WS1_KINEMATICS_FRESH_MS &&
+    ws1ElapsedMs <= WS1_KINEMATICS_FRESH_MS;
 
-  const skgSampleMs =
-    parseIsoEpochMs(vehicle.observedAt) ?? parseIsoEpochMs(vehicle.updatedAt);
-  const skgReceiptMs = vehicle.ingestedAtMs ?? skgSampleMs ?? Number.NaN;
+  const skgPoseMs =
+    vehicle.poseObservedAt !== undefined
+      ? parseIsoEpochMs(vehicle.poseObservedAt)
+      : parseIsoEpochMs(vehicle.observedAt);
   const skgConnected =
     options.skgStatus === undefined || options.skgStatus === "connected";
-  const skgAgeMs = Number.isFinite(skgReceiptMs)
-    ? Math.max(0, nowMs - skgReceiptMs)
-    : Number.POSITIVE_INFINITY;
+  const skgObsElapsedMs =
+    skgPoseMs !== null && skgPoseMs > 0
+      ? nowMs - skgPoseMs
+      : Number.POSITIVE_INFINITY;
+  const skgPoseReceiptMs =
+    vehicle.poseIngestedAtMs !== undefined
+      ? vehicle.poseIngestedAtMs
+      : (vehicle.ingestedAtMs ?? null);
+  const skgReceiptElapsedMs =
+    skgPoseReceiptMs !== null && isFiniteNumber(skgPoseReceiptMs)
+      ? nowMs - skgPoseReceiptMs
+      : null;
   const skgFresh =
     skgConnected &&
     vehicle.feedStatus !== "stale" &&
     vehicle.feedStatus !== "disconnected" &&
-    skgAgeMs <= SKG_VEHICLE_FRESH_MS;
+    skgObsElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
+    skgObsElapsedMs <= SKG_VEHICLE_FRESH_MS &&
+    (skgReceiptElapsedMs === null ||
+      (skgReceiptElapsedMs >= -SKG_VEHICLE_FRESH_MS &&
+        skgReceiptElapsedMs <= SKG_VEHICLE_FRESH_MS));
 
-  let skgNewer = false;
+  let useFast = false;
   if (fast !== undefined) {
-    const comparableClocks =
-      skgSampleMs !== null &&
-      skgSampleMs >= MIN_COMPARABLE_EPOCH_MS &&
+    if (skgPoseMs === null || skgPoseMs <= 0) {
+      useFast = true;
+    } else if (
+      skgPoseMs >= MIN_COMPARABLE_EPOCH_MS &&
       isFiniteNumber(fast.timestamp) &&
-      fast.timestamp >= MIN_COMPARABLE_EPOCH_MS;
-    if (comparableClocks) {
-      if (skgSampleMs > fast.timestamp) {
-        skgNewer = true;
-      } else if (
-        (!ws1Connected || skgSampleMs === fast.timestamp) &&
-        Number.isFinite(skgReceiptMs) &&
-        skgReceiptMs > fast.receivedAtMs
-      ) {
-        skgNewer = true;
+      fast.timestamp >= MIN_COMPARABLE_EPOCH_MS
+    ) {
+      if (fast.timestamp > skgPoseMs) {
+        useFast = true;
+      } else if (skgPoseMs > fast.timestamp) {
+        useFast = false;
+      } else {
+        useFast = ws1Fresh || !skgFresh;
       }
-    } else if (Number.isFinite(skgReceiptMs)) {
-      skgNewer = skgReceiptMs > fast.receivedAtMs;
+    } else if (ws1Fresh && !skgFresh) {
+      useFast = true;
+    } else if (skgFresh && !ws1Fresh) {
+      useFast = false;
+    } else if (skgPoseReceiptMs !== null && isFiniteNumber(skgPoseReceiptMs)) {
+      useFast = fast.receivedAtMs >= skgPoseReceiptMs;
+    } else {
+      useFast = true;
     }
   }
 
-  const useFast = fast !== undefined && !skgNewer && (ws1Fresh || !skgFresh);
-  const stale = !(ws1Fresh || skgFresh);
+  const stale = !(useFast ? ws1Fresh : skgFresh);
 
   if (useFast && fast !== undefined) {
     const quat: [number, number, number, number] = [
@@ -477,7 +498,7 @@ export function resolveLiveVehiclePose(
       fast.lat_lon_alt[1] <= 180
         ? [fast.lat_lon_alt[0], fast.lat_lon_alt[1], fast.lat_lon_alt[2]]
         : null;
-    const hasLocalPos = fast.has_local_pos ?? true;
+    const hasLocalPos = fast.has_local_pos === true;
     return {
       source: "ws1",
       stale,
@@ -499,26 +520,43 @@ export function resolveLiveVehiclePose(
     vehicle.attitudeQuaternion[3],
   ];
   const headingDeg = normalizeHeadingDeg360(vehicle.headingDeg);
-  const hasAttitude = isMeasuredAttitudeQuaternion(quat, vehicle.headingDeg);
-  const lla: [number, number, number] | null = isValidNonZeroLla(
-    vehicle.location.latitude,
-    vehicle.location.longitude,
-    vehicle.location.altitude,
-  )
-    ? [
-        vehicle.location.latitude,
-        vehicle.location.longitude,
-        vehicle.location.altitude,
-      ]
-    : null;
-  const ws1HasUnanchoredLocalPos =
-    fast !== undefined && fast.has_local_pos === false;
+  const hasAttitude =
+    (vehicle.hasAttitude ?? true) &&
+    isMeasuredAttitudeQuaternion(quat, vehicle.headingDeg);
+  const lla: [number, number, number] | null =
+    (vehicle.hasGlobalPos ?? true) &&
+    isValidNonZeroLla(
+      vehicle.location.latitude,
+      vehicle.location.longitude,
+      vehicle.location.altitude,
+    )
+      ? [
+          vehicle.location.latitude,
+          vehicle.location.longitude,
+          vehicle.location.altitude,
+        ]
+      : null;
+  const hasNonZeroVehicleLocalKinematics =
+    vehicle.ned[0] !== 0 ||
+    vehicle.ned[1] !== 0 ||
+    vehicle.ned[2] !== 0 ||
+    vehicle.velocityNed[0] !== 0 ||
+    vehicle.velocityNed[1] !== 0 ||
+    vehicle.velocityNed[2] !== 0;
+  const skgHasConfirmedLocalPos =
+    vehicle.hasLocalPos === true ||
+    (vehicle.hasLocalPos === undefined && hasNonZeroVehicleLocalKinematics);
+  const ws1ContradictsLocalPos =
+    fast !== undefined &&
+    fast.has_local_pos === false &&
+    (skgPoseMs === null || fast.timestamp >= skgPoseMs);
 
   return {
     source: "skg",
     stale,
     hasAttitude,
-    hasVerifiedFrameReference: !ws1HasUnanchoredLocalPos && lla !== null,
+    hasVerifiedFrameReference:
+      skgHasConfirmedLocalPos && !ws1ContradictsLocalPos && lla !== null,
     quat,
     ned: [vehicle.ned[0], vehicle.ned[1], vehicle.ned[2]],
     vel: [

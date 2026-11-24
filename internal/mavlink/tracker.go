@@ -411,10 +411,15 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Quaternion = unitQ
 	next.BodyRates = rates
 	next.HeadingDeg = hdgDeg
+	next.UnmeasuredAttitude = false
+	next.AttitudeObservedUnixNs = obsNs
+	next.UnmeasuredHeading = false
+	next.HeadingObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}
@@ -452,11 +457,14 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.NED = ned
 	next.Vx = vx
 	next.Vy = vy
 	next.Vz = vz
+	next.UnmeasuredLocalPos = false
+	next.LocalPosObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}
@@ -500,12 +508,17 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Latitude = lat
 	next.Longitude = lon
 	next.Altitude = alt
+	next.UnmeasuredGlobalPos = false
+	next.GlobalPosObservedUnixNs = obsNs
 	if !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg {
 		next.HeadingDeg = float64(msg.Hdg) / 100.0
+		next.UnmeasuredHeading = false
+		next.HeadingObservedUnixNs = obsNs
 	}
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
@@ -727,6 +740,16 @@ func marshalSnapshotBaseMessage(snap uxsvocab.VehicleSnapshot) ([]byte, error) {
 	}
 	msg := message.NewBaseMessage(snap.Schema(), &snap, uxsvocab.TripleSource)
 	return json.Marshal(msg)
+}
+
+func unixNanoOrZero(ts time.Time) int64 {
+	if ts.IsZero() {
+		return 0
+	}
+	if ns := ts.UTC().UnixNano(); ns > 0 {
+		return ns
+	}
+	return 0
 }
 
 func isFinite(v float64) bool {

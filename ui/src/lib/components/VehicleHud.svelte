@@ -5,6 +5,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
+    type ResolvedVehiclePose,
     computeFlightMetrics,
     formatLinkTierBadge,
     quaternionToEulerDeg,
@@ -29,36 +30,41 @@
   }: Props = $props();
 
   let canvasEl: HTMLCanvasElement | undefined = $state();
-  let clockStaleOverride = $state<boolean | null>(null);
+  let poseSource = $state<"ws1" | "skg">("skg");
+  let isStale = $state(false);
+  let hasAttitude = $state(false);
 
   const linkBadge = $derived(
     vehicle ? formatLinkTierBadge(vehicle.linkTier) : null,
   );
 
-  const livePose = $derived.by(() => {
-    if (!vehicle) {
-      return null;
+  function syncDiscreteHudState(pose: ResolvedVehiclePose): void {
+    if (poseSource !== pose.source) {
+      poseSource = pose.source;
     }
-    return resolveLiveVehiclePose(vehicle, {
+    if (isStale !== pose.stale) {
+      isStale = pose.stale;
+    }
+    if (hasAttitude !== pose.hasAttitude) {
+      hasAttitude = pose.hasAttitude;
+    }
+  }
+
+  $effect(() => {
+    if (!vehicle) {
+      isStale = false;
+      hasAttitude = false;
+      poseSource = "skg";
+      return;
+    }
+    const pose = resolveLiveVehiclePose(vehicle, {
       fast: telemetryStore.getKinematics(vehicle.sysid),
       telemetryStatus: telemetryStore.status,
       skgStatus,
       nowMs: now(),
     });
+    syncDiscreteHudState(pose);
   });
-
-  $effect(() => {
-    void livePose;
-    clockStaleOverride = null;
-  });
-
-  const isStale = $derived(
-    livePose ? (clockStaleOverride ?? livePose.stale) : false,
-  );
-
-  const liveFlight = $derived(
-    livePose ? computeFlightMetrics(livePose.ned, livePose.vel) : null,
-  );
 
   function get2dContext(
     canvas: HTMLCanvasElement,
@@ -81,15 +87,8 @@
     ctx: CanvasRenderingContext2D,
     widthPx: number,
     heightPx: number,
-    activeVehicle: VehicleEntityState,
-    nowMs: number,
-  ): boolean {
-    const pose = resolveLiveVehiclePose(activeVehicle, {
-      fast: telemetryStore.getKinematics(activeVehicle.sysid),
-      telemetryStatus: telemetryStore.status,
-      skgStatus,
-      nowMs,
-    });
+    pose: ResolvedVehiclePose,
+  ): void {
     const euler = pose.hasAttitude ? quaternionToEulerDeg(pose.quat) : null;
     const flight = computeFlightMetrics(pose.ned, pose.vel);
 
@@ -258,7 +257,6 @@
       ctx.fillText(`R -- P -- HDG ${hdgLabel}°`, widthPx - 10, bottomY);
     }
     ctx.restore();
-    return pose.stale;
   }
 
   onMount(() => {
@@ -266,15 +264,13 @@
     const renderTick = (): void => {
       if (vehicle) {
         const nowMs = now();
-        const freshCheck = resolveLiveVehiclePose(vehicle, {
+        const pose = resolveLiveVehiclePose(vehicle, {
           fast: telemetryStore.getKinematics(vehicle.sysid),
           telemetryStatus: telemetryStore.status,
           skgStatus,
           nowMs,
         });
-        if (clockStaleOverride !== freshCheck.stale) {
-          clockStaleOverride = freshCheck.stale;
-        }
+        syncDiscreteHudState(pose);
         if (canvasEl) {
           const widthPx = Math.max(220, canvasEl.clientWidth || 300);
           const heightPx = Math.max(150, canvasEl.clientHeight || 190);
@@ -288,7 +284,7 @@
           const ctx = get2dContext(canvasEl);
           if (ctx) {
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-            drawHorizonAndTape(ctx, widthPx, heightPx, vehicle, nowMs);
+            drawHorizonAndTape(ctx, widthPx, heightPx, pose);
           }
         }
       }
@@ -299,8 +295,18 @@
   });
 </script>
 
-<section class="hud-panel" data-testid="vehicle-hud">
-  {#if vehicle && linkBadge && livePose && liveFlight}
+<section
+  class="hud-panel"
+  data-testid="vehicle-hud"
+  data-pose-source={vehicle ? poseSource : undefined}
+  data-stale={vehicle ? (isStale ? "true" : "false") : undefined}
+  data-attitude={vehicle
+    ? hasAttitude
+      ? "measured"
+      : "unavailable"
+    : undefined}
+>
+  {#if vehicle && linkBadge}
     <header class="hud-header">
       <span class="hud-title">
         SYS#{vehicle.sysid} · {vehicle.domain}
@@ -309,7 +315,7 @@
         {#if isStale}
           <span class="stale-badge" data-testid="hud-stale-badge">STALE</span>
         {/if}
-        {#if !livePose.hasAttitude}
+        {#if !hasAttitude}
           <span class="no-att-badge" data-testid="hud-attitude-unavailable">
             NO ATT
           </span>
@@ -319,17 +325,6 @@
         </span>
       </span>
     </header>
-    <div
-      class="hud-readout"
-      data-testid="hud-readout"
-      data-pose-source={livePose.source}
-      data-stale={isStale ? "true" : "false"}
-      data-attitude={livePose.hasAttitude ? "measured" : "unavailable"}
-    >
-      HDG {String(Math.round(livePose.headingDeg) % 360).padStart(3, "0")}° · GS {liveFlight.groundspeedMps.toFixed(
-        1,
-      )}m/s · ALT {liveFlight.altitudeRelM.toFixed(1)}m
-    </div>
     <canvas
       bind:this={canvasEl}
       class="hud-canvas"
@@ -359,7 +354,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 6px;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px;
   }
@@ -403,16 +398,9 @@
     font-size: 11px;
   }
 
-  .hud-readout {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    color: var(--ui-text-secondary, #94a3b8);
-    margin-bottom: 4px;
-  }
-
   .hud-canvas {
     width: 100%;
-    height: 172px;
+    height: 184px;
     display: block;
     border-radius: 4px;
   }

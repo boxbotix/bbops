@@ -115,6 +115,11 @@ export interface VehicleEntityState extends CopEntityBase {
     longitude: number;
     altitude: number;
   };
+  hasAttitude?: boolean;
+  hasLocalPos?: boolean;
+  hasGlobalPos?: boolean;
+  poseObservedAt?: string | null;
+  poseIngestedAtMs?: number | null;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -498,6 +503,79 @@ export function parseCopEntityState(
           latestUxsTriple = selectWinningTriple(latestUxsTriple, triple);
         }
       }
+      const posePredicates = [
+        "uxs.attitude.quaternion",
+        "uxs.attitude.rates",
+        "uxs.kinematics.ned",
+        "uxs.kinematics.vx",
+        "uxs.kinematics.vy",
+        "uxs.kinematics.vz",
+        "uxs.kinematics.headingdeg",
+        "geo.location.latitude",
+        "geo.location.longitude",
+        "geo.location.altitude",
+      ] as const;
+      const isMeasuredAssertion = (
+        triple: SkgTriple | undefined,
+      ): triple is SkgTriple =>
+        triple !== undefined &&
+        triple.confidence > 0 &&
+        normalizeKnownTimestamp(triple.timestamp) !== null;
+
+      let latestPoseTriple: SkgTriple | undefined;
+      for (const pred of posePredicates) {
+        const candidate = byPredicate[pred];
+        if (isMeasuredAssertion(candidate)) {
+          latestPoseTriple = selectWinningTriple(latestPoseTriple, candidate);
+        }
+      }
+
+      const quatTriple = byPredicate["uxs.attitude.quaternion"];
+      const nedTriple = byPredicate["uxs.kinematics.ned"];
+      const latTriple = byPredicate["geo.location.latitude"];
+      const lonTriple = byPredicate["geo.location.longitude"];
+      const quatNormSq =
+        quat[0] * quat[0] +
+        quat[1] * quat[1] +
+        quat[2] * quat[2] +
+        quat[3] * quat[3];
+      const wrappedHeading = ((headingDeg % 360) + 360) % 360;
+      const headingDistFromNorth = Math.min(
+        wrappedHeading,
+        360 - wrappedHeading,
+      );
+      const isUnmeasuredIdentityQuat =
+        quatTriple?.context !== "measured" &&
+        Math.abs(quat[0] - 1) < 1e-9 &&
+        Math.abs(quat[1]) < 1e-9 &&
+        Math.abs(quat[2]) < 1e-9 &&
+        Math.abs(quat[3]) < 1e-9 &&
+        headingDistFromNorth > 0.5;
+      const hasAttitude =
+        isMeasuredAssertion(quatTriple) &&
+        quatNormSq >= 1e-6 &&
+        !isUnmeasuredIdentityQuat;
+      const hasNonZeroLocalKinematics =
+        ned[0] !== 0 ||
+        ned[1] !== 0 ||
+        ned[2] !== 0 ||
+        vx !== 0 ||
+        vy !== 0 ||
+        vz !== 0;
+      const hasLocalPos =
+        isMeasuredAssertion(nedTriple) &&
+        (nedTriple.context === "measured" || hasNonZeroLocalKinematics);
+      const hasGlobalPos =
+        isMeasuredAssertion(latTriple) &&
+        isMeasuredAssertion(lonTriple) &&
+        (latTriple.context === "measured" ||
+          lat !== 0 ||
+          lon !== 0 ||
+          alt !== 0);
+
+      const poseObservedAt = normalizeKnownTimestamp(
+        latestPoseTriple?.timestamp,
+      );
       const vehicleObservedAt =
         base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
       const vehicleSource =
@@ -506,6 +584,10 @@ export function parseCopEntityState(
         ...base,
         source: vehicleSource,
         observedAt: vehicleObservedAt,
+        poseObservedAt,
+        hasAttitude,
+        hasLocalPos,
+        hasGlobalPos,
         kind: "uxs-vehicle",
         org: vehicleIdentity.org,
         platform: vehicleIdentity.platform,
@@ -618,6 +700,55 @@ function buildPoisonedEntity(
   };
 }
 
+function tuplesEqual(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function didVehiclePoseAdvance(
+  prior: CopEntityState | undefined,
+  next: VehicleEntityState,
+): boolean {
+  if (!next.poseObservedAt) {
+    return false;
+  }
+  if (
+    prior === undefined ||
+    prior.kind !== "uxs-vehicle" ||
+    !prior.poseObservedAt
+  ) {
+    return true;
+  }
+  const nextNs = parseTripleInstantNs(next.poseObservedAt);
+  const priorNs = parseTripleInstantNs(prior.poseObservedAt);
+  if (nextNs > priorNs) {
+    return true;
+  }
+  if (nextNs < priorNs) {
+    return false;
+  }
+  return (
+    next.hasAttitude !== prior.hasAttitude ||
+    next.hasLocalPos !== prior.hasLocalPos ||
+    next.hasGlobalPos !== prior.hasGlobalPos ||
+    next.headingDeg !== prior.headingDeg ||
+    next.location.latitude !== prior.location.latitude ||
+    next.location.longitude !== prior.location.longitude ||
+    next.location.altitude !== prior.location.altitude ||
+    !tuplesEqual(next.attitudeQuaternion, prior.attitudeQuaternion) ||
+    !tuplesEqual(next.attitudeRates, prior.attitudeRates) ||
+    !tuplesEqual(next.ned, prior.ned) ||
+    !tuplesEqual(next.velocityNed, prior.velocityNed)
+  );
+}
+
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   const now = options.now ?? (() => Date.now());
   const envUrl =
@@ -713,7 +844,13 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     const key = parsed.key;
 
     if (parsed.type === "put") {
-      const entity = parseCopEntityState(parsed.payload, revision, key, now());
+      const receiptMs = now();
+      const entity = parseCopEntityState(
+        parsed.payload,
+        revision,
+        key,
+        receiptMs,
+      );
       if (!entity) {
         malformedFrames += 1;
         return;
@@ -723,12 +860,26 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         if (prevStaged && revision > 0 && revision < prevStaged.kvRevision) {
           return;
         }
+        if (entity.kind === "uxs-vehicle") {
+          const priorVehicle = prevStaged ?? entities.get(key);
+          entity.poseIngestedAtMs =
+            priorVehicle?.kind === "uxs-vehicle"
+              ? (priorVehicle.poseIngestedAtMs ?? null)
+              : null;
+        }
         stagedSnapshot.set(key, entity);
         return;
       }
       const prevLive = entities.get(key);
       if (prevLive && revision > 0 && revision < prevLive.kvRevision) {
         return;
+      }
+      if (entity.kind === "uxs-vehicle") {
+        entity.poseIngestedAtMs = didVehiclePoseAdvance(prevLive, entity)
+          ? receiptMs
+          : prevLive?.kind === "uxs-vehicle"
+            ? (prevLive.poseIngestedAtMs ?? null)
+            : null;
       }
       entities.set(key, entity);
       return;
