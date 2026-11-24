@@ -2243,7 +2243,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
   });
 
   // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
-  it("clears retained previous-session attitude, heading, and local position across an ingest restart while keeping a new global fix live and re-enabling each domain independently", () => {
+  // spec: cop-ui / Renderer-agnostic ViewportAdapter, surface-vs-safety-HUD layer split, and multi-domain tactical canvas
+  it("clears retained previous-session attitude, heading, local position, and geographic frame origin across restarts while honoring legacy #32 local reports", () => {
     const entityId = "boxbotix.bbops.robotics.uxs.vehicle.1";
     let nowMs = Date.parse("2026-11-24T12:00:00.300Z");
     const ws2Rig = new MockWebSocketRig();
@@ -2511,6 +2512,47 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         }),
       );
 
+      const makeExternalContact = (
+        id: string,
+        title: string,
+        lla: [number, number, number],
+      ) => ({
+        id,
+        kind: "external-contact" as const,
+        title,
+        contactType: "a-f-G-U-C",
+        location: { latitude: lla[0], longitude: lla[1], altitude: lla[2] },
+        kvRevision: 1,
+        updatedAt: null,
+        poisoned: false,
+        poisonError: null,
+        indexingProfile: null,
+        source: "tak-bridge",
+        observedAt: null,
+        receivedAt: null,
+        expiresAt: null,
+        uncertaintyMeters: 5,
+        feedStatus: "live" as const,
+        ingestedAtMs: nowMs,
+        triples: [],
+      });
+      skgStore.entities.set(
+        "ais.uscg.cop.contact.vessel.sf",
+        makeExternalContact(
+          "ais.uscg.cop.contact.vessel.sf",
+          "SF Beacon",
+          [37.7749, -122.4194, 25],
+        ),
+      );
+      skgStore.entities.set(
+        "ais.uscg.cop.contact.vessel.austin",
+        makeExternalContact(
+          "ais.uscg.cop.contact.vessel.austin",
+          "Austin Beacon",
+          [30.2672, -97.7431, 150],
+        ),
+      );
+
       hudApp = mount(VehicleHud, {
         target: hudHost,
         props: {
@@ -2566,6 +2608,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushTicks();
 
       const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
+      const tacticalViewport = canvasHost.querySelector(
+        '[data-testid="tactical-viewport"]',
+      );
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
@@ -2573,8 +2618,22 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]'),
       ).toBeNull();
       expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 2.0m");
+      expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
+        "true",
+      );
+      expect(
+        canvasHost.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).toBeNull();
+      const s1NedProj = adapter.project({ ned: [12.5, -4.25, -2] });
+      const s1GeoProj = adapter.project({ lla: [37.7749, -122.4194, 25] });
+      expect(s1NedProj.visible).toBe(true);
+      expect(s1GeoProj.visible).toBe(true);
+      expect(s1GeoProj.x).toBeCloseTo(s1NedProj.x, 4);
+      expect(s1GeoProj.y).toBeCloseTo(s1NedProj.y, 4);
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 2.0m");
+      expect(overlayTexts).toContain("SF Beacon");
+      expect(overlayTexts).not.toContain("Austin Beacon");
       expect(overlayTrailSegments).toHaveLength(1);
 
       // Pan camera away from [0, 0] and tether to entityId before Session 2 restart to prove unmeasured [0, 0, 0] does not snap camera.
@@ -2645,6 +2704,19 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudTexts).toContain("HDG UNAVAILABLE");
       expect(hudTexts).toContain("GS --  VS --  ALT --");
       expect(hudTexts).not.toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
+        "false",
+      );
+      expect(
+        canvasHost.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
+      expect(
+        Number.isNaN(adapter.project({ lla: [37.7749, -122.4194, 25] }).rangeM),
+      ).toBe(true);
+      expect(
+        Number.isNaN(adapter.project({ lla: [30.2672, -97.7431, 150] }).rangeM),
+      ).toBe(true);
       expect(overlayTexts).toEqual([]);
       expect(overlayTrailSegments).toHaveLength(0);
       expect(adapter.getCamera().centerNed).toEqual([40, -25]);
@@ -2687,6 +2759,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(vehAfterHealth.hasLocalPos).toBe(false);
       expect(vehAfterHealth.hasGlobalPos).toBe(true);
       expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(adapter.getCamera().originLla).toBeNull();
       expect(overlayTexts).toEqual([]);
 
       // Re-measure heading (#33 Hdg=180 deg) while attitude and local position remain unavailable.
@@ -2732,10 +2805,11 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
       expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(adapter.getCamera().originLla).toBeNull();
       expect(overlayTexts).toEqual([]);
       expect(overlayTrailSegments).toHaveLength(0);
 
-      // Re-measure local position (#32 [15, -8, -4]) while attitude remains unavailable.
+      // Re-measure local position (#32 [15, -8, -4]) while attitude remains unavailable -> re-anchors geographic origin to Austin!
       nowMs = Date.parse("2026-11-24T13:00:01.000Z");
       skgStore.ingestRawFrame(
         buildMergedPut({
@@ -2779,8 +2853,22 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       ).toBeNull();
       expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
       expect(hudTexts).not.toContain("GS --  VS --  ALT --");
+      expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
+        "true",
+      );
+      expect(
+        canvasHost.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).toBeNull();
+      const s2NedProj = adapter.project({ ned: [15, -8, -4] });
+      const s2GeoProj = adapter.project({ lla: [30.2672, -97.7431, 150] });
+      expect(s2NedProj.visible).toBe(true);
+      expect(s2GeoProj.visible).toBe(true);
+      expect(s2GeoProj.x).toBeCloseTo(s2NedProj.x, 4);
+      expect(s2GeoProj.y).toBeCloseTo(s2NedProj.y, 4);
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 4.0m");
+      expect(overlayTexts).toContain("Austin Beacon");
+      expect(overlayTexts).not.toContain("SF Beacon");
       // First post-restart local sample must NOT connect back to [0, 0, 0] or Session 1's trail.
       expect(overlayTrailSegments).toHaveLength(0);
       expect(adapter.getCamera().centerNed).toEqual([15, -8]);
@@ -2867,10 +2955,19 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(zeroNoGpsSkgPose.hasLocalPos).toBe(true);
       expect(zeroNoGpsSkgPose.lla).toBeNull();
       expect(zeroNoGpsSkgPose.hasVerifiedFrameReference).toBe(false);
+      expect(adapter.getCamera().originLla).toBeNull();
+      expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
+        "false",
+      );
+      expect(
+        canvasHost.querySelector('[data-testid="mixed-frame-withheld"]'),
+      ).not.toBeNull();
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
       expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 0.0m");
+      expect(overlayTexts).not.toContain("Austin Beacon");
+      expect(overlayTexts).not.toContain("SF Beacon");
 
       nowMs = Date.parse("2026-11-24T14:00:00.250Z");
       telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
@@ -2918,6 +3015,253 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 0.0m");
+
+      // Session 4 (15:00:00Z): legacy WS1 local-position lifecycle (omitted optional availability flags).
+      telemetryStore.disconnect();
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Rig.latest.serverOpen();
+      nowMs = Date.parse("2026-11-24T15:00:00.000Z");
+      skgStore.ingestRawFrame(
+        buildMergedPut({
+          revision: 9,
+          healthIso: "2026-11-24T15:00:00.000Z",
+          quat: {
+            value: [0, 0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T15:00:00.000Z",
+          },
+          ned: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T15:00:00.000Z",
+          },
+          heading: {
+            value: 0,
+            measured: false,
+            timestamp: "2026-11-24T15:00:00.000Z",
+          },
+          globalPos: {
+            value: [0, 0, 0],
+            measured: false,
+            timestamp: "2026-11-24T15:00:00.000Z",
+          },
+        }),
+      );
+
+      // 4a. Startup legacy #33 without a local report -> local position unavailable.
+      nowMs = Date.parse("2026-11-24T15:00:00.050Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 1,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toEqual([]);
+
+      // 4b. First legacy #32 LOCAL_POSITION_NED ([12, -5, -4], no GPS, omitted optional flags) -> rendered on HUD & map!
+      nowMs = Date.parse("2026-11-24T15:00:00.100Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 2,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [12, -5, -4],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 4.0m");
+
+      // 4c. Following legacy #33 and #31 fused frames preserve local-position availability in that vehicle session.
+      for (const [offsetMs, seq, msgId] of [
+        [50, 3, 33],
+        [100, 4, 31],
+      ] as const) {
+        nowMs = Date.parse("2026-11-24T15:00:00.100Z") + offsetMs;
+        telemetryStore.ingestRawFrame(
+          JSON.stringify({
+            type: "data",
+            subject: "bbops.telemetry.1",
+            timestamp: nowMs,
+            payload: {
+              sysid: 1,
+              domain: "rover",
+              seq,
+              msg_id: msgId,
+              quat_wxyz: [1, 0, 0, 0],
+              body_rates: [0, 0, 0],
+              ned_xyz: [12, -5, -4],
+              ned_vel: [0, 0, 0],
+              lat_lon_alt: [0, 0, 0],
+              has_global_pos: false,
+              hdg_deg: 0,
+              timestamp: nowMs,
+            },
+          }),
+        );
+        resetDrawn();
+        flushTicks();
+        expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+        expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
+        expect(overlayTexts).toContain("#1 rover");
+        expect(overlayTexts).toContain("0.0m/s · 4.0m");
+      }
+
+      // 4d. Legacy #32 at measured zero ([0, 0, 0], no GPS, omitted flags) stays available.
+      nowMs = Date.parse("2026-11-24T15:00:00.250Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 5,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(overlayTexts).toContain("#1 rover");
+      expect(overlayTexts).toContain("0.0m/s · 0.0m");
+
+      // 4e. Explicit modern has_local_pos: false remains authoritative even on msg_id=32.
+      nowMs = Date.parse("2026-11-24T15:00:00.300Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 6,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [12, -5, -4],
+            has_local_pos: false,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            has_heading: true,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toEqual([]);
+
+      // 4f. Re-latch via legacy #32, then start a new vehicle session -> local position resets until a new #32 arrives.
+      nowMs = Date.parse("2026-11-24T15:00:00.350Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 7,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [6, -3, -2],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
+
+      telemetryStore.disconnect();
+      telemetryStore.connect("ws://127.0.0.1:8080/ws/telemetry");
+      ws1Rig.latest.serverOpen();
+      nowMs = Date.parse("2026-11-24T15:00:01.050Z");
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          timestamp: nowMs,
+          payload: {
+            sysid: 1,
+            domain: "rover",
+            seq: 1,
+            msg_id: 33,
+            quat_wxyz: [1, 0, 0, 0],
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [0, 0, 0],
+            has_global_pos: false,
+            hdg_deg: 0,
+            timestamp: nowMs,
+          },
+        }),
+      );
+      resetDrawn();
+      flushTicks();
+      expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
+      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(overlayTexts).toEqual([]);
     } finally {
       if (canvasApp) unmount(canvasApp);
       if (hudApp) unmount(hudApp);

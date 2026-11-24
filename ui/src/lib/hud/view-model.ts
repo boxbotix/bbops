@@ -297,10 +297,13 @@ const DEG_TO_RAD = Math.PI / 180;
 
 export interface LiveVehiclePoseOptions {
   readonly fast?: {
+    readonly msg_id?: number;
     readonly quat_wxyz: readonly [number, number, number, number];
     readonly has_attitude: boolean;
     readonly ned_xyz: readonly [number, number, number];
     readonly has_local_pos?: boolean;
+    readonly has_explicit_local_pos?: boolean;
+    readonly local_pos_confirmed_at_ms?: number | null;
     readonly ned_vel: readonly [number, number, number];
     readonly lat_lon_alt: readonly [number, number, number];
     readonly has_global_pos: boolean;
@@ -510,7 +513,44 @@ export function resolveLiveVehiclePose(
       fast.lat_lon_alt[1] <= 180
         ? [fast.lat_lon_alt[0], fast.lat_lon_alt[1], fast.lat_lon_alt[2]]
         : null;
-    const hasLocalPos = fast.has_local_pos === true;
+    let skgNewSessionInvalidatesLegacyLatch = false;
+    if (
+      fast.has_explicit_local_pos === false &&
+      fast.msg_id !== 32 &&
+      fast.local_pos_confirmed_at_ms !== null &&
+      fast.local_pos_confirmed_at_ms !== undefined &&
+      fast.local_pos_confirmed_at_ms >= MIN_COMPARABLE_EPOCH_MS &&
+      vehicle.hasLocalPos === false
+    ) {
+      for (const triple of vehicle.triples) {
+        if (
+          triple.predicate === "uxs.kinematics.ned" &&
+          triple.confidence === 0
+        ) {
+          const nedUnmeasuredMs = parseIsoEpochMs(triple.timestamp);
+          if (
+            nedUnmeasuredMs !== null &&
+            nedUnmeasuredMs >= MIN_COMPARABLE_EPOCH_MS &&
+            nedUnmeasuredMs > fast.local_pos_confirmed_at_ms
+          ) {
+            skgNewSessionInvalidatesLegacyLatch = true;
+            break;
+          }
+        }
+      }
+    }
+    const fastHasLocalPos =
+      typeof fast.has_local_pos === "boolean"
+        ? fast.has_local_pos
+        : fast.msg_id !== undefined
+          ? fast.msg_id === 32
+          : fast.ned_xyz[0] !== 0 ||
+            fast.ned_xyz[1] !== 0 ||
+            fast.ned_xyz[2] !== 0 ||
+            fast.ned_vel[0] !== 0 ||
+            fast.ned_vel[1] !== 0 ||
+            fast.ned_vel[2] !== 0;
+    const hasLocalPos = fastHasLocalPos && !skgNewSessionInvalidatesLegacyLatch;
     return {
       source: "ws1",
       stale,
@@ -567,6 +607,7 @@ export function resolveLiveVehiclePose(
     (vehicle.hasLocalPos === undefined && hasNonZeroVehicleLocalKinematics);
   const ws1ContradictsLocalPos =
     fast !== undefined &&
+    fast.has_explicit_local_pos !== false &&
     fast.has_local_pos === false &&
     (skgPoseMs === null || fast.timestamp >= skgPoseMs);
   const hasLocalPos = skgHasConfirmedLocalPos && !ws1ContradictsLocalPos;

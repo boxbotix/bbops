@@ -1085,6 +1085,46 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       host.querySelector('[data-testid="mixed-frame-withheld"]'),
     ).toBeNull();
 
+    // 3. Direct jump to a new geographic local frame ([37.7749, -122.4194, 25] at NED [20, -10, -5]) re-anchors originLla so local & geo projections agree.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [20, -10, -5],
+          lla: [37.7749, -122.4194, 25],
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+        },
+      ]),
+    ).toBe(true);
+    const relocatedNedProj = adapter.project({ ned: [20, -10, -5] });
+    const relocatedGeoProj = adapter.project({ lla: [37.7749, -122.4194, 25] });
+    expect(relocatedNedProj.visible).toBe(true);
+    expect(relocatedGeoProj.visible).toBe(true);
+    expect(relocatedGeoProj.x).toBeCloseTo(relocatedNedProj.x, 4);
+    expect(relocatedGeoProj.y).toBeCloseTo(relocatedNedProj.y, 4);
+
+    // 4. Two live vehicles with incompatible local frames (SF vs Austin) withhold mixed-frame placement rather than misplacing contacts.
+    expect(
+      anchorSharedFrameOrigin(adapter, [
+        {
+          ned: [0, 0, 0],
+          lla: [37.7749, -122.4194, 25],
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+        },
+        {
+          ned: [0, 0, 0],
+          lla: [30.2672, -97.7431, 150],
+          hasLocalPos: true,
+          hasVerifiedFrameReference: true,
+          stale: false,
+        },
+      ]),
+    ).toBe(false);
+    expect(adapter.getCamera().originLla).toBeNull();
+
     unmount(app);
     host.remove();
   });

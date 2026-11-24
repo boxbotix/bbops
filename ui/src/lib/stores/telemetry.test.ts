@@ -728,60 +728,95 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     const legacyParsed = legacyStore.getKinematics(2);
     expect(legacyParsed?.has_attitude).toBe(false);
     expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
 
-    // Out-of-order #31 frame (timestamp 10_150 < 10_200) is dropped and MUST NOT latch attitude!
+    // Out-of-order #31 and #32 frames (timestamp < 10_200) are dropped and MUST NOT latch attitude or local pos!
     rig.latest.serverMessage(makeLegacyFrame(2, 31, 10_150));
-    expect(legacyStore.droppedOutOfOrderCount).toBe(1);
+    rig.latest.serverMessage(makeLegacyFrame(2, 32, 10_160));
+    expect(legacyStore.droppedOutOfOrderCount).toBe(2);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    // First in-order legacy #32 LOCAL_POSITION_NED (including measured zero [0,0,0]) latches local pos while attitude stays unmeasured!
     rig.latest.serverMessage(makeLegacyFrame(3, 32, 10_225));
     expect(legacyParsed?.has_attitude).toBe(false);
     expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(true);
 
-    // Genuine in-order #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) latches attitude + heading.
+    // Genuine in-order #31 ATTITUDE_QUATERNION at exact level North ([1,0,0,0], [0,0,0], msg_id=31) latches attitude + heading and preserves local pos!
     rig.latest.serverMessage(makeLegacyFrame(4, 31, 10_250));
     expect(legacyParsed?.has_attitude).toBe(true);
     expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
 
-    // #32 LOCAL_POSITION_NED 50 ms later carrying fused [1,0,0,0] retains measured attitude + heading!
+    // #32 LOCAL_POSITION_NED 50 ms later carrying fused [1,0,0,0] retains measured attitude + heading + local pos!
     rig.latest.serverMessage(
       makeLegacyFrame(5, 32, 10_300, { ned_xyz: [4, -2, 0] }),
     );
     expect(legacyParsed?.ned_xyz).toEqual([4, -2, 0]);
     expect(legacyParsed?.has_attitude).toBe(true);
     expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
 
-    // #33 GLOBAL_POSITION_INT 50 ms later carrying fused [1,0,0,0] also retains measured attitude + heading!
+    // #33 GLOBAL_POSITION_INT 50 ms later carrying fused [1,0,0,0] also retains measured attitude + heading + local pos!
     rig.latest.serverMessage(
       makeLegacyFrame(6, 33, 10_350, {
+        ned_xyz: [4, -2, 0],
         lat_lon_alt: [30.2673, -97.7432, 150],
       }),
     );
     expect(legacyParsed?.has_attitude).toBe(true);
     expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
 
-    // Explicit modern availability flags override the legacy latch immediately!
+    // Explicit modern availability flags override the legacy latch immediately (even on msg_id=32)!
     rig.latest.serverMessage(
-      makeLegacyFrame(7, 33, 10_400, {
+      makeLegacyFrame(7, 32, 10_400, {
         quat_wxyz: [0, 0, 0, 0],
         has_attitude: false,
+        has_local_pos: false,
         has_heading: true,
         hdg_deg: 0,
       }),
     );
     expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
     expect(legacyParsed?.has_heading).toBe(true);
 
-    // Re-latch via #31, then drop the socket and open a new session: inference MUST reset!
-    rig.latest.serverMessage(makeLegacyFrame(8, 31, 10_450));
+    // Re-latch via #32 + #31, verify link_lost clears latches on next legacy #33, then re-latch and verify socket reconnect resets inference!
+    rig.latest.serverMessage(
+      makeLegacyFrame(8, 32, 10_425, { ned_xyz: [12, -5, -4] }),
+    );
+    rig.latest.serverMessage(
+      makeLegacyFrame(9, 31, 10_450, { ned_xyz: [12, -5, -4] }),
+    );
     expect(legacyParsed?.has_attitude).toBe(true);
     expect(legacyParsed?.has_heading).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
+
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(2, {
+        kind: "link_lost",
+        timestamp: 10_460,
+      }),
+    );
+    rig.latest.serverMessage(makeLegacyFrame(10, 33, 10_475));
+    expect(legacyParsed?.has_attitude).toBe(false);
+    expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
+
+    rig.latest.serverMessage(makeLegacyFrame(11, 32, 10_480));
+    rig.latest.serverMessage(makeLegacyFrame(12, 31, 10_490));
+    expect(legacyParsed?.has_attitude).toBe(true);
+    expect(legacyParsed?.has_local_pos).toBe(true);
 
     rig.latest.serverDrop(1006);
     vi.advanceTimersByTime(500);
     rig.latest.serverOpen();
 
-    rig.latest.serverMessage(makeLegacyFrame(9, 33, 10_500));
+    rig.latest.serverMessage(makeLegacyFrame(13, 33, 10_500));
     expect(legacyParsed?.has_attitude).toBe(false);
     expect(legacyParsed?.has_heading).toBe(false);
+    expect(legacyParsed?.has_local_pos).toBe(false);
 
     legacyStore.disconnect();
   });

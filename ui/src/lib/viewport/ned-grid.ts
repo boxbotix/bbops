@@ -245,33 +245,99 @@ export function deriveNedOriginLla(
   return [lat0Deg, lon0Deg, alt0M];
 }
 
+export const SHARED_ORIGIN_MAX_DRIFT_M = 25;
+
+function poseAgreesWithOrigin(
+  ned: readonly [number, number, number],
+  lla: readonly [number, number, number],
+  originLla: readonly [number, number, number],
+  maxDriftM = SHARED_ORIGIN_MAX_DRIFT_M,
+): boolean {
+  const projectedNed = llaToLocalNed(lla, originLla);
+  if (!projectedNed) {
+    return false;
+  }
+  return (
+    Math.hypot(
+      projectedNed[0] - ned[0],
+      projectedNed[1] - ned[1],
+      projectedNed[2] - ned[2],
+    ) <= maxDriftM
+  );
+}
+
 /**
- * Anchors the viewport's shared NED<->LLA reference exclusively from a vehicle
- * pose that carries both local NED and a verified geographic fix, withholding
- * mixed-frame LLA contact placement until that shared reference exists.
+ * Reconciles the viewport's shared NED<->LLA reference against the active
+ * vehicle poses that carry both local NED and a verified geographic fix.
+ * Clears any prior-session origin while no confirmed (ned, lla) reference is
+ * active or when active confirmed vehicles report conflicting local frames,
+ * and updates originLla whenever the active confirmed pair shifts local frame.
  */
 export function anchorSharedFrameOrigin(
   adapter: ViewportAdapter,
   vehiclePoses: Iterable<
     Pick<ResolvedVehiclePose, "ned" | "lla"> & {
+      readonly hasLocalPos?: boolean;
       readonly hasVerifiedFrameReference?: boolean;
+      readonly stale?: boolean;
     }
   >,
 ): boolean {
-  if (adapter.getCamera().originLla !== null) {
-    return true;
-  }
-  for (const pose of vehiclePoses) {
-    if (pose.hasVerifiedFrameReference === false || pose.lla === null) {
+  const allPoses = Array.from(vehiclePoses);
+  const hasLivePose = allPoses.some((pose) => pose.stale === false);
+  const activePool = hasLivePose
+    ? allPoses.filter((pose) => pose.stale === false)
+    : allPoses;
+
+  const verified: Array<{
+    ned: readonly [number, number, number];
+    lla: readonly [number, number, number];
+    originLla: [number, number, number];
+  }> = [];
+
+  for (const pose of activePool) {
+    if (
+      pose.hasVerifiedFrameReference === false ||
+      pose.hasLocalPos === false ||
+      pose.lla === null
+    ) {
       continue;
     }
     const originLla = deriveNedOriginLla(pose.ned, pose.lla);
     if (originLla !== null) {
-      adapter.setCamera({ originLla });
-      return true;
+      verified.push({ ned: pose.ned, lla: pose.lla, originLla });
     }
   }
-  return false;
+
+  if (verified.length === 0) {
+    if (adapter.getCamera().originLla !== null) {
+      adapter.setCamera({ originLla: null });
+    }
+    return false;
+  }
+
+  const primary = verified[0]!;
+  for (let i = 1; i < verified.length; i += 1) {
+    const peer = verified[i]!;
+    if (!poseAgreesWithOrigin(peer.ned, peer.lla, primary.originLla)) {
+      if (adapter.getCamera().originLla !== null) {
+        adapter.setCamera({ originLla: null });
+      }
+      return false;
+    }
+  }
+
+  const currentOrigin = adapter.getCamera().originLla;
+  const currentOriginValid =
+    currentOrigin !== null &&
+    poseAgreesWithOrigin(primary.ned, primary.lla, currentOrigin, 1e-2) &&
+    verified.every((item) =>
+      poseAgreesWithOrigin(item.ned, item.lla, currentOrigin),
+    );
+  if (!currentOriginValid) {
+    adapter.setCamera({ originLla: primary.originLla });
+  }
+  return true;
 }
 
 function clampZoom(zoomPxPerM: number): number {
