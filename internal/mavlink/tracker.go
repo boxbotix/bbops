@@ -44,12 +44,15 @@ type TelemetryFrame struct {
 	Seq          uint8      `json:"seq"`
 	MsgID        uint32     `json:"msg_id"`
 	QuatWXYZ     [4]float64 `json:"quat_wxyz"`
+	HasAttitude  bool       `json:"has_attitude"`
 	BodyRates    [3]float64 `json:"body_rates"`
 	NEDXYZ       [3]float64 `json:"ned_xyz"`
+	HasLocalPos  bool       `json:"has_local_pos"`
 	NEDVel       [3]float64 `json:"ned_vel"`
 	LatLonAlt    [3]float64 `json:"lat_lon_alt"`
 	HasGlobalPos bool       `json:"has_global_pos"`
 	HdgDeg       float64    `json:"hdg_deg"`
+	HasHeading   bool       `json:"has_heading"`
 	Timestamp    int64      `json:"timestamp"`
 }
 
@@ -108,7 +111,9 @@ type vehicleSession struct {
 	rev          uint64
 	hasSysStatus bool
 	hasAttitude  bool
+	hasLocalPos  bool
 	hasGlobalPos bool
+	hasHeading   bool
 	peerAddr     netip.AddrPort
 }
 
@@ -220,11 +225,17 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		if initErr != nil {
 			return IngestOutcome{CountedError: true}
 		}
+		obsNs := unixNanoOrZero(now)
 		snap.Armed = vh.Armed
 		snap.Authority = authStr
 		snap.CompanionMode = modeStr
 		snap.LinkTier = tierStr
 		snap.Flags = vh.Custom.HealthFlags
+		snap.PoseMetadata = true
+		snap.AttitudeObservedUnixNs = obsNs
+		snap.LocalPosObservedUnixNs = obsNs
+		snap.GlobalPosObservedUnixNs = obsNs
+		snap.HeadingObservedUnixNs = obsNs
 		snap.ObservedAt = now
 		if valErr := snap.Validate(); valErr != nil {
 			return IngestOutcome{CountedError: true}
@@ -408,10 +419,16 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Quaternion = unitQ
 	next.BodyRates = rates
 	next.HeadingDeg = hdgDeg
+	next.PoseMetadata = true
+	next.HasAttitude = true
+	next.AttitudeObservedUnixNs = obsNs
+	next.HasHeading = true
+	next.HeadingObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}
@@ -419,6 +436,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 
 	sess.snap = next
 	sess.hasAttitude = true
+	sess.hasHeading = true
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -449,17 +467,22 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.NED = ned
 	next.Vx = vx
 	next.Vy = vy
 	next.Vz = vz
+	next.PoseMetadata = true
+	next.HasLocalPos = true
+	next.LocalPosObservedUnixNs = obsNs
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}
 	}
 
 	sess.snap = next
+	sess.hasLocalPos = true
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -496,12 +519,25 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		return IngestOutcome{}
 	}
 
+	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Latitude = lat
 	next.Longitude = lon
 	next.Altitude = alt
-	if !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg {
-		next.HeadingDeg = float64(msg.Hdg) / 100.0
+	next.PoseMetadata = true
+	next.HasGlobalPos = true
+	next.GlobalPosObservedUnixNs = obsNs
+	hasFallbackHdg := !sess.hasAttitude && msg.Hdg <= maxValidHdgCdeg
+	if !sess.hasAttitude {
+		if hasFallbackHdg {
+			next.HeadingDeg = float64(msg.Hdg) / 100.0
+			next.HasHeading = true
+			next.HeadingObservedUnixNs = obsNs
+		} else {
+			next.HeadingDeg = 0
+			next.HasHeading = false
+			next.HeadingObservedUnixNs = obsNs
+		}
 	}
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
@@ -510,6 +546,9 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 
 	sess.snap = next
 	sess.hasGlobalPos = true
+	if !sess.hasAttitude {
+		sess.hasHeading = hasFallbackHdg
+	}
 	sess.rev++
 	if peer.IsValid() {
 		sess.peerAddr = peer
@@ -581,12 +620,15 @@ func buildTelemetryFrame(sess *vehicleSession, seq uint8, msgID uint32, now time
 		Seq:          seq,
 		MsgID:        msgID,
 		QuatWXYZ:     sess.snap.Quaternion,
+		HasAttitude:  sess.hasAttitude,
 		BodyRates:    sess.snap.BodyRates,
 		NEDXYZ:       sess.snap.NED,
+		HasLocalPos:  sess.hasLocalPos,
 		NEDVel:       [3]float64{sess.snap.Vx, sess.snap.Vy, sess.snap.Vz},
 		LatLonAlt:    [3]float64{sess.snap.Latitude, sess.snap.Longitude, sess.snap.Altitude},
 		HasGlobalPos: sess.hasGlobalPos,
 		HdgDeg:       sess.snap.HeadingDeg,
+		HasHeading:   sess.hasHeading,
 		Timestamp:    now.UnixMilli(),
 	}
 }
@@ -721,6 +763,16 @@ func marshalSnapshotBaseMessage(snap uxsvocab.VehicleSnapshot) ([]byte, error) {
 	}
 	msg := message.NewBaseMessage(snap.Schema(), &snap, uxsvocab.TripleSource)
 	return json.Marshal(msg)
+}
+
+func unixNanoOrZero(ts time.Time) int64 {
+	if ts.IsZero() {
+		return 0
+	}
+	if ns := ts.UTC().UnixNano(); ns > 0 {
+		return ns
+	}
+	return 0
 }
 
 func isFinite(v float64) bool {

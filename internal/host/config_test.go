@@ -1394,8 +1394,74 @@ func TestUIMiddlewareWebSocketProxyRouting(t *testing.T) {
 		t.Fatalf("POST /ws/telemetry status = %d, want 405", postResp.StatusCode)
 	}
 
-	// Post-ready: routes to distinct upstream telemetry/graph servers rewritten to /ws.
+	// Post-ready: native clients (no Origin) and same-origin browser requests route to distinct upstreams.
 	ready.Store(true)
 	checkGet(frontDoor.URL+"/ws/telemetry", http.StatusOK, "UPSTREAM-TELEMETRY:/ws")
 	checkGet(frontDoor.URL+"/ws/graph", http.StatusOK, "UPSTREAM-GRAPH:/ws")
+
+	checkOrigin := func(route string, origins []string, wantStatus int, wantBodySubstr string) {
+		t.Helper()
+		req, reqErr := http.NewRequest(http.MethodGet, frontDoor.URL+route, nil) //nolint:noctx
+		if reqErr != nil {
+			t.Fatalf("NewRequest(%s): %v", route, reqErr)
+		}
+		for _, o := range origins {
+			req.Header.Add("Origin", o)
+		}
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("Do(%s, Origin=%v): %v", route, origins, doErr)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", route, readErr)
+		}
+		if resp.StatusCode != wantStatus || !strings.Contains(string(body), wantBodySubstr) {
+			t.Fatalf("%s Origin=%v -> (%d, %q), want (%d containing %q)",
+				route, origins, resp.StatusCode, string(body), wantStatus, wantBodySubstr)
+		}
+	}
+
+	frontParsed, parseErr := url.Parse(frontDoor.URL)
+	if parseErr != nil {
+		t.Fatalf("parse frontDoor.URL: %v", parseErr)
+	}
+	for _, route := range []struct {
+		path string
+		want string
+	}{
+		{"/ws/telemetry", "UPSTREAM-TELEMETRY:/ws"},
+		{"/ws/graph", "UPSTREAM-GRAPH:/ws"},
+	} {
+		// Same-origin accepted.
+		checkOrigin(route.path, []string{frontDoor.URL}, http.StatusOK, route.want)
+
+		// Foreign / malformed browser Origins rejected with 403 before proxying.
+		for _, badOrigins := range [][]string{
+			{"http://evil.example"},
+			{"http://127.0.0.1:5173"},
+			{"https://" + frontParsed.Host},
+			{"null"},
+			{""},
+			{frontDoor.URL + "/extra"},
+			{"http://user@" + frontParsed.Host},
+			{frontDoor.URL, "http://evil.example"},
+		} {
+			checkOrigin(route.path, badOrigins, http.StatusForbidden, "forbidden websocket origin")
+		}
+	}
+
+	// Default port :80 normalization and case-insensitive hostname matching.
+	defaultPortHandler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://gcs.boxbotix.local/ws/telemetry", nil)
+	req.Host = "gcs.boxbotix.local"
+	req.Header.Set("Origin", "http://GCS.BOXBOTIX.LOCAL:80")
+	defaultPortHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "UPSTREAM-TELEMETRY:/ws" {
+		t.Fatalf("default :80 same-origin check = (%d, %q), want (200, UPSTREAM-TELEMETRY:/ws)", rec.Code, rec.Body.String())
+	}
 }

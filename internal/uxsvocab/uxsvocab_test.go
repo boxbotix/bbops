@@ -223,22 +223,27 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 				CRSFLinkHealthy:       true,
 				CompanionTrunkHealthy: true,
 			},
-			Failsafes:   1,
-			CRCErrors:   2,
-			LoopDtUs:    1000,
-			MaxLoopDtUs: 1450,
-			RTTUs:       820,
-			Quaternion:  [4]float64{0.70710678, 0, 0, 0.70710678},
-			BodyRates:   [3]float64{0.01, -0.02, 0.15},
-			NED:         [3]float64{12.5, -4.25, -1.5},
-			Vx:          2.4,
-			Vy:          -0.6,
-			Vz:          0.0,
-			HeadingDeg:  360.0,
-			Latitude:    -90.0,
-			Longitude:   180.0,
-			Altitude:    142.75,
-			ObservedAt:  time.Date(2026, 11, 23, 21, 0, 0, 0, time.UTC),
+			Failsafes:    1,
+			CRCErrors:    2,
+			LoopDtUs:     1000,
+			MaxLoopDtUs:  1450,
+			RTTUs:        820,
+			Quaternion:   [4]float64{0.70710678, 0, 0, 0.70710678},
+			BodyRates:    [3]float64{0.01, -0.02, 0.15},
+			NED:          [3]float64{12.5, -4.25, -1.5},
+			Vx:           2.4,
+			Vy:           -0.6,
+			Vz:           0.0,
+			HeadingDeg:   360.0,
+			Latitude:     -90.0,
+			Longitude:    180.0,
+			Altitude:     142.75,
+			ObservedAt:   time.Date(2026, 11, 23, 21, 0, 0, 0, time.UTC),
+			PoseMetadata: true,
+			HasAttitude:  true,
+			HasLocalPos:  true,
+			HasGlobalPos: true,
+			HasHeading:   true,
 		}
 		if err := populated.Validate(); err != nil {
 			t.Fatalf("populated.Validate(%s): %v", domain, err)
@@ -283,6 +288,31 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 		}
 		if _, ok := popTriples[13].Object.([3]float64); !ok {
 			t.Fatalf("uxs.kinematics.ned Object type = %T, want [3]float64", popTriples[13].Object)
+		}
+
+		// Birth snapshot marks unmeasured pose triples [11..20] with Confidence=0 and epoch-0 timestamp,
+		// while populated snapshot marks measured pose triples with Confidence=1 and Context="measured".
+		epochZero := time.Unix(0, 0).UTC()
+		for idx := 11; idx <= 20; idx++ {
+			if initTriples[idx].Confidence != 0 || !initTriples[idx].Timestamp.Equal(epochZero) || initTriples[idx].Context != "" {
+				t.Fatalf("initial pose triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
+			}
+			if popTriples[idx].Confidence != 1.0 || popTriples[idx].Context != "measured" {
+				t.Fatalf("populated pose triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
+			}
+		}
+
+		// Health-only ObservedAt advancement must not overwrite earlier per-domain pose timestamps.
+		poseTS := time.Date(2026, 11, 23, 20, 55, 0, 0, time.UTC)
+		healthLater := *populated
+		healthLater.LocalPosObservedUnixNs = poseTS.UnixNano()
+		healthLater.ObservedAt = poseTS.Add(10 * time.Minute)
+		laterTriples := healthLater.Triples()
+		if !laterTriples[4].Timestamp.Equal(healthLater.ObservedAt) {
+			t.Fatalf("health triple timestamp = %v, want %v", laterTriples[4].Timestamp, healthLater.ObservedAt)
+		}
+		if !laterTriples[13].Timestamp.Equal(poseTS) {
+			t.Fatalf("uxs.kinematics.ned timestamp = %v, want preserved %v", laterTriples[13].Timestamp, poseTS)
 		}
 
 		// JSON Marshal/Unmarshal round-trip.
@@ -447,6 +477,103 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		t.Fatalf("decoded zero-vector control = %+v, want all-zero vectors", gotZero)
 	}
 
+	// Legacy v1 global-only wire payload (no pose_metadata or has_* fields, [1,0,0,0] v1 birth quat):
+	// default zero NED, [1,0,0,0] birth quat, and zero heading must NOT decode as Confidence=1 / Context="measured".
+	legacyGlobalOnlyRaw := []byte(`{
+		"id":"legacy-v1-global-only",
+		"type":{"domain":"uxs","category":"vehicle","version":"v1"},
+		"payload":{
+			"org":"boxbotix","platform":"gcs01","sysid":7,"title":"ROVER-7",
+			"domain":"rover","authority":"companion-teleop","companion_mode":"teleop-velocity",
+			"link_tier":"mesh-high-rate","armed":true,
+			"flags":{"clock_sync_locked":true,"teleop_deadman_clamped":false,"crsf_link_healthy":true,"companion_trunk_healthy":true},
+			"failsafes":0,"crc_errors":0,"loop_dt_us":1000,"max_loop_dt_us":1200,"rtt_us":300,
+			"quaternion":[1,0,0,0],"body_rates":[0,0,0],"ned":[0,0,0],
+			"vx":0,"vy":0,"vz":0,"heading_deg":0,
+			"latitude":37.7749,"longitude":-122.4194,"altitude":15.0,
+			"observed_at":"2026-11-23T18:00:00Z"
+		}
+	}`)
+	legacyMsg, err := dec.Decode(legacyGlobalOnlyRaw)
+	if err != nil {
+		t.Fatalf("dec.Decode(legacyGlobalOnlyRaw): %v", err)
+	}
+	if err := legacyMsg.Validate(); err != nil {
+		t.Fatalf("legacyMsg.Validate(): %v", err)
+	}
+	legacySnap := legacyMsg.Payload().(*VehicleSnapshot)
+	if legacySnap.PoseMetadata || legacySnap.HasLocalPos || legacySnap.HasHeading {
+		t.Fatalf("legacy v1 payload decoded false measurement flags: %+v", legacySnap)
+	}
+	legacyByPred := make(map[string]message.Triple, 22)
+	for _, tr := range legacySnap.Triples() {
+		legacyByPred[tr.Predicate] = tr
+	}
+	for _, unmeasuredPred := range []string{
+		PredicateAttitudeQuaternion,
+		PredicateAttitudeRates,
+		PredicateKinematicsNED,
+		PredicateKinematicsVx,
+		PredicateKinematicsVy,
+		PredicateKinematicsVz,
+		PredicateKinematicsHeadingDeg,
+	} {
+		tr := legacyByPred[unmeasuredPred]
+		if tr.Confidence != 0 || tr.Context != "" {
+			t.Fatalf("legacy v1 global-only %s = %+v, want Confidence=0 Context=\"\"", unmeasuredPred, tr)
+		}
+	}
+	if latTr := legacyByPred[vocabulary.GeoLocationLatitude]; latTr.Confidence != 1.0 || latTr.Context != "" {
+		t.Fatalf("legacy v1 global-only latitude = %+v, want Confidence=1 Context=\"\"", latTr)
+	}
+
+	// Modern wire payload with genuinely measured local zero [0,0,0] and measured 0-deg heading:
+	// preserves Confidence=1 and Context="measured" across wire decode.
+	measuredZeroSnap, err := NewVehicleSnapshot("boxbotix", "gcs01", 7, DomainRover)
+	if err != nil {
+		t.Fatalf("NewVehicleSnapshot(measuredZeroSnap): %v", err)
+	}
+	measuredObs := time.Date(2026, 11, 23, 18, 5, 0, 0, time.UTC)
+	measuredZeroSnap.HasLocalPos = true
+	measuredZeroSnap.LocalPosObservedUnixNs = measuredObs.UnixNano()
+	measuredZeroSnap.HasGlobalPos = true
+	measuredZeroSnap.GlobalPosObservedUnixNs = measuredObs.UnixNano()
+	measuredZeroSnap.Latitude = 37.7749
+	measuredZeroSnap.Longitude = -122.4194
+	measuredZeroSnap.Altitude = 15.0
+	measuredZeroSnap.HasHeading = true
+	measuredZeroSnap.HeadingDeg = 0.0
+	measuredZeroSnap.HeadingObservedUnixNs = measuredObs.UnixNano()
+	measuredZeroSnap.ObservedAt = measuredObs
+	measuredZeroWire, err := json.Marshal(message.NewBaseMessage(measuredZeroSnap.Schema(), measuredZeroSnap, "measured-zero"))
+	if err != nil {
+		t.Fatalf("marshal measuredZeroSnap: %v", err)
+	}
+	measuredZeroDecoded, err := dec.Decode(measuredZeroWire)
+	if err != nil {
+		t.Fatalf("dec.Decode(measuredZeroWire): %v", err)
+	}
+	if err := measuredZeroDecoded.Validate(); err != nil {
+		t.Fatalf("measuredZeroDecoded.Validate(): %v", err)
+	}
+	measuredZeroByPred := make(map[string]message.Triple, 22)
+	for _, tr := range measuredZeroDecoded.Payload().(*VehicleSnapshot).Triples() {
+		measuredZeroByPred[tr.Predicate] = tr
+	}
+	for _, measuredPred := range []string{
+		PredicateKinematicsNED,
+		PredicateKinematicsHeadingDeg,
+		vocabulary.GeoLocationLatitude,
+	} {
+		tr := measuredZeroByPred[measuredPred]
+		if tr.Confidence != 1.0 || tr.Context != "measured" || !tr.Timestamp.Equal(measuredObs) {
+			t.Fatalf("measured zero %s = %+v, want Confidence=1 Context=measured Timestamp=%v", measuredPred, tr, measuredObs)
+		}
+	}
+	if attTr := measuredZeroByPred[PredicateAttitudeQuaternion]; attTr.Confidence != 0 || attTr.Context != "" {
+		t.Fatalf("unmeasured attitude on measuredZeroSnap = %+v, want Confidence=0", attTr)
+	}
+
 	invalidCases := []struct {
 		name   string
 		field  string
@@ -512,5 +639,38 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 
 	if err := json.Unmarshal([]byte("null"), &VehicleSnapshot{}); err == nil {
 		t.Fatal("json.Unmarshal(null) succeeded, want error")
+	}
+
+	// Invalidated domain (!HasHeading with HeadingObservedUnixNs > 0) MUST carry the invalidation
+	// timestamp so graph.ReplaceBySource supersedes a prior measured heading instead of rejecting epochZero!
+	t1 := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	t2 := t1.Add(250 * time.Millisecond)
+	measuredSnap := *valid
+	measuredSnap.PoseMetadata = true
+	measuredSnap.HasGlobalPos = true
+	measuredSnap.GlobalPosObservedUnixNs = t1.UnixNano()
+	measuredSnap.HasHeading = true
+	measuredSnap.HeadingDeg = 274.5
+	measuredSnap.HeadingObservedUnixNs = t1.UnixNano()
+	measuredSnap.ObservedAt = t1
+
+	invalidatedSnap := measuredSnap
+	invalidatedSnap.HasHeading = false
+	invalidatedSnap.HeadingDeg = 0
+	invalidatedSnap.HeadingObservedUnixNs = t2.UnixNano()
+	invalidatedSnap.GlobalPosObservedUnixNs = t2.UnixNano()
+	invalidatedSnap.ObservedAt = t2
+
+	rep1 := graph.ReplaceBySource(nil, measuredSnap.Triples())
+	rep2 := graph.ReplaceBySource(rep1.Triples, invalidatedSnap.Triples())
+	if len(rep2.Stale) != 0 {
+		t.Fatalf("ReplaceBySource rejected invalidated heading as stale: %+v", rep2.Stale)
+	}
+	for _, tr := range rep2.Triples {
+		if tr.Predicate == PredicateKinematicsHeadingDeg {
+			if tr.Confidence != 0.0 || tr.Context != "" || tr.Object != 0.0 || !tr.Timestamp.Equal(t2) {
+				t.Fatalf("ReplaceBySource invalidated heading triple = %+v, want Object=0 Confidence=0 Timestamp=%v", tr, t2)
+			}
+		}
 	}
 }

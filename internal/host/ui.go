@@ -57,6 +57,10 @@ func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyR
 					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 					return
 				}
+				if !isSameOriginWebSocketRequest(r) {
+					http.Error(w, "forbidden websocket origin", http.StatusForbidden)
+					return
+				}
 				if isReady != nil && !isReady() {
 					w.WriteHeader(http.StatusServiceUnavailable)
 					_, _ = w.Write([]byte("NOT READY"))
@@ -133,6 +137,59 @@ func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyR
 			next.ServeHTTP(w, r)
 		})
 	}, nil
+}
+
+func isSameOriginWebSocketRequest(r *http.Request) bool {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) > 1 {
+		return false
+	}
+	rawOrigin := strings.TrimSpace(origins[0])
+	if rawOrigin == "" {
+		return false
+	}
+	originURL, err := url.Parse(rawOrigin)
+	if err != nil || originURL.Host == "" || originURL.User != nil ||
+		originURL.Path != "" || originURL.RawQuery != "" || originURL.Fragment != "" {
+		return false
+	}
+	reqScheme := "http"
+	if r.TLS != nil {
+		reqScheme = "https"
+	}
+	if strings.ToLower(originURL.Scheme) != reqScheme {
+		return false
+	}
+	reqHost := strings.TrimSpace(r.Host)
+	if reqHost == "" {
+		return false
+	}
+	reqURL, err := url.Parse(reqScheme + "://" + reqHost)
+	if err != nil || reqURL.Host == "" || reqURL.User != nil ||
+		reqURL.Path != "" || reqURL.RawQuery != "" || reqURL.Fragment != "" {
+		return false
+	}
+	originHostname := originURL.Hostname()
+	reqHostname := reqURL.Hostname()
+	if originHostname == "" || reqHostname == "" || !strings.EqualFold(originHostname, reqHostname) {
+		return false
+	}
+	defaultPort := "80"
+	if reqScheme == "https" {
+		defaultPort = "443"
+	}
+	originPort := originURL.Port()
+	if originPort == "" {
+		originPort = defaultPort
+	}
+	reqPort := reqURL.Port()
+	if reqPort == "" {
+		reqPort = defaultPort
+	}
+	return originPort == reqPort
 }
 
 func newSingleEndpointWSProxy(label, rawTarget string) (http.Handler, error) {

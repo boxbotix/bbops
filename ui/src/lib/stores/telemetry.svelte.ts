@@ -51,12 +51,19 @@ export interface VehicleKinematics {
   seq: number;
   msg_id: number;
   quat_wxyz: [number, number, number, number];
+  has_attitude: boolean;
   body_rates: [number, number, number];
   ned_xyz: [number, number, number];
+  has_local_pos: boolean;
+  has_explicit_local_pos?: boolean;
+  local_pos_confirmed_at_ms?: number | null;
+  local_pos_observed_at_ms?: number | null;
   ned_vel: [number, number, number];
   lat_lon_alt: [number, number, number];
   has_global_pos: boolean;
+  global_pos_observed_at_ms?: number | null;
   hdg_deg: number;
+  has_heading: boolean;
   timestamp: number;
   receivedAtMs: number;
 }
@@ -149,6 +156,10 @@ function parseTelemetryPayload(
   payload: unknown,
   expectedSysId: number,
   receivedAtMs: number,
+  priorLegacyAttitudeLatched: boolean,
+  priorLegacyLocalPosConfirmedAtMs: number | null,
+  priorLocalPosObservedAtMs: number | null,
+  priorGlobalPosObservedAtMs: number | null,
 ): VehicleKinematics | null {
   if (!isRecord(payload)) {
     return null;
@@ -159,6 +170,12 @@ function parseTelemetryPayload(
     !isNonNegativeInt(payload.seq) ||
     payload.seq > 255 ||
     !isNonNegativeInt(payload.msg_id) ||
+    (payload.has_attitude !== undefined &&
+      typeof payload.has_attitude !== "boolean") ||
+    (payload.has_local_pos !== undefined &&
+      typeof payload.has_local_pos !== "boolean") ||
+    (payload.has_heading !== undefined &&
+      typeof payload.has_heading !== "boolean") ||
     typeof payload.has_global_pos !== "boolean" ||
     !isValidHeadingDeg(payload.hdg_deg) ||
     !isFiniteNumber(payload.timestamp)
@@ -176,18 +193,70 @@ function parseTelemetryPayload(
   if (!isValidLatLon(lla[0], lla[1])) {
     return null;
   }
+  const quatNormSq =
+    quat[0] * quat[0] +
+    quat[1] * quat[1] +
+    quat[2] * quat[2] +
+    quat[3] * quat[3];
+  const wrappedHdg = ((payload.hdg_deg % 360) + 360) % 360;
+  const hdgDistFromNorth = Math.min(wrappedHdg, 360 - wrappedHdg);
+  const hasNonZeroRates = rates[0] !== 0 || rates[1] !== 0 || rates[2] !== 0;
+  const isLegacyUnmeasuredBirthQuat =
+    payload.msg_id !== 31 &&
+    Math.abs(quat[0] - 1) < 1e-9 &&
+    Math.abs(quat[1]) < 1e-9 &&
+    Math.abs(quat[2]) < 1e-9 &&
+    Math.abs(quat[3]) < 1e-9 &&
+    (hdgDistFromNorth > 0.5 ||
+      (!hasNonZeroRates && !priorLegacyAttitudeLatched));
+  const hasAttitude =
+    typeof payload.has_attitude === "boolean"
+      ? payload.has_attitude && quatNormSq >= 1e-6
+      : quatNormSq >= 1e-6 && !isLegacyUnmeasuredBirthQuat;
+  const hasExplicitLocalPos = typeof payload.has_local_pos === "boolean";
+  const hasLocalPos = hasExplicitLocalPos
+    ? (payload.has_local_pos as boolean)
+    : payload.msg_id === 32 || priorLegacyLocalPosConfirmedAtMs !== null;
+  const localPosConfirmedAtMs = hasExplicitLocalPos
+    ? payload.has_local_pos
+      ? payload.timestamp
+      : null
+    : payload.msg_id === 32
+      ? payload.timestamp
+      : priorLegacyLocalPosConfirmedAtMs;
+  const localPosObservedAtMs = !hasLocalPos
+    ? null
+    : payload.msg_id === 32
+      ? payload.timestamp
+      : priorLocalPosObservedAtMs;
+  const globalPosObservedAtMs = !payload.has_global_pos
+    ? null
+    : payload.msg_id === 33
+      ? payload.timestamp
+      : priorGlobalPosObservedAtMs;
+  const hasHeading =
+    typeof payload.has_heading === "boolean"
+      ? payload.has_heading || hasAttitude
+      : hasAttitude || payload.hdg_deg !== 0;
   return {
     sysid: expectedSysId,
     domain: payload.domain,
     seq: payload.seq,
     msg_id: payload.msg_id,
     quat_wxyz: quat,
+    has_attitude: hasAttitude,
     body_rates: rates,
     ned_xyz: ned,
+    has_local_pos: hasLocalPos,
+    has_explicit_local_pos: hasExplicitLocalPos,
+    local_pos_confirmed_at_ms: localPosConfirmedAtMs,
+    local_pos_observed_at_ms: localPosObservedAtMs,
     ned_vel: vel,
     lat_lon_alt: lla,
     has_global_pos: payload.has_global_pos,
+    global_pos_observed_at_ms: globalPosObservedAtMs,
     hdg_deg: payload.hdg_deg,
+    has_heading: hasHeading,
     timestamp: payload.timestamp,
     receivedAtMs,
   };
@@ -204,12 +273,17 @@ function overwriteKinematicsInPlace(
   target.quat_wxyz[1] = next.quat_wxyz[1];
   target.quat_wxyz[2] = next.quat_wxyz[2];
   target.quat_wxyz[3] = next.quat_wxyz[3];
+  target.has_attitude = next.has_attitude;
   target.body_rates[0] = next.body_rates[0];
   target.body_rates[1] = next.body_rates[1];
   target.body_rates[2] = next.body_rates[2];
   target.ned_xyz[0] = next.ned_xyz[0];
   target.ned_xyz[1] = next.ned_xyz[1];
   target.ned_xyz[2] = next.ned_xyz[2];
+  target.has_local_pos = next.has_local_pos;
+  target.has_explicit_local_pos = next.has_explicit_local_pos;
+  target.local_pos_confirmed_at_ms = next.local_pos_confirmed_at_ms;
+  target.local_pos_observed_at_ms = next.local_pos_observed_at_ms;
   target.ned_vel[0] = next.ned_vel[0];
   target.ned_vel[1] = next.ned_vel[1];
   target.ned_vel[2] = next.ned_vel[2];
@@ -217,7 +291,9 @@ function overwriteKinematicsInPlace(
   target.lat_lon_alt[1] = next.lat_lon_alt[1];
   target.lat_lon_alt[2] = next.lat_lon_alt[2];
   target.has_global_pos = next.has_global_pos;
+  target.global_pos_observed_at_ms = next.global_pos_observed_at_ms;
   target.hdg_deg = next.hdg_deg;
+  target.has_heading = next.has_heading;
   target.timestamp = next.timestamp;
   target.receivedAtMs = next.receivedAtMs;
 }
@@ -324,6 +400,14 @@ export function createTelemetryStore(
   // D1 Option A: non-reactive Map mutated in place so 20 Hz frames never trigger DOM $state thrash.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const kinematicsBySysId = new Map<number, VehicleKinematics>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const legacyAttitudeLatchedBySysId = new Set<number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const legacyLocalPosLatchedAtBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const localPosObservedAtBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const globalPosObservedAtBySysId = new Map<number, number>();
   const eventRing = new Array<TransitionEvent | undefined>(maxEvents);
   let ringWriteIdx = 0;
   let ringSize = 0;
@@ -336,6 +420,20 @@ export function createTelemetryStore(
   let events = $state.raw<readonly TransitionEvent[]>([]);
   let reconnectCount = $state(0);
   let lastDisconnectedAt = $state<number | null>(null);
+
+  function clearAllSessionLatches(): void {
+    legacyAttitudeLatchedBySysId.clear();
+    legacyLocalPosLatchedAtBySysId.clear();
+    localPosObservedAtBySysId.clear();
+    globalPosObservedAtBySysId.clear();
+  }
+
+  function clearSysIdSessionLatches(sysid: number): void {
+    legacyAttitudeLatchedBySysId.delete(sysid);
+    legacyLocalPosLatchedAtBySysId.delete(sysid);
+    localPosObservedAtBySysId.delete(sysid);
+    globalPosObservedAtBySysId.delete(sysid);
+  }
 
   function snapshotEventRing(): readonly TransitionEvent[] {
     if (ringSize === 0) {
@@ -375,9 +473,10 @@ export function createTelemetryStore(
       return;
     }
 
-    const receivedAtMs = isFiniteNumber(parsed.timestamp)
-      ? parsed.timestamp
-      : now();
+    // Stamp local arrival time from the browser clock so WS1 staleness timeout
+    // never depends on server and browser clocks agreeing; producer timestamps
+    // on payload.timestamp remain authoritative for cross-lane ordering.
+    const receivedAtMs = now();
     const segments = parsed.subject.split(".");
     if (segments[0] !== "bbops" || segments[1] !== "telemetry") {
       malformedFrames += 1;
@@ -390,17 +489,60 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
-      const frame = parseTelemetryPayload(parsed.payload, sysid, receivedAtMs);
+      const frame = parseTelemetryPayload(
+        parsed.payload,
+        sysid,
+        receivedAtMs,
+        legacyAttitudeLatchedBySysId.has(sysid),
+        legacyLocalPosLatchedAtBySysId.get(sysid) ?? null,
+        localPosObservedAtBySysId.get(sysid) ?? null,
+        globalPosObservedAtBySysId.get(sysid) ?? null,
+      );
       if (!frame) {
         malformedFrames += 1;
         return;
       }
       const existing = kinematicsBySysId.get(sysid);
+      if (existing !== undefined && frame.timestamp < existing.timestamp) {
+        droppedOutOfOrder += 1;
+        return;
+      }
+      if (frame.has_attitude) {
+        legacyAttitudeLatchedBySysId.add(sysid);
+      } else {
+        legacyAttitudeLatchedBySysId.delete(sysid);
+      }
+      if (
+        frame.has_local_pos &&
+        frame.local_pos_confirmed_at_ms !== null &&
+        frame.local_pos_confirmed_at_ms !== undefined
+      ) {
+        legacyLocalPosLatchedAtBySysId.set(
+          sysid,
+          frame.local_pos_confirmed_at_ms,
+        );
+      } else {
+        legacyLocalPosLatchedAtBySysId.delete(sysid);
+      }
+      if (
+        frame.has_local_pos &&
+        frame.local_pos_observed_at_ms !== null &&
+        frame.local_pos_observed_at_ms !== undefined
+      ) {
+        localPosObservedAtBySysId.set(sysid, frame.local_pos_observed_at_ms);
+      } else {
+        localPosObservedAtBySysId.delete(sysid);
+      }
+      if (
+        frame.has_global_pos &&
+        frame.global_pos_observed_at_ms !== null &&
+        frame.global_pos_observed_at_ms !== undefined
+      ) {
+        globalPosObservedAtBySysId.set(sysid, frame.global_pos_observed_at_ms);
+      } else {
+        globalPosObservedAtBySysId.delete(sysid);
+      }
       if (existing !== undefined) {
-        if (frame.timestamp < existing.timestamp) {
-          droppedOutOfOrder += 1;
-          return;
-        }
         overwriteKinematicsInPlace(existing, frame);
         return;
       }
@@ -420,6 +562,18 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
+      if (
+        transition.kind === "link_lost" ||
+        transition.kind === "link_restored"
+      ) {
+        const existing = kinematicsBySysId.get(sysid);
+        if (
+          existing === undefined ||
+          transition.timestamp >= existing.timestamp
+        ) {
+          clearSysIdSessionLatches(sysid);
+        }
+      }
       pushTransitionEvent(transition);
       return;
     }
@@ -429,6 +583,7 @@ export function createTelemetryStore(
 
   function clearFeedState(): void {
     kinematicsBySysId.clear();
+    clearAllSessionLatches();
     eventRing.fill(undefined);
     ringWriteIdx = 0;
     ringSize = 0;
@@ -454,6 +609,7 @@ export function createTelemetryStore(
       status = nextStatus;
     },
     onOpen() {
+      clearAllSessionLatches();
       if (hasEstablishedOnce) {
         reconnectCount += 1;
       }
@@ -461,21 +617,24 @@ export function createTelemetryStore(
     },
     onMessage: ingestRawFrame,
     onDisconnect(info) {
+      clearAllSessionLatches();
       if (info.wasConnected) {
         lastDisconnectedAt = info.timestamp;
       }
     },
-    onEndpointChange() {
+    onEndpointChange(nextUrl) {
+      currentUrl = nextUrl;
       clearFeedState();
     },
   });
+  let currentUrl = $state(wsClient.url);
 
   return {
     get status() {
       return status;
     },
     get url() {
-      return wsClient.url;
+      return currentUrl;
     },
     get vehicleCount() {
       return vehicleCount;
@@ -500,6 +659,7 @@ export function createTelemetryStore(
     },
     disconnect() {
       wsClient.disconnect();
+      clearAllSessionLatches();
     },
     getKinematics(sysid: number) {
       return kinematicsBySysId.get(sysid);
