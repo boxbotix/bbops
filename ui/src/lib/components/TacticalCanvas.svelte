@@ -54,6 +54,8 @@
     onSyncHash,
   }: Props = $props();
 
+  const instanceId = $props.id();
+
   let containerEl: HTMLDivElement | undefined = $state();
   let surfaceCanvasEl: HTMLCanvasElement | undefined = $state();
   let overlayCanvasEl: HTMLCanvasElement | undefined = $state();
@@ -917,62 +919,78 @@
       {/each}
     </div>
 
-    <div class="chip-group" role="group" aria-label="Camera and declutter">
-      <button
-        type="button"
-        class="chip"
-        aria-pressed={viewportStore.tetheredEntityId !== null}
-        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
-          ? "T"
-          : undefined}
-        disabled={viewportStore.selectedEntityId === null &&
-          viewportStore.tetheredEntityId === null}
-        onclick={() => {
-          viewportStore.tetherEntity(
-            viewportStore.tetheredEntityId !== null
-              ? null
-              : viewportStore.selectedEntityId,
-          );
-          onSyncHash?.(viewportStore.toUrlHash());
-        }}
-      >
-        {viewportStore.characterShortcutsEnabled ? "Tether [T]" : "Tether"}
-      </button>
-      <button
-        type="button"
-        class="chip"
-        aria-pressed={viewportStore.chaseLock}
-        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
-          ? "C"
-          : undefined}
-        disabled={viewportStore.selectedEntityId === null &&
-          viewportStore.tetheredEntityId === null}
-        onclick={() => {
-          viewportStore.setChaseLock(!viewportStore.chaseLock);
-          onSyncHash?.(viewportStore.toUrlHash());
-        }}
-      >
-        {viewportStore.characterShortcutsEnabled ? "Chase [C]" : "Chase"}
-      </button>
-      {#each DECLUTTER_LEVELS as level (level)}
+    <div class="chip-group">
+      <div class="sub-group" role="group" aria-label="Camera tracking">
         <button
           type="button"
           class="chip"
-          aria-pressed={viewportStore.declutter === level}
+          aria-pressed={viewportStore.tetheredEntityId !== null}
           aria-keyshortcuts={viewportStore.characterShortcutsEnabled
-            ? "H"
+            ? "T"
             : undefined}
-          title={viewportStore.characterShortcutsEnabled
-            ? `HUD declutter: ${level} (cycle with H)`
-            : `HUD declutter: ${level}`}
+          disabled={viewportStore.selectedEntityId === null &&
+            viewportStore.tetheredEntityId === null}
           onclick={() => {
-            viewportStore.setDeclutter(level);
+            viewportStore.tetherEntity(
+              viewportStore.tetheredEntityId !== null
+                ? null
+                : viewportStore.selectedEntityId,
+            );
             onSyncHash?.(viewportStore.toUrlHash());
           }}
         >
-          {level}
+          {viewportStore.characterShortcutsEnabled ? "Tether [T]" : "Tether"}
         </button>
-      {/each}
+        <button
+          type="button"
+          class="chip"
+          aria-pressed={viewportStore.chaseLock}
+          aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+            ? "C"
+            : undefined}
+          disabled={viewportStore.selectedEntityId === null &&
+            viewportStore.tetheredEntityId === null}
+          onclick={() => {
+            viewportStore.setChaseLock(!viewportStore.chaseLock);
+            onSyncHash?.(viewportStore.toUrlHash());
+          }}
+        >
+          {viewportStore.characterShortcutsEnabled ? "Chase [C]" : "Chase"}
+        </button>
+      </div>
+      <div
+        class="sub-group"
+        role="group"
+        data-testid="declutter-group"
+        aria-label="HUD declutter"
+        aria-describedby={viewportStore.characterShortcutsEnabled
+          ? `${instanceId}-declutter-shortcut`
+          : undefined}
+      >
+        {#if viewportStore.characterShortcutsEnabled}
+          <span
+            id="{instanceId}-declutter-shortcut"
+            class="sr-only"
+            data-testid="declutter-shortcut-hint"
+          >
+            Press H to cycle HUD declutter levels
+          </span>
+        {/if}
+        {#each DECLUTTER_LEVELS as level (level)}
+          <button
+            type="button"
+            class="chip"
+            aria-pressed={viewportStore.declutter === level}
+            title={`HUD declutter: ${level}`}
+            onclick={() => {
+              viewportStore.setDeclutter(level);
+              onSyncHash?.(viewportStore.toUrlHash());
+            }}
+          >
+            {level}
+          </button>
+        {/each}
+      </div>
     </div>
   </div>
 </div>
@@ -1054,6 +1072,24 @@
     border: 1px solid var(--ui-border-subtle, #1e293b);
     border-radius: 6px;
     pointer-events: auto;
+  }
+
+  .sub-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 
   .chip {

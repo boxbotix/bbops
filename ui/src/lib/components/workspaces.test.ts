@@ -372,13 +372,28 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
     });
     flushSync();
 
-    // 1. COP Solo-Mode accordion mounts strictly ONE panel at a time.
-    const countSoloPanels = () =>
+    // 1. COP Solo-Mode accordion keeps all 3 role="tabpanel" targets mounted for aria-controls while expanding strictly ONE unhidden panel lazily.
+    const countMountedPanels = () =>
       hostEl.querySelectorAll('[data-testid^="cop-solo-panel-"]').length;
-    expect(countSoloPanels()).toBe(1);
-    expect(
-      hostEl.querySelector('[data-testid="cop-solo-panel-summary"]'),
-    ).not.toBeNull();
+    const getVisiblePanels = () =>
+      Array.from(
+        hostEl.querySelectorAll<HTMLElement>(
+          '[data-testid^="cop-solo-panel-"]:not([hidden])',
+        ),
+      );
+    const getHiddenPanels = () =>
+      Array.from(
+        hostEl.querySelectorAll<HTMLElement>(
+          '[data-testid^="cop-solo-panel-"][hidden]',
+        ),
+      );
+    expect(countMountedPanels()).toBe(3);
+    expect(getVisiblePanels().map((el) => el.dataset.testid)).toEqual([
+      "cop-solo-panel-summary",
+    ]);
+    expect(getHiddenPanels().every((el) => el.children.length === 0)).toBe(
+      true,
+    );
 
     (
       hostEl.querySelector(
@@ -386,10 +401,13 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       ) as HTMLButtonElement
     ).click();
     flushSync();
-    expect(countSoloPanels()).toBe(1);
-    expect(
-      hostEl.querySelector('[data-testid="cop-solo-panel-alerts"]'),
-    ).not.toBeNull();
+    expect(countMountedPanels()).toBe(3);
+    expect(getVisiblePanels().map((el) => el.dataset.testid)).toEqual([
+      "cop-solo-panel-alerts",
+    ]);
+    expect(getHiddenPanels().every((el) => el.children.length === 0)).toBe(
+      true,
+    );
 
     (
       hostEl.querySelector(
@@ -397,10 +415,13 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       ) as HTMLButtonElement
     ).click();
     flushSync();
-    expect(countSoloPanels()).toBe(1);
-    expect(
-      hostEl.querySelector('[data-testid="cop-solo-panel-skg"]'),
-    ).not.toBeNull();
+    expect(countMountedPanels()).toBe(3);
+    expect(getVisiblePanels().map((el) => el.dataset.testid)).toEqual([
+      "cop-solo-panel-skg",
+    ]);
+    expect(getHiddenPanels().every((el) => el.children.length === 0)).toBe(
+      true,
+    );
 
     // 2. Switch to Pilot: defaults to Map-Primary with floating HUD PiP, ISA-101 abnormal chip, and guarded action seam.
     viewportStore.setWorkspace("pilot");
@@ -1852,17 +1873,34 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
         '[data-testid="cop-solo-tab-skg"]',
       ) as HTMLButtonElement;
 
+      const tabs = [summaryTab, alertsTab, skgTab];
+      const assertPanelLinkageAndSingleExposed = (expectedPanelId: string) => {
+        const resolved = tabs.map((tab) => {
+          const controlsId = tab.getAttribute("aria-controls");
+          expect(controlsId).toBeTruthy();
+          const panel = document.getElementById(controlsId!);
+          expect(panel).not.toBeNull();
+          expect(panel?.getAttribute("role")).toBe("tabpanel");
+          expect(panel?.getAttribute("aria-labelledby")).toBe(tab.id);
+          return panel as HTMLElement;
+        });
+        const exposed = resolved.filter((panel) => !panel.hidden);
+        expect(exposed.map((panel) => panel.id)).toEqual([expectedPanelId]);
+        for (const hiddenPanel of resolved.filter((panel) => panel.hidden)) {
+          expect(hiddenPanel.children.length).toBe(0);
+          expect(hiddenPanel.getAttribute("tabindex")).toBeNull();
+        }
+      };
+
       expect(summaryTab.getAttribute("tabindex")).toBe("0");
       expect(alertsTab.getAttribute("tabindex")).toBe("-1");
       expect(skgTab.getAttribute("tabindex")).toBe("-1");
-      expect(summaryTab.getAttribute("aria-controls")).toBe(
-        "cop-solo-panel-summary",
-      );
-      const summaryPanel = hostEl.querySelector(
-        '[data-testid="cop-solo-panel-summary"]',
-      ) as HTMLElement;
-      expect(summaryPanel.getAttribute("role")).toBe("tabpanel");
-      expect(summaryPanel.getAttribute("aria-labelledby")).toBe(summaryTab.id);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-summary");
+      const summaryPanel = document.getElementById("cop-solo-panel-summary")!;
+      const alertsPanel = document.getElementById("cop-solo-panel-alerts")!;
+      const skgPanel = document.getElementById("cop-solo-panel-skg")!;
+      // Selected quad1 supplies .jump-btn controls inside Summary -> panel itself omits tabindex.
+      expect(summaryPanel.getAttribute("tabindex")).toBeNull();
 
       summaryTab.focus();
       summaryTab.dispatchEvent(
@@ -1877,11 +1915,8 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       expect(alertsTab.getAttribute("aria-selected")).toBe("true");
       expect(alertsTab.getAttribute("tabindex")).toBe("0");
       expect(summaryTab.getAttribute("tabindex")).toBe("-1");
-      expect(
-        hostEl
-          .querySelector('[data-testid="cop-solo-panel-alerts"]')
-          ?.getAttribute("aria-labelledby"),
-      ).toBe(alertsTab.id);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-alerts");
+      expect(alertsPanel.getAttribute("tabindex")).toBeNull();
 
       // ArrowRight -> skg; ArrowRight -> wraps to summary; ArrowLeft -> wraps to skg; Home -> summary; End -> skg.
       alertsTab.dispatchEvent(
@@ -1894,6 +1929,8 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       flushSync();
       expect(document.activeElement).toBe(skgTab);
       expect(skgTab.getAttribute("aria-selected")).toBe("true");
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-skg");
+      expect(skgPanel.getAttribute("tabindex")).toBeNull();
 
       skgTab.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -1904,6 +1941,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       );
       flushSync();
       expect(document.activeElement).toBe(summaryTab);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-summary");
 
       summaryTab.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -1914,6 +1952,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       );
       flushSync();
       expect(document.activeElement).toBe(skgTab);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-skg");
 
       skgTab.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -1924,6 +1963,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       );
       flushSync();
       expect(document.activeElement).toBe(summaryTab);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-summary");
 
       summaryTab.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -1934,8 +1974,9 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       );
       flushSync();
       expect(document.activeElement).toBe(skgTab);
+      assertPanelLinkageAndSingleExposed("cop-solo-panel-skg");
 
-      // 3. Panel focus recovery when focused child inside tabpanel unmounts on selection or fault changes.
+      // 3. Panel focus recovery and read-only tabpanel tab stop (tabindex="0") when no focusable children exist.
       summaryTab.click();
       flushSync();
       const jumpPilotBtn = Array.from(
@@ -1945,14 +1986,16 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       jumpPilotBtn!.focus();
       expect(document.activeElement).toBe(jumpPilotBtn);
 
-      // Deselecting entity unmounts jump buttons inside summary panel -> focus recovers to active summary tab.
+      // Deselecting entity unmounts jump buttons -> focus recovers to active summary tab, and read-only summary panel becomes tabindex="0".
       viewportStore.selectEntity(null);
       flushSync();
       expect(document.activeElement).toBe(summaryTab);
+      expect(summaryPanel.getAttribute("tabindex")).toBe("0");
 
-      // Switch to alerts tab, focus faultedRover's exception button, then resolve fault -> focus recovers to alerts tab.
+      // Switch to alerts tab, focus faultedRover's exception button, then resolve fault -> focus recovers to alerts tab and alerts panel becomes tabindex="0".
       alertsTab.click();
       flushSync();
+      expect(alertsPanel.getAttribute("tabindex")).toBeNull();
       const exceptionBtn = hostEl.querySelector(
         ".exception-select",
       ) as HTMLButtonElement;
@@ -1977,11 +2020,22 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       flushSync();
       expect(hostEl.querySelector(".exception-select")).toBeNull();
       expect(document.activeElement).toBe(alertsTab);
+      expect(alertsPanel.getAttribute("tabindex")).toBe("0");
 
-      // 4. Post-workspace-switch focus: direct topbar nav click keeps button focused; jump button / hotkey focuses destination stage.
-      viewportStore.selectEntity(quad1.id);
+      // SKG panel with no selected entity also exposes tabindex="0" as a read-only tab stop.
+      skgTab.click();
+      flushSync();
+      expect(skgPanel.getAttribute("tabindex")).toBe("0");
+
+      // Focusing read-only summary panel and then selecting quad1 (mounting focusable buttons and removing panel tabindex) recovers focus cleanly to summaryTab.
       summaryTab.click();
       flushSync();
+      summaryPanel.focus();
+      expect(document.activeElement).toBe(summaryPanel);
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      expect(summaryPanel.getAttribute("tabindex")).toBeNull();
+      expect(document.activeElement).toBe(summaryTab);
 
       pilotNavBtn.focus();
       pilotNavBtn.click();
@@ -2065,11 +2119,35 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       expect(shortcutsToggle.getAttribute("aria-pressed")).toBe("true");
       expect(hostEl.querySelectorAll("kbd").length).toBeGreaterThan(0);
 
+      const declutterGroup = hostEl.querySelector(
+        '[data-testid="declutter-group"]',
+      ) as HTMLElement;
+      expect(declutterGroup).not.toBeNull();
+      const declutterDescIdOn = declutterGroup.getAttribute("aria-describedby");
+      expect(declutterDescIdOn).toBeTruthy();
+      expect(
+        document.getElementById(declutterDescIdOn!)?.textContent?.trim(),
+      ).toBe("Press H to cycle HUD declutter levels");
+      const declutterButtons = Array.from(
+        declutterGroup.querySelectorAll<HTMLButtonElement>("button.chip"),
+      );
+      expect(declutterButtons).toHaveLength(3);
+      for (const btn of declutterButtons) {
+        expect(btn.getAttribute("aria-keyshortcuts")).toBeNull();
+        expect(btn.getAttribute("title")).toBe(
+          `HUD declutter: ${btn.textContent?.trim()}`,
+        );
+      }
+
       shortcutsToggle.click();
       flushSync();
       expect(shortcutsToggle.textContent).toContain("Shortcuts: Off");
       expect(shortcutsToggle.getAttribute("aria-pressed")).toBe("false");
       expect(storageMap.get(CHARACTER_SHORTCUTS_STORAGE_KEY)).toBe("false");
+      expect(declutterGroup.getAttribute("aria-describedby")).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="declutter-shortcut-hint"]'),
+      ).toBeNull();
 
       // Zero <kbd> hints remain in topbar or filmstrip, and [D]/[B]/[K]/[T]/[C] suffixes & aria-keyshortcuts are removed.
       expect(hostEl.querySelectorAll("kbd").length).toBe(0);

@@ -176,8 +176,14 @@
   );
   const tripleRows = $derived(formatEntityTriples(selectedEntity).slice(0, 16));
 
+  const summaryHasFocusableContent = $derived(
+    Boolean((vehicleSummary && selectedVehicle) || contactSummary),
+  );
+  const alertsHasFocusableContent = $derived(faultedOwnshipEntries.length > 0);
+  const skgHasFocusableContent = $derived(Boolean(selectedEntity));
+
   const panelFocusDeps = $derived(
-    `${activeSection}|${selectedEntity?.id ?? ""}|${selectedEntity?.poisoned ? "1" : "0"}|${faultedOwnshipEntries.map((entry) => entry.id).join(",")}|${tripleRows.length}`,
+    `${activeSection}|${selectedEntity?.id ?? ""}|${selectedEntity?.poisoned ? "1" : "0"}|${faultedOwnshipEntries.map((entry) => entry.id).join(",")}|${tripleRows.length}|${summaryHasFocusableContent ? "1" : "0"}|${alertsHasFocusableContent ? "1" : "0"}|${skgHasFocusableContent ? "1" : "0"}`,
   );
 
   function getSoloTabElement(
@@ -258,7 +264,10 @@
       !activeEl ||
       activeEl === document.body ||
       activeEl === document.documentElement ||
-      !activeEl.isConnected
+      !activeEl.isConnected ||
+      activeEl.closest("[hidden]") !== null ||
+      (activeEl.getAttribute("role") === "tabpanel" &&
+        !activeEl.hasAttribute("tabindex"))
     ) {
       getSoloTabElement(activeSection)?.focus({ preventScroll: true });
     }
@@ -430,14 +439,18 @@
       </div>
 
       <div class="solo-panel-host" bind:this={panelHostEl}>
-        {#if activeSection === "summary"}
-          <div
-            id="cop-solo-panel-summary"
-            role="tabpanel"
-            aria-labelledby="cop-solo-tab-summary"
-            class="solo-panel"
-            data-testid="cop-solo-panel-summary"
-          >
+        <div
+          id="cop-solo-panel-summary"
+          role="tabpanel"
+          aria-labelledby="cop-solo-tab-summary"
+          class="solo-panel"
+          hidden={activeSection !== "summary"}
+          tabindex={activeSection === "summary" && !summaryHasFocusableContent
+            ? 0
+            : undefined}
+          data-testid="cop-solo-panel-summary"
+        >
+          {#if activeSection === "summary"}
             {#if vehicleSummary && selectedVehicle}
               <div class="summary-header">
                 <strong>UXS #{vehicleSummary.sysid}</strong>
@@ -595,15 +608,21 @@
                 or filmstrip.
               </p>
             {/if}
-          </div>
-        {:else if activeSection === "alerts"}
-          <div
-            id="cop-solo-panel-alerts"
-            role="tabpanel"
-            aria-labelledby="cop-solo-tab-alerts"
-            class="solo-panel"
-            data-testid="cop-solo-panel-alerts"
-          >
+          {/if}
+        </div>
+
+        <div
+          id="cop-solo-panel-alerts"
+          role="tabpanel"
+          aria-labelledby="cop-solo-tab-alerts"
+          class="solo-panel"
+          hidden={activeSection !== "alerts"}
+          tabindex={activeSection === "alerts" && !alertsHasFocusableContent
+            ? 0
+            : undefined}
+          data-testid="cop-solo-panel-alerts"
+        >
+          {#if activeSection === "alerts"}
             {#if faultedOwnshipEntries.length === 0}
               <p class="rail-empty" data-testid="cop-exceptions-empty">
                 {fleetHealth.exceptionsEmptyCopy}
@@ -656,15 +675,21 @@
                 {/each}
               </ul>
             {/if}
-          </div>
-        {:else}
-          <div
-            id="cop-solo-panel-skg"
-            role="tabpanel"
-            aria-labelledby="cop-solo-tab-skg"
-            class="solo-panel"
-            data-testid="cop-solo-panel-skg"
-          >
+          {/if}
+        </div>
+
+        <div
+          id="cop-solo-panel-skg"
+          role="tabpanel"
+          aria-labelledby="cop-solo-tab-skg"
+          class="solo-panel"
+          hidden={activeSection !== "skg"}
+          tabindex={activeSection === "skg" && !skgHasFocusableContent
+            ? 0
+            : undefined}
+          data-testid="cop-solo-panel-skg"
+        >
+          {#if activeSection === "skg"}
             {#if !selectedEntity}
               <p class="rail-empty">Select an entity to inspect SKG triples.</p>
             {:else}
@@ -692,8 +717,8 @@
                 {/each}
               </ul>
             {/if}
-          </div>
-        {/if}
+          {/if}
+        </div>
       </div>
     </aside>
   {/if}
@@ -853,6 +878,14 @@
     flex-direction: column;
     gap: 10px;
     min-width: 0;
+  }
+
+  .solo-panel[hidden] {
+    display: none;
+  }
+
+  .solo-panel:focus-visible {
+    border-radius: 4px;
   }
 
   .summary-header {
