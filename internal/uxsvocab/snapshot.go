@@ -317,19 +317,18 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		}
 	}
 
+	hasSysStatusMeta := s.HasSysStatus || s.SysStatusObservedUnixNs > 0
 	hasPoseMeta := s.PoseMetadata ||
-		s.HasSysStatus ||
 		s.HasAttitude ||
 		s.HasLocalPos ||
 		s.HasGlobalPos ||
 		s.HasHeading ||
-		s.SysStatusObservedUnixNs > 0 ||
 		s.AttitudeObservedUnixNs > 0 ||
 		s.LocalPosObservedUnixNs > 0 ||
 		s.GlobalPosObservedUnixNs > 0 ||
 		s.HeadingObservedUnixNs > 0
 
-	legacySysStatus := s.Failsafes != 0 || s.CRCErrors != 0 || s.LoopDtUs != 0 || s.MaxLoopDtUs != 0 || s.RTTUs != 0
+	legacySysStatus := s.LoopDtUs != 0 || s.MaxLoopDtUs != 0 || s.RTTUs != 0
 	quatNormSq := s.Quaternion[0]*s.Quaternion[0] +
 		s.Quaternion[1]*s.Quaternion[1] +
 		s.Quaternion[2]*s.Quaternion[2] +
@@ -340,8 +339,8 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 	legacyHdg := s.HeadingDeg != 0 || legacyAtt
 	legacyGlobal := s.Latitude != 0 || s.Longitude != 0 || s.Altitude != 0
 
-	poseTriple := func(predicate string, obj any, hasDomain bool, observedUnixNs int64, legacyPresent bool) message.Triple {
-		if hasPoseMeta {
+	domainTriple := func(predicate string, obj any, hasMeta, hasDomain bool, observedUnixNs int64, legacyPresent bool) message.Triple {
+		if hasMeta {
 			if !hasDomain {
 				unmeasuredTS := epochZero
 				if observedUnixNs > 0 {
@@ -392,19 +391,19 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		triple(PredicateHealthFlags, s.Flags),
 		triple(PredicateHealthFailsafes, s.Failsafes),
 		triple(PredicateHealthCRCErrors, s.CRCErrors),
-		poseTriple(PredicateHealthLoopDtUs, s.LoopDtUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
-		poseTriple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
-		poseTriple(PredicateHealthRTTUs, s.RTTUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
-		poseTriple(PredicateAttitudeQuaternion, s.Quaternion, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
-		poseTriple(PredicateAttitudeRates, s.BodyRates, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
-		poseTriple(PredicateKinematicsNED, s.NED, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
-		poseTriple(PredicateKinematicsVx, s.Vx, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
-		poseTriple(PredicateKinematicsVy, s.Vy, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
-		poseTriple(PredicateKinematicsVz, s.Vz, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
-		poseTriple(PredicateKinematicsHeadingDeg, s.HeadingDeg, s.HasHeading, s.HeadingObservedUnixNs, legacyHdg),
-		poseTriple(vocabulary.GeoLocationLatitude, s.Latitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
-		poseTriple(vocabulary.GeoLocationLongitude, s.Longitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
-		poseTriple(vocabulary.GeoLocationAltitude, s.Altitude, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
+		domainTriple(PredicateHealthLoopDtUs, s.LoopDtUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
+		domainTriple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
+		domainTriple(PredicateHealthRTTUs, s.RTTUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
+		domainTriple(PredicateAttitudeQuaternion, s.Quaternion, hasPoseMeta, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
+		domainTriple(PredicateAttitudeRates, s.BodyRates, hasPoseMeta, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
+		domainTriple(PredicateKinematicsNED, s.NED, hasPoseMeta, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		domainTriple(PredicateKinematicsVx, s.Vx, hasPoseMeta, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		domainTriple(PredicateKinematicsVy, s.Vy, hasPoseMeta, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		domainTriple(PredicateKinematicsVz, s.Vz, hasPoseMeta, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),
+		domainTriple(PredicateKinematicsHeadingDeg, s.HeadingDeg, hasPoseMeta, s.HasHeading, s.HeadingObservedUnixNs, legacyHdg),
+		domainTriple(vocabulary.GeoLocationLatitude, s.Latitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
+		domainTriple(vocabulary.GeoLocationLongitude, s.Longitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
+		domainTriple(vocabulary.GeoLocationAltitude, s.Altitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
 		triple(vocabulary.DCTermsTitle, title),
 	}
 }
