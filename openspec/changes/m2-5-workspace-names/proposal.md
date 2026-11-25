@@ -1,5 +1,5 @@
 # Proposal: m2-5-workspace-names
-Approved-by:
+Approved-by: Coby Leuschke (2026-11-25) sha256:67a10bb66acc
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track

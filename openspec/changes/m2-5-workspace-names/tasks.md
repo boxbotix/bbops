@@ -2,7 +2,7 @@
 
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval (`proposal.md` `Approved-by:` digest from `ateam state spec-queue` for `#38`).
+- [x] 1.1 Owner approved `proposal.md` (`Approved-by: Coby Leuschke (2026-11-25) sha256:67a10bb66acc` for `#38`).
 
 ## 2. Implementation
 
