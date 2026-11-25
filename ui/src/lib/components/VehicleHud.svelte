@@ -305,6 +305,7 @@
         const nowMs = now();
         const pose = resolveLiveVehiclePose(vehicle, {
           fast: telemetryStore.getKinematics(vehicle.sysid),
+          telemetryLink: telemetryStore.getLinkState(vehicle.sysid),
           telemetryStatus: telemetryStore.status,
           skgStatus,
           nowMs,

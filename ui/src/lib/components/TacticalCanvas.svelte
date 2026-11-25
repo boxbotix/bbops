@@ -11,6 +11,7 @@
   import { onMount, type Snippet } from "svelte";
   import {
     type ResolvedVehiclePose,
+    evaluateVehicleFreshness,
     resolveLiveVehiclePose,
   } from "$lib/hud/view-model";
   import type { SkgStore, VehicleEntityState } from "$lib/stores/skg.svelte";
@@ -81,6 +82,7 @@
   ): ResolvedVehiclePose {
     return resolveLiveVehiclePose(v, {
       fast: telemetryStore.getKinematics(v.sysid),
+      telemetryLink: telemetryStore.getLinkState(v.sysid),
       telemetryStatus: telemetryStore.status,
       skgStatus: skgStore.status,
       nowMs,
@@ -403,6 +405,7 @@
     widthPx: number,
     heightPx: number,
     poses: ReadonlyMap<string, ResolvedVehiclePose>,
+    nowMs = now(),
   ): void {
     ctx.clearRect(0, 0, widthPx, heightPx);
     const nextHits: RenderedHitTarget[] = [];
@@ -531,7 +534,19 @@
           continue;
         }
 
-        const tone = resolveVehicleSafetyTone(vehicle);
+        const hasLiveSkgSession =
+          skgStore.status !== "disconnected" ||
+          skgStore.lastSyncedRevision !== null;
+        const vehicleFreshness = evaluateVehicleFreshness(vehicle, {
+          telemetryLink: telemetryStore.getLinkState(vehicle.sysid),
+          telemetryStatus: telemetryStore.status,
+          skgStatus: hasLiveSkgSession ? skgStore.status : undefined,
+          skgSynced: hasLiveSkgSession ? skgStore.synced : undefined,
+          nowMs,
+        });
+        const tone = resolveVehicleSafetyTone(vehicle, {
+          isStale: snap.stale || !vehicleFreshness.fresh,
+        });
         const bowScreenRad = adapter.screenCourseRad(snap.headingRad);
         const crab = computeCrabAngleVectors(
           snap.headingRad,
@@ -706,8 +721,9 @@
 
     let rafId = 0;
     const renderTick = (): void => {
+      const tickNowMs = now();
       const vehicles = skgStore.vehicles;
-      const poses = reconcileSharedOriginAndStatuses(vehicles);
+      const poses = reconcileSharedOriginAndStatuses(vehicles, tickNowMs);
       applyTetherAndChase(vehicles, poses);
       if (surfaceCanvasEl && overlayCanvasEl) {
         const { widthPx, heightPx } = adapter.getViewportSize();
@@ -717,7 +733,7 @@
           drawSurfaceGrid(surfaceCtx, widthPx, heightPx);
         }
         if (overlayCtx) {
-          drawSafetyHudOverlay(overlayCtx, widthPx, heightPx, poses);
+          drawSafetyHudOverlay(overlayCtx, widthPx, heightPx, poses, tickNowMs);
         }
       }
       rafId = window.requestAnimationFrame(renderTick);

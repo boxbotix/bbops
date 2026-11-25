@@ -1,5 +1,5 @@
 # Proposal: m2-5-health-freshness
-Approved-by:
+Approved-by: coby (2026-11-25) sha256:c37274802fdc
 Architect: gemini (gemini-4-carbon, medium)
 
 ## Track

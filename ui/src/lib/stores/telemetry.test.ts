@@ -820,4 +820,176 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
 
     legacyStore.disconnect();
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("preserves per-sysid linkLost state across 100-event ring eviction, clearEvents, socket reconnects, and pre-loss packets until link_restored or post-loss telemetry arrives", () => {
+    const rig = new MockWebSocketRig();
+    let nowMs = 1_732_500_000_000;
+    const store = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: rig.createSocket,
+      now: () => nowMs,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    // 1. Admit sysid=1 with live kinematics at t0.
+    rig.latest.serverMessage(
+      buildKinematicEnvelope(1, {
+        seq: 1,
+        msg_id: 32,
+        has_local_pos: true,
+        ned_xyz: [10, -4, -8],
+        timestamp: nowMs,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: false,
+      linkLostAtMs: null,
+      linkLostTimestamp: null,
+      lastPacketTimestamp: nowMs,
+      lastPacketReceivedAtMs: nowMs,
+    });
+
+    // 2. Steady-state 20 Hz updates advance lastPacketTimestamp/lastPacketReceivedAtMs in place.
+    const initialPacketMs = nowMs;
+    nowMs += 50;
+    rig.latest.serverMessage(
+      buildKinematicEnvelope(1, {
+        seq: 2,
+        msg_id: 32,
+        has_local_pos: true,
+        ned_xyz: [11, -4, -8],
+        timestamp: nowMs,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(false);
+    expect(store.getLinkState(1)?.lastPacketTimestamp).toBe(
+      initialPacketMs + 50,
+    );
+    expect(store.getLinkState(1)?.lastPacketReceivedAtMs).toBe(
+      initialPacketMs + 50,
+    );
+
+    // 3. sysid=1 crosses silence threshold at +3_050ms -> link_lost latches without advancing lastPacketTimestamp.
+    const lastLivePacketMs = nowMs;
+    nowMs += 3_000;
+    const lossMs = nowMs;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        kind: "link_lost",
+        reasons: ["silence_timeout"],
+        timestamp: lossMs,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: true,
+      linkLostAtMs: lossMs,
+      linkLostTimestamp: lossMs,
+      lastPacketTimestamp: lastLivePacketMs,
+      lastPacketReceivedAtMs: lastLivePacketMs,
+    });
+
+    // 4. Push 125 events for sysid=2 so sysid=1's link_lost event is completely evicted from the 100-entry ring.
+    for (let i = 0; i < 125; i += 1) {
+      nowMs += 10;
+      rig.latest.serverMessage(
+        buildTransitionEnvelope(2, {
+          seq: i % 256,
+          kind: "statustext",
+          timestamp: nowMs,
+          status_text: {
+            severity: 6,
+            text: `sys2-event-${i}`,
+            id: 0,
+            chunk_seq: 0,
+          },
+        }),
+      );
+    }
+    expect(store.events).toHaveLength(100);
+    expect(store.events.some((ev) => ev.sysid === 1)).toBe(false);
+    expect(store.getLinkState(1)?.linkLost).toBe(true);
+    expect(store.getLinkState(2)?.linkLost).toBe(false);
+
+    // Clearing the UI event log also preserves per-sysid link state.
+    store.clearEvents();
+    expect(store.events).toHaveLength(0);
+    expect(store.getLinkState(1)?.linkLost).toBe(true);
+
+    // 5. Socket drop + reconnect alone NEVER clears linkLost.
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    rig.latest.serverOpen();
+    expect(store.status).toBe("connected");
+    expect(store.getLinkState(1)?.linkLost).toBe(true);
+
+    // 6. A delayed pre-loss kinematic frame (timestamp between lastLivePacketMs and lossMs) does NOT clear linkLost.
+    nowMs += 100;
+    rig.latest.serverMessage(
+      buildKinematicEnvelope(1, {
+        seq: 3,
+        msg_id: 32,
+        has_local_pos: true,
+        ned_xyz: [11.5, -4, -8],
+        timestamp: lossMs - 500,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(true);
+
+    // 7. Explicit link_restored clears linkLost, and endpoint override resets link state cleanly.
+    nowMs += 200;
+    const restoreMs = nowMs;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 4,
+        kind: "link_restored",
+        reasons: ["link_restored"],
+        timestamp: restoreMs,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: false,
+      linkLostAtMs: null,
+      linkLostTimestamp: null,
+      lastPacketTimestamp: restoreMs,
+      lastPacketReceivedAtMs: restoreMs,
+    });
+
+    // Re-trigger link_lost and verify a post-loss kinematic packet (>= lossTimestamp) also clears linkLost.
+    nowMs += 3_100;
+    const secondLossMs = nowMs;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 5,
+        kind: "link_lost",
+        reasons: ["silence_timeout"],
+        timestamp: secondLossMs,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(true);
+
+    nowMs += 50;
+    const resumeKinMs = nowMs;
+    rig.latest.serverMessage(
+      buildKinematicEnvelope(1, {
+        seq: 6,
+        msg_id: 32,
+        has_local_pos: true,
+        ned_xyz: [15, -2, -8],
+        timestamp: resumeKinMs,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(false);
+    expect(store.getLinkState(1)?.lastPacketTimestamp).toBe(resumeKinMs);
+
+    store.connect("ws://127.0.0.1:8099/ws-next");
+    expect(store.getLinkState(1)).toBeUndefined();
+    store.disconnect();
+  });
 });

@@ -94,6 +94,15 @@ export interface TransitionEvent {
   timestamp: number;
 }
 
+export interface VehicleTelemetryLinkState {
+  readonly sysid: number;
+  readonly linkLost: boolean;
+  readonly linkLostAtMs: number | null;
+  readonly linkLostTimestamp: number | null;
+  readonly lastPacketTimestamp: number | null;
+  readonly lastPacketReceivedAtMs: number | null;
+}
+
 export interface TelemetryStoreOptions {
   url?: string;
   maxEvents?: number;
@@ -116,6 +125,7 @@ export interface TelemetryStore {
   connect(overrideUrl?: string): void;
   disconnect(): void;
   getKinematics(sysid: number): VehicleKinematics | undefined;
+  getLinkState(sysid: number): VehicleTelemetryLinkState | undefined;
   kinematicsEntries(): IterableIterator<[number, VehicleKinematics]>;
   onKinematicsAccepted(
     listener: (frame: VehicleKinematics) => void,
@@ -401,9 +411,20 @@ export function createTelemetryStore(
       ? (import.meta.env.VITE_TELEMETRY_WS_URL as string | undefined)
       : undefined;
 
+  interface MutableTelemetryLinkState {
+    sysid: number;
+    linkLost: boolean;
+    linkLostAtMs: number | null;
+    linkLostTimestamp: number | null;
+    lastPacketTimestamp: number | null;
+    lastPacketReceivedAtMs: number | null;
+  }
+
   // D1 Option A: non-reactive Map mutated in place so 20 Hz frames never trigger DOM $state thrash.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const kinematicsBySysId = new Map<number, VehicleKinematics>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const linkStateBySysId = new Map<number, MutableTelemetryLinkState>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const legacyAttitudeLatchedBySysId = new Set<number>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -427,9 +448,84 @@ export function createTelemetryStore(
 
   let status = $state<WsConnectionStatus>("disconnected");
   let vehicleCount = $state(0);
+  let linkStateVersion = $state(0);
   let events = $state.raw<readonly TransitionEvent[]>([]);
   let reconnectCount = $state(0);
   let lastDisconnectedAt = $state<number | null>(null);
+
+  function recordPacketLinkReceipt(
+    sysid: number,
+    packetTimestamp: number,
+    receivedAtMs: number,
+    forceRestore = false,
+  ): void {
+    const entry = linkStateBySysId.get(sysid);
+    if (entry === undefined) {
+      linkStateBySysId.set(sysid, {
+        sysid,
+        linkLost: false,
+        linkLostAtMs: null,
+        linkLostTimestamp: null,
+        lastPacketTimestamp: packetTimestamp,
+        lastPacketReceivedAtMs: receivedAtMs,
+      });
+      linkStateVersion += 1;
+      return;
+    }
+    if (
+      forceRestore ||
+      entry.lastPacketTimestamp === null ||
+      packetTimestamp >= entry.lastPacketTimestamp
+    ) {
+      entry.lastPacketTimestamp = packetTimestamp;
+      entry.lastPacketReceivedAtMs = receivedAtMs;
+    }
+    if (
+      entry.linkLost &&
+      (forceRestore ||
+        entry.linkLostTimestamp === null ||
+        packetTimestamp >= entry.linkLostTimestamp)
+    ) {
+      entry.linkLost = false;
+      entry.linkLostAtMs = null;
+      entry.linkLostTimestamp = null;
+      linkStateVersion += 1;
+    }
+  }
+
+  function recordLinkLostTransition(
+    sysid: number,
+    lossTimestamp: number,
+    receivedAtMs: number,
+  ): void {
+    const entry = linkStateBySysId.get(sysid);
+    if (
+      entry !== undefined &&
+      entry.lastPacketTimestamp !== null &&
+      lossTimestamp < entry.lastPacketTimestamp
+    ) {
+      return;
+    }
+    if (entry === undefined) {
+      linkStateBySysId.set(sysid, {
+        sysid,
+        linkLost: true,
+        linkLostAtMs: receivedAtMs,
+        linkLostTimestamp: lossTimestamp,
+        lastPacketTimestamp: null,
+        lastPacketReceivedAtMs: null,
+      });
+      linkStateVersion += 1;
+      return;
+    }
+    const wasLost = entry.linkLost;
+    entry.linkLost = true;
+    entry.linkLostAtMs = receivedAtMs;
+    entry.linkLostTimestamp = lossTimestamp;
+    if (!wasLost) {
+      linkStateVersion += 1;
+    }
+  }
 
   function clearAllSessionLatches(): void {
     legacyAttitudeLatchedBySysId.clear();
@@ -517,6 +613,7 @@ export function createTelemetryStore(
         droppedOutOfOrder += 1;
         return;
       }
+      recordPacketLinkReceipt(sysid, frame.timestamp, receivedAtMs);
       if (frame.has_attitude) {
         legacyAttitudeLatchedBySysId.add(sysid);
       } else {
@@ -578,17 +675,31 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
+      const existing = kinematicsBySysId.get(sysid);
+      const notOlderThanKinematics =
+        existing === undefined || transition.timestamp >= existing.timestamp;
       if (
-        transition.kind === "link_lost" ||
-        transition.kind === "link_restored"
+        (transition.kind === "link_lost" ||
+          transition.kind === "link_restored") &&
+        notOlderThanKinematics
       ) {
-        const existing = kinematicsBySysId.get(sysid);
-        if (
-          existing === undefined ||
-          transition.timestamp >= existing.timestamp
-        ) {
-          clearSysIdSessionLatches(sysid);
+        clearSysIdSessionLatches(sysid);
+      }
+      if (transition.kind === "link_lost") {
+        if (notOlderThanKinematics) {
+          recordLinkLostTransition(sysid, transition.timestamp, receivedAtMs);
         }
+      } else if (transition.kind === "link_restored") {
+        if (notOlderThanKinematics) {
+          recordPacketLinkReceipt(
+            sysid,
+            transition.timestamp,
+            receivedAtMs,
+            true,
+          );
+        }
+      } else {
+        recordPacketLinkReceipt(sysid, transition.timestamp, receivedAtMs);
       }
       pushTransitionEvent(transition);
       return;
@@ -598,7 +709,9 @@ export function createTelemetryStore(
   }
 
   function clearFeedState(): void {
+    const hadLinkState = linkStateBySysId.size > 0;
     kinematicsBySysId.clear();
+    linkStateBySysId.clear();
     clearAllSessionLatches();
     eventRing.fill(undefined);
     ringWriteIdx = 0;
@@ -607,6 +720,9 @@ export function createTelemetryStore(
     malformedFrames = 0;
     hasEstablishedOnce = false;
     vehicleCount = 0;
+    if (hadLinkState) {
+      linkStateVersion += 1;
+    }
     events = [];
     reconnectCount = 0;
     lastDisconnectedAt = null;
@@ -682,6 +798,10 @@ export function createTelemetryStore(
     },
     getKinematics(sysid: number) {
       return kinematicsBySysId.get(sysid);
+    },
+    getLinkState(sysid: number) {
+      void linkStateVersion;
+      return linkStateBySysId.get(sysid);
     },
     kinematicsEntries() {
       return kinematicsBySysId.entries();

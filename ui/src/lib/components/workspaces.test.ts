@@ -759,10 +759,17 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
   // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
   // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
   it("counts poisoned-first ownship vehicle snapshots as non-commandable fleet faults until replaced by a healthy put, and prioritizes current P4 faults over historical failsafe/CRC counters while retaining cumulative counts in Bench", () => {
-    const skgStore = createSkgStore();
+    const ws2Rig = new MockWebSocketRig();
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: ws2Rig.createSocket,
+    });
     const telemetryStore = createTelemetryStore();
     const viewportStore = createViewportStore({ skgStore });
     const poisonedKey = "boxbotix.local.robotics.uxs.vehicle.2";
+
+    skgStore.connect();
+    ws2Rig.latest.serverOpen();
 
     // 1. Poisoned-first initial snapshot (no prior decodable put -> entity.kind === "generic").
     skgStore.ingestRawFrame(
@@ -941,6 +948,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
     } finally {
       unmount(app);
       hostEl.remove();
+      skgStore.disconnect();
     }
   });
 
@@ -1112,6 +1120,476 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
         `${window.location.pathname}${window.location.search}${originalHash}`,
       );
       vi.unstubAllGlobals();
+    }
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("gates FLEET NOMINAL on connected+synced Fleet data and fresh non-empty vehicles, ticks 1 Hz LAST KNOWN staleness without WebSocket messages, standardizes ARMED/DISARMED, and retains stale faults across link loss and snapshot replay (#39)", () => {
+    vi.useFakeTimers();
+    const startMs = Date.parse("2026-11-25T12:00:00.000Z");
+    vi.setSystemTime(startMs);
+
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: ws1Rig.createSocket,
+      now: () => Date.now(),
+    });
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: ws2Rig.createSocket,
+      now: () => Date.now(),
+    });
+    const viewportStore = createViewportStore({ skgStore });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(WorkspaceShell, {
+      target: hostEl,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        now: () => Date.now(),
+      },
+    });
+    flushSync();
+
+    try {
+      // 1a. Initial disconnected state (before connect()): never claims FLEET NOMINAL.
+      expect(
+        hostEl.querySelector('[data-testid="stream-pill-telemetry"]')
+          ?.textContent,
+      ).toContain("Telemetry:");
+      expect(
+        hostEl.querySelector('[data-testid="stream-pill-fleet"]')?.textContent,
+      ).toContain("Fleet data:");
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-health-badge"]')?.textContent,
+      ).toContain("FLEET DATA UNAVAILABLE");
+
+      // 1b. Connecting pre-sync -> AWAITING FLEET DATA…
+      telemetryStore.connect();
+      skgStore.connect();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-health-badge"]')?.textContent,
+      ).toContain("AWAITING FLEET DATA");
+
+      // 1c. Handshake drop before ENTITY_STATES sync -> RECONNECTING FLEET DATA…
+      ws1Rig.latest.serverDrop(1006);
+      ws2Rig.latest.serverDrop(1006);
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-health-badge"]')?.textContent,
+      ).toContain("RECONNECTING FLEET DATA");
+      expect(hostEl.textContent).not.toContain("FLEET NOMINAL");
+
+      // Open COP Exceptions solo tab to verify readiness-aware empty copy.
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-alerts"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cop-exceptions-empty"]')
+          ?.textContent,
+      ).toContain("Waiting for initial Fleet data sync");
+
+      // 2. Reconnect both streams & sync with 0 ownship vehicles + 1 external contact -> No vehicles detected.
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+      const contactId = "boxbotix.local.tak.cop.vessel.bravo";
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: contactId,
+          revision: 1,
+          payload: {
+            id: contactId,
+            triples: [
+              {
+                subject: contactId,
+                predicate: "dc.terms.title",
+                object: "Bravo Buoy",
+                source: "ais",
+                timestamp: new Date(Date.now()).toISOString(),
+                confidence: 1,
+              },
+              {
+                subject: contactId,
+                predicate: "cop.contact.source",
+                object: "ais",
+                source: "ais",
+                timestamp: new Date(Date.now()).toISOString(),
+                confidence: 1,
+              },
+            ],
+          },
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl
+          .querySelector('[data-testid="fleet-health-badge"]')
+          ?.getAttribute("data-fleet-state"),
+      ).toBe("empty");
+      expect(
+        hostEl.querySelector('[data-testid="fleet-health-badge"]')?.textContent,
+      ).toContain("No vehicles detected");
+      expect(
+        hostEl.querySelector('[data-testid="cop-exceptions-empty"]')
+          ?.textContent,
+      ).toContain("No ownship UXS vehicles detected.");
+
+      // 3. Ingest two live fault-free vehicles: Quad #1 (sitl-local, ARMED) + Boat #2 (mesh-supervisory, DISARMED).
+      const quad1 = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+          "uxs.health.crcerrors": 0,
+        },
+        { observedAt: new Date(Date.now()).toISOString() },
+      );
+      const boat2 = buildVehicleStoredPayload(
+        2,
+        {
+          "uxs.domain.kind": "surface-boat",
+          "uxs.authority.state": "companion-autonomous",
+          "uxs.link.tier": "mesh-supervisory",
+          "uxs.health.armed": false,
+          "uxs.health.crcerrors": 0,
+        },
+        { observedAt: new Date(Date.now()).toISOString() },
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 2,
+          payload: quad1,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: boat2.id,
+          revision: 3,
+          payload: boat2,
+        }),
+      );
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]')
+          ?.textContent,
+      ).toContain("FLEET NOMINAL (2)");
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      const armedBadge = hostEl.querySelector('[data-testid="armed-badge"]');
+      expect(armedBadge?.textContent?.trim()).toBe("ARMED");
+      expect(armedBadge?.className).toContain("severity-success");
+
+      // Explicit ARMED / DISARMED across filmstrip & roster (never "SAFE").
+      const filmstripText =
+        hostEl.querySelector('[data-testid="fleet-filmstrip"]')?.textContent ??
+        "";
+      expect(filmstripText).toContain("ARMED");
+      expect(filmstripText).toContain("DISARMED");
+      expect(filmstripText).not.toContain("SAFE");
+      const rosterText =
+        hostEl.querySelector('[data-testid="cop-roster"]')?.textContent ?? "";
+      expect(rosterText).toContain("ARMED");
+      expect(rosterText).toContain("DISARMED");
+      expect(rosterText).not.toContain("SAFE");
+
+      // 4. Partial stream degradation: Telemetry (WS #1) drops while Fleet data (WS #2) remains connected+synced & fresh.
+      ws1Rig.latest.serverDrop(1006);
+      flushSync();
+      expect(
+        hostEl
+          .querySelector('[data-testid="stream-pill-telemetry"]')
+          ?.getAttribute("data-tone"),
+      ).toBe("degraded");
+      expect(
+        hostEl
+          .querySelector('[data-testid="stream-pill-fleet"]')
+          ?.getAttribute("data-tone"),
+      ).toBe("connected");
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]')
+          ?.textContent,
+      ).toContain("FLEET NOMINAL (2)");
+
+      // Reconnect WS #1 before advancing timers so backoff doesn't interfere.
+      telemetryStore.connect();
+      ws1Rig.latest.serverOpen();
+      flushSync();
+
+      // 5. Silent vehicle + 1 Hz shell clock (+5_000 ms with ZERO new WebSocket messages!):
+      // Quad #1 (4_000 ms sitl-local threshold) turns stale while Boat #2 (11_000 ms mesh-supervisory) stays fresh.
+      vi.advanceTimersByTime(5_000);
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      const stalePill = hostEl.querySelector(
+        '[data-testid="fleet-health-badge"]',
+      );
+      expect(stalePill?.getAttribute("data-fleet-state")).toBe("stale");
+      expect(stalePill?.textContent).toContain("FLEET STALE (1/2 LAST KNOWN");
+      expect(stalePill?.textContent).toContain("5s ago");
+
+      // Stale fault-free ARMED vehicle withholds safety green (severity-warning) and surfaces LAST KNOWN badge.
+      const staleArmedBadge = hostEl.querySelector(
+        '[data-testid="armed-badge"]',
+      );
+      expect(staleArmedBadge?.className).toContain("severity-warning");
+      expect(staleArmedBadge?.className).not.toContain("severity-success");
+      expect(
+        hostEl.querySelector('[data-testid="vehicle-freshness-badge"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · 5s ago");
+
+      // Switch COP solo tab back to Summary & Pilot workspace to verify LAST KNOWN propagation + 1 Hz age tick.
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-summary"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-freshness"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · 5s ago");
+
+      vi.advanceTimersByTime(1_000);
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="vehicle-freshness-badge"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · 6s ago");
+
+      viewportStore.setWorkspace("pilot");
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="pilot-freshness-chip"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · 6s ago");
+      viewportStore.setWorkspace("cop");
+      flushSync();
+
+      // 6. Active P4 fault retained across WS #1 link_lost + WS #2 disconnect + unchanged snapshot replay (#29).
+      const faultObsIso = new Date(Date.now()).toISOString();
+      const quad1P4 = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "mcu-failsafe",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+          "uxs.health.failsafes": 1,
+        },
+        { observedAt: faultObsIso },
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 4,
+          payload: quad1P4,
+        }),
+      );
+      flushSync();
+
+      const liveFaultBadge = hostEl.querySelector(
+        '[data-testid="fleet-fault-badge"]',
+      );
+      expect(liveFaultBadge?.textContent).toContain("1 FLEET FAULT");
+      expect(liveFaultBadge?.getAttribute("data-stale-fault")).toBe("false");
+
+      // Advance +3_000 ms, emit WS #1 link_lost for sysid 1, and drop WS #2.
+      vi.advanceTimersByTime(3_000);
+      ws1Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.events.1",
+          timestamp: Date.now(),
+          payload: {
+            sysid: 1,
+            entity_id: quad1.id,
+            domain: "quadcopter",
+            seq: 9,
+            msg_id: 1,
+            kind: "link_lost",
+            reasons: ["link_timeout"],
+            armed: true,
+            authority: "mcu-failsafe",
+            companion_mode: "teleop-velocity",
+            link_tier: "sitl-local",
+            flags: {
+              clock_sync_locked: true,
+              teleop_deadman_clamped: false,
+              crsf_link_healthy: false,
+              companion_trunk_healthy: false,
+            },
+            failsafes: 1,
+            timestamp: Date.now(),
+          },
+        }),
+      );
+      ws2Rig.latest.serverDrop(1006);
+      flushSync();
+      expect(telemetryStore.malformedFrameCount).toBe(0);
+
+      const staleFaultBadge = hostEl.querySelector(
+        '[data-testid="fleet-fault-badge"]',
+      );
+      expect(staleFaultBadge?.textContent).toContain("1 FLEET FAULT");
+      expect(staleFaultBadge?.textContent).toContain("LAST KNOWN");
+      expect(staleFaultBadge?.getAttribute("data-stale-fault")).toBe("true");
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-alerts"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cop-exception-stale"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN");
+
+      // Reconnect WS #2 + replay unchanged frozen faultObsIso snapshot (#29) + synced -> still LAST KNOWN!
+      vi.advanceTimersByTime(5_000);
+      skgStore.connect();
+      ws2Rig.latest.serverOpen();
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 4,
+          payload: quad1P4,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: boat2.id,
+          revision: 3,
+          payload: boat2,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 4,
+        }),
+      );
+      flushSync();
+
+      expect(
+        hostEl
+          .querySelector('[data-testid="fleet-fault-badge"]')
+          ?.getAttribute("data-stale-fault"),
+      ).toBe("true");
+
+      // Fresh recovery put with advancing observedAt restores live FLEET NOMINAL (2)!
+      const freshIso = new Date(Date.now()).toISOString();
+      const recoveredQuad1 = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+          "uxs.health.failsafes": 1,
+        },
+        { observedAt: freshIso },
+      );
+      const refreshedBoat2 = buildVehicleStoredPayload(
+        2,
+        {
+          "uxs.domain.kind": "surface-boat",
+          "uxs.authority.state": "companion-autonomous",
+          "uxs.link.tier": "mesh-supervisory",
+          "uxs.health.armed": false,
+        },
+        { observedAt: freshIso },
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 5,
+          payload: recoveredQuad1,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: boat2.id,
+          revision: 6,
+          payload: refreshedBoat2,
+        }),
+      );
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="fleet-fault-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]')
+          ?.textContent,
+      ).toContain("FLEET NOMINAL (2)");
+      expect(
+        hostEl.querySelector('[data-testid="vehicle-freshness-badge"]'),
+      ).toBeNull();
+    } finally {
+      unmount(app);
+      hostEl.remove();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+      vi.useRealTimers();
     }
   });
 });

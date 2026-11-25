@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
-import type { Locator, Page } from "@playwright/test";
+import type { Locator, Page, WebSocketRoute } from "@playwright/test";
 import { expect, test } from "./fixtures";
 
 interface BoxRect {
@@ -256,17 +256,19 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
       "data-workspace",
       "cop",
     );
-    await expect(page.locator(".stream-pill").nth(0)).toContainText(
-      "WS1: connected (3)",
+    await expect(page.getByTestId("stream-pill-telemetry")).toContainText(
+      "Telemetry: Live (3)",
       { timeout: 15_000 },
     );
-    await expect(page.locator(".stream-pill").nth(1)).toContainText(
-      "WS2: connected",
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "Fleet data: Live · synced",
       { timeout: 15_000 },
     );
-    await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
-      timeout: 15_000,
-    });
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+    await expect(page.getByTestId("fleet-filmstrip")).not.toContainText("SAFE");
 
     // Verify approved workspace labels (Fleet, Vehicle, Diagnostics, Analysis) expose accessible names and render unclipped at 1440x900 and 1024x768.
     const workspaceNav = page.getByRole("navigation", {
@@ -857,5 +859,101 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  test("withholds FLEET NOMINAL across pre-sync startup, empty ENTITY_STATES sync, and dropped WebSockets before converging on live recovery (#39)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+    const heldTelemetrySockets: WebSocketRoute[] = [];
+    const heldGraphSockets: WebSocketRoute[] = [];
+    let allowUpstream = false;
+    let dropImmediately = false;
+
+    await page.routeWebSocket(/\/ws\/telemetry$/, (ws) => {
+      if (allowUpstream) {
+        ws.connectToServer();
+        return;
+      }
+      if (dropImmediately) {
+        void ws.close({ code: 1006, reason: "simulated telemetry outage" });
+        return;
+      }
+      heldTelemetrySockets.push(ws);
+    });
+
+    await page.routeWebSocket(/\/ws\/graph$/, (ws) => {
+      if (allowUpstream) {
+        ws.connectToServer();
+        return;
+      }
+      if (dropImmediately) {
+        void ws.close({ code: 1006, reason: "simulated graph outage" });
+        return;
+      }
+      heldGraphSockets.push(ws);
+    });
+
+    await page.goto(info.baseURL);
+
+    // 1. Pre-sync startup: Fleet data socket is open/awaiting initial ENTITY_STATES sync -> never claims FLEET NOMINAL.
+    await expect
+      .poll(() => heldGraphSockets.length, { timeout: 10_000 })
+      .toBeGreaterThanOrEqual(1);
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "Fleet data: Syncing…",
+    );
+    await expect(page.getByTestId("fleet-health-badge")).toHaveText(
+      "AWAITING FLEET DATA…",
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveCount(0);
+
+    // 2. Empty ENTITY_STATES sync (0 ownship vehicles) -> explicit "No vehicles detected", never FLEET NOMINAL.
+    heldGraphSockets.at(-1)!.send(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 0,
+      }),
+    );
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "Fleet data: Live · synced",
+    );
+    await expect(page.getByTestId("fleet-health-badge")).toHaveText(
+      "No vehicles detected",
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveCount(0);
+
+    // 3. Simulated upstream drop across both WebSockets -> RECONNECTING FLEET DATA…, never FLEET NOMINAL.
+    dropImmediately = true;
+    for (const sock of [...heldTelemetrySockets, ...heldGraphSockets]) {
+      await sock.close({ code: 1006, reason: "simulated upstream drop" });
+    }
+    await expect(page.getByTestId("stream-pill-telemetry")).toContainText(
+      /Telemetry: (Reconnecting…|Connecting…)/,
+    );
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      /Fleet data: (Reconnecting · last known|Reconnecting…|Syncing…)/,
+    );
+    await expect(page.getByTestId("fleet-health-badge")).toHaveText(
+      /^(RECONNECTING FLEET DATA…|AWAITING FLEET DATA…)$/,
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveCount(0);
+
+    // 4. Restore upstream WebSocket forwarding -> automatic backoff recovery converges to FLEET NOMINAL (3).
+    dropImmediately = false;
+    allowUpstream = true;
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "Fleet data: Live · synced",
+      { timeout: 15_000 },
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    expect(copStack.pageErrors).toEqual([]);
   });
 });

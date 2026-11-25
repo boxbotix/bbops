@@ -3,17 +3,23 @@
   Copyright (c) 2026 boxbotix
 -->
 <script lang="ts">
-  import { selectBannerPresentation } from "$lib/hud/view-model";
+  import {
+    type FleetFreshnessContext,
+    selectBannerPresentation,
+  } from "$lib/hud/view-model";
   import type { CopEntityState } from "$lib/stores/skg.svelte";
 
   interface Props {
     entity: CopEntityState | null;
+    freshnessContext?: FleetFreshnessContext;
     compact?: boolean;
   }
 
-  let { entity, compact = false }: Props = $props();
+  let { entity, freshnessContext, compact = false }: Props = $props();
 
-  const presentation = $derived(selectBannerPresentation(entity));
+  const presentation = $derived(
+    selectBannerPresentation(entity, freshnessContext),
+  );
 </script>
 
 {#if presentation?.kind === "uxs-vehicle"}
@@ -21,6 +27,9 @@
     class="banner vehicle-banner"
     class:compact
     data-testid="vehicle-authority-banner"
+    data-stale={presentation.freshness && !presentation.freshness.fresh
+      ? "true"
+      : "false"}
     aria-label="UXS vehicle authority and safety health"
   >
     <div class="banner-primary">
@@ -46,6 +55,19 @@
       <span class="link-pill" data-testid="banner-link-tier">
         {presentation.linkBadge.label}
       </span>
+
+      {#if presentation.freshness && !presentation.freshness.fresh}
+        <span
+          class="safety-badge severity-warning"
+          data-testid="vehicle-freshness-badge"
+          data-stale-reason={presentation.freshness.staleReason}
+          title={presentation.freshness.lastObservedAt
+            ? `Last observed ${presentation.freshness.lastObservedAt}`
+            : undefined}
+        >
+          {presentation.freshness.statusLabel}
+        </span>
+      {/if}
 
       {#if presentation.poisoned}
         <span class="safety-badge severity-error" data-testid="poisoned-badge">
@@ -75,6 +97,9 @@
     class="banner vehicle-banner"
     class:compact
     data-testid="vehicle-authority-banner"
+    data-stale={presentation.freshness && !presentation.freshness.fresh
+      ? "true"
+      : "false"}
     aria-label="Poisoned UXS vehicle warning"
   >
     <div class="banner-primary">
@@ -84,6 +109,15 @@
           ? `: ${presentation.poisonError}`
           : ""}
       </span>
+      {#if presentation.freshness && !presentation.freshness.fresh}
+        <span
+          class="safety-badge severity-warning"
+          data-testid="vehicle-freshness-badge"
+          data-stale-reason={presentation.freshness.staleReason}
+        >
+          {presentation.freshness.statusLabel}
+        </span>
+      {/if}
     </div>
   </section>
 {:else if presentation?.kind === "external-contact"}

@@ -126,6 +126,9 @@ export interface VehicleEntityState extends CopEntityBase {
   globalPosObservedAt?: string | null;
   poseIngestedAtMs?: number | null;
   poseIngestedLive?: boolean;
+  stateObservedAt?: string | null;
+  stateIngestedAtMs?: number | null;
+  stateIngestedLive?: boolean;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -511,9 +514,19 @@ export function parseCopEntityState(
       isFiniteNumber(alt)
     ) {
       let latestUxsTriple: SkgTriple | undefined;
+      let latestMeasuredUxsTriple: SkgTriple | undefined;
       for (const triple of triples) {
         if (triple.predicate.startsWith("uxs.")) {
           latestUxsTriple = selectWinningTriple(latestUxsTriple, triple);
+          if (
+            triple.confidence > 0 &&
+            normalizeKnownTimestamp(triple.timestamp) !== null
+          ) {
+            latestMeasuredUxsTriple = selectWinningTriple(
+              latestMeasuredUxsTriple,
+              triple,
+            );
+          }
         }
       }
       const posePredicates = [
@@ -618,14 +631,29 @@ export function parseCopEntityState(
       const globalPosObservedAt = hasGlobalPos
         ? normalizeKnownTimestamp(latestGlobalPosTriple?.timestamp)
         : null;
+      const rawExplicitObs =
+        normalizeNonEmptyString(byPredicate["cop.time.observed"]?.object) ??
+        normalizeNonEmptyString(
+          byPredicate["cop.contact.observed-at"]?.object,
+        ) ??
+        normalizeNonEmptyString(byPredicate["cop.contact.observed_at"]?.object);
+      const stateObservedAt =
+        rawExplicitObs !== null &&
+        normalizeKnownTimestamp(rawExplicitObs) !== null
+          ? rawExplicitObs
+          : (latestMeasuredUxsTriple?.timestamp.trim() ?? null);
       const vehicleObservedAt =
-        base.observedAt ?? normalizeKnownTimestamp(latestUxsTriple?.timestamp);
+        base.observedAt ??
+        normalizeKnownTimestamp(
+          latestMeasuredUxsTriple?.timestamp ?? latestUxsTriple?.timestamp,
+        );
       const vehicleSource =
         base.source ?? normalizeNonEmptyString(latestUxsTriple?.source);
       return {
         ...base,
         source: vehicleSource,
         observedAt: vehicleObservedAt,
+        stateObservedAt,
         poseObservedAt,
         localPosObservedAt,
         globalPosObservedAt,
@@ -863,6 +891,95 @@ function applyVehiclePoseReceipt(
   return highWater;
 }
 
+function didVehicleStateAdvance(
+  prior: VehicleEntityState,
+  next: VehicleEntityState,
+): boolean {
+  return (
+    next.domain !== prior.domain ||
+    next.authority !== prior.authority ||
+    next.companionMode !== prior.companionMode ||
+    next.linkTier !== prior.linkTier ||
+    next.armed !== prior.armed ||
+    next.hasSysStatus !== prior.hasSysStatus ||
+    next.healthFlags.clock_sync_locked !==
+      prior.healthFlags.clock_sync_locked ||
+    next.healthFlags.teleop_deadman_clamped !==
+      prior.healthFlags.teleop_deadman_clamped ||
+    next.healthFlags.crsf_link_healthy !==
+      prior.healthFlags.crsf_link_healthy ||
+    next.healthFlags.companion_trunk_healthy !==
+      prior.healthFlags.companion_trunk_healthy ||
+    next.sysStatus.failsafes !== prior.sysStatus.failsafes ||
+    next.sysStatus.crcErrors !== prior.sysStatus.crcErrors ||
+    next.sysStatus.loopDtUs !== prior.sysStatus.loopDtUs ||
+    next.sysStatus.maxLoopDtUs !== prior.sysStatus.maxLoopDtUs ||
+    next.sysStatus.rttUs !== prior.sysStatus.rttUs ||
+    didVehiclePoseAdvance(prior, next)
+  );
+}
+
+interface VehicleStateHighWater {
+  observedNs: bigint;
+  state: VehicleEntityState;
+  ingestedAtMs: number | null;
+  ingestedLive: boolean;
+}
+
+function applyVehicleStateReceipt(
+  highWater: VehicleStateHighWater | undefined,
+  next: VehicleEntityState,
+  receiptMs: number,
+  isLivePostSync: boolean,
+): VehicleStateHighWater | undefined {
+  const nextStateObs = next.stateObservedAt ?? next.observedAt;
+  if (!nextStateObs) {
+    next.stateIngestedAtMs =
+      highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
+    next.stateIngestedLive = false;
+    return highWater;
+  }
+
+  const nextNs = parseTripleInstantNs(nextStateObs);
+  if (highWater === undefined || nextNs > highWater.observedNs) {
+    next.stateIngestedAtMs = receiptMs;
+    next.stateIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      state: next,
+      ingestedAtMs: next.stateIngestedAtMs,
+      ingestedLive: next.stateIngestedLive,
+    };
+  }
+
+  if (nextNs < highWater.observedNs) {
+    next.stateIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
+    next.stateIngestedLive = false;
+    return highWater;
+  }
+
+  if (didVehicleStateAdvance(highWater.state, next)) {
+    next.stateIngestedAtMs = receiptMs;
+    next.stateIngestedLive = isLivePostSync;
+    return {
+      observedNs: nextNs,
+      state: next,
+      ingestedAtMs: next.stateIngestedAtMs,
+      ingestedLive: next.stateIngestedLive,
+    };
+  }
+
+  next.stateIngestedAtMs =
+    highWater.ingestedAtMs ?? (isLivePostSync ? null : EXPIRED_POSE_RECEIPT_MS);
+  next.stateIngestedLive = highWater.ingestedLive;
+  return {
+    observedNs: highWater.observedNs,
+    state: next,
+    ingestedAtMs: next.stateIngestedAtMs,
+    ingestedLive: next.stateIngestedLive,
+  };
+}
+
 export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   const now = options.now ?? (() => Date.now());
   const envUrl =
@@ -878,6 +995,10 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
   const maxPoseByKey = new Map<string, VehiclePoseHighWater>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const stagedMaxPoseByKey = new Map<string, VehiclePoseHighWater>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const maxStateByKey = new Map<string, VehicleStateHighWater>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const stagedMaxStateByKey = new Map<string, VehicleStateHighWater>();
   let malformedFrames = 0;
 
   let status = $state<WsConnectionStatus>("disconnected");
@@ -915,6 +1036,8 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     stagedSnapshot.clear();
     maxPoseByKey.clear();
     stagedMaxPoseByKey.clear();
+    maxStateByKey.clear();
+    stagedMaxStateByKey.clear();
     synced = false;
     lastSyncedRevision = null;
     malformedFrames = 0;
@@ -925,12 +1048,19 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       if (!stagedSnapshot.has(existingKey)) {
         entities.delete(existingKey);
         maxPoseByKey.delete(existingKey);
+        maxStateByKey.delete(existingKey);
       }
     }
     for (const trackedKey of Array.from(maxPoseByKey.keys())) {
       const stagedEntity = stagedSnapshot.get(trackedKey);
       if (!stagedEntity || stagedEntity.kind !== "uxs-vehicle") {
         maxPoseByKey.delete(trackedKey);
+      }
+    }
+    for (const trackedKey of Array.from(maxStateByKey.keys())) {
+      const stagedEntity = stagedSnapshot.get(trackedKey);
+      if (!stagedEntity || stagedEntity.kind !== "uxs-vehicle") {
+        maxStateByKey.delete(trackedKey);
       }
     }
     for (const [key, entity] of stagedSnapshot.entries()) {
@@ -940,12 +1070,18 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         if (nextHighWater !== undefined) {
           maxPoseByKey.set(key, nextHighWater);
         }
+        const nextStateHighWater = stagedMaxStateByKey.get(key);
+        if (nextStateHighWater !== undefined) {
+          maxStateByKey.set(key, nextStateHighWater);
+        }
       } else {
         maxPoseByKey.delete(key);
+        maxStateByKey.delete(key);
       }
     }
     stagedSnapshot.clear();
     stagedMaxPoseByKey.clear();
+    stagedMaxStateByKey.clear();
     synced = true;
     lastSyncedRevision = syncRevision;
   }
@@ -1008,8 +1144,20 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           if (nextHighWater !== undefined) {
             stagedMaxPoseByKey.set(key, nextHighWater);
           }
+          const priorStateHighWater =
+            stagedMaxStateByKey.get(key) ?? maxStateByKey.get(key);
+          const nextStateHighWater = applyVehicleStateReceipt(
+            priorStateHighWater,
+            entity,
+            receiptMs,
+            false,
+          );
+          if (nextStateHighWater !== undefined) {
+            stagedMaxStateByKey.set(key, nextStateHighWater);
+          }
         } else {
           stagedMaxPoseByKey.delete(key);
+          stagedMaxStateByKey.delete(key);
         }
         stagedSnapshot.set(key, entity);
         return;
@@ -1028,8 +1176,18 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         if (nextHighWater !== undefined) {
           maxPoseByKey.set(key, nextHighWater);
         }
+        const nextStateHighWater = applyVehicleStateReceipt(
+          maxStateByKey.get(key),
+          entity,
+          receiptMs,
+          true,
+        );
+        if (nextStateHighWater !== undefined) {
+          maxStateByKey.set(key, nextStateHighWater);
+        }
       } else {
         maxPoseByKey.delete(key);
+        maxStateByKey.delete(key);
       }
       entities.set(key, entity);
       return;
@@ -1043,6 +1201,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
         }
         stagedSnapshot.delete(key);
         stagedMaxPoseByKey.delete(key);
+        stagedMaxStateByKey.delete(key);
         return;
       }
       const prevLive = entities.get(key);
@@ -1051,6 +1210,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       }
       entities.delete(key);
       maxPoseByKey.delete(key);
+      maxStateByKey.delete(key);
       return;
     }
 
@@ -1109,12 +1269,14 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       synced = false;
       stagedSnapshot.clear();
       stagedMaxPoseByKey.clear();
+      stagedMaxStateByKey.clear();
     },
     onMessage: ingestRawFrame,
     onDisconnect() {
       synced = false;
       stagedSnapshot.clear();
       stagedMaxPoseByKey.clear();
+      stagedMaxStateByKey.clear();
     },
     onEndpointChange(nextUrl) {
       currentUrl = nextUrl;
@@ -1159,6 +1321,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
       synced = false;
       stagedSnapshot.clear();
       stagedMaxPoseByKey.clear();
+      stagedMaxStateByKey.clear();
     },
     getEntity(entityId: string | null | undefined) {
       if (!entityId) {

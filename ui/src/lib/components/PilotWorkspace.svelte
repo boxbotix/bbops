@@ -7,8 +7,10 @@
   import TacticalCanvas from "$lib/components/TacticalCanvas.svelte";
   import VehicleHud from "$lib/components/VehicleHud.svelte";
   import {
+    type FleetFreshnessContext,
     buildExternalContactSummary,
     buildHealthStrip,
+    evaluateVehicleFreshness,
     extractAbnormalHealthChips,
   } from "$lib/hud/view-model";
   import {
@@ -25,6 +27,8 @@
     telemetryStore: TelemetryStore;
     skgStore: SkgStore;
     viewportStore: ViewportStore;
+    freshnessContext?: FleetFreshnessContext;
+    now?: () => number;
     onSyncHash?: (hash: string) => void;
     // shortcut: Pilot guarded action slot renders read-only placeholder when unpopulated in M2.4, wire ADR-111 arm/disarm/mode/e-stop actions in M3.1 (#11)
     guardedActions?: Snippet<[VehicleEntityState]>;
@@ -34,6 +38,8 @@
     telemetryStore,
     skgStore,
     viewportStore,
+    freshnessContext,
+    now,
     onSyncHash,
     guardedActions,
   }: Props = $props();
@@ -57,6 +63,26 @@
   const contactSummary = $derived(
     selectedContact ? buildExternalContactSummary(selectedContact) : null,
   );
+
+  const selectedFreshness = $derived.by(() => {
+    if (!selectedVehicle) {
+      return null;
+    }
+    if (!freshnessContext) {
+      return null;
+    }
+    return evaluateVehicleFreshness(selectedVehicle, {
+      telemetryLink:
+        freshnessContext.telemetryLink ??
+        freshnessContext.getTelemetryLink?.(selectedVehicle.sysid) ??
+        telemetryStore.getLinkState(selectedVehicle.sysid),
+      telemetryStatus:
+        freshnessContext.telemetryStatus ?? telemetryStore.status,
+      skgStatus: freshnessContext.skgStatus ?? skgStore.status,
+      skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
+      nowMs: freshnessContext.nowMs,
+    });
+  });
 
   const abnormalChips = $derived(
     selectedVehicle
@@ -110,6 +136,7 @@
           {telemetryStore}
           {skgStore}
           {viewportStore}
+          {now}
           {onSyncHash}
         />
       </div>
@@ -123,6 +150,15 @@
             ? "MAP-PRIMARY + ATTITUDE PIP"
             : "50/50 PFD + MAP SPLIT"}
         </span>
+
+        {#if selectedFreshness && !selectedFreshness.fresh}
+          <span
+            class="exception-chip severity-warning"
+            data-testid="pilot-freshness-chip"
+          >
+            {selectedFreshness.statusLabel}
+          </span>
+        {/if}
 
         {#if abnormalChips.length > 0}
           <div
@@ -159,6 +195,7 @@
           {telemetryStore}
           {skgStore}
           {viewportStore}
+          {now}
           {onSyncHash}
         />
 
@@ -168,6 +205,7 @@
               {telemetryStore}
               vehicle={selectedVehicle}
               skgStatus={skgStore.status}
+              {now}
             />
           </div>
 
@@ -204,6 +242,7 @@
             {telemetryStore}
             vehicle={selectedVehicle}
             skgStatus={skgStore.status}
+            {now}
           />
 
           {#if commandableVehicle}
@@ -234,6 +273,7 @@
             {telemetryStore}
             {skgStore}
             {viewportStore}
+            {now}
             {onSyncHash}
           />
         </div>

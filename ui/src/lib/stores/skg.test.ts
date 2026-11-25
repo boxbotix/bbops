@@ -1447,4 +1447,116 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
       hasSysStatus: true,
     });
   });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("tracks stateIngestedAtMs and stateIngestedLive across stationary heartbeats while preserving stale age across reconnect snapshot replays", () => {
+    const rig = new MockWebSocketRig();
+    let browserNowMs = Date.parse("2026-11-25T12:00:00.000Z");
+    const store = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: rig.createSocket,
+      now: () => browserNowMs,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    // 1. Initial pre-synced snapshot from 20s ago sets stateIngestedLive=false.
+    const initialObsIso = new Date(browserNowMs - 20_000).toISOString();
+    const initialSnapshot = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.authority.state": "companion-teleop",
+        "uxs.health.armed": true,
+      },
+      {
+        observedAt: initialObsIso,
+        updatedAt: new Date(browserNowMs).toISOString(),
+      },
+    );
+    rig.latest.serverMessage(putFrame(initialSnapshot.id, 1, initialSnapshot));
+    rig.latest.serverMessage(syncedFrame(1));
+
+    const v0 = store.getCommandableVehicle(initialSnapshot.id)!;
+    expect(v0.stateObservedAt).toBe(initialObsIso);
+    expect(v0.stateIngestedAtMs).toBe(browserNowMs);
+    expect(v0.stateIngestedLive).toBe(false);
+
+    // 2. Stationary 1 Hz #0 HEARTBEAT update advances health/authority timestamps while poseObservedAt stays frozen!
+    const liveHbReceiptMs = browserNowMs + 1_000;
+    browserNowMs = liveHbReceiptMs;
+    const liveHbIso = "2026-11-25T12:00:01.000000500Z";
+    const stationaryHeartbeatPayload = {
+      ...initialSnapshot,
+      updated_at: liveHbIso,
+      triples: initialSnapshot.triples.map((triple) =>
+        triple.predicate.startsWith("uxs.health.") ||
+        triple.predicate === "uxs.authority.state" ||
+        triple.predicate === "uxs.mode.companion" ||
+        triple.predicate === "uxs.link.tier" ||
+        triple.predicate === "uxs.domain.kind"
+          ? { ...triple, timestamp: liveHbIso }
+          : triple,
+      ),
+    };
+    rig.latest.serverMessage(
+      putFrame(initialSnapshot.id, 2, stationaryHeartbeatPayload),
+    );
+
+    const vLiveHb = store.getCommandableVehicle(initialSnapshot.id)!;
+    expect(vLiveHb.stateObservedAt).toBe(liveHbIso);
+    expect(vLiveHb.stateIngestedAtMs).toBe(liveHbReceiptMs);
+    expect(vLiveHb.stateIngestedLive).toBe(true);
+    // Pose did NOT advance on stationary heartbeat-only update:
+    expect(vLiveHb.poseObservedAt).toBe(initialObsIso);
+    expect(vLiveHb.poseIngestedLive).toBe(false);
+
+    // 3. Vehicle goes silent for 10s; WS2 drops, reconnects, and replays the unchanged rev=2 snapshot.
+    browserNowMs += 10_000;
+    rig.latest.serverDrop(1006);
+    vi.advanceTimersByTime(500);
+    browserNowMs += 500;
+    rig.latest.serverOpen();
+    expect(store.synced).toBe(false);
+    expect(store.lastSyncedRevision).toBe(1);
+
+    rig.latest.serverMessage(
+      putFrame(initialSnapshot.id, 2, stationaryHeartbeatPayload),
+    );
+    rig.latest.serverMessage(syncedFrame(2));
+
+    const vReplayed = store.getCommandableVehicle(initialSnapshot.id)!;
+    expect(store.synced).toBe(true);
+    expect(store.lastSyncedRevision).toBe(2);
+    // Reconnect snapshot replay MUST preserve liveHbReceiptMs rather than resetting to browserNowMs!
+    expect(vReplayed.stateIngestedAtMs).toBe(liveHbReceiptMs);
+    expect(vReplayed.stateObservedAt).toBe(liveHbIso);
+
+    // 4. Fresh post-reconnect observation advances sub-millisecond nanosecond timestamp and refreshes stateIngestedAtMs.
+    browserNowMs += 1_000;
+    const recoveredReceiptMs = browserNowMs;
+    const recoveredIso = "2026-11-25T12:00:12.500000900Z";
+    const recoveredPayload = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.authority.state": "companion-teleop",
+        "uxs.health.armed": true,
+      },
+      {
+        observedAt: recoveredIso,
+        updatedAt: recoveredIso,
+      },
+    );
+    rig.latest.serverMessage(putFrame(initialSnapshot.id, 3, recoveredPayload));
+
+    const vRecovered = store.getCommandableVehicle(initialSnapshot.id)!;
+    expect(vRecovered.stateObservedAt).toBe(recoveredIso);
+    expect(vRecovered.stateIngestedAtMs).toBe(recoveredReceiptMs);
+    expect(vRecovered.stateIngestedLive).toBe(true);
+
+    store.disconnect();
+  });
 });
