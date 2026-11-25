@@ -691,12 +691,46 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
   // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
-  test("preserves strict UXS authority, HUD, and actuation isolation across Pilot and Bench when selecting an external COP contact", async ({
+  test("preserves strict UXS authority, HUD, and actuation isolation and distinct observed/received freshness across Pilot and Bench for full and partial external COP contacts", async ({
     copStack,
   }) => {
     const { page, info } = copStack;
+
+    // 1. Delayed external contact with distinct known observed_at vs received_at, expires_at, and uncertainty_meters.
+    const delayedContactId = `${info.org}.${info.platform}.sensor.cop.vessel.delayed-9`;
+    const observedIso = "2030-01-15T12:00:00.000Z";
+    const receivedIso = "2030-01-15T12:00:12.500Z";
+    const expiresIso = "2030-01-15T12:05:00.000Z";
+    await copStack.upsertExternalContact({
+      id: delayedContactId,
+      title: "AIS Delayed Tanker-9",
+      contact_type: "cargo-vessel",
+      source: "ais-coastal-relay",
+      feed_status: "degraded",
+      latitude: 37.772,
+      longitude: -122.423,
+      observed_at: observedIso,
+      received_at: receivedIso,
+      expires_at: expiresIso,
+      uncertainty_meters: 18.5,
+    });
+
+    // 2. Partial-metadata external contact with known observed_at and omitted received_at, expires_at, and uncertainty_meters.
+    const partialContactId = `${info.org}.${info.platform}.sensor.cop.vessel.partial-4`;
+    const partialObservedIso = "2030-01-15T12:02:00.000Z";
+    await copStack.upsertExternalContact({
+      id: partialContactId,
+      title: "Radar Track Partial-4",
+      contact_type: "unknown-surface",
+      source: "harbor-radar-2",
+      feed_status: "stale",
+      latitude: 37.771,
+      longitude: -122.421,
+      observed_at: partialObservedIso,
+    });
+
     await page.goto(
-      `${info.baseURL}/#mode=pilot&sel=${encodeURIComponent(info.externalContactId)}`,
+      `${info.baseURL}/#mode=pilot&sel=${encodeURIComponent(delayedContactId)}`,
     );
 
     await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
@@ -705,14 +739,23 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
     const contactBanner = page.getByTestId("external-contact-banner");
     await expect(contactBanner).toBeVisible();
-    await expect(contactBanner).toContainText("AIS Vessel Harbor-7");
-    await expect(contactBanner).toContainText("type: surface-vessel");
-    await expect(contactBanner).toContainText("source: ais-receiver-1");
-    await expect(contactBanner).toContainText("expires: unknown");
-    await expect(contactBanner).toContainText("uncertainty: unknown");
+    await expect(contactBanner).toContainText("AIS Delayed Tanker-9");
+    await expect(contactBanner).toContainText("type: cargo-vessel");
+    await expect(contactBanner).toContainText("feed: degraded");
+    await expect(contactBanner).toContainText("source: ais-coastal-relay");
+    await expect(contactBanner).toContainText(`observed: ${observedIso}`);
+    await expect(contactBanner).toContainText(`received: ${receivedIso}`);
+    await expect(contactBanner).toContainText(`expires: ${expiresIso}`);
+    await expect(contactBanner).toContainText("uncertainty: ±18.5 m");
+
+    const pilotIsolation = page.getByTestId("pilot-contact-isolation");
+    await expect(pilotIsolation).toBeVisible();
+    await expect(pilotIsolation).toContainText(`observed: ${observedIso}`);
+    await expect(pilotIsolation).toContainText(`received: ${receivedIso}`);
+    await expect(pilotIsolation).toContainText(`expires: ${expiresIso}`);
+    await expect(pilotIsolation).toContainText("uncertainty: ±18.5 m");
 
     // Non-UXS external contact MUST NEVER expose vehicle P1-P4 authority, arming, link-tier, HUD attitude readouts, or guarded actions.
-    await expect(page.getByTestId("pilot-contact-isolation")).toBeVisible();
     await expect(page.getByTestId("vehicle-authority-banner")).toHaveCount(0);
     await expect(page.getByTestId("authority-badge")).toHaveCount(0);
     await expect(page.getByTestId("armed-badge")).toHaveCount(0);
@@ -720,12 +763,46 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(page.getByTestId("hud-readout-strip")).toHaveCount(0);
     await expect(page.getByTestId("pilot-guarded-actions")).toHaveCount(0);
 
-    // Bench also withholds parameter tuning controls on external COP contacts.
+    // Bench also surfaces distinct observed/received freshness and withholds parameter tuning controls on external COP contacts.
     await page.keyboard.press("b");
+    const benchNotice = page.getByTestId("bench-contact-notice");
+    await expect(benchNotice).toContainText("AIS Delayed Tanker-9");
+    await expect(benchNotice).toContainText(`observed: ${observedIso}`);
+    await expect(benchNotice).toContainText(`received: ${receivedIso}`);
+    await expect(benchNotice).toContainText(`expires: ${expiresIso}`);
+    await expect(benchNotice).toContainText("uncertainty: ±18.5 m");
     await expect(page.getByTestId("bench-tuning-withheld")).toContainText(
       "External COP contacts expose no parameter tuning rack.",
     );
     await expect(page.getByTestId("bench-staged-count")).toHaveCount(0);
+
+    // Switch to the partial-metadata contact via FleetFilmstrip and verify unknown-preserving fields across Bench and Pilot.
+    const partialCard = page
+      .getByTestId("fleet-filmstrip")
+      .locator(`button[data-entity-id="${partialContactId}"]`);
+    await partialCard.click();
+
+    await expect(contactBanner).toContainText("Radar Track Partial-4");
+    await expect(contactBanner).toContainText(
+      `observed: ${partialObservedIso}`,
+    );
+    await expect(contactBanner).toContainText("received: unknown");
+    await expect(contactBanner).toContainText("expires: unknown");
+    await expect(contactBanner).toContainText("uncertainty: unknown");
+
+    await expect(benchNotice).toContainText("Radar Track Partial-4");
+    await expect(benchNotice).toContainText(`observed: ${partialObservedIso}`);
+    await expect(benchNotice).toContainText("received: unknown");
+    await expect(benchNotice).toContainText("expires: unknown");
+    await expect(benchNotice).toContainText("uncertainty: unknown");
+
+    await page.keyboard.press("d");
+    await expect(pilotIsolation).toContainText(
+      `observed: ${partialObservedIso}`,
+    );
+    await expect(pilotIsolation).toContainText("received: unknown");
+    await expect(pilotIsolation).toContainText("expires: unknown");
+    await expect(pilotIsolation).toContainText("uncertainty: unknown");
 
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);

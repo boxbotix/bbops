@@ -272,7 +272,7 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
           "2026-11-24T11:25:55.000Z",
           { source: "atak-bridge" },
         ),
-        makeTriple(richContactId, "cop.location.uncertainty_m", 8.5, {
+        makeTriple(richContactId, "cop.location.uncertainty-m", 8.5, {
           source: "atak-bridge",
         }),
         makeTriple(richContactId, "cop.feed.status", "live", {

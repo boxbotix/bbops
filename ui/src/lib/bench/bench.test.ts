@@ -57,15 +57,16 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
           ts = clock;
         }
 
+        const opt = (val: number) => (rng() < 0.2 ? null : val);
         const sample: TelemetrySample = {
           timestamp: ts,
-          rollRateDegS: Math.round((rng() - 0.5) * 200) + 0,
-          pitchRateDegS: Math.round((rng() - 0.5) * 180) + 0,
-          yawRateDegS: Math.round((rng() - 0.5) * 120) + 0,
-          groundspeedMps: Math.max(0, Math.round(rng() * 15)) + 0,
-          climbRateMps: Math.round((rng() - 0.5) * 8) + 0,
-          loopDtUs: 1000 + Math.floor(rng() * 500),
-          rttUs: 800 + Math.floor(rng() * 600),
+          rollRateDegS: opt(Math.round((rng() - 0.5) * 200) + 0),
+          pitchRateDegS: opt(Math.round((rng() - 0.5) * 180) + 0),
+          yawRateDegS: opt(Math.round((rng() - 0.5) * 120) + 0),
+          groundspeedMps: opt(Math.max(0, Math.round(rng() * 15)) + 0),
+          climbRateMps: opt(Math.round((rng() - 0.5) * 8) + 0),
+          loopDtUs: opt(1000 + Math.floor(rng() * 500)),
+          rttUs: opt(800 + Math.floor(rng() * 600)),
         };
 
         const accepted = ring.push(sample);
@@ -396,6 +397,272 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       expect(
         bufAfterBurst?.toChronologicalSamples().map((s) => s.timestamp),
       ).toEqual([1_000, 1_050]);
+
+      unmount(app);
+    } finally {
+      hostEl.remove();
+      getContextSpy.mockRestore();
+      cafSpy.mockRestore();
+      rafSpy.mockRestore();
+    }
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("distinguishes missing motion and timing measurements from measured stationary zeros across missing -> measured zero -> missing sequences", () => {
+    const rafCallbacks = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    const rafSpy = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        const id = nextRafId++;
+        rafCallbacks.set(id, cb);
+        return id;
+      });
+    const cafSpy = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id: number) => {
+        rafCallbacks.delete(id);
+      });
+
+    const drawnTexts: string[] = [];
+    const lineToCalls: Array<[number, number]> = [];
+    const markerRects: Array<[number, number, number, number]> = [];
+    const fake2dCtx = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      scale: vi.fn(),
+      setTransform: vi.fn(),
+      fillRect: vi.fn((x: number, y: number, w: number, h: number) => {
+        if (w === 3 && h === 3) {
+          markerRects.push([x, y, w, h]);
+        }
+      }),
+      strokeRect: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn((x: number, y: number) => {
+        lineToCalls.push([x, y]);
+      }),
+      stroke: vi.fn(),
+      fillText: vi.fn((text: string) => {
+        drawnTexts.push(text);
+      }),
+      measureText: () => ({ width: 32 }),
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      font: "",
+      textAlign: "left",
+    } as unknown as CanvasRenderingContext2D;
+    const getContextSpy = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(function (
+        this: HTMLCanvasElement,
+        contextId: string,
+      ) {
+        if (
+          contextId === "2d" &&
+          this.getAttribute("data-testid") === "bench-oscilloscope"
+        ) {
+          return fake2dCtx;
+        }
+        return null;
+      } as typeof HTMLCanvasElement.prototype.getContext);
+
+    const stepNextPaint = (frameTimeMs: number): void => {
+      drawnTexts.length = 0;
+      lineToCalls.length = 0;
+      markerRects.length = 0;
+      const pending = [...rafCallbacks.entries()];
+      rafCallbacks.clear();
+      for (const [, cb] of pending) {
+        cb(frameTimeMs);
+      }
+    };
+
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore({ now: () => 5_000 });
+    const traceBook = new TelemetryTraceBook();
+    const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
+
+    // Seed vehicle #1 initially poisoned (no SKG timing available -> lookupSysStatus returns null),
+    // then select it by ID once healthy, then poison again for the trailing missing timing sample.
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: vehicleId,
+        revision: 1,
+        error: "no timing yet",
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 1,
+      }),
+    );
+
+    const viewportStore = createViewportStore({ skgStore });
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    try {
+      const app = mount(BenchWorkspace, {
+        target: hostEl,
+        props: { telemetryStore, skgStore, viewportStore, traceBook },
+      });
+      flushSync();
+
+      // Step 1 (Missing): has_attitude=false, has_local_pos=false, and no SKG sysStatus.
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 1,
+            msg_id: 33,
+            quat_wxyz: [0, 0, 0, 0],
+            has_attitude: false,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            has_local_pos: false,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [37.7749, -122.4194, 10],
+            has_global_pos: true,
+            hdg_deg: 0,
+            has_heading: false,
+            timestamp: 1_000,
+          },
+        }),
+      );
+
+      // Step 2 (Measured stationary zero): SKG arrives with loopDtUs=0 & rttUs=0, followed by WS1 with has_attitude=true & has_local_pos=true at 0.
+      const zeroTimingQuad = buildVehicleStoredPayload(1, {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.health.loopdtus": 0,
+        "uxs.health.rttus": 0,
+      });
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision: 2,
+          payload: zeroTimingQuad,
+        }),
+      );
+      viewportStore.selectEntity(vehicleId);
+      flushSync();
+
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 2,
+            msg_id: 32,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            has_local_pos: true,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [37.7749, -122.4194, 10],
+            has_global_pos: true,
+            hdg_deg: 0,
+            has_heading: true,
+            timestamp: 1_050,
+          },
+        }),
+      );
+
+      stepNextPaint(16);
+      // At Step 2, latest sample is genuinely measured 0 across all 7 channels -> legend shows :0.0!
+      expect(drawnTexts).toContain("p:0.0");
+      expect(drawnTexts).toContain("GS:0.0");
+      expect(drawnTexts).toContain("loop_dt:0.0");
+      expect(drawnTexts).toContain("rtt:0.0");
+
+      // Step 3 (Missing again): clear SKG vehicle via delete (re-selecting after put or inspecting buffer),
+      // or record directly on traceBook with sysStatus=null and both flags false, then restore selection to render!
+      traceBook.recordKinematics(
+        {
+          sysid: 1,
+          domain: "quadcopter",
+          seq: 3,
+          msg_id: 33,
+          quat_wxyz: [0, 0, 0, 0],
+          has_attitude: false,
+          body_rates: [0, 0, 0],
+          ned_xyz: [0, 0, 0],
+          has_local_pos: false,
+          ned_vel: [0, 0, 0],
+          lat_lon_alt: [37.7749, -122.4194, 10],
+          has_global_pos: true,
+          hdg_deg: 0,
+          has_heading: false,
+          timestamp: 1_100,
+          receivedAtMs: 5_100,
+        },
+        null,
+      );
+
+      const samples = traceBook.getBuffer(1)?.toChronologicalSamples() ?? [];
+      expect(samples).toEqual([
+        {
+          timestamp: 1_000,
+          rollRateDegS: null,
+          pitchRateDegS: null,
+          yawRateDegS: null,
+          groundspeedMps: null,
+          climbRateMps: null,
+          loopDtUs: null,
+          rttUs: null,
+        },
+        {
+          timestamp: 1_050,
+          rollRateDegS: 0,
+          pitchRateDegS: 0,
+          yawRateDegS: 0,
+          groundspeedMps: 0,
+          climbRateMps: 0,
+          loopDtUs: 0,
+          rttUs: 0,
+        },
+        {
+          timestamp: 1_100,
+          rollRateDegS: null,
+          pitchRateDegS: null,
+          yawRateDegS: null,
+          groundspeedMps: null,
+          climbRateMps: null,
+          loopDtUs: null,
+          rttUs: null,
+        },
+      ]);
+
+      stepNextPaint(32);
+      // Latest sample (1_100) is missing across all 7 channels -> legend transitions back to :-- (NOT :0.0),
+      // only the 2 zero-reference axis lines call lineTo (zero data-bridging lineTo across null gaps),
+      // and all 7 channels render isolated 3x3 markers at the measured middle sample!
+      expect(drawnTexts).toContain("p:--");
+      expect(drawnTexts).toContain("q:--");
+      expect(drawnTexts).toContain("r:--");
+      expect(drawnTexts).toContain("GS:--");
+      expect(drawnTexts).toContain("VS:--");
+      expect(drawnTexts).toContain("loop_dt:--");
+      expect(drawnTexts).toContain("rtt:--");
+      expect(drawnTexts).not.toContain("p:0.0");
+      expect(drawnTexts).not.toContain("GS:0.0");
+      expect(drawnTexts).not.toContain("loop_dt:0.0");
+      expect(lineToCalls).toHaveLength(2); // strictly the CH1 & CH2 symmetricZero axis lines
+      expect(markerRects).toHaveLength(7); // 1 isolated middle sample marker per channel
 
       unmount(app);
     } finally {

@@ -48,9 +48,15 @@
   }: Props = $props();
 
   const banner = $derived(formatShellBanner("v0.1.0-dev"));
-  const fleetFaults = $derived(summarizeFleetFaults(skgStore.vehicles));
+  const fleetFaults = $derived(
+    summarizeFleetFaults(skgStore.entities.values()),
+  );
   const filmstripItems = $derived(
-    buildFilmstripItems(skgStore.vehicles, skgStore.externalContacts),
+    buildFilmstripItems(
+      skgStore.vehicles,
+      skgStore.externalContacts,
+      skgStore.entities.values(),
+    ),
   );
 
   $effect(() => {

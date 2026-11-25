@@ -70,6 +70,22 @@
       </div>
     {/if}
   </section>
+{:else if presentation?.kind === "poisoned-uxs-vehicle"}
+  <section
+    class="banner vehicle-banner"
+    class:compact
+    data-testid="vehicle-authority-banner"
+    aria-label="Poisoned UXS vehicle warning"
+  >
+    <div class="banner-primary">
+      <span class="entity-tag">UXS #{presentation.sysid}</span>
+      <span class="safety-badge severity-error" data-testid="poisoned-badge">
+        POISONED{presentation.poisonError
+          ? `: ${presentation.poisonError}`
+          : ""}
+      </span>
+    </div>
+  </section>
 {:else if presentation?.kind === "external-contact"}
   <section
     class="banner contact-banner"
@@ -84,6 +100,8 @@
       <span class="contact-pill">feed: {presentation.feedStatus}</span>
       {#if compact}
         <span class="contact-pill">source: {presentation.source}</span>
+        <span class="contact-pill">observed: {presentation.observedAt}</span>
+        <span class="contact-pill">received: {presentation.receivedAt}</span>
         <span class="contact-pill">expires: {presentation.expiresAt}</span>
         <span class="contact-pill"
           >uncertainty: {presentation.uncertaintyLabel}</span

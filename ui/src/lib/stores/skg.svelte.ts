@@ -364,19 +364,25 @@ function extractCommonMetadata(
 
   const explicitObserved =
     normalizeKnownTimestamp(byPredicate["cop.time.observed"]?.object) ??
+    normalizeKnownTimestamp(byPredicate["cop.contact.observed-at"]?.object) ??
     normalizeKnownTimestamp(byPredicate["cop.contact.observed_at"]?.object);
 
   const receivedAt =
     normalizeKnownTimestamp(byPredicate["cop.time.received"]?.object) ??
+    normalizeKnownTimestamp(byPredicate["cop.contact.received-at"]?.object) ??
     normalizeKnownTimestamp(byPredicate["cop.contact.received_at"]?.object);
 
   const expiresAt =
     normalizeKnownTimestamp(byPredicate["cop.time.expires"]?.object) ??
+    normalizeKnownTimestamp(byPredicate["cop.contact.expires-at"]?.object) ??
     normalizeKnownTimestamp(byPredicate["cop.contact.expires_at"]?.object);
 
   const rawUncertainty =
+    byPredicate["cop.location.uncertainty-m"]?.object ??
     byPredicate["cop.location.uncertainty_m"]?.object ??
+    byPredicate["geo.location.uncertainty-m"]?.object ??
     byPredicate["geo.location.uncertainty_m"]?.object ??
+    byPredicate["cop.contact.ce-m"]?.object ??
     byPredicate["cop.contact.ce_m"]?.object;
   const uncertaintyMeters =
     isFiniteNumber(rawUncertainty) && rawUncertainty >= 0
@@ -385,6 +391,7 @@ function extractCommonMetadata(
 
   const rawFeedStatus =
     byPredicate["cop.feed.status"]?.object ??
+    byPredicate["cop.contact.feed-status"]?.object ??
     byPredicate["cop.contact.feed_status"]?.object;
 
   return {

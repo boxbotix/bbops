@@ -269,4 +269,24 @@ func TestStartStackStreamsMultiDomainTelemetryEdgesAndPathSearch(t *testing.T) {
 	if len(gqlOut.Errors) > 0 || gqlOut.Data.PathSearch == nil || len(gqlOut.Data.PathSearch.Paths) == 0 {
 		t.Fatalf("unexpected pathSearch response: %s", string(gqlRaw))
 	}
+
+	obs := time.Date(2030, 1, 15, 12, 0, 0, 0, time.UTC)
+	rec := obs.Add(12500 * time.Millisecond)
+	exp := obs.Add(5 * time.Minute)
+	unc := 14.5
+	if err := stack.UpsertExternalContact(ctx, e2eharness.ExternalContactSeed{
+		ID:                info.Org + "." + info.Platform + ".sensor.cop.vessel.delayed-check",
+		Title:             "Delayed Check Contact",
+		ContactType:       "cargo-vessel",
+		Source:            "ais-test",
+		FeedStatus:        "degraded",
+		Latitude:          37.772,
+		Longitude:         -122.423,
+		ObservedAt:        &obs,
+		ReceivedAt:        &rec,
+		ExpiresAt:         &exp,
+		UncertaintyMeters: &unc,
+	}); err != nil {
+		t.Fatalf("UpsertExternalContact full provenance: %v", err)
+	}
 }

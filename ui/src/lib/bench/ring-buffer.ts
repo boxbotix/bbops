@@ -12,23 +12,35 @@ export const DEFAULT_TRACE_CAPACITY = 300;
 
 export interface TelemetrySample {
   readonly timestamp: number;
-  readonly rollRateDegS: number;
-  readonly pitchRateDegS: number;
-  readonly yawRateDegS: number;
-  readonly groundspeedMps: number;
-  readonly climbRateMps: number;
-  readonly loopDtUs: number;
-  readonly rttUs: number;
+  readonly rollRateDegS: number | null;
+  readonly pitchRateDegS: number | null;
+  readonly yawRateDegS: number | null;
+  readonly groundspeedMps: number | null;
+  readonly climbRateMps: number | null;
+  readonly loopDtUs: number | null;
+  readonly rttUs: number | null;
 }
 
-function sanitizeFinite(value: number): number {
-  return isFiniteNumber(value) ? (Object.is(value, -0) ? 0 : value) : 0;
+function encodeOptionalFinite(
+  value: number | null | undefined,
+  clampNonNegative = false,
+): number {
+  if (value === null || value === undefined || !isFiniteNumber(value)) {
+    return Number.NaN;
+  }
+  const cleaned = Object.is(value, -0) ? 0 : value;
+  return clampNonNegative ? Math.max(0, cleaned) : cleaned;
+}
+
+function decodeOptionalFinite(stored: number | undefined): number | null {
+  return stored !== undefined && Number.isFinite(stored) ? stored : null;
 }
 
 /**
  * Fixed-capacity typed-array circular buffer for a single UXS vehicle's 20 Hz
  * telemetry traces. Mutates pre-allocated Float64Arrays outside Svelte $state
- * so 20 Hz WS #1 frames never trigger reactive DOM diffing.
+ * so 20 Hz WS #1 frames never trigger reactive DOM diffing. Unavailable
+ * channels are stored in-place as IEEE-754 NaN and decoded as `null`.
  */
 export class VehicleRingBuffer {
   readonly capacity: number;
@@ -85,16 +97,13 @@ export class VehicleRingBuffer {
 
     const slot = this.head;
     this.timestamps[slot] = sample.timestamp;
-    this.rollRates[slot] = sanitizeFinite(sample.rollRateDegS);
-    this.pitchRates[slot] = sanitizeFinite(sample.pitchRateDegS);
-    this.yawRates[slot] = sanitizeFinite(sample.yawRateDegS);
-    this.groundspeeds[slot] = Math.max(
-      0,
-      sanitizeFinite(sample.groundspeedMps),
-    );
-    this.climbRates[slot] = sanitizeFinite(sample.climbRateMps);
-    this.loopDts[slot] = Math.max(0, sanitizeFinite(sample.loopDtUs));
-    this.rtts[slot] = Math.max(0, sanitizeFinite(sample.rttUs));
+    this.rollRates[slot] = encodeOptionalFinite(sample.rollRateDegS);
+    this.pitchRates[slot] = encodeOptionalFinite(sample.pitchRateDegS);
+    this.yawRates[slot] = encodeOptionalFinite(sample.yawRateDegS);
+    this.groundspeeds[slot] = encodeOptionalFinite(sample.groundspeedMps, true);
+    this.climbRates[slot] = encodeOptionalFinite(sample.climbRateMps);
+    this.loopDts[slot] = encodeOptionalFinite(sample.loopDtUs, true);
+    this.rtts[slot] = encodeOptionalFinite(sample.rttUs, true);
 
     this.head = (slot + 1) % this.capacity;
     if (this.count < this.capacity) {
@@ -117,13 +126,13 @@ export class VehicleRingBuffer {
       visitor(
         {
           timestamp: this.timestamps[slot] ?? 0,
-          rollRateDegS: this.rollRates[slot] ?? 0,
-          pitchRateDegS: this.pitchRates[slot] ?? 0,
-          yawRateDegS: this.yawRates[slot] ?? 0,
-          groundspeedMps: this.groundspeeds[slot] ?? 0,
-          climbRateMps: this.climbRates[slot] ?? 0,
-          loopDtUs: this.loopDts[slot] ?? 0,
-          rttUs: this.rtts[slot] ?? 0,
+          rollRateDegS: decodeOptionalFinite(this.rollRates[slot]),
+          pitchRateDegS: decodeOptionalFinite(this.pitchRates[slot]),
+          yawRateDegS: decodeOptionalFinite(this.yawRates[slot]),
+          groundspeedMps: decodeOptionalFinite(this.groundspeeds[slot]),
+          climbRateMps: decodeOptionalFinite(this.climbRates[slot]),
+          loopDtUs: decodeOptionalFinite(this.loopDts[slot]),
+          rttUs: decodeOptionalFinite(this.rtts[slot]),
         },
         i,
         total,
@@ -192,21 +201,40 @@ export class TelemetryTraceBook {
     sysStatus?: Pick<VehicleSysStatus, "loopDtUs" | "rttUs"> | null,
   ): boolean {
     const buf = this.getOrCreateBuffer(kinematics.sysid);
-    const hasLocal = kinematics.has_local_pos;
-    const vx = hasLocal ? kinematics.ned_vel[0] : 0;
-    const vy = hasLocal ? kinematics.ned_vel[1] : 0;
-    const vz = hasLocal ? kinematics.ned_vel[2] : 0;
-    const hasAtt = kinematics.has_attitude;
+    const hasLocal = kinematics.has_local_pos === true;
+    const hasAtt = kinematics.has_attitude === true;
+    const hasTiming =
+      sysStatus !== null &&
+      sysStatus !== undefined &&
+      isFiniteNumber(sysStatus.loopDtUs) &&
+      isFiniteNumber(sysStatus.rttUs);
 
     return buf.push({
       timestamp: kinematics.timestamp,
-      rollRateDegS: hasAtt ? kinematics.body_rates[0] * RAD_TO_DEG : 0,
-      pitchRateDegS: hasAtt ? kinematics.body_rates[1] * RAD_TO_DEG : 0,
-      yawRateDegS: hasAtt ? kinematics.body_rates[2] * RAD_TO_DEG : 0,
-      groundspeedMps: hasLocal ? Math.hypot(vx, vy) : 0,
-      climbRateMps: hasLocal ? -vz : 0,
-      loopDtUs: sysStatus?.loopDtUs ?? 0,
-      rttUs: sysStatus?.rttUs ?? 0,
+      rollRateDegS:
+        hasAtt && isFiniteNumber(kinematics.body_rates[0])
+          ? kinematics.body_rates[0] * RAD_TO_DEG
+          : null,
+      pitchRateDegS:
+        hasAtt && isFiniteNumber(kinematics.body_rates[1])
+          ? kinematics.body_rates[1] * RAD_TO_DEG
+          : null,
+      yawRateDegS:
+        hasAtt && isFiniteNumber(kinematics.body_rates[2])
+          ? kinematics.body_rates[2] * RAD_TO_DEG
+          : null,
+      groundspeedMps:
+        hasLocal &&
+        isFiniteNumber(kinematics.ned_vel[0]) &&
+        isFiniteNumber(kinematics.ned_vel[1])
+          ? Math.hypot(kinematics.ned_vel[0], kinematics.ned_vel[1])
+          : null,
+      climbRateMps:
+        hasLocal && isFiniteNumber(kinematics.ned_vel[2])
+          ? -kinematics.ned_vel[2]
+          : null,
+      loopDtUs: hasTiming ? sysStatus.loopDtUs : null,
+      rttUs: hasTiming ? sysStatus.rttUs : null,
     });
   }
 

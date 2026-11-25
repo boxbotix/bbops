@@ -17,7 +17,10 @@
     revertTuningDraft,
     stageTuningValue,
   } from "$lib/bench/tuning-rack";
-  import { buildHealthStrip } from "$lib/hud/view-model";
+  import {
+    buildExternalContactSummary,
+    buildHealthStrip,
+  } from "$lib/hud/view-model";
   import { formatTransitionEvent } from "$lib/skg/graphology-adapter";
   import {
     type SkgStore,
@@ -26,6 +29,7 @@
   } from "$lib/stores/skg.svelte";
   import type { TelemetryStore } from "$lib/stores/telemetry.svelte";
   import type { ViewportStore } from "$lib/stores/viewport.svelte";
+  import { parseVehicleEntityId } from "$lib/uxs";
 
   interface Props {
     telemetryStore: TelemetryStore;
@@ -57,6 +61,14 @@
   );
   const selectedContact = $derived(
     isExternalContactEntity(selectedEntity) ? selectedEntity : null,
+  );
+  const contactSummary = $derived(
+    selectedContact ? buildExternalContactSummary(selectedContact) : null,
+  );
+  const poisonedOwnshipId = $derived(
+    !selectedVehicle && selectedEntity?.poisoned
+      ? parseVehicleEntityId(selectedEntity.id)
+      : null,
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
 
@@ -132,7 +144,7 @@
     series: ReadonlyArray<{
       label: string;
       color: string;
-      pick: (s: TelemetrySample) => number;
+      pick: (s: TelemetrySample) => number | null;
     }>,
     symmetricZero: boolean,
   ): void {
@@ -146,7 +158,7 @@
     ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.fillText(title, x + 8, y + 14);
 
-    if (samples.length < 2) {
+    if (samples.length === 0) {
       ctx.fillStyle = "#64748b";
       ctx.fillText(
         "Awaiting 20 Hz WS #1 telemetry samples…",
@@ -156,21 +168,55 @@
       return;
     }
 
+    let legendX = x + width - 8;
+    ctx.textAlign = "right";
+    for (let idx = series.length - 1; idx >= 0; idx -= 1) {
+      const line = series[idx];
+      if (!line) continue;
+      const latest = line.pick(samples[samples.length - 1]!);
+      const tag =
+        latest !== null
+          ? `${line.label}:${latest.toFixed(1)}`
+          : `${line.label}:--`;
+      ctx.fillStyle = line.color;
+      ctx.fillText(tag, legendX, y + 14);
+      legendX -= ctx.measureText(tag).width + 10;
+    }
+    ctx.textAlign = "left";
+
+    let measuredCount = 0;
     let minVal = symmetricZero ? -1 : 0;
     let maxVal = 1;
     for (const sample of samples) {
       for (const line of series) {
         const v = line.pick(sample);
-        if (v < minVal) minVal = v;
-        if (v > maxVal) maxVal = v;
+        if (v === null) continue;
+        if (measuredCount === 0 && !symmetricZero) {
+          minVal = v;
+          maxVal = v;
+        } else {
+          if (v < minVal) minVal = v;
+          if (v > maxVal) maxVal = v;
+        }
+        measuredCount += 1;
       }
     }
+
+    if (measuredCount === 0) {
+      ctx.fillStyle = "#64748b";
+      ctx.fillText("No measured samples in window", x + 8, y + height * 0.55);
+      return;
+    }
+
     if (symmetricZero) {
       const bound = Math.max(Math.abs(minVal), Math.abs(maxVal), 1);
       minVal = -bound;
       maxVal = bound;
-    } else if (maxVal - minVal < 1e-3) {
-      maxVal = minVal + 1;
+    } else {
+      minVal = Math.min(0, minVal);
+      if (maxVal - minVal < 1e-3) {
+        maxVal = minVal + 1;
+      }
     }
 
     const plotTop = y + 22;
@@ -186,35 +232,48 @@
       ctx.stroke();
     }
 
-    let legendX = x + width - 8;
-    ctx.textAlign = "right";
-    for (let idx = series.length - 1; idx >= 0; idx -= 1) {
-      const line = series[idx];
-      if (!line) continue;
-      const latest = line.pick(samples[samples.length - 1]!);
-      const tag = `${line.label}:${latest.toFixed(1)}`;
-      ctx.fillStyle = line.color;
-      ctx.fillText(tag, legendX, y + 14);
-      legendX -= ctx.measureText(tag).width + 10;
-    }
-    ctx.textAlign = "left";
-
     for (const line of series) {
       ctx.strokeStyle = line.color;
+      ctx.fillStyle = line.color;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
+      let runLength = 0;
+      let hasLineSegment = false;
+      let lastPx = 0;
+      let lastPy = 0;
       for (let i = 0; i < samples.length; i += 1) {
         const sample = samples[i]!;
-        const px = x + 6 + (i / Math.max(1, samples.length - 1)) * (width - 12);
-        const norm = (line.pick(sample) - minVal) / span;
+        const v = line.pick(sample);
+        if (v === null) {
+          if (runLength === 1) {
+            ctx.fillRect(lastPx - 1.5, lastPy - 1.5, 3, 3);
+          }
+          runLength = 0;
+          continue;
+        }
+        const px =
+          samples.length === 1
+            ? x + width * 0.5
+            : x + 6 + (i / (samples.length - 1)) * (width - 12);
+        const norm = (v - minVal) / span;
         const py = plotTop + (1 - norm) * plotHeight;
-        if (i === 0) {
+        if (runLength === 0) {
           ctx.moveTo(px, py);
+          runLength = 1;
         } else {
           ctx.lineTo(px, py);
+          runLength += 1;
+          hasLineSegment = true;
         }
+        lastPx = px;
+        lastPy = py;
       }
-      ctx.stroke();
+      if (runLength === 1) {
+        ctx.fillRect(lastPx - 1.5, lastPy - 1.5, 3, 3);
+      }
+      if (hasLineSegment) {
+        ctx.stroke();
+      }
     }
   }
 
@@ -369,11 +428,17 @@
           </span>
         {/each}
       </div>
-    {:else if selectedContact}
+    {:else if poisonedOwnshipId}
+      <span class="bar-muted" data-testid="bench-poisoned-notice">
+        UXS #{poisonedOwnshipId.sysid} is POISONED — 0xB1 MCU diagnostics failed to
+        decode.
+      </span>
+    {:else if contactSummary}
       <span class="bar-muted" data-testid="bench-contact-notice">
-        External COP contact selected ({selectedContact.title ??
-          selectedContact.id}) — 0xB1 MCU diagnostics apply only to ownship UXS
-        vehicles.
+        External COP contact selected ({contactSummary.title}) — source: {contactSummary.source}
+        · observed: {contactSummary.observedAt} · received: {contactSummary.receivedAt}
+        · expires: {contactSummary.expiresAt} · uncertainty: {contactSummary.uncertaintyLabel}
+        — 0xB1 MCU diagnostics apply only to ownship UXS vehicles.
       </span>
     {:else}
       <span class="bar-muted">
@@ -393,6 +458,8 @@
         <span class="muted">
           {#if selectedVehicle}
             UXS #{selectedVehicle.sysid} · {selectedVehicle.domain}
+          {:else if poisonedOwnshipId}
+            UXS #{poisonedOwnshipId.sysid} · POISONED
           {:else}
             STANDBY
           {/if}
@@ -536,6 +603,8 @@
             External COP contacts expose no parameter tuning rack.
           {:else if selectedVehicle?.poisoned}
             UXS #{selectedVehicle.sysid} is POISONED — parameter staging is withheld.
+          {:else if poisonedOwnshipId}
+            UXS #{poisonedOwnshipId.sysid} is POISONED — parameter staging is withheld.
           {:else}
             Select a commandable UXS vehicle to stage control and deadman
             parameters.

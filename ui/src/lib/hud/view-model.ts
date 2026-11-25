@@ -6,6 +6,7 @@ import {
   type HealthFlags,
   type LinkTier,
   isFiniteNumber,
+  parseVehicleEntityId,
 } from "../uxs";
 import type {
   CopEntityState,
@@ -75,6 +76,13 @@ export interface VehicleBannerView {
   readonly armedBadge: ArmedBadgeView;
   readonly linkBadge: LinkTierBadgeView;
   readonly healthStrip: readonly HealthChipView[];
+}
+
+export interface PoisonedVehicleBannerView {
+  readonly kind: "poisoned-uxs-vehicle";
+  readonly entityId: string;
+  readonly sysid: number;
+  readonly poisonError: string | null;
 }
 
 export interface ExternalContactSummaryView {
@@ -787,7 +795,11 @@ export function buildExternalContactSummary(
 
 export function selectBannerPresentation(
   entity: CopEntityState | null | undefined,
-): VehicleBannerView | ExternalContactSummaryView | null {
+):
+  | VehicleBannerView
+  | PoisonedVehicleBannerView
+  | ExternalContactSummaryView
+  | null {
   if (!entity) {
     return null;
   }
@@ -796,6 +808,17 @@ export function selectBannerPresentation(
   }
   if (entity.kind === "external-contact") {
     return buildExternalContactSummary(entity);
+  }
+  if (entity.poisoned) {
+    const parsed = parseVehicleEntityId(entity.id);
+    if (parsed !== null) {
+      return {
+        kind: "poisoned-uxs-vehicle",
+        entityId: entity.id,
+        sysid: parsed.sysid,
+        poisonError: entity.poisonError,
+      };
+    }
   }
   return null;
 }
@@ -905,6 +928,43 @@ export function formatVehicleHudReadouts(
   };
 }
 
+export interface ActiveVehicleFault {
+  readonly severity: "error" | "warning" | null;
+  readonly reason: string | null;
+}
+
+/**
+ * Evaluates strictly current/active fault conditions on an ownship UXS vehicle
+ * without treating cumulative lifetime counters (`failsafes`, `crcErrors`,
+ * retained in Bench diagnostics) as unrecoverable active exceptions.
+ */
+export function evaluateActiveVehicleFault(
+  vehicle: Pick<VehicleEntityState, "poisoned" | "authority" | "healthFlags">,
+): ActiveVehicleFault {
+  if (vehicle.poisoned) {
+    return { severity: "error", reason: "POISONED" };
+  }
+  if (vehicle.authority === "mcu-failsafe") {
+    return { severity: "error", reason: "P4" };
+  }
+  if (!vehicle.healthFlags.crsf_link_healthy) {
+    return { severity: "error", reason: "CRSF FAULT" };
+  }
+  if (!vehicle.healthFlags.companion_trunk_healthy) {
+    return { severity: "error", reason: "TRUNK FAULT" };
+  }
+  if (vehicle.authority === "direct-crsf-override") {
+    return { severity: "warning", reason: "P1" };
+  }
+  if (vehicle.healthFlags.teleop_deadman_clamped) {
+    return { severity: "warning", reason: "DEADMAN" };
+  }
+  if (!vehicle.healthFlags.clock_sync_locked) {
+    return { severity: "warning", reason: "CLOCK UNLOCKED" };
+  }
+  return { severity: null, reason: null };
+}
+
 export interface FleetFaultSummary {
   readonly totalVehicles: number;
   readonly faultedCount: number;
@@ -914,43 +974,68 @@ export interface FleetFaultSummary {
   readonly firstFaultLabel: string | null;
 }
 
+interface FleetFaultCandidate {
+  readonly id: string;
+  readonly sysid: number;
+  readonly fault: ActiveVehicleFault;
+}
+
 /**
- * Aggregates active safety faults across all ownship UXS vehicles in deterministic
+ * Aggregates active safety faults across all ownship UXS vehicles (including
+ * poisoned-first ownship vehicle keys whose triples never decoded) in deterministic
  * ascending sysid order so off-screen or unselected vehicle faults remain visible
  * in the invariant topbar across COP, Pilot, Bench, and Cortex.
  */
 export function summarizeFleetFaults(
-  vehicles: Iterable<VehicleEntityState>,
+  entities: Iterable<CopEntityState>,
 ): FleetFaultSummary {
-  const ordered = Array.from(vehicles).sort((a, b) => a.sysid - b.sysid);
-  let errorCount = 0;
-  let warningCount = 0;
-  let firstErrorVehicle: VehicleEntityState | null = null;
-  let firstWarningVehicle: VehicleEntityState | null = null;
-
-  for (const vehicle of ordered) {
-    const severity = evaluateVehicleSafetySeverity(vehicle);
-    if (severity === "error") {
-      errorCount += 1;
-      if (firstErrorVehicle === null) {
-        firstErrorVehicle = vehicle;
-      }
-    } else if (severity === "warning") {
-      warningCount += 1;
-      if (firstWarningVehicle === null) {
-        firstWarningVehicle = vehicle;
+  const byId = new Map<string, FleetFaultCandidate>();
+  for (const entity of entities) {
+    if (entity.kind === "uxs-vehicle") {
+      byId.set(entity.id, {
+        id: entity.id,
+        sysid: entity.sysid,
+        fault: evaluateActiveVehicleFault(entity),
+      });
+    } else if (entity.poisoned) {
+      const parsed = parseVehicleEntityId(entity.id);
+      if (parsed !== null) {
+        byId.set(entity.id, {
+          id: entity.id,
+          sysid: parsed.sysid,
+          fault: { severity: "error", reason: "POISONED" },
+        });
       }
     }
   }
 
-  const primary = firstErrorVehicle ?? firstWarningVehicle;
-  let firstFaultLabel: string | null = null;
-  if (primary !== null) {
-    const reason = primary.poisoned
-      ? "POISONED"
-      : formatAuthorityBadge(primary.authority).code;
-    firstFaultLabel = `UXS #${primary.sysid} · ${reason}`;
+  const ordered = Array.from(byId.values()).sort(
+    (a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id),
+  );
+  let errorCount = 0;
+  let warningCount = 0;
+  let firstError: FleetFaultCandidate | null = null;
+  let firstWarning: FleetFaultCandidate | null = null;
+
+  for (const candidate of ordered) {
+    if (candidate.fault.severity === "error") {
+      errorCount += 1;
+      if (firstError === null) {
+        firstError = candidate;
+      }
+    } else if (candidate.fault.severity === "warning") {
+      warningCount += 1;
+      if (firstWarning === null) {
+        firstWarning = candidate;
+      }
+    }
   }
+
+  const primary = firstError ?? firstWarning;
+  const firstFaultLabel =
+    primary !== null && primary.fault.reason !== null
+      ? `UXS #${primary.sysid} · ${primary.fault.reason}`
+      : null;
 
   return {
     totalVehicles: ordered.length,
@@ -986,33 +1071,89 @@ export interface FilmstripItemView {
 
 /**
  * Builds deterministic FleetFilmstrip items (ownship vehicles sorted by sysid,
+ * including poisoned-first ownship vehicle keys when `allEntities` is supplied,
  * followed by external contacts sorted by entity ID), assigning 1..9 hotkeys
  * and keeping reserved safety severities strictly null on external contacts.
  */
 export function buildFilmstripItems(
   vehicles: Iterable<VehicleEntityState>,
   contacts: Iterable<ExternalContactEntityState>,
+  allEntities?: Iterable<CopEntityState>,
 ): readonly FilmstripItemView[] {
-  const orderedVehicles = Array.from(vehicles).sort(
-    (a, b) => a.sysid - b.sysid,
+  type OwnshipEntry =
+    | {
+        readonly sysid: number;
+        readonly id: string;
+        readonly decoded: VehicleEntityState;
+      }
+    | {
+        readonly sysid: number;
+        readonly id: string;
+        readonly poisonedEntity: CopEntityState;
+      };
+
+  const ownshipById = new Map<string, OwnshipEntry>();
+  for (const vehicle of vehicles) {
+    ownshipById.set(vehicle.id, {
+      sysid: vehicle.sysid,
+      id: vehicle.id,
+      decoded: vehicle,
+    });
+  }
+  if (allEntities) {
+    for (const entity of allEntities) {
+      if (
+        entity.kind !== "uxs-vehicle" &&
+        entity.poisoned &&
+        !ownshipById.has(entity.id)
+      ) {
+        const parsed = parseVehicleEntityId(entity.id);
+        if (parsed !== null) {
+          ownshipById.set(entity.id, {
+            sysid: parsed.sysid,
+            id: entity.id,
+            poisonedEntity: entity,
+          });
+        }
+      }
+    }
+  }
+
+  const orderedOwnship = Array.from(ownshipById.values()).sort(
+    (a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id),
   );
   const orderedContacts = Array.from(contacts).sort((a, b) =>
     a.id.localeCompare(b.id),
   );
 
   const items: FilmstripItemView[] = [];
-  for (const vehicle of orderedVehicles) {
+  for (const entry of orderedOwnship) {
     const shortcutKey = items.length < 9 ? String(items.length + 1) : null;
-    const authCode = formatAuthorityBadge(vehicle.authority).code;
-    items.push({
-      entityId: vehicle.id,
-      shortcutKey,
-      kind: "uxs-vehicle",
-      primaryLabel: vehicle.title ?? `UXS #${vehicle.sysid}`,
-      secondaryLabel: `#${vehicle.sysid} · ${authCode} · ${vehicle.armed ? "ARMED" : "SAFE"}`,
-      safetySeverity: evaluateVehicleSafetySeverity(vehicle),
-      contactFeedStatus: null,
-    });
+    if ("decoded" in entry) {
+      const vehicle = entry.decoded;
+      const authCode = formatAuthorityBadge(vehicle.authority).code;
+      const activeFault = evaluateActiveVehicleFault(vehicle);
+      items.push({
+        entityId: vehicle.id,
+        shortcutKey,
+        kind: "uxs-vehicle",
+        primaryLabel: vehicle.title ?? `UXS #${vehicle.sysid}`,
+        secondaryLabel: `#${vehicle.sysid} · ${authCode} · ${vehicle.armed ? "ARMED" : "SAFE"}`,
+        safetySeverity:
+          activeFault.severity ?? (vehicle.armed ? "success" : "nominal"),
+        contactFeedStatus: null,
+      });
+    } else {
+      items.push({
+        entityId: entry.id,
+        shortcutKey,
+        kind: "uxs-vehicle",
+        primaryLabel: entry.poisonedEntity.title ?? `UXS #${entry.sysid}`,
+        secondaryLabel: `#${entry.sysid} · POISONED`,
+        safetySeverity: "error",
+        contactFeedStatus: null,
+      });
+    }
   }
 
   for (const contact of orderedContacts) {

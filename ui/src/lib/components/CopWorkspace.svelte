@@ -6,10 +6,12 @@
   import TacticalCanvas from "$lib/components/TacticalCanvas.svelte";
   import {
     type CopSoloSection,
+    type HealthChipView,
     buildExternalContactSummary,
     buildHealthStrip,
     buildVehicleBannerView,
     computeFlightMetrics,
+    evaluateActiveVehicleFault,
     evaluateVehicleSafetySeverity,
     extractAbnormalHealthChips,
     resolveLiveVehiclePose,
@@ -30,6 +32,7 @@
     ViewportStore,
     WorkspaceMode,
   } from "$lib/stores/viewport.svelte";
+  import { parseVehicleEntityId } from "$lib/uxs";
 
   interface Props {
     telemetryStore: TelemetryStore;
@@ -75,15 +78,47 @@
       : null,
   );
 
-  const fleetFaults = $derived(summarizeFleetFaults(skgStore.vehicles));
-  const faultedVehicles = $derived(
-    skgStore.vehicles
-      .filter((v) => {
-        const sev = evaluateVehicleSafetySeverity(v);
-        return sev === "error" || sev === "warning";
-      })
-      .sort((a, b) => a.sysid - b.sysid),
+  const fleetFaults = $derived(
+    summarizeFleetFaults(skgStore.entities.values()),
   );
+  const faultedOwnshipEntries = $derived.by(() => {
+    const rows: Array<{
+      id: string;
+      sysid: number;
+      statusLabel: string;
+      poisoned: boolean;
+      chips: readonly HealthChipView[];
+    }> = [];
+    for (const entity of skgStore.entities.values()) {
+      if (entity.kind === "uxs-vehicle") {
+        const fault = evaluateActiveVehicleFault(entity);
+        if (fault.severity !== null) {
+          rows.push({
+            id: entity.id,
+            sysid: entity.sysid,
+            statusLabel: entity.authority,
+            poisoned: entity.poisoned,
+            chips: extractAbnormalHealthChips(
+              buildHealthStrip(entity.healthFlags, entity.sysStatus),
+            ),
+          });
+        }
+      } else if (entity.poisoned) {
+        const parsed = parseVehicleEntityId(entity.id);
+        if (parsed !== null) {
+          rows.push({
+            id: entity.id,
+            sysid: parsed.sysid,
+            statusLabel: "decode-error",
+            poisoned: true,
+            chips: [],
+          });
+        }
+      }
+    }
+    rows.sort((a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id));
+    return rows;
+  });
 
   const recentEvents = $derived(
     [...telemetryStore.events]
@@ -315,6 +350,14 @@
                   <dt>Observed</dt>
                   <dd>{contactSummary.observedAt}</dd>
                 </div>
+                <div>
+                  <dt>Received</dt>
+                  <dd>{contactSummary.receivedAt}</dd>
+                </div>
+                <div>
+                  <dt>Expires</dt>
+                  <dd>{contactSummary.expiresAt}</dd>
+                </div>
               </dl>
               <div class="jump-actions">
                 <button
@@ -339,28 +382,25 @@
           data-testid="cop-solo-panel-alerts"
           aria-label="Active fleet exceptions"
         >
-          {#if faultedVehicles.length === 0}
+          {#if faultedOwnshipEntries.length === 0}
             <p class="rail-empty">All ingested UXS vehicles nominal.</p>
           {:else}
             <ul class="exception-list">
-              {#each faultedVehicles as vehicle (vehicle.id)}
-                {@const chips = extractAbnormalHealthChips(
-                  buildHealthStrip(vehicle.healthFlags, vehicle.sysStatus),
-                )}
+              {#each faultedOwnshipEntries as entry (entry.id)}
                 <li class="exception-card">
                   <button
                     type="button"
                     class="exception-select"
-                    onclick={() => handleSelectEntity(vehicle.id)}
+                    onclick={() => handleSelectEntity(entry.id)}
                   >
-                    <strong>UXS #{vehicle.sysid}</strong>
-                    <span>{vehicle.authority}</span>
+                    <strong>UXS #{entry.sysid}</strong>
+                    <span>{entry.statusLabel}</span>
                   </button>
-                  {#if vehicle.poisoned}
+                  {#if entry.poisoned}
                     <span class="chip-error">POISONED</span>
                   {/if}
                   <div class="chip-wrap">
-                    {#each chips as chip (chip.key)}
+                    {#each entry.chips as chip (chip.key)}
                       <span class="chip-{chip.severity}">
                         {chip.label}: {chip.value}
                       </span>

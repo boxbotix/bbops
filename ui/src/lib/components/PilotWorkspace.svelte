@@ -19,6 +19,7 @@
   } from "$lib/stores/skg.svelte";
   import type { TelemetryStore } from "$lib/stores/telemetry.svelte";
   import type { ViewportStore } from "$lib/stores/viewport.svelte";
+  import { parseVehicleEntityId } from "$lib/uxs";
 
   interface Props {
     telemetryStore: TelemetryStore;
@@ -45,6 +46,13 @@
     isExternalContactEntity(selectedEntity) ? selectedEntity : null,
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
+  const isPoisonedOwnshipSelected = $derived(
+    Boolean(
+      selectedVehicle?.poisoned ||
+      (selectedEntity?.poisoned &&
+        parseVehicleEntityId(selectedEntity.id) !== null),
+    ),
+  );
 
   const contactSummary = $derived(
     selectedContact ? buildExternalContactSummary(selectedContact) : null,
@@ -88,6 +96,8 @@
           <span>source: <strong>{contactSummary.source}</strong></span>
           <span>feed: <strong>{contactSummary.feedStatus}</strong></span>
           <span>observed: <strong>{contactSummary.observedAt}</strong></span>
+          <span>received: <strong>{contactSummary.receivedAt}</strong></span>
+          <span>expires: <strong>{contactSummary.expiresAt}</strong></span>
           <span
             >uncertainty: <strong>{contactSummary.uncertaintyLabel}</strong
             ></span
@@ -177,7 +187,7 @@
                 </div>
               {/if}
             </div>
-          {:else if selectedVehicle?.poisoned}
+          {:else if isPoisonedOwnshipSelected}
             <div
               class="pilot-poisoned-guard"
               data-testid="pilot-poisoned-guard"
@@ -209,7 +219,7 @@
                 </div>
               {/if}
             </div>
-          {:else if selectedVehicle?.poisoned}
+          {:else if isPoisonedOwnshipSelected}
             <div
               class="pilot-poisoned-guard"
               data-testid="pilot-poisoned-guard"

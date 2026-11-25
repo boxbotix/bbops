@@ -320,12 +320,70 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       hostEl.querySelector('[data-testid="pilot-map-primary"]'),
     ).toBeNull();
 
-    // 3. Selecting ExternalContactEntityState in Pilot withholds VehicleHud, authority/armed badges, and guarded action slot!
+    // 3. Selecting ExternalContactEntityState in Pilot & Bench surfaces both observed and received provenance while withholding UXS authority/HUD/actuation!
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: contactId,
+        revision: 3,
+        payload: {
+          id: contactId,
+          triples: [
+            {
+              subject: contactId,
+              predicate: "dc.terms.title",
+              object: "Delta 4",
+              source: "ais",
+              timestamp: "2030-01-15T12:00:00Z",
+              confidence: 1,
+            },
+            {
+              subject: contactId,
+              predicate: "cop.contact.source",
+              object: "ais-coastal",
+              source: "ais",
+              timestamp: "2030-01-15T12:00:00Z",
+              confidence: 1,
+            },
+            {
+              subject: contactId,
+              predicate: "cop.time.observed",
+              object: "2030-01-15T12:00:00.000Z",
+              source: "ais",
+              timestamp: "2030-01-15T12:00:14Z",
+              confidence: 1,
+            },
+            {
+              subject: contactId,
+              predicate: "cop.time.received",
+              object: "2030-01-15T12:00:14.000Z",
+              source: "ais",
+              timestamp: "2030-01-15T12:00:14Z",
+              confidence: 1,
+            },
+          ],
+        },
+      }),
+    );
     viewportStore.selectEntity(contactId);
     flushSync();
     expect(
-      hostEl.querySelector('[data-testid="pilot-contact-isolation"]'),
-    ).not.toBeNull();
+      hostEl.querySelector('[data-testid="external-contact-banner"]')
+        ?.textContent,
+    ).toContain("observed: 2030-01-15T12:00:00.000Z");
+    expect(
+      hostEl.querySelector('[data-testid="external-contact-banner"]')
+        ?.textContent,
+    ).toContain("received: 2030-01-15T12:00:14.000Z");
+    expect(
+      hostEl.querySelector('[data-testid="pilot-contact-isolation"]')
+        ?.textContent,
+    ).toContain("observed: 2030-01-15T12:00:00.000Z");
+    expect(
+      hostEl.querySelector('[data-testid="pilot-contact-isolation"]')
+        ?.textContent,
+    ).toContain("received: 2030-01-15T12:00:14.000Z");
     expect(hostEl.querySelector('[data-testid="vehicle-hud"]')).toBeNull();
     expect(
       hostEl.querySelector('[data-testid="vehicle-hud-standby"]'),
@@ -335,6 +393,15 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
     expect(
       hostEl.querySelector('[data-testid="pilot-guarded-actions"]'),
     ).toBeNull();
+
+    viewportStore.setWorkspace("bench");
+    flushSync();
+    expect(
+      hostEl.querySelector('[data-testid="bench-contact-notice"]')?.textContent,
+    ).toContain("observed: 2030-01-15T12:00:00.000Z");
+    expect(
+      hostEl.querySelector('[data-testid="bench-contact-notice"]')?.textContent,
+    ).toContain("received: 2030-01-15T12:00:14.000Z");
 
     unmount(app);
     hostEl.remove();
@@ -575,6 +642,194 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       expect(mockGraphql.pathSearch).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener("keydown", onKeyDown);
+      unmount(app);
+      hostEl.remove();
+    }
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  // spec: cop-ui / Primary attitude HUD, 4-state ControlAuthority banner, and external contact UI isolation
+  it("counts poisoned-first ownship vehicle snapshots as non-commandable fleet faults until replaced by a healthy put, and prioritizes current P4 faults over historical failsafe/CRC counters while retaining cumulative counts in Bench", () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore();
+    const viewportStore = createViewportStore({ skgStore });
+    const poisonedKey = "boxbotix.local.robotics.uxs.vehicle.2";
+
+    // 1. Poisoned-first initial snapshot (no prior decodable put -> entity.kind === "generic").
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: poisonedKey,
+        revision: 1,
+        error: "corrupt msgpack triple",
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 1,
+      }),
+    );
+
+    expect(skgStore.getEntity(poisonedKey)?.kind).toBe("generic");
+    expect(skgStore.vehicles).toHaveLength(0);
+    expect(skgStore.commandableVehicles).toHaveLength(0);
+    expect(skgStore.getCommandableVehicle(poisonedKey)).toBeNull();
+
+    const poisonedSummary = summarizeFleetFaults(skgStore.entities.values());
+    expect(poisonedSummary).toEqual({
+      totalVehicles: 1,
+      faultedCount: 1,
+      errorCount: 1,
+      warningCount: 0,
+      firstFaultEntityId: poisonedKey,
+      firstFaultLabel: "UXS #2 · POISONED",
+    });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(WorkspaceShell, {
+      target: hostEl,
+      props: { telemetryStore, skgStore, viewportStore },
+    });
+    flushSync();
+
+    try {
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]'),
+      ).toBeNull();
+      const faultBtn = hostEl.querySelector(
+        '[data-testid="fleet-fault-badge"]',
+      ) as HTMLButtonElement;
+      expect(faultBtn?.textContent).toContain("1 FLEET FAULT");
+      expect(faultBtn?.textContent).toContain("UXS #2 · POISONED");
+
+      // Clicking the badge selects the poisoned-first record while keeping Pilot & Bench non-commandable.
+      faultBtn.click();
+      flushSync();
+      expect(viewportStore.selectedEntityId).toBe(poisonedKey);
+      expect(viewportStore.selectedCommandableVehicle).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="poisoned-badge"]')?.textContent,
+      ).toContain("POISONED: corrupt msgpack triple");
+      expect(
+        hostEl.querySelector('[data-testid="authority-badge"]'),
+      ).toBeNull();
+
+      viewportStore.setWorkspace("pilot");
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="pilot-guarded-actions"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="pilot-poisoned-guard"]')
+          ?.textContent,
+      ).toContain("POISONED ENTITY");
+
+      viewportStore.setWorkspace("bench");
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-tuning-withheld"]')
+          ?.textContent,
+      ).toContain("UXS #2 is POISONED");
+      expect(hostEl.querySelectorAll('input[type="range"]')).toHaveLength(0);
+
+      // 2. Replacement by a healthy put upgrades UXS #2 and clears the fleet fault to FLEET NOMINAL (1).
+      const healthyRover2 = buildVehicleStoredPayload(2, {
+        "uxs.domain.kind": "rover",
+        "uxs.authority.state": "companion-autonomous",
+        "uxs.health.armed": true,
+      });
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: poisonedKey,
+          revision: 2,
+          payload: healthyRover2,
+        }),
+      );
+      flushSync();
+
+      expect(skgStore.commandableVehicles).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="fleet-fault-badge"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="fleet-nominal-badge"]')
+          ?.textContent,
+      ).toContain("FLEET NOMINAL (1)");
+
+      // 3. UXS #1 recovers to P2 with nonzero historical failsafes=1 & crcErrors=2 while UXS #2 enters P4.
+      const recoveredQuad1 = buildVehicleStoredPayload(1, {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.authority.state": "companion-teleop",
+        "uxs.health.armed": true,
+        "uxs.health.failsafes": 1,
+        "uxs.health.crcerrors": 2,
+      });
+      const failsafeRover2 = buildVehicleStoredPayload(2, {
+        "uxs.domain.kind": "rover",
+        "uxs.authority.state": "mcu-failsafe",
+        "uxs.health.failsafes": 1,
+      });
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: recoveredQuad1.id,
+          revision: 3,
+          payload: recoveredQuad1,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: failsafeRover2.id,
+          revision: 4,
+          payload: failsafeRover2,
+        }),
+      );
+      flushSync();
+
+      const postRecoverySummary = summarizeFleetFaults(
+        skgStore.entities.values(),
+      );
+      expect(postRecoverySummary).toEqual({
+        totalVehicles: 2,
+        faultedCount: 1,
+        errorCount: 1,
+        warningCount: 0,
+        firstFaultEntityId: failsafeRover2.id,
+        firstFaultLabel: "UXS #2 · P4",
+      });
+
+      // Selecting UXS #1 in Bench still retains cumulative failsafes=1 and crcErrors=2 in bench-health-strip,
+      // while the topbar badge jumps to UXS #2 · P4 rather than UXS #1 · P2!
+      viewportStore.selectEntity(recoveredQuad1.id);
+      flushSync();
+      const benchStrip = hostEl.querySelector(
+        '[data-testid="bench-health-strip"]',
+      );
+      expect(
+        benchStrip?.querySelector('[data-chip-key="failsafes"]')?.textContent,
+      ).toContain("1");
+      expect(
+        benchStrip?.querySelector('[data-chip-key="crc_errors"]')?.textContent,
+      ).toContain("2");
+
+      const activeBadge = hostEl.querySelector(
+        '[data-testid="fleet-fault-badge"]',
+      ) as HTMLButtonElement;
+      expect(activeBadge.textContent).toContain("1 FLEET FAULT");
+      expect(activeBadge.textContent).toContain("UXS #2 · P4");
+      activeBadge.click();
+      flushSync();
+      expect(viewportStore.selectedEntityId).toBe(failsafeRover2.id);
+    } finally {
       unmount(app);
       hostEl.remove();
     }
