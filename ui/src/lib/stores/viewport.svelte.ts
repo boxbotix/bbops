@@ -43,15 +43,26 @@ export interface ViewportSnapshot {
   declutter: DeclutterLevel;
 }
 
+export interface ShortcutStorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export const CHARACTER_SHORTCUTS_STORAGE_KEY =
+  "bbops.characterShortcutsEnabled";
+
 export interface ViewportStoreOptions {
   skgStore?: Pick<SkgStore, "getEntity" | "getCommandableVehicle">;
   initialHash?: string;
+  storage?: ShortcutStorageLike | null;
+  initialCharacterShortcutsEnabled?: boolean;
 }
 
 export interface ViewportStore {
   readonly workspace: WorkspaceMode;
   readonly pilotLayout: PilotLayout;
   readonly lightsOut: boolean;
+  readonly characterShortcutsEnabled: boolean;
   readonly selectedEntityId: string | null;
   readonly tetheredEntityId: string | null;
   readonly chaseLock: boolean;
@@ -64,6 +75,7 @@ export interface ViewportStore {
   setPilotLayout(layout: PilotLayout): void;
   togglePilotLayout(): void;
   setLightsOut(enabled?: boolean): void;
+  setCharacterShortcutsEnabled(enabled?: boolean): void;
   selectEntity(entityId: string | null): void;
   tetherEntity(entityId: string | null): void;
   setChaseLock(enabled: boolean): void;
@@ -80,6 +92,43 @@ export interface ViewportStore {
 
 const EMPTY_SET_SENTINEL = "none";
 const LIGHTS_OUT_CHROME_TOKEN = "lights-out";
+
+function readStoredCharacterShortcutsEnabled(
+  storage: ShortcutStorageLike | null | undefined,
+): boolean {
+  if (!storage) {
+    return true;
+  }
+  try {
+    const raw = storage.getItem(CHARACTER_SHORTCUTS_STORAGE_KEY)?.trim();
+    if (raw === "false" || raw === "0") {
+      return false;
+    }
+    if (raw === "true" || raw === "1") {
+      return true;
+    }
+  } catch {
+    // Ignore storage read failures in restricted browser contexts.
+  }
+  return true;
+}
+
+function writeStoredCharacterShortcutsEnabled(
+  storage: ShortcutStorageLike | null | undefined,
+  enabled: boolean,
+): void {
+  if (!storage) {
+    return;
+  }
+  try {
+    storage.setItem(
+      CHARACTER_SHORTCUTS_STORAGE_KEY,
+      enabled ? "true" : "false",
+    );
+  } catch {
+    // Ignore storage write failures in restricted browser contexts.
+  }
+}
 
 export function isWorkspaceMode(value: unknown): value is WorkspaceMode {
   return (
@@ -300,6 +349,11 @@ export function createViewportStore(
   let workspace = $state<WorkspaceMode>(initial.workspace);
   let pilotLayout = $state<PilotLayout>(initial.pilotLayout);
   let lightsOut = $state<boolean>(initial.lightsOut);
+  let characterShortcutsEnabled = $state<boolean>(
+    options.initialCharacterShortcutsEnabled !== undefined
+      ? Boolean(options.initialCharacterShortcutsEnabled)
+      : readStoredCharacterShortcutsEnabled(options.storage),
+  );
   let selectedEntityId = $state<string | null>(initial.selectedEntityId);
   let tetheredEntityId = $state<string | null>(initial.tetheredEntityId);
   let chaseLock = $state(initial.chaseLock);
@@ -353,6 +407,9 @@ export function createViewportStore(
     get lightsOut() {
       return lightsOut;
     },
+    get characterShortcutsEnabled() {
+      return characterShortcutsEnabled;
+    },
     get selectedEntityId() {
       return selectedEntityId;
     },
@@ -396,6 +453,13 @@ export function createViewportStore(
 
     setLightsOut(enabled?: boolean) {
       lightsOut = enabled !== undefined ? Boolean(enabled) : !lightsOut;
+    },
+
+    setCharacterShortcutsEnabled(enabled?: boolean) {
+      const next =
+        enabled !== undefined ? Boolean(enabled) : !characterShortcutsEnabled;
+      characterShortcutsEnabled = next;
+      writeStoredCharacterShortcutsEnabled(options.storage, next);
     },
 
     selectEntity(entityId: string | null) {

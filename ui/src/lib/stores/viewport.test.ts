@@ -6,6 +6,7 @@ import { UXS_DOMAIN_KINDS, type UxsDomainKind } from "../uxs";
 import { createSkgStore } from "./skg.svelte";
 import { buildVehicleStoredPayload, createSeededRng } from "./test-helpers";
 import {
+  CHARACTER_SHORTCUTS_STORAGE_KEY,
   COP_LAYERS,
   type CopLayer,
   createViewportStore,
@@ -16,6 +17,7 @@ import {
   PILOT_LAYOUTS,
   type PilotLayout,
   serializeViewportHash,
+  type ShortcutStorageLike,
   type ViewportSnapshot,
   WORKSPACE_MODES,
   type WorkspaceMode,
@@ -383,5 +385,69 @@ describe("viewport.svelte.ts — deterministic COP controller verbs & URL hash c
     expect(sawAllModes.size).toBe(WORKSPACE_MODES.length);
     expect(sawSplit).toBe(true);
     expect(sawLightsOut).toBe(true);
+  });
+
+  // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
+  it("persists characterShortcutsEnabled in storage without leaking into ViewportSnapshot or shared URL hashes", () => {
+    const backing = new Map<string, string>();
+    const storage: ShortcutStorageLike = {
+      getItem: (key) => backing.get(key) ?? null,
+      setItem: (key, value) => {
+        backing.set(key, value);
+      },
+    };
+
+    const store = createViewportStore({ storage });
+    expect(store.characterShortcutsEnabled).toBe(true);
+
+    store.selectEntity("boxbotix.local.robotics.uxs.vehicle.4");
+    const hashBeforeToggle = store.toUrlHash();
+    const snapBeforeToggle = store.snapshot();
+
+    // Implicit toggle -> false; persisted in storage, omitted from snapshot & URL hash.
+    store.setCharacterShortcutsEnabled();
+    expect(store.characterShortcutsEnabled).toBe(false);
+    expect(backing.get(CHARACTER_SHORTCUTS_STORAGE_KEY)).toBe("false");
+    expect(store.toUrlHash()).toBe(hashBeforeToggle);
+    expect(store.snapshot()).toEqual(snapBeforeToggle);
+
+    // Applying a shared URL hash or resetting tactical viewport state preserves operator shortcut preference.
+    store.applyUrlHash("#mode=bench&sel=boxbotix.local.robotics.uxs.vehicle.9");
+    expect(store.characterShortcutsEnabled).toBe(false);
+    store.reset();
+    expect(store.characterShortcutsEnabled).toBe(false);
+
+    // Fresh store hydrates false from storage; explicit true writes "true".
+    const rehydrated = createViewportStore({ storage });
+    expect(rehydrated.characterShortcutsEnabled).toBe(false);
+    rehydrated.setCharacterShortcutsEnabled(true);
+    expect(rehydrated.characterShortcutsEnabled).toBe(true);
+    expect(backing.get(CHARACTER_SHORTCUTS_STORAGE_KEY)).toBe("true");
+
+    // Malformed storage token falls back to initialCharacterShortcutsEnabled (default true).
+    backing.set(CHARACTER_SHORTCUTS_STORAGE_KEY, "corrupted");
+    expect(createViewportStore({ storage }).characterShortcutsEnabled).toBe(
+      true,
+    );
+    expect(
+      createViewportStore({
+        storage,
+        initialCharacterShortcutsEnabled: false,
+      }).characterShortcutsEnabled,
+    ).toBe(false);
+
+    // Throwing storage (e.g. sandboxed iframe) degrades gracefully in memory without throwing.
+    const brokenStorage: ShortcutStorageLike = {
+      getItem: () => {
+        throw new Error("SecurityError");
+      },
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+    };
+    const sandboxed = createViewportStore({ storage: brokenStorage });
+    expect(sandboxed.characterShortcutsEnabled).toBe(true);
+    sandboxed.setCharacterShortcutsEnabled(false);
+    expect(sandboxed.characterShortcutsEnabled).toBe(false);
   });
 });

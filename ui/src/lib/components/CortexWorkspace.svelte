@@ -597,7 +597,14 @@
   });
 </script>
 
-<div class="cortex-stage" data-testid="cortex-workspace">
+<div
+  class="cortex-stage"
+  data-testid="cortex-workspace"
+  data-workspace-stage="cortex"
+  role="region"
+  aria-label="Analysis workspace"
+  tabindex="-1"
+>
   <form
     class="cortex-query-bar"
     data-testid="cortex-query-bar"
@@ -609,6 +616,7 @@
           type="button"
           class="tier-btn"
           class:active={activeTier === tier}
+          aria-pressed={activeTier === tier}
           data-testid="cortex-tier-{tier}"
           onclick={() => {
             activeTier = tier;
@@ -746,7 +754,6 @@
         data-sigma-ready={sigmaReady ? "true" : "false"}
         data-highlighted-node={viewportStore.selectedEntityId ?? ""}
         data-hovered-node={hoveredNodeId ?? ""}
-        data-viewport-hotkey-scope="true"
         role="application"
         aria-label="Causal SKG interactive WebGL canvas"
         tabindex="-1"

@@ -956,4 +956,281 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
     expect(copStack.pageErrors).toEqual([]);
   });
+
+  // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  test("preserves Tab/Shift+Tab order across canvases, enforces single-stop WAI-ARIA inspector tabs and focus recovery, gates character shortcuts across reloads, and keeps :focus-visible unobstructed (#41)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(info.baseURL);
+
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    const workspaceNav = page.getByRole("navigation", {
+      name: "Task workspaces",
+    });
+    const fleetNavBtn = page.getByTestId("workspace-tab-cop");
+    const vehicleNavBtn = page.getByTestId("workspace-tab-pilot");
+    const diagnosticsNavBtn = page.getByTestId("workspace-tab-bench");
+    const analysisNavBtn = page.getByTestId("workspace-tab-cortex");
+
+    await expect(fleetNavBtn).toHaveAttribute("aria-current", "page");
+    await expect(vehicleNavBtn).not.toHaveAttribute("aria-current", "page");
+    await expect(diagnosticsNavBtn).not.toHaveAttribute("aria-current", "page");
+    await expect(analysisNavBtn).not.toHaveAttribute("aria-current", "page");
+
+    // 1. Page-entry Tab enters topbar with visible, unobstructed :focus-visible outline.
+    await page.keyboard.press("Tab");
+    const firstTabCheck = await page.evaluate(() => {
+      const el = document.activeElement as HTMLElement | null;
+      if (!el || el === document.body) {
+        return null;
+      }
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        rect.left + rect.width * 0.5,
+        rect.top + rect.height * 0.5,
+      );
+      return {
+        inTopbar: Boolean(
+          el.closest('[data-testid="invariant-safety-topbar"]'),
+        ),
+        focusVisible: el.matches(":focus-visible"),
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+        unobstructed: Boolean(hit && (hit === el || el.contains(hit))),
+      };
+    });
+    expect(firstTabCheck).toEqual({
+      inTopbar: true,
+      focusVisible: true,
+      outlineStyle: "solid",
+      outlineWidth: "2px",
+      unobstructed: true,
+    });
+
+    // 2. Clicking TacticalCanvas then pressing Tab / Shift+Tab moves focus in DOM order without toggling Lights-Out; L toggles Lights-Out.
+    const hudCanvas = page.locator(".safety-hud-canvas");
+    await hudCanvas.click({ position: { x: 24, y: 120 } });
+    await page.keyboard.press("Tab");
+    await expect(page.getByTestId("cop-roster")).toBeVisible();
+    const postCanvasTab = await page.evaluate(() => {
+      const el = document.activeElement as HTMLElement | null;
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        rect.left + rect.width * 0.5,
+        rect.top + rect.height * 0.5,
+      );
+      return {
+        text: el.textContent?.trim(),
+        inToolbar: Boolean(el.closest('[data-testid="viewport-toolbar"]')),
+        focusVisible: el.matches(":focus-visible"),
+        unobstructed: Boolean(hit && (hit === el || el.contains(hit))),
+      };
+    });
+    expect(postCanvasTab).toEqual({
+      text: "quadcopter",
+      inToolbar: true,
+      focusVisible: true,
+      unobstructed: true,
+    });
+
+    await hudCanvas.click({ position: { x: 24, y: 120 } });
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByTestId("cop-roster")).toBeVisible();
+    const postCanvasShiftTabInRoster = await page.evaluate(() =>
+      Boolean(document.activeElement?.closest('[data-testid="cop-roster"]')),
+    );
+    expect(postCanvasShiftTabInRoster).toBe(true);
+
+    // L toggles Lights-Out on and off; topbar Lights-Out button exposes L shortcut.
+    const lightsOutBtn = page.getByTestId("lights-out-toggle");
+    await expect(lightsOutBtn).toHaveAttribute("aria-keyshortcuts", "L");
+    await page.keyboard.press("l");
+    await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("cop-roster")).toHaveCount(0);
+    await page.keyboard.press("l");
+    await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("cop-roster")).toBeVisible();
+
+    // 3. Fleet inspector tablist: single Tab stop, Arrow/Home/End activation, and panel unmount focus recovery.
+    await page.keyboard.press("1");
+    const summaryTab = page.getByTestId("cop-solo-tab-summary");
+    const alertsTab = page.getByTestId("cop-solo-tab-alerts");
+    const skgTab = page.getByTestId("cop-solo-tab-skg");
+
+    await summaryTab.focus();
+    await expect(summaryTab).toHaveAttribute("tabindex", "0");
+    await expect(alertsTab).toHaveAttribute("tabindex", "-1");
+    await expect(skgTab).toHaveAttribute("tabindex", "-1");
+
+    // Single Tab stop: pressing Tab from active Summary tab skips inactive tabs and lands inside Summary tabpanel.
+    await page.keyboard.press("Tab");
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Vehicle [D]" }),
+    ).toBeFocused();
+
+    // Unmounting the focused panel button via reactive hash deselection restores focus to the active Summary tab (not document.body).
+    await page.evaluate(() => {
+      window.location.hash = "";
+    });
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Vehicle [D]" }),
+    ).toHaveCount(0);
+    await expect(summaryTab).toBeFocused();
+
+    await page.keyboard.press("1");
+    await summaryTab.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(alertsTab).toBeFocused();
+    await expect(alertsTab).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("cop-solo-panel-alerts")).toHaveAttribute(
+      "role",
+      "tabpanel",
+    );
+
+    await page.keyboard.press("End");
+    await expect(skgTab).toBeFocused();
+    await expect(skgTab).toHaveAttribute("aria-selected", "true");
+
+    await page.keyboard.press("Home");
+    await expect(summaryTab).toBeFocused();
+    await expect(summaryTab).toHaveAttribute("aria-selected", "true");
+
+    // 4. Cross-workspace jump button focuses destination stage (not document.body), and Bench/Cortex canvases preserve Tab order.
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    const jumpBenchBtn = page
+      .getByTestId("cop-solo-panel-summary")
+      .getByRole("button", { name: "Diagnostics [B]" });
+    await expect(jumpBenchBtn).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect(diagnosticsNavBtn).toHaveAttribute("aria-current", "page");
+    await expect(page.getByTestId("bench-workspace")).toBeFocused();
+
+    await page.getByTestId("bench-oscilloscope").click({
+      position: { x: 40, y: 60 },
+    });
+    await page.keyboard.press("Tab");
+    const postScopeFocusTag = await page.evaluate(
+      () => document.activeElement?.tagName ?? null,
+    );
+    expect(postScopeFocusTag).toBe("INPUT");
+
+    // Switch to Analysis via hotkey K -> stage focused; typing shortcut letters inside search input never triggers hotkeys.
+    await page.keyboard.press("Escape");
+    await page.getByTestId("bench-oscilloscope").click({
+      position: { x: 40, y: 60 },
+    });
+    await page.keyboard.press("k");
+    await expect(analysisNavBtn).toHaveAttribute("aria-current", "page");
+    await expect(page.getByTestId("cortex-workspace")).toBeFocused();
+
+    await page.getByTestId("cortex-sigma-host").click({
+      position: { x: 20, y: 20 },
+    });
+    await page.keyboard.press("Tab");
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cortex",
+    );
+    await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
+
+    const queryInput = page.getByTestId("cortex-query-input");
+    await queryInput.click();
+    await queryInput.pressSequentially("gdbkml1tch");
+    await expect(queryInput).toHaveValue("gdbkml1tch");
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cortex",
+    );
+    await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
+
+    // 5. Direct topbar click preserves button focus; disabling character shortcuts persists across reload while keeping Escape active.
+    await fleetNavBtn.click();
+    await expect(fleetNavBtn).toBeFocused();
+    await expect(fleetNavBtn).toHaveAttribute("aria-current", "page");
+
+    await page.keyboard.press("1");
+    await page.keyboard.press("t");
+    const tetherRegularBtn = page
+      .getByTestId("viewport-toolbar")
+      .getByRole("button", { name: /^Tether\b/ });
+    await expect(tetherRegularBtn).toHaveAttribute("aria-pressed", "true");
+
+    const shortcutsBtn = page.getByTestId("character-shortcuts-toggle");
+    await expect(shortcutsBtn).toHaveText("Shortcuts: On");
+    await shortcutsBtn.click();
+    await expect(shortcutsBtn).toHaveText("Shortcuts: Off");
+    await expect(shortcutsBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(page.locator("kbd")).toHaveCount(0);
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Vehicle", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByTestId("viewport-toolbar")
+        .getByRole("button", { name: "Tether", exact: true }),
+    ).toBeVisible();
+
+    // Character keys are ignored when off; Escape still clears camera tether.
+    for (const key of ["d", "b", "k", "l", "2", "c", "h"]) {
+      await page.keyboard.press(key);
+    }
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cop",
+    );
+    await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(tetherRegularBtn).toHaveAttribute("aria-pressed", "true");
+
+    await page.keyboard.press("Escape");
+    await expect(tetherRegularBtn).toHaveAttribute("aria-pressed", "false");
+
+    // Verify browser accessibility tree snapshot exposes clean role/name semantics with inactive shortcut hints omitted.
+    const railAriaSnapshot = await page
+      .getByTestId("cop-solo-rail")
+      .ariaSnapshot();
+    expect(railAriaSnapshot).toContain("tablist");
+    expect(railAriaSnapshot).toContain('tab "Summary" [selected]');
+    expect(railAriaSnapshot).toContain('tabpanel "Summary"');
+
+    const navAriaSnapshot = await workspaceNav.ariaSnapshot();
+    expect(navAriaSnapshot).toContain('button "Fleet"');
+    expect(navAriaSnapshot).toContain('button "Lights-Out"');
+    expect(navAriaSnapshot).toContain('button "Shortcuts: Off"');
+    expect(navAriaSnapshot).not.toContain("[G]");
+    expect(navAriaSnapshot).not.toContain("[L]");
+
+    // Reloading the page preserves Shortcuts: Off from localStorage; re-enabling restores Shortcuts: On.
+    await page.reload();
+    await expect(page.getByTestId("character-shortcuts-toggle")).toHaveText(
+      "Shortcuts: Off",
+    );
+    await expect(page.locator("kbd")).toHaveCount(0);
+
+    await page.getByTestId("character-shortcuts-toggle").click();
+    await expect(page.getByTestId("character-shortcuts-toggle")).toHaveText(
+      "Shortcuts: On",
+    );
+    await expect(
+      workspaceNav.getByRole("button", { name: /^Fleet\b/ }).locator("kbd"),
+    ).toHaveText("G");
+
+    expect(copStack.pageErrors).toEqual([]);
+  });
 });

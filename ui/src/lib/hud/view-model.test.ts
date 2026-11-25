@@ -22,6 +22,7 @@ import {
   resolveVehicleSafetyTone,
 } from "../viewport/ned-grid";
 import {
+  COP_SOLO_SECTIONS,
   HUD_READOUT_THROTTLE_MS,
   SKG_VEHICLE_FRESH_MS,
   USV_HUD_CRAB_DEADBAND_MPS,
@@ -47,6 +48,7 @@ import {
   selectBannerPresentation,
   selectFilmstripItems,
   shouldRefreshHudReadout,
+  stepTablistIndex,
   summarizeFleetHealth,
   summarizeStreamReadiness,
 } from "./view-model";
@@ -5173,5 +5175,32 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
     telemetryStore.disconnect();
     skgStore.disconnect();
+  });
+
+  // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
+  it("steps roving tablist indices with wrap-around on ArrowRight/ArrowLeft, Home/End bounds, and null on non-navigation keys", () => {
+    const count = COP_SOLO_SECTIONS.length;
+    expect(count).toBe(3);
+
+    // ArrowRight wraps 0 -> 1 -> 2 -> 0
+    expect(stepTablistIndex(0, "ArrowRight", count)).toBe(1);
+    expect(stepTablistIndex(1, "ArrowRight", count)).toBe(2);
+    expect(stepTablistIndex(2, "ArrowRight", count)).toBe(0);
+
+    // ArrowLeft wraps 0 -> 2 -> 1 -> 0
+    expect(stepTablistIndex(0, "ArrowLeft", count)).toBe(2);
+    expect(stepTablistIndex(2, "ArrowLeft", count)).toBe(1);
+    expect(stepTablistIndex(1, "ArrowLeft", count)).toBe(0);
+
+    // Home / End jump deterministically to 0 and count - 1
+    expect(stepTablistIndex(2, "Home", count)).toBe(0);
+    expect(stepTablistIndex(0, "End", count)).toBe(2);
+
+    // Out-of-range current indices clamp before stepping; non-positive count and unrelated keys return null
+    expect(stepTablistIndex(-5, "ArrowRight", count)).toBe(1);
+    expect(stepTablistIndex(99, "ArrowLeft", count)).toBe(1);
+    expect(stepTablistIndex(0, "ArrowRight", 0)).toBeNull();
+    expect(stepTablistIndex(0, "Tab", count)).toBeNull();
+    expect(stepTablistIndex(0, "Enter", count)).toBeNull();
   });
 });

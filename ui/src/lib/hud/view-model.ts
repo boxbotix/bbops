@@ -2128,3 +2128,28 @@ export function selectCopSoloSection(
     ? (requested as CopSoloSection)
     : current;
 }
+
+export function stepTablistIndex(
+  currentIndex: number,
+  key: string,
+  count: number,
+): number | null {
+  if (!Number.isInteger(count) || count <= 0) {
+    return null;
+  }
+  const safeCurrent = Number.isFinite(currentIndex)
+    ? Math.min(count - 1, Math.max(0, Math.trunc(currentIndex)))
+    : 0;
+  switch (key) {
+    case "ArrowRight":
+      return (safeCurrent + 1) % count;
+    case "ArrowLeft":
+      return (safeCurrent - 1 + count) % count;
+    case "Home":
+      return 0;
+    case "End":
+      return count - 1;
+    default:
+      return null;
+  }
+}

@@ -116,7 +116,14 @@
   }
 </script>
 
-<div class="pilot-stage" data-testid="pilot-workspace">
+<div
+  class="pilot-stage"
+  data-testid="pilot-workspace"
+  data-workspace-stage="pilot"
+  role="region"
+  aria-label="Vehicle workspace"
+  tabindex="-1"
+>
   {#if contactSummary}
     <div
       class="pilot-contact-isolation"
@@ -197,9 +204,14 @@
         type="button"
         class="swap-btn"
         data-testid="pilot-layout-toggle"
+        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+          ? "M"
+          : undefined}
         onclick={toggleLayout}
       >
-        Swap Layout [M] →
+        {viewportStore.characterShortcutsEnabled
+          ? "Swap Layout [M] →"
+          : "Swap Layout →"}
         {viewportStore.pilotLayout === "map" ? "50/50 Split" : "Map-Primary"}
       </button>
     </div>
