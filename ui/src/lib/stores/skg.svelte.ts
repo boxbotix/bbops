@@ -1074,7 +1074,10 @@ function applyVehicleStateReceipt(
       const replayed = crossedDisconnect || priorPred.replayedUnchanged;
       effectivePred = {
         observedNs: priorPred.observedNs,
-        ingestedAtMs: priorPred.ingestedAtMs,
+        ingestedAtMs:
+          isLivePostSync && !replayed
+            ? Math.min(priorPred.ingestedAtMs, projectedReceiptMs)
+            : priorPred.ingestedAtMs,
         ingestedLive: replayed ? false : priorPred.ingestedLive,
         replayedUnchanged: replayed,
       };

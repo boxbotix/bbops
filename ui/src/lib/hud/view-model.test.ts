@@ -5109,6 +5109,68 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
     expect(recoveredAfterPartial.state).toBe("nominal");
     expect(recoveredAfterPartial.badgeLabel).toBe("FLEET NOMINAL (1)");
 
+    // --- Sequence 3: Buffered delivery burst (HB at T, pos at T+1s, T+2s, T+3s delivered over 90 ms) + 1,100 ms silence ---
+    const burstHbProducerMs = t14ProducerMs + 10_000;
+    nowMs += 13_000;
+    const burstStartMs = nowMs;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 6,
+        safetyObsMs: burstHbProducerMs,
+        nedObsMs: burstHbProducerMs,
+        updatedAtMs: burstHbProducerMs,
+      }),
+    );
+    for (const sec of [1, 2, 3]) {
+      nowMs = burstStartMs + sec * 30;
+      const posProducerMs = burstHbProducerMs + sec * 1_000;
+      ws2Rig.latest.serverMessage(
+        buildSnapshotPut({
+          revision: 6 + sec,
+          safetyObsMs: burstHbProducerMs,
+          nedObsMs: posProducerMs,
+          updatedAtMs: posProducerMs,
+        }),
+      );
+    }
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // After 1,100 ms of silence, the heartbeat is provably >= 4,100 ms old (> 4,000 ms threshold) -> stale!
+    nowMs += 1_100;
+    const afterSilenceSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(afterSilenceSummary.state).toBe("stale");
+    expect(afterSilenceSummary.badgeLabel).toBe(
+      "FLEET STALE · LAST KNOWN (1 · 4s ago)",
+    );
+
+    // Indicated heartbeat age continues advancing as the browser clock ticks (+1,000 ms -> 5s ago):
+    nowMs += 1_000;
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET STALE · LAST KNOWN (1 · 5s ago)");
+
+    // Complete new #0 HEARTBEAT restores FLEET NOMINAL (1):
+    nowMs += 500;
+    const postBurstHbProducerMs = burstHbProducerMs + 6_000;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 10,
+        safetyObsMs: postBurstHbProducerMs,
+        nedObsMs: postBurstHbProducerMs,
+        updatedAtMs: postBurstHbProducerMs,
+      }),
+    );
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET NOMINAL (1)");
+
     telemetryStore.disconnect();
     skgStore.disconnect();
   });

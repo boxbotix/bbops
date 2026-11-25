@@ -1906,6 +1906,50 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(vCompleteT14.stateIngestedAtMs).toBe(t14ReceiptMs);
     expect(vCompleteT14.stateIngestedLive).toBe(true);
 
+    // 5. Buffered burst delivery: HB at T+20s and position-only snapshots at T+21s, T+22s, T+23s
+    // arrive over 90 ms starting at T+23s -> stateIngestedAtMs tightens to burstStartMs - 2_910!
+    const burstProducerT0Ms = producerT0Ms + 20_000;
+    browserNowMs += 9_000;
+    const burstStartMs = browserNowMs;
+    const burstHbIso = new Date(burstProducerT0Ms).toISOString();
+    const burstHbPayload = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter", "uxs.health.armed": true },
+      { observedAt: burstHbIso, updatedAt: burstHbIso },
+    );
+    rig.latest.serverMessage(putFrame(base.id, 5, burstHbPayload));
+    expect(store.getCommandableVehicle(base.id)!.stateIngestedAtMs).toBe(
+      burstStartMs,
+    );
+
+    for (const sec of [1, 2, 3]) {
+      browserNowMs = burstStartMs + sec * 30;
+      const posIso = new Date(burstProducerT0Ms + sec * 1_000).toISOString();
+      const posPayload = {
+        ...burstHbPayload,
+        updated_at: posIso,
+        triples: burstHbPayload.triples.map((t) =>
+          t.predicate === "uxs.kinematics.ned" ||
+          t.predicate === "uxs.kinematics.vx"
+            ? {
+                ...t,
+                object:
+                  t.predicate === "uxs.kinematics.ned"
+                    ? [12 + sec * 2, -2, -15]
+                    : 3.0,
+                timestamp: posIso,
+              }
+            : t,
+        ),
+      };
+      rig.latest.serverMessage(putFrame(base.id, 5 + sec, posPayload));
+    }
+
+    const vAfterBurst = store.getCommandableVehicle(base.id)!;
+    expect(vAfterBurst.stateObservedAt).toBe(burstHbIso);
+    expect(vAfterBurst.stateProducerAgeMs).toBe(3_000);
+    expect(vAfterBurst.stateIngestedAtMs).toBe(burstStartMs + 90 - 3_000);
+
     store.disconnect();
   });
 });
