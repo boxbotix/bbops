@@ -1536,106 +1536,18 @@ func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
 			preds2[uxsvocab.PredicateLinkTier] == uxsvocab.LinkTierMeshSupervisory
 	})
 
-	// Phase 1 — Delayed graph readiness + explicit #253 STATUSTEXT restoration:
-	// Even when setup/readiness exceeds link_timeout_ms (forced here by waiting until sysid=1 emits link_lost),
-	// restoring sysid=1 via #253 STATUSTEXT MUST emit [link_restored, statustext], advance ENTITY_STATES via
-	// UrgentSKGSync, and synchronize a fresh live baseline for both vehicles before testing steady-state STATUSTEXT.
-	sys2LostDuringSetup := false
-	for {
-		wsFrame := readWSFrame(t, telWS, 5*time.Second)
-		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
-			continue
-		}
-		var ev mavlink.TransitionEvent
-		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
-			t.Fatalf("unmarshal setup TransitionEvent: %v", uErr)
-		}
-		if ev.SysID == 2 && ev.Kind == mavlink.EventKindLinkLost {
-			sys2LostDuringSetup = true
-		}
-		if ev.SysID == 1 && ev.Kind == mavlink.EventKindLinkLost {
-			break
-		}
-	}
-
-	entry1PreRestore, err := entityBucket.Get(ctx, vehicle1ID)
+	entry1Initial, err := entityBucket.Get(ctx, vehicle1ID)
 	if err != nil {
-		t.Fatalf("ENTITY_STATES.Get(%q) pre-restore: %v", vehicle1ID, err)
+		t.Fatalf("ENTITY_STATES.Get(%q) initial: %v", vehicle1ID, err)
 	}
-	rev1PreRestore := entry1PreRestore.Revision()
-	entry2PreSync, err := entityBucket.Get(ctx, vehicle2ID)
+	entry2Initial, err := entityBucket.Get(ctx, vehicle2ID)
 	if err != nil {
-		t.Fatalf("ENTITY_STATES.Get(%q) pre-sync: %v", vehicle2ID, err)
+		t.Fatalf("ENTITY_STATES.Get(%q) initial: %v", vehicle2ID, err)
 	}
-	rev2PreSync := entry2PreSync.Revision()
+	rev1Initial := entry1Initial.Revision()
+	maxInitialRev := max(rev1Initial, entry2Initial.Revision())
 
-	sendFrame(1, 3, mavcodec.StatusText{Severity: 5, Text: "RESTORE VIA STATUSTEXT"})
-	sendFrame(2, 2, mavcodec.StatusText{Severity: 6, Text: "MESH SYNC"})
-
-	var sys1RestoreKinds []string
-	seenSyncST := map[uint8]bool{}
-	for len(seenSyncST) < 2 {
-		wsFrame := readWSFrame(t, telWS, 5*time.Second)
-		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
-			continue
-		}
-		var ev mavlink.TransitionEvent
-		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
-			t.Fatalf("unmarshal restore/sync TransitionEvent: %v", uErr)
-		}
-		if ev.SysID == 1 {
-			sys1RestoreKinds = append(sys1RestoreKinds, ev.Kind)
-		}
-		if ev.SysID == 2 && ev.Kind == mavlink.EventKindLinkLost {
-			sys2LostDuringSetup = true
-		}
-		if ev.Kind == mavlink.EventKindStatusText {
-			seenSyncST[ev.SysID] = true
-		}
-	}
-	if !slices.Equal(sys1RestoreKinds, []string{mavlink.EventKindLinkRestored, mavlink.EventKindStatusText}) {
-		t.Fatalf("sysid=1 STATUSTEXT restoration event order = %v, want [link_restored, statustext]", sys1RestoreKinds)
-	}
-
-	var rev1Confirmed uint64
-	waitForCondition(t, 5*time.Second, "vehicle.1 ENTITY_STATES urgent flush on STATUSTEXT link_restored", func() bool {
-		entry1, err1 := entityBucket.Get(ctx, vehicle1ID)
-		if err1 != nil || entry1.Revision() <= rev1PreRestore {
-			return false
-		}
-		if sys2LostDuringSetup {
-			entry2, err2 := entityBucket.Get(ctx, vehicle2ID)
-			if err2 != nil || entry2.Revision() <= rev2PreSync {
-				return false
-			}
-		}
-		rev1Confirmed = entry1.Revision()
-		return true
-	})
-
-	// Phase 2 — Steady-state #253 STATUSTEXT on synchronized live baseline:
-	// Both vehicles are live and SKG-settled; steady-state STATUSTEXT MUST deliver on WS #1 with zero
-	// link_lost/link_restored transitions and without bumping ENTITY_STATES (`OQ3 Option A`).
-	sendFrame(1, 4, mavcodec.StatusText{Severity: 6, Text: "BENCH READY"})
-	sendFrame(2, 3, mavcodec.StatusText{Severity: 6, Text: "MESH READY"})
-
-	seenST := map[uint8]bool{}
-	for len(seenST) < 2 {
-		wsFrame := readWSFrame(t, telWS, 5*time.Second)
-		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
-			continue
-		}
-		var ev mavlink.TransitionEvent
-		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
-			t.Fatalf("unmarshal steady TransitionEvent: %v", uErr)
-		}
-		if ev.Kind != mavlink.EventKindStatusText {
-			t.Fatalf("unexpected non-statustext event during steady-state baseline = %+v", ev)
-		}
-		seenST[ev.SysID] = true
-	}
-
-	// Phase 3 — Both vehicles go silent:
+	// Phase 1 — LinkTier-scaled silence ordering & silent SKG non-re-upsert:
 	// - sysid=1 (`sitl-local`, 800ms) MUST emit `link_lost` first while sysid=2 (`mesh-supervisory`, 1800ms) stays alive.
 	// - sysid=2 MUST emit `link_lost` after ~1800ms with zero duplicate `link_lost` for sysid=1.
 	var lostOrder []mavlink.TransitionEvent
@@ -1649,26 +1561,27 @@ func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
 			t.Fatalf("unmarshal link_lost TransitionEvent: %v", uErr)
 		}
 		if ev.Kind != mavlink.EventKindLinkLost {
-			t.Fatalf("unexpected Lane 3 event during silence = %+v, want link_lost", ev)
+			t.Fatalf("unexpected Lane 3 event during initial silence = %+v, want link_lost", ev)
 		}
 		lostOrder = append(lostOrder, ev)
 	}
-	if lostOrder[0].SysID != 1 || lostOrder[0].Authority != uxsvocab.AuthorityDirectCRSFOverride || lostOrder[0].Failsafes != 2 {
-		t.Fatalf("first link_lost = %+v, want sysid=1 preserving DirectCRSFOverride and Failsafes=2", lostOrder[0])
+	if lostOrder[0].SysID != 1 || lostOrder[0].Seq != 2 ||
+		lostOrder[0].Authority != uxsvocab.AuthorityDirectCRSFOverride || lostOrder[0].Failsafes != 2 {
+		t.Fatalf("first link_lost = %+v, want sysid=1 seq=2 preserving DirectCRSFOverride and Failsafes=2", lostOrder[0])
 	}
-	if lostOrder[1].SysID != 2 || lostOrder[1].LinkTier != uxsvocab.LinkTierMeshSupervisory {
-		t.Fatalf("second link_lost = %+v, want sysid=2 mesh-supervisory", lostOrder[1])
+	if lostOrder[1].SysID != 2 || lostOrder[1].Seq != 1 || lostOrder[1].LinkTier != uxsvocab.LinkTierMeshSupervisory {
+		t.Fatalf("second link_lost = %+v, want sysid=2 seq=1 mesh-supervisory", lostOrder[1])
 	}
 
-	// Across steady-state #253 STATUSTEXT and ~1800ms of 5 Hz periodic ticks while silent,
-	// vehicle.1 MUST NOT have been redundantly re-upserted into ENTITY_STATES, while retaining its 23 triples!
+	// Across ~1800ms of 5 Hz periodic ticks while silent, vehicle.1 MUST NOT have been redundantly
+	// re-upserted into ENTITY_STATES, while retaining all 23 predicates in GraphQL.
 	entry1DuringSilence, err := entityBucket.Get(ctx, vehicle1ID)
 	if err != nil {
 		t.Fatalf("ENTITY_STATES.Get(%q) during silence: %v", vehicle1ID, err)
 	}
-	if entry1DuringSilence.Revision() != rev1Confirmed {
-		t.Fatalf("vehicle.1 ENTITY_STATES revision advanced during steady STATUSTEXT / silence (%d -> %d), want %d",
-			rev1Confirmed, entry1DuringSilence.Revision(), rev1Confirmed)
+	if entry1DuringSilence.Revision() != rev1Initial {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision advanced while silent (%d -> %d), want %d",
+			rev1Initial, entry1DuringSilence.Revision(), rev1Initial)
 	}
 	predsSilent, _, okSilent := queryEntityPredicates(vehicle1ID)
 	if !okSilent || len(predsSilent) != 23 ||
@@ -1676,6 +1589,72 @@ func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
 		predsSilent[uxsvocab.PredicateHealthFailsafes] != float64(2) {
 		t.Fatalf("retained GraphQL predicates during silence = (%+v, ok=%v), want 23 predicates with DirectCRSFOverride & Failsafes=2",
 			predsSilent, okSilent)
+	}
+
+	// Phase 2 — Restoring #253 STATUSTEXT followed immediately by steady-state #253 STATUSTEXT:
+	// Sent back-to-back before waiting on WebSocket or KV so slow KV reads can never race the silence timer.
+	// WS #1 MUST deliver [link_restored(seq=3), statustext(seq=3), statustext(seq=4)], and ENTITY_STATES
+	// MUST advance by exactly 1 bucket revision (`maxInitialRev + 1`) for the pair.
+	sendFrame(1, 3, mavcodec.StatusText{Severity: 5, Text: "RESTORE VIA STATUSTEXT"})
+	sendFrame(1, 4, mavcodec.StatusText{Severity: 6, Text: "BENCH READY"})
+
+	var pairEvents []mavlink.TransitionEvent
+	for len(pairEvents) < 3 {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+			t.Fatalf("unmarshal STATUSTEXT pair TransitionEvent: %v", uErr)
+		}
+		pairEvents = append(pairEvents, ev)
+	}
+	if pairEvents[0].SysID != 1 || pairEvents[0].Kind != mavlink.EventKindLinkRestored || pairEvents[0].Seq != 3 ||
+		pairEvents[1].SysID != 1 || pairEvents[1].Kind != mavlink.EventKindStatusText || pairEvents[1].Seq != 3 ||
+		pairEvents[1].StatusText == nil || pairEvents[1].StatusText.Text != "RESTORE VIA STATUSTEXT" ||
+		pairEvents[2].SysID != 1 || pairEvents[2].Kind != mavlink.EventKindStatusText || pairEvents[2].Seq != 4 ||
+		pairEvents[2].StatusText == nil || pairEvents[2].StatusText.Text != "BENCH READY" {
+		t.Fatalf("STATUSTEXT [restore, steady] pair events = %+v, want [link_restored(3), statustext(3), statustext(4)]", pairEvents)
+	}
+
+	var rev1AfterPair uint64
+	waitForCondition(t, 5*time.Second, "vehicle.1 ENTITY_STATES single urgent flush on STATUSTEXT pair", func() bool {
+		entry1, err1 := entityBucket.Get(ctx, vehicle1ID)
+		if err1 != nil || entry1.Revision() <= maxInitialRev {
+			return false
+		}
+		rev1AfterPair = entry1.Revision()
+		return true
+	})
+	if rev1AfterPair != maxInitialRev+1 {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision after [restoring, steady] STATUSTEXT pair = %d, want %d (single upsert)",
+			rev1AfterPair, maxInitialRev+1)
+	}
+
+	// Phase 3 — Await sysid=1's next silence timeout (seq=4), confirm neither steady-state STATUSTEXT
+	// nor subsequent periodic ticks wrote a second upsert, then verify #32 LOCAL_POSITION_NED restoration order.
+	for {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+			t.Fatalf("unmarshal post-pair silence TransitionEvent: %v", uErr)
+		}
+		if ev.SysID != 1 || ev.Kind != mavlink.EventKindLinkLost || ev.Seq != 4 {
+			t.Fatalf("post-pair silence event = %+v, want sysid=1 link_lost seq=4 (with zero duplicate sysid=2 link_lost)", ev)
+		}
+		break
+	}
+	entry1SecondSilence, err := entityBucket.Get(ctx, vehicle1ID)
+	if err != nil {
+		t.Fatalf("ENTITY_STATES.Get(%q) post-pair silence: %v", vehicle1ID, err)
+	}
+	if entry1SecondSilence.Revision() != rev1AfterPair {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision advanced after steady STATUSTEXT / second silence (%d -> %d), want %d",
+			rev1AfterPair, entry1SecondSilence.Revision(), rev1AfterPair)
 	}
 
 	// Phase 4 — Resume UDP traffic on sysid=1 with #32 LOCAL_POSITION_NED:
@@ -1695,8 +1674,8 @@ func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
 			if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
 				t.Fatalf("unmarshal link_restored: %v", uErr)
 			}
-			if ev.Kind != mavlink.EventKindLinkRestored {
-				t.Fatalf("event on resume = %+v, want link_restored", ev)
+			if ev.Kind != mavlink.EventKindLinkRestored || ev.Seq != 5 {
+				t.Fatalf("event on resume = %+v, want link_restored seq=5", ev)
 			}
 			resumeSubjects = append(resumeSubjects, wsFrame.Subject)
 		case "bbops.telemetry.1":
@@ -1716,7 +1695,7 @@ func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
 
 	waitForCondition(t, 5*time.Second, "vehicle.1 ENTITY_STATES revision advances on link_restored", func() bool {
 		entry, getErr := entityBucket.Get(ctx, vehicle1ID)
-		return getErr == nil && entry.Revision() > rev1Confirmed
+		return getErr == nil && entry.Revision() > rev1AfterPair
 	})
 }
 
