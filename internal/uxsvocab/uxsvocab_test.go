@@ -240,6 +240,7 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			Altitude:     142.75,
 			ObservedAt:   time.Date(2026, 11, 23, 21, 0, 0, 0, time.UTC),
 			PoseMetadata: true,
+			HasSysStatus: true,
 			HasAttitude:  true,
 			HasLocalPos:  true,
 			HasGlobalPos: true,
@@ -290,15 +291,15 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			t.Fatalf("uxs.kinematics.ned Object type = %T, want [3]float64", popTriples[13].Object)
 		}
 
-		// Birth snapshot marks unmeasured pose triples [11..20] with Confidence=0 and epoch-0 timestamp,
-		// while populated snapshot marks measured pose triples with Confidence=1 and Context="measured".
+		// Birth snapshot marks unmeasured SYS_STATUS timing & pose triples [8..20] with Confidence=0 and epoch-0 timestamp,
+		// while populated snapshot marks measured triples with Confidence=1 and Context="measured".
 		epochZero := time.Unix(0, 0).UTC()
-		for idx := 11; idx <= 20; idx++ {
+		for idx := 8; idx <= 20; idx++ {
 			if initTriples[idx].Confidence != 0 || !initTriples[idx].Timestamp.Equal(epochZero) || initTriples[idx].Context != "" {
-				t.Fatalf("initial pose triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
+				t.Fatalf("initial unmeasured triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
 			}
 			if popTriples[idx].Confidence != 1.0 || popTriples[idx].Context != "measured" {
-				t.Fatalf("populated pose triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
+				t.Fatalf("populated measured triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
 			}
 		}
 
@@ -534,6 +535,8 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		t.Fatalf("NewVehicleSnapshot(measuredZeroSnap): %v", err)
 	}
 	measuredObs := time.Date(2026, 11, 23, 18, 5, 0, 0, time.UTC)
+	measuredZeroSnap.HasSysStatus = true
+	measuredZeroSnap.SysStatusObservedUnixNs = measuredObs.UnixNano()
 	measuredZeroSnap.HasLocalPos = true
 	measuredZeroSnap.LocalPosObservedUnixNs = measuredObs.UnixNano()
 	measuredZeroSnap.HasGlobalPos = true
@@ -561,6 +564,9 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		measuredZeroByPred[tr.Predicate] = tr
 	}
 	for _, measuredPred := range []string{
+		PredicateHealthLoopDtUs,
+		PredicateHealthMaxLoopDtUs,
+		PredicateHealthRTTUs,
 		PredicateKinematicsNED,
 		PredicateKinematicsHeadingDeg,
 		vocabulary.GeoLocationLatitude,
@@ -572,6 +578,121 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 	}
 	if attTr := measuredZeroByPred[PredicateAttitudeQuaternion]; attTr.Confidence != 0 || attTr.Context != "" {
 		t.Fatalf("unmeasured attitude on measuredZeroSnap = %+v, want Confidence=0", attTr)
+	}
+
+	// Pre-upgrade base-format uxs.vehicle.v1 JSON envelope (pose_metadata=true, real observation
+	// timestamp, nonzero MCU timings, and NO has_sys_status or sys_status_observed_unix_ns fields):
+	// reprocessing through dec.Decode + Triples() must preserve timing values, Confidence=1, and ObservedAt,
+	// while still keeping unmeasured pose predicates (has_attitude=false, has_local_pos=false) at Confidence=0.
+	preUpgradeObs := time.Date(2026, 11, 24, 20, 15, 30, 0, time.UTC)
+	preUpgradeRaw := []byte(`{
+		"id":"pre-upgrade-base-vehicle",
+		"type":{"domain":"uxs","category":"vehicle","version":"v1"},
+		"payload":{
+			"org":"boxbotix","platform":"gcs01","sysid":7,"title":"ROVER-7",
+			"domain":"rover","authority":"companion-teleop","companion_mode":"teleop-velocity",
+			"link_tier":"mesh-high-rate","armed":true,
+			"flags":{"clock_sync_locked":true,"teleop_deadman_clamped":false,"crsf_link_healthy":true,"companion_trunk_healthy":true},
+			"failsafes":1,"crc_errors":2,"loop_dt_us":2500,"max_loop_dt_us":3100,"rtt_us":420,
+			"quaternion":[0,0,0,0],"body_rates":[0,0,0],"ned":[0,0,0],
+			"vx":0,"vy":0,"vz":0,"heading_deg":90,
+			"latitude":37.7749,"longitude":-122.4194,"altitude":15.0,
+			"observed_at":"2026-11-24T20:15:30Z",
+			"pose_metadata":true,
+			"has_global_pos":true,
+			"has_heading":true,
+			"global_pos_observed_unix_ns":1795551330000000000,
+			"heading_observed_unix_ns":1795551330000000000
+		}
+	}`)
+	preUpgradeMsg, err := dec.Decode(preUpgradeRaw)
+	if err != nil {
+		t.Fatalf("dec.Decode(preUpgradeRaw): %v", err)
+	}
+	if err := preUpgradeMsg.Validate(); err != nil {
+		t.Fatalf("preUpgradeMsg.Validate(): %v", err)
+	}
+	preUpgradeSnap := preUpgradeMsg.Payload().(*VehicleSnapshot)
+	if !preUpgradeSnap.PoseMetadata || preUpgradeSnap.HasSysStatus || preUpgradeSnap.SysStatusObservedUnixNs != 0 {
+		t.Fatalf("preUpgradeSnap metadata = %+v, want PoseMetadata=true HasSysStatus=false SysStatusObservedUnixNs=0", preUpgradeSnap)
+	}
+	preUpgradeByPred := make(map[string]message.Triple, 22)
+	for _, tr := range preUpgradeSnap.Triples() {
+		preUpgradeByPred[tr.Predicate] = tr
+	}
+	wantPreUpgradeTimings := []struct {
+		pred string
+		want int
+	}{
+		{pred: PredicateHealthLoopDtUs, want: 2500},
+		{pred: PredicateHealthMaxLoopDtUs, want: 3100},
+		{pred: PredicateHealthRTTUs, want: 420},
+	}
+	for _, tc := range wantPreUpgradeTimings {
+		tr := preUpgradeByPred[tc.pred]
+		if tr.Object != tc.want || tr.Confidence != 1.0 || !tr.Timestamp.Equal(preUpgradeObs) {
+			t.Fatalf("pre-upgrade %s = %+v, want Object=%d Confidence=1 Timestamp=%v", tc.pred, tr, tc.want, preUpgradeObs)
+		}
+	}
+	for _, unmeasuredPred := range []string{PredicateAttitudeQuaternion, PredicateKinematicsNED} {
+		if tr := preUpgradeByPred[unmeasuredPred]; tr.Confidence != 0.0 || tr.Context != "" {
+			t.Fatalf("pre-upgrade unmeasured pose %s = %+v, want Confidence=0", unmeasuredPred, tr)
+		}
+	}
+
+	// Unmeasured birth wire control (current producer before #1 SYS_STATUS, plus pre-upgrade zero-timing birth
+	// even if failsafes/crc_errors were nonzero): timing predicates stay Confidence=0.
+	birthControlSnap, err := NewVehicleSnapshot("boxbotix", "gcs01", 7, DomainRover)
+	if err != nil {
+		t.Fatalf("NewVehicleSnapshot(birthControlSnap): %v", err)
+	}
+	birthObs := time.Date(2026, 11, 24, 20, 16, 0, 0, time.UTC)
+	birthControlSnap.ObservedAt = birthObs
+	birthControlSnap.SysStatusObservedUnixNs = birthObs.UnixNano()
+	birthWire, err := json.Marshal(message.NewBaseMessage(birthControlSnap.Schema(), birthControlSnap, "birth-control"))
+	if err != nil {
+		t.Fatalf("marshal birthControlSnap: %v", err)
+	}
+	birthDecoded, err := dec.Decode(birthWire)
+	if err != nil {
+		t.Fatalf("dec.Decode(birthWire): %v", err)
+	}
+	for _, tr := range birthDecoded.Payload().(*VehicleSnapshot).Triples() {
+		switch tr.Predicate {
+		case PredicateHealthLoopDtUs, PredicateHealthMaxLoopDtUs, PredicateHealthRTTUs:
+			if tr.Confidence != 0.0 || tr.Context != "" || !tr.Timestamp.Equal(birthObs) {
+				t.Fatalf("birth wire control %s = %+v, want Confidence=0 Context=\"\" Timestamp=%v", tr.Predicate, tr, birthObs)
+			}
+		}
+	}
+
+	preUpgradeZeroTimingRaw := []byte(`{
+		"id":"pre-upgrade-zero-timing",
+		"type":{"domain":"uxs","category":"vehicle","version":"v1"},
+		"payload":{
+			"org":"boxbotix","platform":"gcs01","sysid":7,"title":"ROVER-7",
+			"domain":"rover","authority":"companion-teleop","companion_mode":"teleop-velocity",
+			"link_tier":"mesh-high-rate","armed":false,
+			"flags":{"clock_sync_locked":true,"teleop_deadman_clamped":false,"crsf_link_healthy":true,"companion_trunk_healthy":true},
+			"failsafes":1,"crc_errors":2,"loop_dt_us":0,"max_loop_dt_us":0,"rtt_us":0,
+			"quaternion":[0,0,0,0],"body_rates":[0,0,0],"ned":[0,0,0],
+			"vx":0,"vy":0,"vz":0,"heading_deg":0,
+			"latitude":0,"longitude":0,"altitude":0,
+			"observed_at":"2026-11-24T20:16:30Z",
+			"pose_metadata":true
+		}
+	}`)
+	preUpgradeZeroMsg, err := dec.Decode(preUpgradeZeroTimingRaw)
+	if err != nil {
+		t.Fatalf("dec.Decode(preUpgradeZeroTimingRaw): %v", err)
+	}
+	for _, tr := range preUpgradeZeroMsg.Payload().(*VehicleSnapshot).Triples() {
+		switch tr.Predicate {
+		case PredicateHealthLoopDtUs, PredicateHealthMaxLoopDtUs, PredicateHealthRTTUs:
+			if tr.Confidence != 0.0 || tr.Context != "" {
+				t.Fatalf("pre-upgrade zero-timing control %s = %+v, want Confidence=0", tr.Predicate, tr)
+			}
+		}
 	}
 
 	invalidCases := []struct {

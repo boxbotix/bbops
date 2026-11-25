@@ -1657,3 +1657,231 @@ func TestRuntimeUpgradeFromM02PersistedFlowPreservesOperatorSettings(t *testing.
 		t.Fatalf("corrupt KV unexpectedly mutated with components.%s (err=%v)", host.MAVLinkIngestComponent, getErr)
 	}
 }
+
+type testExternalContactPayload struct {
+	ID          string    `json:"id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Source      string    `json:"source"`
+	Observed    time.Time `json:"observed"`
+}
+
+func (p *testExternalContactPayload) Schema() message.Type {
+	return message.Type{Domain: "cop", Category: "contact", Version: "v1"}
+}
+
+func (p *testExternalContactPayload) Validate() error {
+	if p.ID == "" {
+		return errors.New("contact id required")
+	}
+	return nil
+}
+
+func (p *testExternalContactPayload) MarshalJSON() ([]byte, error) {
+	type alias testExternalContactPayload
+	return json.Marshal((*alias)(p))
+}
+
+func (p *testExternalContactPayload) UnmarshalJSON(data []byte) error {
+	type alias testExternalContactPayload
+	return json.Unmarshal(data, (*alias)(p))
+}
+
+func (p *testExternalContactPayload) EntityID() string { return p.ID }
+
+func (p *testExternalContactPayload) Triples() []message.Triple {
+	ts := p.Observed
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	return []message.Triple{
+		{
+			Subject:    p.ID,
+			Predicate:  vocabulary.DCTermsTitle,
+			Object:     p.Title,
+			Source:     "ais-ingest-test",
+			Timestamp:  ts,
+			Confidence: 1.0,
+		},
+		{
+			Subject:    p.ID,
+			Predicate:  "dc.terms.description",
+			Object:     p.Description,
+			Source:     "ais-ingest-test",
+			Timestamp:  ts,
+			Confidence: 1.0,
+		},
+		{
+			Subject:    p.ID,
+			Predicate:  "cop.contact.source",
+			Object:     p.Source,
+			Source:     "ais-ingest-test",
+			Timestamp:  ts,
+			Confidence: 1.0,
+		},
+	}
+}
+
+var _ graph.Graphable = (*testExternalContactPayload)(nil)
+
+// spec: host-runtime / Read-only SKG lexical and neural search HTTP bridge
+func TestRuntimeGraphGatewaySearchBridge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		DataDir: t.TempDir(),
+		UIDir:   t.TempDir(),
+		Version: "v0.2.0-search-test",
+		RegisterPayloads: func(reg *payloadregistry.Registry) error {
+			return reg.Register(&payloadregistry.Registration{
+				Factory:     func() any { return &testExternalContactPayload{} },
+				Domain:      "cop",
+				Category:    "contact",
+				Version:     "v1",
+				Description: "In-process COP external contact test payload",
+			})
+		},
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("Stop: %v", stopErr)
+		}
+	})
+
+	searchURL := rt.Endpoints().HTTPBaseURL + host.GraphSearchFrontDoorPath
+
+	// 1. Pre-ready POST returns 503 Service Unavailable, and GET returns 405 Method Not Allowed.
+	if !rt.IsReady() {
+		preResp, postErr := http.Post(searchURL, "application/json", strings.NewReader(`{"verb":"globalSearch","params":{"query":"rover"}}`)) //nolint:noctx
+		if postErr != nil {
+			t.Fatalf("pre-ready POST /graph-gateway/search: %v", postErr)
+		}
+		preBody, _ := io.ReadAll(preResp.Body)
+		_ = preResp.Body.Close()
+		if preResp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("pre-ready POST status = %d (%s), want 503", preResp.StatusCode, string(preBody))
+		}
+	}
+
+	assertHTTPGet(t, searchURL, http.StatusMethodNotAllowed, "method not allowed\n")
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	// 2. Malformed or non-whitelisted requests fail closed with 400 after readiness.
+	badResp, err := http.Post(searchURL, "application/json", strings.NewReader(`{"verb":"graph.mutation.apply","params":{"query":"rover"}}`)) //nolint:noctx
+	if err != nil {
+		t.Fatalf("malformed POST: %v", err)
+	}
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("non-whitelisted verb status = %d, want 400", badResp.StatusCode)
+	}
+
+	// 3. Ingest both an ownship UXS vehicle and an external COP contact into ENTITY_STATES.
+	platform := rt.Platform()
+	vehicleSnap, err := uxsvocab.NewVehicleSnapshot(platform.Org, platform.Platform, 2, uxsvocab.DomainRover)
+	if err != nil {
+		t.Fatalf("NewVehicleSnapshot: %v", err)
+	}
+	vehicleSnap.Title = "UXS Vanguard Rover"
+	vehicleSnap.ObservedAt = time.Now().UTC().Truncate(time.Millisecond)
+	vehicleID := vehicleSnap.EntityID()
+	vehicleBytes, err := json.Marshal(message.NewBaseMessage(uxsvocab.VehiclePayloadType, vehicleSnap, uxsvocab.TripleSource))
+	if err != nil {
+		t.Fatalf("marshal vehicle BaseMessage: %v", err)
+	}
+	if err := rt.NATSClient().PublishToStream(ctx, "entity."+vehicleID, vehicleBytes); err != nil {
+		t.Fatalf("publish vehicle entity: %v", err)
+	}
+
+	contactID := fmt.Sprintf("%s.%s.cop.ais.vessel.harbor7", platform.Org, platform.Platform)
+	contact := &testExternalContactPayload{
+		ID:          contactID,
+		Title:       "AIS Harbor Escort",
+		Description: "Coastal radar and AIS vessel near north channel",
+		Source:      "ais",
+		Observed:    time.Now().UTC().Truncate(time.Millisecond),
+	}
+	contactBytes, err := json.Marshal(message.NewBaseMessage(contact.Schema(), contact, "ais-ingest-test"))
+	if err != nil {
+		t.Fatalf("marshal contact BaseMessage: %v", err)
+	}
+	if err := rt.NATSClient().PublishToStream(ctx, "entity."+contactID, contactBytes); err != nil {
+		t.Fatalf("publish contact entity: %v", err)
+	}
+
+	// 4. Poll globalSearch until graph-lexical indexes both entities, verifying matches + indexed_revision.
+	waitForCondition(t, 10*time.Second, "globalSearch returns Vanguard Rover", func() bool {
+		resp, ok := postGraphSearch(t, searchURL, `{"verb":"globalSearch","params":{"query":"Vanguard","limit":10}}`)
+		if !ok || !resp.OK {
+			return false
+		}
+		var qr graph.QueryResponse[graph.GlobalSearchData]
+		if err := json.Unmarshal(resp.Result, &qr); err != nil || qr.Data.Text == nil {
+			return false
+		}
+		return qr.IndexedRevision > 0 && slices.ContainsFunc(qr.Data.Text.Matches, func(m graph.TextSearchMatch) bool {
+			return m.ID == vehicleID
+		})
+	})
+
+	waitForCondition(t, 10*time.Second, "localSearch returns AIS Harbor Escort in its group", func() bool {
+		body := fmt.Sprintf(`{"verb":"localSearch","params":{"entity_id":%q,"query":"Harbor","level":0,"limit":5}}`, contactID)
+		resp, ok := postGraphSearch(t, searchURL, body)
+		if !ok || !resp.OK {
+			return false
+		}
+		var qr graph.QueryResponse[graph.LocalSearchData]
+		if err := json.Unmarshal(resp.Result, &qr); err != nil {
+			return false
+		}
+		return qr.IndexedRevision > 0 && slices.ContainsFunc(qr.Data.Matches, func(m graph.TextSearchMatch) bool {
+			return m.ID == contactID
+		})
+	})
+
+	// 5. Verify semantic and similar surface structured not_enabled refusals when embedding_enabled: false.
+	for _, tc := range []struct {
+		verb string
+		body string
+	}{
+		{verb: "semantic", body: `{"verb":"semantic","params":{"query":"coastal escort","limit":5}}`},
+		{verb: "similar", body: fmt.Sprintf(`{"verb":"similar","params":{"entity_id":%q,"limit":5}}`, vehicleID)},
+	} {
+		resp, ok := postGraphSearch(t, searchURL, tc.body)
+		if !ok {
+			t.Fatalf("%s HTTP call failed", tc.verb)
+		}
+		if resp.OK || resp.Error == nil || resp.Error.Code != "not_enabled" {
+			t.Fatalf("%s response = %+v (err=%+v), want ok=false error.code=not_enabled", tc.verb, resp, resp.Error)
+		}
+	}
+}
+
+func postGraphSearch(t *testing.T, searchURL, body string) (host.GraphSearchResponse, bool) {
+	t.Helper()
+	httpResp, err := http.Post(searchURL, "application/json", strings.NewReader(body)) //nolint:noctx
+	if err != nil {
+		return host.GraphSearchResponse{}, false
+	}
+	raw, readErr := io.ReadAll(httpResp.Body)
+	_ = httpResp.Body.Close()
+	if readErr != nil || httpResp.StatusCode != http.StatusOK {
+		return host.GraphSearchResponse{}, false
+	}
+	var parsed host.GraphSearchResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return host.GraphSearchResponse{}, false
+	}
+	return parsed, true
+}

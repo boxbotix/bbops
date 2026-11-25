@@ -232,6 +232,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		snap.LinkTier = tierStr
 		snap.Flags = vh.Custom.HealthFlags
 		snap.PoseMetadata = true
+		snap.SysStatusObservedUnixNs = obsNs
 		snap.AttitudeObservedUnixNs = obsNs
 		snap.LocalPosObservedUnixNs = obsNs
 		snap.GlobalPosObservedUnixNs = obsNs
@@ -347,6 +348,9 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	next.Failsafes = int(msg.ErrorsCount1)
 	next.MaxLoopDtUs = int(msg.ErrorsCount2)
 	next.RTTUs = int(msg.ErrorsCount3)
+	next.PoseMetadata = true
+	next.HasSysStatus = true
+	next.SysStatusObservedUnixNs = unixNanoOrZero(now)
 	next.ObservedAt = now
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}

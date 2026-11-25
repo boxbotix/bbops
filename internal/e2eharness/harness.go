@@ -122,6 +122,11 @@ func (s *ExternalContactSeed) Validate() error {
 			return fmt.Errorf("e2eharness: invalid corridor_entity_id %q: %w", s.CorridorEntityID, err)
 		}
 	}
+	for _, tr := range s.Triples() {
+		if _, err := vocabulary.ParsePredicate(tr.Predicate); err != nil {
+			return fmt.Errorf("e2eharness: invalid predicate %q: %w", tr.Predicate, err)
+		}
+	}
 	return nil
 }
 
@@ -183,7 +188,7 @@ func (s *ExternalContactSeed) Triples() []message.Triple {
 		triples = append(triples, add("cop.time.expires", s.ExpiresAt.UTC().Format(time.RFC3339Nano)))
 	}
 	if s.UncertaintyMeters != nil {
-		triples = append(triples, add("cop.location.uncertainty_m", *s.UncertaintyMeters))
+		triples = append(triples, add("cop.location.uncertainty-m", *s.UncertaintyMeters))
 	}
 	if s.MonitorsEntityID != "" {
 		triples = append(triples, add("cop.contact.monitors", s.MonitorsEntityID))
@@ -518,6 +523,7 @@ func StartStack(ctx context.Context, opts Options) (*Stack, error) {
 	}
 
 	nowUTC := time.Now().UTC().Truncate(time.Millisecond)
+	observedUTC := nowUTC.Add(-12500 * time.Millisecond)
 	contactLLA, err := LocalNEDToLLA([3]float64{-26.0, -24.0, 0.0}, [3]float64{defaultOriginLatDeg, defaultOriginLonDeg, defaultOriginAltM})
 	if err != nil {
 		_ = stack.Stop(context.Background())
@@ -530,7 +536,7 @@ func StartStack(ctx context.Context, opts Options) (*Stack, error) {
 		_ = stack.Stop(context.Background())
 		return nil, err
 	}
-	// Deliberately omit ExpiresAt and UncertaintyMeters so unknown-preserving external-contact UI rendering is verified.
+	// Seed distinct ObservedAt vs ReceivedAt while omitting ExpiresAt and UncertaintyMeters so both delayed-feed freshness and unknown-preserving fields are verified.
 	if err := stack.UpsertExternalContact(ctx, ExternalContactSeed{
 		ID:               contactID,
 		Title:            "AIS Vessel Harbor-7",
@@ -539,7 +545,7 @@ func StartStack(ctx context.Context, opts Options) (*Stack, error) {
 		FeedStatus:       "live",
 		Latitude:         contactLLA[0],
 		Longitude:        contactLLA[1],
-		ObservedAt:       &nowUTC,
+		ObservedAt:       &observedUTC,
 		ReceivedAt:       &nowUTC,
 		MonitorsEntityID: quadID,
 		CorridorEntityID: corridorID,
@@ -562,12 +568,35 @@ func StartStack(ctx context.Context, opts Options) (*Stack, error) {
 func (s *Stack) Info() StackInfo { return s.info }
 
 // UpsertExternalContact validates and publishes a non-UXS external COP contact
-// entity into `entity.>` -> `graph-ingest` -> `ENTITY_STATES`.
+// entity into `entity.>` -> `graph-ingest` -> `ENTITY_STATES` and awaits KV convergence.
 func (s *Stack) UpsertExternalContact(ctx context.Context, seed ExternalContactSeed) error {
 	if err := seed.Validate(); err != nil {
 		return err
 	}
-	return s.publishGraphable(ctx, &seed)
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	kv, err := s.rt.NATSClient().GetKeyValueBucket(waitCtx, graph.BucketEntityStates)
+	if err != nil {
+		return fmt.Errorf("e2eharness: lookup ENTITY_STATES: %w", err)
+	}
+	var prevRev uint64
+	if prior, getErr := kv.Get(waitCtx, seed.ID); getErr == nil && prior != nil {
+		prevRev = prior.Revision()
+	}
+	if err := s.publishGraphable(waitCtx, &seed); err != nil {
+		return err
+	}
+	for {
+		if entry, getErr := kv.Get(waitCtx, seed.ID); getErr == nil && entry != nil && entry.Revision() > prevRev {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("e2eharness: timed out awaiting ENTITY_STATES upsert for %q: %w", seed.ID, waitCtx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Stack) publishGraphable(ctx context.Context, payload message.Payload) error {

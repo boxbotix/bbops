@@ -1723,7 +1723,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 			}
 			if snap.Domain != rv.domain || snap.Armed != rv.armed || snap.Authority != rv.authority ||
 				snap.CompanionMode != rv.mode || snap.LinkTier != rv.tier || snap.Flags != rv.flags ||
-				snap.Failsafes != rv.failsafes || snap.HasAttitude != rv.hasAttitude ||
+				snap.Failsafes != rv.failsafes || snap.HasSysStatus != rv.hasSysStatus || snap.HasAttitude != rv.hasAttitude ||
 				snap.HasLocalPos != rv.hasLocalPos || snap.HasGlobalPos != rv.hasGlobalPos ||
 				snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
 				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt {
@@ -1748,6 +1748,8 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				t.Fatalf("seed %d sysid=%d: missing %s in ReplaceBySource output", seed, sysid, pred)
 				return message.Triple{}
 			}
+			assertMergedDomain(uxsvocab.PredicateHealthLoopDtUs, rv.hasSysStatus)
+			assertMergedDomain(uxsvocab.PredicateHealthRTTUs, rv.hasSysStatus)
 			assertMergedDomain(uxsvocab.PredicateAttitudeQuaternion, rv.hasAttitude)
 			assertMergedDomain(uxsvocab.PredicateKinematicsNED, rv.hasLocalPos)
 			assertMergedDomain("geo.location.latitude", rv.hasGlobalPos)

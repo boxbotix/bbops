@@ -747,6 +747,7 @@
     if (ev.button !== 0 || !overlayCanvasEl) {
       return;
     }
+    overlayCanvasEl.focus?.({ preventScroll: true });
     isDragging = true;
     dragMoved = false;
     lastPointerX = ev.clientX;
@@ -845,6 +846,8 @@
     bind:this={overlayCanvasEl}
     class="safety-hud-canvas"
     data-layer="safety-hud-overlay"
+    data-viewport-hotkey-scope="true"
+    tabindex="-1"
     aria-label="Multi-domain tactical COP canvas"
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}

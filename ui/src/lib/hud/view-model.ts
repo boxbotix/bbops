@@ -6,12 +6,14 @@ import {
   type HealthFlags,
   type LinkTier,
   isFiniteNumber,
+  parseVehicleEntityId,
 } from "../uxs";
 import type {
   CopEntityState,
   CopFeedStatus,
   ExternalContactEntityState,
   GeoLocation,
+  SkgStore,
   VehicleEntityState,
   VehicleSysStatus,
 } from "../stores/skg.svelte";
@@ -75,6 +77,13 @@ export interface VehicleBannerView {
   readonly armedBadge: ArmedBadgeView;
   readonly linkBadge: LinkTierBadgeView;
   readonly healthStrip: readonly HealthChipView[];
+}
+
+export interface PoisonedVehicleBannerView {
+  readonly kind: "poisoned-uxs-vehicle";
+  readonly entityId: string;
+  readonly sysid: number;
+  readonly poisonError: string | null;
 }
 
 export interface ExternalContactSummaryView {
@@ -232,6 +241,7 @@ export function buildHealthStrip(
   flags: HealthFlags,
   sysStatus: VehicleSysStatus,
 ): readonly HealthChipView[] {
+  const hasTiming = sysStatus.hasSysStatus !== false;
   return [
     {
       key: "crsf_link_healthy",
@@ -272,19 +282,19 @@ export function buildHealthStrip(
     {
       key: "loop_dt_us",
       label: "Loop dt",
-      value: `${sysStatus.loopDtUs} us`,
+      value: hasTiming ? `${sysStatus.loopDtUs} us` : "--",
       severity: "nominal",
     },
     {
       key: "max_loop_dt_us",
       label: "Max dt",
-      value: `${sysStatus.maxLoopDtUs} us`,
+      value: hasTiming ? `${sysStatus.maxLoopDtUs} us` : "--",
       severity: "nominal",
     },
     {
       key: "rtt_us",
       label: "RTT",
-      value: `${sysStatus.rttUs} us`,
+      value: hasTiming ? `${sysStatus.rttUs} us` : "--",
       severity: "nominal",
     },
   ];
@@ -787,7 +797,11 @@ export function buildExternalContactSummary(
 
 export function selectBannerPresentation(
   entity: CopEntityState | null | undefined,
-): VehicleBannerView | ExternalContactSummaryView | null {
+):
+  | VehicleBannerView
+  | PoisonedVehicleBannerView
+  | ExternalContactSummaryView
+  | null {
   if (!entity) {
     return null;
   }
@@ -796,6 +810,17 @@ export function selectBannerPresentation(
   }
   if (entity.kind === "external-contact") {
     return buildExternalContactSummary(entity);
+  }
+  if (entity.poisoned) {
+    const parsed = parseVehicleEntityId(entity.id);
+    if (parsed !== null) {
+      return {
+        kind: "poisoned-uxs-vehicle",
+        entityId: entity.id,
+        sysid: parsed.sysid,
+        poisonError: entity.poisonError,
+      };
+    }
   }
   return null;
 }
@@ -903,4 +928,275 @@ export function formatVehicleHudReadouts(
     crabAngleDeg,
     crabText,
   };
+}
+
+export interface ActiveVehicleFault {
+  readonly severity: "error" | "warning" | null;
+  readonly reason: string | null;
+}
+
+/**
+ * Evaluates strictly current/active fault conditions on an ownship UXS vehicle
+ * without treating cumulative lifetime counters (`failsafes`, `crcErrors`,
+ * retained in Bench diagnostics) as unrecoverable active exceptions.
+ */
+export function evaluateActiveVehicleFault(
+  vehicle: Pick<VehicleEntityState, "poisoned" | "authority" | "healthFlags">,
+): ActiveVehicleFault {
+  if (vehicle.poisoned) {
+    return { severity: "error", reason: "POISONED" };
+  }
+  if (vehicle.authority === "mcu-failsafe") {
+    return { severity: "error", reason: "P4" };
+  }
+  if (!vehicle.healthFlags.crsf_link_healthy) {
+    return { severity: "error", reason: "CRSF FAULT" };
+  }
+  if (!vehicle.healthFlags.companion_trunk_healthy) {
+    return { severity: "error", reason: "TRUNK FAULT" };
+  }
+  if (vehicle.authority === "direct-crsf-override") {
+    return { severity: "warning", reason: "P1" };
+  }
+  if (vehicle.healthFlags.teleop_deadman_clamped) {
+    return { severity: "warning", reason: "DEADMAN" };
+  }
+  if (!vehicle.healthFlags.clock_sync_locked) {
+    return { severity: "warning", reason: "CLOCK UNLOCKED" };
+  }
+  return { severity: null, reason: null };
+}
+
+export interface FleetFaultSummary {
+  readonly totalVehicles: number;
+  readonly faultedCount: number;
+  readonly errorCount: number;
+  readonly warningCount: number;
+  readonly firstFaultEntityId: string | null;
+  readonly firstFaultLabel: string | null;
+}
+
+interface FleetFaultCandidate {
+  readonly id: string;
+  readonly sysid: number;
+  readonly fault: ActiveVehicleFault;
+}
+
+/**
+ * Aggregates active safety faults across all ownship UXS vehicles (including
+ * poisoned-first ownship vehicle keys whose triples never decoded) in deterministic
+ * ascending sysid order so off-screen or unselected vehicle faults remain visible
+ * in the invariant topbar across COP, Pilot, Bench, and Cortex.
+ */
+export function summarizeFleetFaults(
+  entities: Iterable<CopEntityState>,
+): FleetFaultSummary {
+  const byId = new Map<string, FleetFaultCandidate>();
+  for (const entity of entities) {
+    if (entity.kind === "uxs-vehicle") {
+      byId.set(entity.id, {
+        id: entity.id,
+        sysid: entity.sysid,
+        fault: evaluateActiveVehicleFault(entity),
+      });
+    } else if (entity.poisoned) {
+      const parsed = parseVehicleEntityId(entity.id);
+      if (parsed !== null) {
+        byId.set(entity.id, {
+          id: entity.id,
+          sysid: parsed.sysid,
+          fault: { severity: "error", reason: "POISONED" },
+        });
+      }
+    }
+  }
+
+  const ordered = Array.from(byId.values()).sort(
+    (a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id),
+  );
+  let errorCount = 0;
+  let warningCount = 0;
+  let firstError: FleetFaultCandidate | null = null;
+  let firstWarning: FleetFaultCandidate | null = null;
+
+  for (const candidate of ordered) {
+    if (candidate.fault.severity === "error") {
+      errorCount += 1;
+      if (firstError === null) {
+        firstError = candidate;
+      }
+    } else if (candidate.fault.severity === "warning") {
+      warningCount += 1;
+      if (firstWarning === null) {
+        firstWarning = candidate;
+      }
+    }
+  }
+
+  const primary = firstError ?? firstWarning;
+  const firstFaultLabel =
+    primary !== null && primary.fault.reason !== null
+      ? `UXS #${primary.sysid} · ${primary.fault.reason}`
+      : null;
+
+  return {
+    totalVehicles: ordered.length,
+    faultedCount: errorCount + warningCount,
+    errorCount,
+    warningCount,
+    firstFaultEntityId: primary?.id ?? null,
+    firstFaultLabel,
+  };
+}
+
+/**
+ * Filters a vehicle's 0xB1 health strip down to ISA-101 abnormal exceptions
+ * (error first, then warning) for Pilot cockpit promotion.
+ */
+export function extractAbnormalHealthChips(
+  strip: readonly HealthChipView[],
+): readonly HealthChipView[] {
+  const errors = strip.filter((chip) => chip.severity === "error");
+  const warnings = strip.filter((chip) => chip.severity === "warning");
+  return [...errors, ...warnings];
+}
+
+export interface FilmstripItemView {
+  readonly entityId: string;
+  readonly shortcutKey: string | null;
+  readonly kind: "uxs-vehicle" | "external-contact";
+  readonly primaryLabel: string;
+  readonly secondaryLabel: string;
+  readonly safetySeverity: SafetyBadgeSeverity | null;
+  readonly contactFeedStatus: CopFeedStatus | null;
+}
+
+/**
+ * Builds deterministic FleetFilmstrip items (ownship vehicles sorted by sysid,
+ * including poisoned-first ownship vehicle keys when `allEntities` is supplied,
+ * followed by external contacts sorted by entity ID), assigning 1..9 hotkeys
+ * and keeping reserved safety severities strictly null on external contacts.
+ */
+export function buildFilmstripItems(
+  vehicles: Iterable<VehicleEntityState>,
+  contacts: Iterable<ExternalContactEntityState>,
+  allEntities?: Iterable<CopEntityState>,
+): readonly FilmstripItemView[] {
+  type OwnshipEntry =
+    | {
+        readonly sysid: number;
+        readonly id: string;
+        readonly decoded: VehicleEntityState;
+      }
+    | {
+        readonly sysid: number;
+        readonly id: string;
+        readonly poisonedEntity: CopEntityState;
+      };
+
+  const ownshipById = new Map<string, OwnshipEntry>();
+  for (const vehicle of vehicles) {
+    ownshipById.set(vehicle.id, {
+      sysid: vehicle.sysid,
+      id: vehicle.id,
+      decoded: vehicle,
+    });
+  }
+  if (allEntities) {
+    for (const entity of allEntities) {
+      if (
+        entity.kind !== "uxs-vehicle" &&
+        entity.poisoned &&
+        !ownshipById.has(entity.id)
+      ) {
+        const parsed = parseVehicleEntityId(entity.id);
+        if (parsed !== null) {
+          ownshipById.set(entity.id, {
+            sysid: parsed.sysid,
+            id: entity.id,
+            poisonedEntity: entity,
+          });
+        }
+      }
+    }
+  }
+
+  const orderedOwnship = Array.from(ownshipById.values()).sort(
+    (a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id),
+  );
+  const orderedContacts = Array.from(contacts).sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
+
+  const items: FilmstripItemView[] = [];
+  for (const entry of orderedOwnship) {
+    const shortcutKey = items.length < 9 ? String(items.length + 1) : null;
+    if ("decoded" in entry) {
+      const vehicle = entry.decoded;
+      const authCode = formatAuthorityBadge(vehicle.authority).code;
+      const activeFault = evaluateActiveVehicleFault(vehicle);
+      items.push({
+        entityId: vehicle.id,
+        shortcutKey,
+        kind: "uxs-vehicle",
+        primaryLabel: vehicle.title ?? `UXS #${vehicle.sysid}`,
+        secondaryLabel: `#${vehicle.sysid} · ${authCode} · ${vehicle.armed ? "ARMED" : "SAFE"}`,
+        safetySeverity:
+          activeFault.severity ?? (vehicle.armed ? "success" : "nominal"),
+        contactFeedStatus: null,
+      });
+    } else {
+      items.push({
+        entityId: entry.id,
+        shortcutKey,
+        kind: "uxs-vehicle",
+        primaryLabel: entry.poisonedEntity.title ?? `UXS #${entry.sysid}`,
+        secondaryLabel: `#${entry.sysid} · POISONED`,
+        safetySeverity: "error",
+        contactFeedStatus: null,
+      });
+    }
+  }
+
+  for (const contact of orderedContacts) {
+    const shortcutKey = items.length < 9 ? String(items.length + 1) : null;
+    items.push({
+      entityId: contact.id,
+      shortcutKey,
+      kind: "external-contact",
+      primaryLabel: contact.title ?? contact.id,
+      secondaryLabel: `EXT · ${contact.source ?? "unknown"} · ${contact.feedStatus}`,
+      safetySeverity: null,
+      contactFeedStatus: contact.feedStatus,
+    });
+  }
+
+  return items;
+}
+
+/**
+ * Canonical SKG store selector for FleetFilmstrip cards and 1..9 keyboard
+ * shortcuts, ensuring poisoned-first ownship vehicle keys are ordered
+ * identically in both the top-level hotkey listener and rendered filmstrip.
+ */
+export function selectFilmstripItems(
+  skgStore: Pick<SkgStore, "vehicles" | "externalContacts" | "entities">,
+): readonly FilmstripItemView[] {
+  return buildFilmstripItems(
+    skgStore.vehicles,
+    skgStore.externalContacts,
+    skgStore.entities.values(),
+  );
+}
+
+export const COP_SOLO_SECTIONS = ["summary", "alerts", "skg"] as const;
+export type CopSoloSection = (typeof COP_SOLO_SECTIONS)[number];
+
+export function selectCopSoloSection(
+  current: CopSoloSection,
+  requested: string,
+): CopSoloSection {
+  return (COP_SOLO_SECTIONS as readonly string[]).includes(requested)
+    ? (requested as CopSoloSection)
+    : current;
 }

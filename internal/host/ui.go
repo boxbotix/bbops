@@ -21,10 +21,12 @@ const (
 )
 
 // WebSocketProxyRoutes holds the resolved internal output/websocket URLs to
-// expose at same-origin /ws/telemetry and /ws/graph on the HTTP front door.
+// expose at same-origin /ws/telemetry and /ws/graph on the HTTP front door,
+// plus the optional read-only SKG search requester for /graph-gateway/search.
 type WebSocketProxyRoutes struct {
 	TelemetryWS string
 	GraphWS     string
+	GraphSearch GraphRequester
 	ShutdownCtx context.Context
 }
 
@@ -37,7 +39,8 @@ func NewStaticUIMiddleware(uiDir string, isReady func() bool) service.HTTPMiddle
 }
 
 // NewUIMiddleware extends NewStaticUIMiddleware with same-origin WebSocket
-// reverse-proxying for /ws/telemetry and /ws/graph gated on runtime readiness.
+// reverse-proxying for /ws/telemetry and /ws/graph and the read-only SKG
+// POST /graph-gateway/search bridge gated on runtime readiness.
 func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyRoutes) (service.HTTPMiddleware, error) {
 	telemetryProxy, err := newSingleEndpointWSProxy("telemetry_ws", wsRoutes.TelemetryWS)
 	if err != nil {
@@ -51,6 +54,25 @@ func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyR
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			normalizedPath := strings.ToLower(path.Clean("/" + r.URL.Path))
+			if normalizedPath == GraphSearchFrontDoorPath {
+				if r.Method != http.MethodPost {
+					w.Header().Set("Allow", http.MethodPost)
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				if isReady != nil && !isReady() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte("NOT READY"))
+					return
+				}
+				if wsRoutes.GraphSearch == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
+				serveGraphSearch(w, r, wsRoutes.GraphSearch, wsRoutes.ShutdownCtx)
+				return
+			}
+
 			wsProxy := matchWebSocketProxy(normalizedPath, telemetryProxy, graphProxy)
 			if wsProxy != nil || isReservedWebSocketPath(normalizedPath) {
 				if r.Method != http.MethodGet {

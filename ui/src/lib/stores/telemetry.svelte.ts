@@ -117,6 +117,10 @@ export interface TelemetryStore {
   disconnect(): void;
   getKinematics(sysid: number): VehicleKinematics | undefined;
   kinematicsEntries(): IterableIterator<[number, VehicleKinematics]>;
+  onKinematicsAccepted(
+    listener: (frame: VehicleKinematics) => void,
+  ): () => void;
+  onFeedReset?(listener: () => void): () => void;
   ingestRawFrame(rawText: string): void;
   clearEvents(): void;
   reset(): void;
@@ -408,6 +412,12 @@ export function createTelemetryStore(
   const localPosObservedAtBySysId = new Map<number, number>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const globalPosObservedAtBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const kinematicsAcceptedListeners = new Set<
+    (frame: VehicleKinematics) => void
+  >();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const feedResetListeners = new Set<() => void>();
   const eventRing = new Array<TransitionEvent | undefined>(maxEvents);
   let ringWriteIdx = 0;
   let ringSize = 0;
@@ -544,10 +554,16 @@ export function createTelemetryStore(
       }
       if (existing !== undefined) {
         overwriteKinematicsInPlace(existing, frame);
+        for (const listener of kinematicsAcceptedListeners) {
+          listener(existing);
+        }
         return;
       }
       kinematicsBySysId.set(sysid, frame);
       vehicleCount = kinematicsBySysId.size;
+      for (const listener of kinematicsAcceptedListeners) {
+        listener(frame);
+      }
       return;
     }
 
@@ -594,6 +610,9 @@ export function createTelemetryStore(
     events = [];
     reconnectCount = 0;
     lastDisconnectedAt = null;
+    for (const listener of feedResetListeners) {
+      listener();
+    }
   }
 
   const wsClient = new ManagedWebSocketClient({
@@ -666,6 +685,18 @@ export function createTelemetryStore(
     },
     kinematicsEntries() {
       return kinematicsBySysId.entries();
+    },
+    onKinematicsAccepted(listener: (frame: VehicleKinematics) => void) {
+      kinematicsAcceptedListeners.add(listener);
+      return () => {
+        kinematicsAcceptedListeners.delete(listener);
+      };
+    },
+    onFeedReset(listener: () => void) {
+      feedResetListeners.add(listener);
+      return () => {
+        feedResetListeners.delete(listener);
+      };
     },
     ingestRawFrame,
     clearEvents() {

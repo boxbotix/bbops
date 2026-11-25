@@ -26,7 +26,7 @@
 
 5. **SemStreams UI (`C360Studio/semstreams-ui`) — MIT License**
    Copyright (c) 2026 Complete 360 Studio
-   - Sigma.js v3 WebGL SKG topology canvas, neighborhood focus reducers, Graphology incremental synchronization, and ForceAtlas2 Web Worker lifecycle (`ui/src/lib/components/SkgPane.svelte`, `ui/src/lib/skg/graphology-adapter.ts`, and `ui/src/lib/skg/sigma-layout.ts` adapted from `src/lib/components/runtime/SigmaCanvas.svelte`, `src/lib/utils/graphology-adapter.ts`, and `src/lib/utils/sigma-layout.ts`):
+   - Sigma.js v3 WebGL SKG topology canvas, neighborhood focus reducers, Graphology incremental synchronization, and ForceAtlas2 Web Worker lifecycle (`ui/src/lib/components/SkgPane.svelte`, `ui/src/lib/components/CortexWorkspace.svelte`, `ui/src/lib/skg/graphology-adapter.ts`, and `ui/src/lib/skg/sigma-layout.ts` adapted from `src/lib/components/runtime/SigmaCanvas.svelte`, `src/lib/utils/graphology-adapter.ts`, and `src/lib/utils/sigma-layout.ts`):
      `C360Studio/semstreams-ui` `src/lib/components/runtime/SigmaCanvas.svelte`, `src/lib/utils/graphology-adapter.ts`, `src/lib/utils/sigma-layout.ts` @ `3814b3d59dab7136011429cad99a8148aeceb0cc`
 
 6. **gomavlib (`bluenviron/gomavlib`) — MIT License**

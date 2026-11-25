@@ -279,6 +279,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	uiMiddleware, err := NewUIMiddleware(uiDir, rt.isUIAdmitted, WebSocketProxyRoutes{
 		TelemetryWS: endpoints.TelemetryWS,
 		GraphWS:     endpoints.GraphWS,
+		GraphSearch: client.RequestClassified,
 		ShutdownCtx: wsProxyCtx,
 	})
 	if err != nil {

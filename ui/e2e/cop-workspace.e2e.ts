@@ -242,63 +242,33 @@ async function locateSigmaNodeViaWebGLPicking(
   }, targetEntityId);
 }
 
-test.describe("Full-stack Chromium COP workspace end-to-end verification", () => {
+test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification", () => {
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
-  test("streams live multi-domain dual-WebSocket telemetry and SKG state across Canvas2D, WebGL Sigma, non-overlapping HUD readouts, 2-hop pathSearch, hotkeys, and Lane 3 transitions", async ({
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  test("streams live multi-domain dual-WebSocket telemetry and SKG state across COP, Pilot, Cortex, and Bench workspaces", async ({
     copStack,
   }) => {
     const { page, info } = copStack;
     await page.goto(info.baseURL);
 
-    // 1. Both live WebSockets converge against the embedded Go host + NATS/JetStream SKG.
+    // 1. Both live WebSockets converge in the invariant topbar against the embedded Go host + NATS/JetStream SKG.
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cop",
+    );
     await expect(page.locator(".stream-pill").nth(0)).toContainText(
-      "WS1 telemetry: connected (3)",
+      "WS1: connected (3)",
       { timeout: 15_000 },
     );
     await expect(page.locator(".stream-pill").nth(1)).toContainText(
-      "WS2 SKG: connected",
+      "WS2: connected",
       { timeout: 15_000 },
     );
     await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
       timeout: 15_000,
     });
 
-    // 2. Real WebGL Sigma topology mounts (never jsdom fallback) with DPR=2 canvases and settles ForceAtlas2 layout.
-    await expect(page.getByTestId("skg-topology-fallback")).toHaveCount(0);
-    const sigmaStage = page.getByTestId("skg-sigma-stage");
-    await expect(sigmaStage).toBeVisible();
-    await expect(sigmaStage).toHaveAttribute("data-sigma-ready", "true", {
-      timeout: 10_000,
-    });
-    await expect(page.locator(".skg-topology-card .meta-count")).toContainText(
-      "5N · 2E",
-      { timeout: 10_000 },
-    );
-    await expect(
-      page.locator(".skg-topology-card .meta-count"),
-    ).not.toContainText("layout", { timeout: 10_000 });
-
-    const sigmaCanvasMetrics = await sigmaStage.evaluate((stageEl) => {
-      const canvases = Array.from(stageEl.querySelectorAll("canvas"));
-      return {
-        canvasCount: canvases.length,
-        allDprScaled: canvases.every(
-          (c) =>
-            c.width === Math.floor(c.clientWidth * 2) &&
-            c.height === Math.floor(c.clientHeight * 2),
-        ),
-      };
-    });
-    expect(sigmaCanvasMetrics.canvasCount).toBeGreaterThanOrEqual(2);
-    expect(sigmaCanvasMetrics.allDprScaled).toBe(true);
-
-    // Unselected Sigma hover layer starts blank (proving highlight pill pixels come exclusively from selection/hover).
-    const unselectedHover = await sampleSigmaHoverLayer(sigmaStage);
-    expect(unselectedHover.exists).toBe(true);
-    expect(unselectedHover.darkPillPixels).toBe(0);
-    expect(unselectedHover.lightTextPixels).toBe(0);
-
-    // 3. TacticalCanvas DPR=2 layers paint non-blank NED grid & vehicle glyphs, and concentric range-ring labels clear .viewport-toolbar.
+    // 2. COP TacticalCanvas DPR=2 layers paint non-blank NED grid & vehicle glyphs, and concentric range-ring labels clear .viewport-toolbar.
     await expect
       .poll(async () => {
         const grid = await sampleCanvas2DPixels(
@@ -402,7 +372,7 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     expect(toolbarClearance.glyphPixelsUnderToolbar).toBe(0);
     expect(toolbarClearance.eastAxisLabelPixels).toBeGreaterThan(20);
 
-    // 4. Hit-test Quadcopter #1 directly on the TacticalCanvas (NED [24, -14] at default 4 px/m zoom).
+    // 3. Hit-test Quadcopter #1 directly on COP TacticalCanvas (NED [24, -14] at default 4 px/m zoom).
     const initialCanvasSize = await page
       .locator(".safety-hud-canvas")
       .evaluate((el) => ({ w: el.clientWidth, h: el.clientHeight }));
@@ -416,7 +386,6 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
       .poll(() => new URL(page.url()).hash)
       .toContain(`sel=${info.vehicles.quadcopter}`);
 
-    // 5. AuthorityBanner, Triple Inspector, VehicleHud horizon canvas, and non-overlapping HTML readouts.
     const authBanner = page.getByTestId("vehicle-authority-banner");
     await expect(authBanner).toContainText("UXS #1 · quadcopter");
     await expect(page.getByTestId("authority-badge")).toHaveText(
@@ -424,9 +393,63 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     );
     await expect(page.getByTestId("armed-badge")).toHaveText("ARMED");
     await expect(page.getByTestId("banner-link-tier")).toHaveText("SITL");
-    await expect(page.getByTestId("skg-triple-inspector")).toContainText(
-      "23 triples",
+    await expect(page.getByTestId("cop-solo-panel-summary")).toContainText(
+      "UXS #1",
     );
+
+    // Exercise COP canvas double-click tether plus keyboard hotkeys T (Tether), C (Chase), H (Declutter), and Escape (Clear).
+    const tetherBtn = page.getByRole("button", { name: "Tether [T]" });
+    const chaseBtn = page.getByRole("button", { name: "Chase [C]" });
+    const liveCanvasSize = await page
+      .locator(".safety-hud-canvas")
+      .evaluate((el) => ({ w: el.clientWidth, h: el.clientHeight }));
+    await page.locator(".safety-hud-canvas").dblclick({
+      position: {
+        x: liveCanvasSize.w * 0.5 + 28 * 4,
+        y: liveCanvasSize.h * 0.5 - -18 * 4,
+      },
+    });
+    await expect(tetherBtn).toHaveAttribute("aria-pressed", "true");
+    await expect
+      .poll(() => new URL(page.url()).hash)
+      .toContain(`tether=${info.vehicles.rover}`);
+
+    await page.keyboard.press("t");
+    await expect(tetherBtn).toHaveAttribute("aria-pressed", "false");
+    await page.keyboard.press("t");
+    await expect(tetherBtn).toHaveAttribute("aria-pressed", "true");
+
+    await page.keyboard.press("c");
+    await expect(chaseBtn).toHaveAttribute("aria-pressed", "true");
+
+    await page.keyboard.press("h");
+    await expect(
+      page.getByRole("button", { name: "minimal", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await page.keyboard.press("h");
+    await expect(
+      page.getByRole("button", { name: "tactical", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await page.keyboard.press("h");
+    await expect(
+      page.getByRole("button", { name: "none", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    await page.keyboard.press("Escape");
+    await expect(tetherBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(chaseBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(authBanner).toContainText("UXS #2 · rover");
+    expect(new URL(page.url()).hash).not.toContain("tether=");
+
+    // 4. Switch to Pilot [D], select UXS #1 via FleetFilmstrip [1], and verify DPR=2 horizon, [M] split swap, and zero-overlap readouts.
+    await page.keyboard.press("1");
+    await expect(authBanner).toContainText("UXS #1 · quadcopter");
+    await page.keyboard.press("d");
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "pilot",
+    );
+    await expect(page.getByTestId("pilot-map-primary")).toBeVisible();
 
     await expect
       .poll(async () => {
@@ -459,24 +482,71 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
       page.getByTestId("hud-readout-attitude"),
     ]);
 
-    // Positively verify dark #0f172a hover pill + #f8fafc text and zero #ffffff white-on-white background on canvas.sigma-hovers.
-    await expect(sigmaStage).toHaveAttribute(
-      "data-highlighted-node",
-      info.vehicles.quadcopter,
-    );
-    let quadHover = await sampleSigmaHoverLayer(sigmaStage);
-    await expect
-      .poll(async () => {
-        quadHover = await sampleSigmaHoverLayer(sigmaStage);
-        return (
-          quadHover.darkPillPixels > 80 &&
-          quadHover.lightTextPixels > 8 &&
-          quadHover.pureWhitePixels === 0
-        );
-      })
-      .toBe(true);
+    // Swap Pilot to 50/50 Split via [M] and select SurfaceBoat #3 via [3] to verify signed Fossen Ch. 2 crab-angle (-30.1°) with zero overlap.
+    await page.keyboard.press("m");
+    await expect(page.getByTestId("pilot-split-view")).toBeVisible();
+    await expect.poll(() => new URL(page.url()).hash).toContain("pilot=split");
 
-    // Click Rover #2 directly on the real WebGL Sigma stage and verify bidirectional selection + highlight shift.
+    await page.keyboard.press("3");
+    await expect(authBanner).toContainText("UXS #3 · surface-boat");
+    const crabCell = page.getByTestId("hud-readout-crab");
+    await expect(crabCell).toBeVisible();
+    await expect(crabCell.locator("dd")).toHaveText("-30.1°");
+
+    await assertZeroPairwiseOverlapWithinParent(readoutStrip, [
+      page.getByTestId("hud-readout-gs"),
+      page.getByTestId("hud-readout-vs"),
+      page.getByTestId("hud-readout-alt"),
+      page.getByTestId("hud-readout-attitude"),
+      crabCell,
+    ]);
+
+    // 5. Open Cortex [K] unselected first so all 5 SKG entities mount in real WebGL Sigma (DPR=2, dark #0f172a hover pill, zero #ffffff white-on-white).
+    await page.goto(`${info.baseURL}/#mode=cortex`);
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cortex",
+    );
+    await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
+      timeout: 15_000,
+    });
+    await expect(page.getByTestId("cortex-subgraph-fallback")).toHaveCount(0);
+
+    const sigmaStage = page.getByTestId("cortex-sigma-host");
+    await expect(sigmaStage).toBeVisible();
+    await expect(sigmaStage).toHaveAttribute("data-sigma-ready", "true", {
+      timeout: 10_000,
+    });
+    await expect(page.getByTestId("cortex-causal-subgraph")).toContainText(
+      "5 nodes · 2 edges",
+      { timeout: 10_000 },
+    );
+    await expect(page.getByTestId("cortex-causal-subgraph")).not.toContainText(
+      "settling",
+      { timeout: 10_000 },
+    );
+
+    const sigmaCanvasMetrics = await sigmaStage.evaluate((stageEl) => {
+      const canvases = Array.from(stageEl.querySelectorAll("canvas"));
+      return {
+        canvasCount: canvases.length,
+        allDprScaled: canvases.every(
+          (c) =>
+            c.width === Math.floor(c.clientWidth * 2) &&
+            c.height === Math.floor(c.clientHeight * 2),
+        ),
+      };
+    });
+    expect(sigmaCanvasMetrics.canvasCount).toBeGreaterThanOrEqual(2);
+    expect(sigmaCanvasMetrics.allDprScaled).toBe(true);
+
+    // Unselected Sigma hover layer starts blank (proving highlight pill pixels come exclusively from selection/hover).
+    const unselectedHover = await sampleSigmaHoverLayer(sigmaStage);
+    expect(unselectedHover.exists).toBe(true);
+    expect(unselectedHover.darkPillPixels).toBe(0);
+    expect(unselectedHover.lightTextPixels).toBe(0);
+
+    // Click Rover #2 directly on the real WebGL Sigma stage and verify dark #0f172a highlight pill + 23 grounded triples.
     const roverSigmaPos = await locateSigmaNodeViaWebGLPicking(
       sigmaStage,
       info.vehicles.rover,
@@ -485,7 +555,6 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     await sigmaStage
       .locator("canvas.sigma-mouse")
       .click({ position: roverSigmaPos! });
-    // Move pointer away from Sigma so canvas.sigma-hovers reflects persistent clickNode selection rather than pointer hover.
     await page.mouse.move(8, 8);
 
     await expect
@@ -495,43 +564,38 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     await expect(page.getByTestId("authority-badge")).toHaveText(
       "P3 CompanionAutonomous",
     );
-    await expect(page.getByTestId("skg-triple-inspector")).toContainText(
+    await expect(page.getByTestId("cortex-provenance-column")).toContainText(
+      "GROUNDED PROVENANCE (23)",
+    );
+    await expect(page.getByTestId("cortex-provenance-column")).toContainText(
       "companion-autonomous",
     );
     await expect(sigmaStage).toHaveAttribute(
       "data-highlighted-node",
       info.vehicles.rover,
     );
+
+    let roverHover = await sampleSigmaHoverLayer(sigmaStage);
     await expect
       .poll(async () => {
-        const roverHover = await sampleSigmaHoverLayer(sigmaStage);
+        roverHover = await sampleSigmaHoverLayer(sigmaStage);
         return (
           roverHover.darkPillPixels > 80 &&
           roverHover.lightTextPixels > 8 &&
-          roverHover.pureWhitePixels === 0 &&
-          Math.hypot(
-            roverHover.centroidX - quadHover.centroidX,
-            roverHover.centroidY - quadHover.centroidY,
-          ) > 15
+          roverHover.pureWhitePixels === 0
         );
       })
       .toBe(true);
 
-    // Click Quadcopter #1 back via the real WebGL Sigma stage before 2-Hop pathSearch expansion.
-    const quadSigmaPos = await locateSigmaNodeViaWebGLPicking(
-      sigmaStage,
+    // Select Quadcopter #1 via [1] and run Cortex "2-Hop & Similar" (POST /graph-gateway/search + POST /graph-gateway/graphql pathSearch).
+    await page.keyboard.press("1");
+    await expect(authBanner).toContainText("UXS #1 · quadcopter");
+    await expect(sigmaStage).toHaveAttribute(
+      "data-highlighted-node",
       info.vehicles.quadcopter,
     );
-    expect(quadSigmaPos).not.toBeNull();
-    await sigmaStage
-      .locator("canvas.sigma-mouse")
-      .click({ position: quadSigmaPos! });
-    await page.mouse.move(8, 8);
-    await expect
-      .poll(() => new URL(page.url()).hash)
-      .toContain(`sel=${info.vehicles.quadcopter}`);
-    await expect(authBanner).toContainText("UXS #1 · quadcopter");
-    const expandButton = page.getByRole("button", { name: "2-Hop" });
+
+    const expandButton = page.getByTestId("cortex-similar-btn");
     await expect(expandButton).toBeEnabled();
     const [gqlResponse] = await Promise.all([
       page.waitForResponse(
@@ -556,74 +620,45 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
     );
     expect(discoveredIds).toContain(info.externalContactId);
     expect(discoveredIds).toContain(info.corridorEntityId);
-    await expect(page.locator(".expand-error")).toHaveCount(0);
-    await expect(page.locator(".skg-topology-card .meta-count")).toContainText(
-      "5N · 2E",
+    await expect(page.getByTestId("cortex-error-banner")).toHaveCount(0);
+    await expect(page.getByTestId("cortex-causal-subgraph")).toContainText(
+      "3 nodes · 2 edges",
     );
 
-    // 7. Exercise canvas double-click tether plus keyboard hotkeys T (Tether), C (Chase), H (Declutter), and Escape (Clear).
-    const tetherBtn = page.getByRole("button", { name: "Tether [T]" });
-    const chaseBtn = page.getByRole("button", { name: "Chase [C]" });
-    const liveCanvasSize = await page
-      .locator(".safety-hud-canvas")
-      .evaluate((el) => ({ w: el.clientWidth, h: el.clientHeight }));
-    await page.locator(".safety-hud-canvas").dblclick({
-      position: {
-        x: liveCanvasSize.w * 0.5 + 28 * 4,
-        y: liveCanvasSize.h * 0.5 - -18 * 4,
-      },
-    });
-    await expect(tetherBtn).toHaveAttribute("aria-pressed", "true");
     await expect
-      .poll(() => new URL(page.url()).hash)
-      .toContain(`tether=${info.vehicles.rover}`);
+      .poll(async () => {
+        const quadHover = await sampleSigmaHoverLayer(sigmaStage);
+        return (
+          quadHover.darkPillPixels > 80 &&
+          quadHover.lightTextPixels > 8 &&
+          quadHover.pureWhitePixels === 0
+        );
+      })
+      .toBe(true);
 
-    // Toggle tether off then back on via hotkey T.
-    await page.keyboard.press("t");
-    await expect(tetherBtn).toHaveAttribute("aria-pressed", "false");
-    await page.keyboard.press("t");
-    await expect(tetherBtn).toHaveAttribute("aria-pressed", "true");
-
-    await page.keyboard.press("c");
-    await expect(chaseBtn).toHaveAttribute("aria-pressed", "true");
-
-    await page.keyboard.press("h");
-    await expect(
-      page.getByRole("button", { name: "minimal", exact: true }),
-    ).toHaveAttribute("aria-pressed", "true");
-    await page.keyboard.press("h");
-    await expect(
-      page.getByRole("button", { name: "tactical", exact: true }),
-    ).toHaveAttribute("aria-pressed", "true");
-    await page.keyboard.press("h");
-    await expect(
-      page.getByRole("button", { name: "none", exact: true }),
-    ).toHaveAttribute("aria-pressed", "true");
-
-    await page.keyboard.press("Escape");
-    await expect(tetherBtn).toHaveAttribute("aria-pressed", "false");
-    await expect(chaseBtn).toHaveAttribute("aria-pressed", "false");
-    await expect(authBanner).toContainText("UXS #2 · rover");
-    expect(new URL(page.url()).hash).not.toContain("tether=");
-
-    // 8. Select SurfaceBoat #3 and verify signed Fossen Ch. 2 crab-angle readout (-30.1°) with zero cell overlap.
-    await page.goto(
-      `${info.baseURL}/#sel=${encodeURIComponent(info.vehicles.surfaceBoat)}`,
+    // 6. Switch to Bench [B], verify DPR=2 20 Hz oscilloscope, and inject live Lane 3 P1 CRSF override + STATUSTEXT transitions.
+    await page.keyboard.press("b");
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "bench",
     );
-    await expect(authBanner).toContainText("UXS #3 · surface-boat");
-    const crabCell = page.getByTestId("hud-readout-crab");
-    await expect(crabCell).toBeVisible();
-    await expect(crabCell.locator("dd")).toHaveText("-30.1°");
+    await expect
+      .poll(async () => {
+        const scope = await sampleCanvas2DPixels(
+          page,
+          '[data-testid="bench-oscilloscope"]',
+          [9, 13, 22],
+        );
+        return (
+          scope.width === Math.floor(scope.clientWidth * 2) &&
+          scope.nonBgPixels > 50
+        );
+      })
+      .toBe(true);
 
-    await assertZeroPairwiseOverlapWithinParent(readoutStrip, [
-      page.getByTestId("hud-readout-gs"),
-      page.getByTestId("hud-readout-vs"),
-      page.getByTestId("hud-readout-alt"),
-      page.getByTestId("hud-readout-attitude"),
-      crabCell,
-    ]);
+    await page.keyboard.press("2");
+    await expect(authBanner).toContainText("UXS #2 · rover");
 
-    // 9. Inject live Lane 3 P1 CRSF override on SYS#1 and STATUSTEXT on SYS#3; verify timeline + click selection.
     await copStack.pulseCrsfOverride(1);
     await copStack.emitStatusText(3, 4, "CROSS CURRENT DRIFT");
 
@@ -655,12 +690,47 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
   });
 
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
-  test("preserves strict UXS authority and HUD isolation when selecting an external COP contact with unknown optional provenance", async ({
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  test("preserves strict UXS authority, HUD, and actuation isolation and distinct observed/received freshness across Pilot and Bench for full and partial external COP contacts", async ({
     copStack,
   }) => {
     const { page, info } = copStack;
+
+    // 1. Delayed external contact with distinct known observed_at vs received_at, expires_at, and uncertainty_meters.
+    const delayedContactId = `${info.org}.${info.platform}.sensor.cop.vessel.delayed-9`;
+    const observedIso = "2030-01-15T12:00:00.000Z";
+    const receivedIso = "2030-01-15T12:00:12.500Z";
+    const expiresIso = "2030-01-15T12:05:00.000Z";
+    await copStack.upsertExternalContact({
+      id: delayedContactId,
+      title: "AIS Delayed Tanker-9",
+      contact_type: "cargo-vessel",
+      source: "ais-coastal-relay",
+      feed_status: "degraded",
+      latitude: 37.772,
+      longitude: -122.423,
+      observed_at: observedIso,
+      received_at: receivedIso,
+      expires_at: expiresIso,
+      uncertainty_meters: 18.5,
+    });
+
+    // 2. Partial-metadata external contact with known observed_at and omitted received_at, expires_at, and uncertainty_meters.
+    const partialContactId = `${info.org}.${info.platform}.sensor.cop.vessel.partial-4`;
+    const partialObservedIso = "2030-01-15T12:02:00.000Z";
+    await copStack.upsertExternalContact({
+      id: partialContactId,
+      title: "Radar Track Partial-4",
+      contact_type: "unknown-surface",
+      source: "harbor-radar-2",
+      feed_status: "stale",
+      latitude: 37.771,
+      longitude: -122.421,
+      observed_at: partialObservedIso,
+    });
+
     await page.goto(
-      `${info.baseURL}/#sel=${encodeURIComponent(info.externalContactId)}`,
+      `${info.baseURL}/#mode=pilot&sel=${encodeURIComponent(delayedContactId)}`,
     );
 
     await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
@@ -669,19 +739,70 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
 
     const contactBanner = page.getByTestId("external-contact-banner");
     await expect(contactBanner).toBeVisible();
-    await expect(contactBanner).toContainText("AIS Vessel Harbor-7");
-    await expect(contactBanner).toContainText("type: surface-vessel");
-    await expect(contactBanner).toContainText("source: ais-receiver-1");
-    await expect(contactBanner).toContainText("expires: unknown");
-    await expect(contactBanner).toContainText("uncertainty: unknown");
+    await expect(contactBanner).toContainText("AIS Delayed Tanker-9");
+    await expect(contactBanner).toContainText("type: cargo-vessel");
+    await expect(contactBanner).toContainText("feed: degraded");
+    await expect(contactBanner).toContainText("source: ais-coastal-relay");
+    await expect(contactBanner).toContainText(`observed: ${observedIso}`);
+    await expect(contactBanner).toContainText(`received: ${receivedIso}`);
+    await expect(contactBanner).toContainText(`expires: ${expiresIso}`);
+    await expect(contactBanner).toContainText("uncertainty: ±18.5 m");
 
-    // Non-UXS external contact MUST NEVER expose vehicle P1-P4 authority, arming, link-tier, or HUD attitude readouts.
-    await expect(page.getByTestId("vehicle-hud-standby")).toBeVisible();
+    const pilotIsolation = page.getByTestId("pilot-contact-isolation");
+    await expect(pilotIsolation).toBeVisible();
+    await expect(pilotIsolation).toContainText(`observed: ${observedIso}`);
+    await expect(pilotIsolation).toContainText(`received: ${receivedIso}`);
+    await expect(pilotIsolation).toContainText(`expires: ${expiresIso}`);
+    await expect(pilotIsolation).toContainText("uncertainty: ±18.5 m");
+
+    // Non-UXS external contact MUST NEVER expose vehicle P1-P4 authority, arming, link-tier, HUD attitude readouts, or guarded actions.
     await expect(page.getByTestId("vehicle-authority-banner")).toHaveCount(0);
     await expect(page.getByTestId("authority-badge")).toHaveCount(0);
     await expect(page.getByTestId("armed-badge")).toHaveCount(0);
     await expect(page.getByTestId("hud-link-tier")).toHaveCount(0);
     await expect(page.getByTestId("hud-readout-strip")).toHaveCount(0);
+    await expect(page.getByTestId("pilot-guarded-actions")).toHaveCount(0);
+
+    // Bench also surfaces distinct observed/received freshness and withholds parameter tuning controls on external COP contacts.
+    await page.keyboard.press("b");
+    const benchNotice = page.getByTestId("bench-contact-notice");
+    await expect(benchNotice).toContainText("AIS Delayed Tanker-9");
+    await expect(benchNotice).toContainText(`observed: ${observedIso}`);
+    await expect(benchNotice).toContainText(`received: ${receivedIso}`);
+    await expect(benchNotice).toContainText(`expires: ${expiresIso}`);
+    await expect(benchNotice).toContainText("uncertainty: ±18.5 m");
+    await expect(page.getByTestId("bench-tuning-withheld")).toContainText(
+      "External COP contacts expose no parameter tuning rack.",
+    );
+    await expect(page.getByTestId("bench-staged-count")).toHaveCount(0);
+
+    // Switch to the partial-metadata contact via FleetFilmstrip and verify unknown-preserving fields across Bench and Pilot.
+    const partialCard = page
+      .getByTestId("fleet-filmstrip")
+      .locator(`button[data-entity-id="${partialContactId}"]`);
+    await partialCard.click();
+
+    await expect(contactBanner).toContainText("Radar Track Partial-4");
+    await expect(contactBanner).toContainText(
+      `observed: ${partialObservedIso}`,
+    );
+    await expect(contactBanner).toContainText("received: unknown");
+    await expect(contactBanner).toContainText("expires: unknown");
+    await expect(contactBanner).toContainText("uncertainty: unknown");
+
+    await expect(benchNotice).toContainText("Radar Track Partial-4");
+    await expect(benchNotice).toContainText(`observed: ${partialObservedIso}`);
+    await expect(benchNotice).toContainText("received: unknown");
+    await expect(benchNotice).toContainText("expires: unknown");
+    await expect(benchNotice).toContainText("uncertainty: unknown");
+
+    await page.keyboard.press("d");
+    await expect(pilotIsolation).toContainText(
+      `observed: ${partialObservedIso}`,
+    );
+    await expect(pilotIsolation).toContainText("received: unknown");
+    await expect(pilotIsolation).toContainText("expires: unknown");
+    await expect(pilotIsolation).toContainText("uncertainty: unknown");
 
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
