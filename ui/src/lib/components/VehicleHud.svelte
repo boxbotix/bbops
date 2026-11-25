@@ -6,10 +6,12 @@
   import { onMount } from "svelte";
   import {
     type ResolvedVehiclePose,
-    computeFlightMetrics,
+    type VehicleHudReadoutView,
     formatLinkTierBadge,
+    formatVehicleHudReadouts,
     quaternionToEulerDeg,
     resolveLiveVehiclePose,
+    shouldRefreshHudReadout,
   } from "$lib/hud/view-model";
   import type { VehicleEntityState } from "$lib/stores/skg.svelte";
   import type { TelemetryStore } from "$lib/stores/telemetry.svelte";
@@ -35,12 +37,36 @@
   let hasAttitude = $state(false);
   let hasHeading = $state(false);
   let hasLocalPos = $state(false);
+  let readout = $state<VehicleHudReadoutView | null>(null);
+
+  let lastReadoutEntityId: string | null = null;
+  let lastReadoutDiscreteKey = "";
+  let lastReadoutRefreshMs: number | null = null;
 
   const linkBadge = $derived(
     vehicle ? formatLinkTierBadge(vehicle.linkTier) : null,
   );
 
-  function syncDiscreteHudState(pose: ResolvedVehiclePose): void {
+  function isSameReadout(
+    a: VehicleHudReadoutView | null,
+    b: VehicleHudReadoutView,
+  ): boolean {
+    return (
+      a !== null &&
+      a.gsText === b.gsText &&
+      a.vsText === b.vsText &&
+      a.altText === b.altText &&
+      a.attitudeLabel === b.attitudeLabel &&
+      a.attitudeText === b.attitudeText &&
+      a.crabText === b.crabText
+    );
+  }
+
+  function syncHudState(
+    currentVehicle: VehicleEntityState,
+    pose: ResolvedVehiclePose,
+    nowMs: number,
+  ): void {
     if (poseSource !== pose.source) {
       poseSource = pose.source;
     }
@@ -56,6 +82,22 @@
     if (hasLocalPos !== pose.hasLocalPos) {
       hasLocalPos = pose.hasLocalPos;
     }
+
+    const discreteKey = `${currentVehicle.id}|${currentVehicle.domain}|${pose.source}|${pose.stale}|${pose.hasAttitude}|${pose.hasHeading}|${pose.hasLocalPos}`;
+    const forceImmediate =
+      readout === null ||
+      lastReadoutEntityId !== currentVehicle.id ||
+      lastReadoutDiscreteKey !== discreteKey;
+
+    if (shouldRefreshHudReadout(lastReadoutRefreshMs, nowMs, forceImmediate)) {
+      const nextReadout = formatVehicleHudReadouts(pose, currentVehicle.domain);
+      if (!isSameReadout(readout, nextReadout)) {
+        readout = nextReadout;
+      }
+      lastReadoutEntityId = currentVehicle.id;
+      lastReadoutDiscreteKey = discreteKey;
+      lastReadoutRefreshMs = nowMs;
+    }
   }
 
   $effect(() => {
@@ -65,15 +107,20 @@
       hasHeading = false;
       hasLocalPos = false;
       poseSource = "skg";
+      readout = null;
+      lastReadoutEntityId = null;
+      lastReadoutDiscreteKey = "";
+      lastReadoutRefreshMs = null;
       return;
     }
+    const nowMs = now();
     const pose = resolveLiveVehiclePose(vehicle, {
       fast: telemetryStore.getKinematics(vehicle.sysid),
       telemetryStatus: telemetryStore.status,
       skgStatus,
-      nowMs: now(),
+      nowMs,
     });
-    syncDiscreteHudState(pose);
+    syncHudState(vehicle, pose, nowMs);
   });
 
   function get2dContext(
@@ -100,15 +147,12 @@
     pose: ResolvedVehiclePose,
   ): void {
     const euler = pose.hasAttitude ? quaternionToEulerDeg(pose.quat) : null;
-    const flight = pose.hasLocalPos
-      ? computeFlightMetrics(pose.ned, pose.vel)
-      : null;
 
     ctx.clearRect(0, 0, widthPx, heightPx);
 
     const tapeHeight = 28;
     const horizonTop = tapeHeight + 4;
-    const horizonHeight = Math.max(40, heightPx - horizonTop - 32);
+    const horizonHeight = Math.max(40, heightPx - horizonTop - 8);
     const cx = widthPx * 0.5;
     const cy = horizonTop + horizonHeight * 0.5;
     const pxPerPitchDeg = 2.4;
@@ -252,37 +296,6 @@
       ctx.fillText("HDG UNAVAILABLE", cx, 19);
     }
     ctx.restore();
-
-    // 3. Bottom telemetry readout bar (GS, VS, ALT, Roll/Pitch/Yaw or Heading).
-    ctx.save();
-    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
-    const bottomY = heightPx - 10;
-    if (flight !== null) {
-      ctx.fillStyle = "#e2e8f0";
-      ctx.fillText(
-        `GS ${flight.groundspeedMps.toFixed(1)}m/s  VS ${flight.climbRateMps >= 0 ? "+" : ""}${flight.climbRateMps.toFixed(1)}m/s  ALT ${flight.altitudeRelM.toFixed(1)}m`,
-        10,
-        bottomY,
-      );
-    } else {
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText("GS --  VS --  ALT --", 10, bottomY);
-    }
-    ctx.textAlign = "right";
-    ctx.fillStyle = "#94a3b8";
-    if (euler !== null) {
-      ctx.fillText(
-        `R ${euler.rollDeg.toFixed(0)}° P ${euler.pitchDeg.toFixed(0)}° Y ${euler.yawDeg.toFixed(0)}°`,
-        widthPx - 10,
-        bottomY,
-      );
-    } else if (pose.hasHeading) {
-      const hdgLabel = String(Math.round(headingDeg) % 360).padStart(3, "0");
-      ctx.fillText(`R -- P -- HDG ${hdgLabel}°`, widthPx - 10, bottomY);
-    } else {
-      ctx.fillText("R -- P -- HDG ---", widthPx - 10, bottomY);
-    }
-    ctx.restore();
   }
 
   onMount(() => {
@@ -296,10 +309,10 @@
           skgStatus,
           nowMs,
         });
-        syncDiscreteHudState(pose);
+        syncHudState(vehicle, pose, nowMs);
         if (canvasEl) {
           const widthPx = Math.max(220, canvasEl.clientWidth || 300);
-          const heightPx = Math.max(150, canvasEl.clientHeight || 190);
+          const heightPx = Math.max(120, canvasEl.clientHeight || 152);
           const dpr = Math.max(1, window.devicePixelRatio || 1);
           const targetW = Math.floor(widthPx * dpr);
           const targetH = Math.floor(heightPx * dpr);
@@ -372,6 +385,38 @@
       class="hud-canvas"
       aria-label="Primary attitude horizon and heading tape"
     ></canvas>
+    {#if readout}
+      <dl class="hud-readout-strip" data-testid="hud-readout-strip">
+        <div class="readout-cell" data-testid="hud-readout-gs">
+          <dt>GS</dt>
+          <dd>{readout.gsText}</dd>
+        </div>
+        <div class="readout-cell" data-testid="hud-readout-vs">
+          <dt>VS</dt>
+          <dd>{readout.vsText}</dd>
+        </div>
+        <div class="readout-cell" data-testid="hud-readout-alt">
+          <dt>ALT</dt>
+          <dd>{readout.altText}</dd>
+        </div>
+        <div
+          class="readout-cell readout-cell-wide"
+          data-testid="hud-readout-attitude"
+        >
+          <dt>{readout.attitudeLabel}</dt>
+          <dd>{readout.attitudeText}</dd>
+        </div>
+        {#if readout.crabText !== null}
+          <div
+            class="readout-cell readout-cell-crab"
+            data-testid="hud-readout-crab"
+          >
+            <dt>CRAB</dt>
+            <dd>{readout.crabText}</dd>
+          </div>
+        {/if}
+      </dl>
+    {/if}
   {:else}
     <div class="hud-empty" data-testid="vehicle-hud-standby">
       Select a controllable UXS vehicle to view live attitude horizon &amp; link
@@ -388,7 +433,7 @@
     border: 1px solid var(--ui-border-subtle, #1e293b);
     border-radius: 6px;
     padding: 8px;
-    min-height: 220px;
+    min-height: 244px;
   }
 
   .hud-header {
@@ -442,9 +487,65 @@
 
   .hud-canvas {
     width: 100%;
-    height: 184px;
+    height: 152px;
     display: block;
     border-radius: 4px;
+  }
+
+  .hud-readout-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    margin: 6px 0 0;
+    padding: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .readout-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    padding: 3px 6px;
+    border-radius: 4px;
+    background: var(--ui-surface-primary, #090d16);
+    border: 1px solid var(--ui-border-subtle, #1e293b);
+    overflow: hidden;
+  }
+
+  .readout-cell-wide {
+    grid-column: 1 / -1;
+  }
+
+  .hud-readout-strip:has(.readout-cell-crab) .readout-cell-wide {
+    grid-column: span 2;
+  }
+
+  .readout-cell-crab {
+    grid-column: span 1;
+    border-color: rgba(56, 189, 248, 0.35);
+  }
+
+  .readout-cell dt {
+    font-size: 9px;
+    line-height: 1.1;
+    color: var(--ui-text-muted, #64748b);
+    white-space: nowrap;
+  }
+
+  .readout-cell dd {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.25;
+    font-weight: 600;
+    color: var(--ui-text-primary, #e2e8f0);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .readout-cell-crab dd {
+    color: var(--status-info, #38bdf8);
   }
 
   .hud-empty {

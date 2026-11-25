@@ -25,6 +25,8 @@
   import type { GraphQLClient, PathSearchResult } from "$lib/graphql";
   import {
     SKG_EDGE_PALETTE,
+    drawSkgNodeHover,
+    drawSkgNodeLabel,
     syncTopologyToGraph,
   } from "$lib/skg/graphology-adapter";
   import { LayoutController } from "$lib/skg/sigma-layout";
@@ -34,7 +36,10 @@
   export interface CortexSigmaRenderer {
     refresh(): void;
     kill(): void;
-    on(event: "clickNode", handler: (payload: { node: string }) => void): void;
+    on(
+      event: "clickNode" | "enterNode" | "leaveNode",
+      handler: (payload: { node: string }) => void,
+    ): void;
   }
 
   export type CortexSigmaConstructor = new (
@@ -100,6 +105,8 @@
   let sigmaContainerEl: HTMLDivElement | undefined = $state();
   let mounted = $state(false);
   let webglAvailable = $state(false);
+  let sigmaReady = $state(false);
+  let hoveredNodeId = $state<string | null>(null);
   let layoutRunning = $state(false);
 
   const graph = new MultiDirectedGraph();
@@ -477,10 +484,16 @@
     const { structureChanged } = syncTopologyToGraph(graph, model);
     if (sigmaInstance) {
       sigmaInstance.refresh();
-      if (structureChanged) {
+      if (structureChanged && graph.order > 1 && graph.size > 0) {
         layoutController.start(graph);
       }
     }
+  });
+
+  $effect(() => {
+    void viewportStore.selectedEntityId;
+    void hoveredNodeId;
+    sigmaInstance?.refresh();
   });
 
   $effect(() => {
@@ -499,29 +512,61 @@
         syncTopologyToGraph(graph, causalSubgraph);
         const renderer = new Sigma(graph, container, {
           renderEdgeLabels: false,
+          stagePadding: 32,
           defaultNodeColor: "#60a5fa",
           defaultEdgeColor: SKG_EDGE_PALETTE.default,
           labelColor: { color: "#e2e8f0" },
           labelSize: 11,
+          defaultDrawNodeLabel: drawSkgNodeLabel,
+          defaultDrawNodeHover: drawSkgNodeHover,
+          nodeReducer: (node: string, data: Record<string, unknown>) => {
+            const res = { ...data };
+            const focusId = hoveredNodeId ?? viewportStore.selectedEntityId;
+            if (focusId) {
+              if (node === focusId) {
+                res.highlighted = true;
+              } else if (
+                graph.hasNode(focusId) &&
+                graph.hasNode(node) &&
+                !graph.areNeighbors(focusId, node) &&
+                graph.size > 0
+              ) {
+                res.color = "#1e293b";
+                res.label = "";
+              }
+            }
+            return res;
+          },
         });
         renderer.on("clickNode", ({ node }) => {
           selectHit(node);
         });
+        renderer.on("enterNode", ({ node }) => {
+          hoveredNodeId = node;
+          container.setAttribute("data-hovered-node", node);
+        });
+        renderer.on("leaveNode", () => {
+          hoveredNodeId = null;
+          container.setAttribute("data-hovered-node", "");
+        });
         createdRenderer = renderer;
         sigmaInstance = renderer;
+        sigmaReady = true;
         renderer.refresh();
-        if (graph.order > 1) {
+        if (graph.order > 1 && graph.size > 0) {
           layoutController.start(graph);
         }
       })
       .catch(() => {
         if (!cancelled && !isUnmounted) {
+          sigmaReady = false;
           webglAvailable = false;
         }
       });
 
     return () => {
       cancelled = true;
+      sigmaReady = false;
       layoutController.stop();
       if (createdRenderer) {
         createdRenderer.kill();
@@ -540,6 +585,7 @@
     return () => {
       isUnmounted = true;
       mounted = false;
+      sigmaReady = false;
       activeSearchController?.abort();
       activeExpandController?.abort();
       activeSearchController = null;
@@ -697,6 +743,9 @@
         class="sigma-host"
         class:hidden={!webglAvailable}
         data-testid="cortex-sigma-host"
+        data-sigma-ready={sigmaReady ? "true" : "false"}
+        data-highlighted-node={viewportStore.selectedEntityId ?? ""}
+        data-hovered-node={hoveredNodeId ?? ""}
         data-viewport-hotkey-scope="true"
         role="application"
         aria-label="Causal SKG interactive WebGL canvas"

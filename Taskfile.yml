@@ -45,6 +45,16 @@ tasks:
       - GOTOOLCHAIN=auto go test -race -count=1 ./...
       - npm --prefix ui run test
 
+  test:e2e:
+    desc: Build UI + ephemeral Go E2E harness and run headless Chromium Playwright E2E suite
+    cmds:
+      - |
+        tmp_dir=$(mktemp -d)
+        trap 'rm -rf "$tmp_dir"' EXIT
+        npm --prefix ui run build
+        GOTOOLCHAIN=auto go build -o "$tmp_dir/e2eharness" ./internal/e2eharness/cmd/e2eharness
+        BBOPS_E2E_BIN="$tmp_dir/e2eharness" BBOPS_E2E_UI_DIR="$PWD/ui/build" npm --prefix ui run test:e2e
+
   build:
     desc: Build static Svelte 5 UI and standalone ./bin/bbops binary
     cmds:
@@ -70,9 +80,11 @@ tasks:
       - ateam state spec-queue
 
   test:spec:
-    desc: Check deterministic Go and Vitest test-to-spec citations
+    desc: Check deterministic Go, Vitest, and Playwright E2E test-to-spec citations
     cmds:
       - ateam test-spec
+      - node ui/e2e/check-spec-attribution.mjs --self-test
+      - node ui/e2e/check-spec-attribution.mjs
 
   doctor:
     desc: Check ateam version pin, multi-agent parity, MCP schema budget, and hook latency
@@ -87,6 +99,7 @@ tasks:
         task fmt:check
         task lint
         task test
+        task test:e2e
         task spec:check
         task test:spec
         task doctor

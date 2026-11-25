@@ -32,6 +32,7 @@
     skgStore: SkgStore;
     viewportStore: ViewportStore;
     traceBook?: TelemetryTraceBook;
+    onSyncHash?: (hash: string) => void;
     onApplyTuning?: (
       sysid: number,
       diffs: readonly TuningDiffEntry[],
@@ -43,6 +44,7 @@
     skgStore,
     viewportStore,
     traceBook = new TelemetryTraceBook(),
+    onSyncHash,
     onApplyTuning,
   }: Props = $props();
 
@@ -568,8 +570,22 @@
       <ul class="console-list" data-testid="transition-event-timeline">
         {#each eventRows as row (row.key)}
           <li class="console-line">
-            <span class="console-tag">{row.headline}</span>
-            <span>{row.detail}</span>
+            {#if row.entityId}
+              <button
+                type="button"
+                class="event-btn"
+                onclick={() => {
+                  viewportStore.selectEntity(row.entityId);
+                  onSyncHash?.(viewportStore.toUrlHash());
+                }}
+              >
+                <span class="console-tag">{row.headline}</span>
+                <span>{row.detail}</span>
+              </button>
+            {:else}
+              <span class="console-tag">{row.headline}</span>
+              <span>{row.detail}</span>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -813,6 +829,20 @@
     padding: 4px 6px;
     border-radius: 4px;
     background: var(--ui-surface-elevated, #172033);
+  }
+
+  .event-btn {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
   }
 
   .console-tag {

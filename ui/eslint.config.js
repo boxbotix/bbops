@@ -73,6 +73,12 @@ export default [
   },
   prettier,
   {
-    ignores: ["build/", ".svelte-kit/", "node_modules/"],
+    ignores: [
+      "build/",
+      ".svelte-kit/",
+      "node_modules/",
+      "playwright-report/",
+      "test-results/",
+    ],
   },
 ];

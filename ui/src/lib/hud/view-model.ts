@@ -800,6 +800,111 @@ export function selectBannerPresentation(
   return null;
 }
 
+export const HUD_READOUT_THROTTLE_MS = 250;
+export const USV_HUD_CRAB_DEADBAND_MPS = 0.15;
+
+export interface VehicleHudReadoutView {
+  readonly gsText: string;
+  readonly vsText: string;
+  readonly altText: string;
+  readonly attitudeLabel: "R / P / Y" | "R / P / HDG";
+  readonly attitudeText: string;
+  readonly crabAngleDeg: number | null;
+  readonly crabText: string | null;
+}
+
+function wrapSignedAngleRad(rad: number): number {
+  if (!isFiniteNumber(rad)) {
+    return 0;
+  }
+  const twoPi = 2 * Math.PI;
+  let wrapped = ((((rad + Math.PI) % twoPi) + twoPi) % twoPi) - Math.PI;
+  if (wrapped <= -Math.PI) {
+    wrapped += twoPi;
+  }
+  return cleanZero(wrapped);
+}
+
+export function shouldRefreshHudReadout(
+  lastRefreshMs: number | null,
+  nowMs: number,
+  forceImmediate: boolean,
+  throttleMs = HUD_READOUT_THROTTLE_MS,
+): boolean {
+  if (
+    forceImmediate ||
+    lastRefreshMs === null ||
+    !isFiniteNumber(lastRefreshMs) ||
+    !isFiniteNumber(nowMs) ||
+    nowMs < lastRefreshMs
+  ) {
+    return true;
+  }
+  return nowMs - lastRefreshMs >= throttleMs;
+}
+
+/**
+ * Formats non-overlapping semantic HTML HUD telemetry cells (GS, VS, ALT,
+ * R/P/Y or R/P/HDG, plus signed Fossen Ch. 2 crab angle beta = chi - psi for
+ * active surface-boat vehicles above USV_HUD_CRAB_DEADBAND_MPS).
+ */
+export function formatVehicleHudReadouts(
+  pose: ResolvedVehiclePose,
+  domain: VehicleEntityState["domain"],
+): VehicleHudReadoutView {
+  const flight = pose.hasLocalPos
+    ? computeFlightMetrics(pose.ned, pose.vel)
+    : null;
+  const gsText =
+    flight !== null ? `${flight.groundspeedMps.toFixed(1)} m/s` : "--";
+  const vsText =
+    flight !== null
+      ? `${flight.climbRateMps >= 0 ? "+" : ""}${flight.climbRateMps.toFixed(1)} m/s`
+      : "--";
+  const altText =
+    flight !== null ? `${flight.altitudeRelM.toFixed(1)} m` : "--";
+
+  let attitudeLabel: "R / P / Y" | "R / P / HDG" = "R / P / HDG";
+  let attitudeText = "-- / -- / ---";
+  if (pose.hasAttitude) {
+    const euler = quaternionToEulerDeg(pose.quat);
+    const roll = cleanZero(Math.round(euler.rollDeg));
+    const pitch = cleanZero(Math.round(euler.pitchDeg));
+    const yaw = ((Math.round(euler.yawDeg) % 360) + 360) % 360;
+    attitudeLabel = "R / P / Y";
+    attitudeText = `${roll}° / ${pitch}° / ${yaw}°`;
+  } else if (pose.hasHeading) {
+    const hdg = ((Math.round(pose.headingDeg) % 360) + 360) % 360;
+    attitudeText = `-- / -- / ${String(hdg).padStart(3, "0")}°`;
+  }
+
+  let crabAngleDeg: number | null = null;
+  let crabText: string | null = null;
+  if (
+    domain === "surface-boat" &&
+    pose.hasHeading &&
+    pose.hasLocalPos &&
+    flight !== null &&
+    flight.groundspeedMps >= USV_HUD_CRAB_DEADBAND_MPS
+  ) {
+    const bowRad = wrapSignedAngleRad(pose.headingRad);
+    const cogRad = Math.atan2(pose.vel[1], pose.vel[0]);
+    const crabRad = wrapSignedAngleRad(cogRad - bowRad);
+    crabAngleDeg = cleanZero(crabRad * RAD_TO_DEG);
+    crabText = `${crabAngleDeg >= 0 ? "+" : ""}${crabAngleDeg.toFixed(1)}°`;
+  }
+
+  return {
+    gsText,
+    vsText,
+    altText,
+    attitudeLabel,
+    attitudeText,
+    crabAngleDeg,
+    crabText,
+  };
+}
+
 export interface FleetFaultSummary {
   readonly totalVehicles: number;
   readonly faultedCount: number;

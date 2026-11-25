@@ -489,3 +489,305 @@ export function formatTransitionEvent(
     }
   }
 }
+
+export const SKG_HOVER_PILL_FILL = "#0f172a";
+export const SKG_HOVER_TEXT_HEX = "#f8fafc";
+
+export interface ClampedNodeLabelPlacement {
+  readonly textX: number;
+  readonly textY: number;
+  readonly boxX: number;
+  readonly boxY: number;
+  readonly boxWidth: number;
+  readonly boxHeight: number;
+  readonly maxTextWidth: number;
+  readonly side: "right" | "left";
+}
+
+export function computeClampedLabelPlacement(
+  nodeX: number,
+  nodeY: number,
+  nodeSize: number,
+  textWidth: number,
+  fontSize: number,
+  stageWidthPx: number,
+): ClampedNodeLabelPlacement {
+  const padX = 5;
+  const padY = 3;
+  const gap = 4;
+  const edgeMargin = 4;
+  const fullBoxWidth = Math.ceil(Math.max(0, textWidth) + padX * 2);
+  const boxHeight = Math.ceil(fontSize + padY * 2);
+  const textY = nodeY + fontSize / 3;
+  const boxY = Math.round(nodeY - boxHeight * 0.5);
+
+  const rawRightBoxX = Math.round(nodeX + nodeSize + gap);
+  if (stageWidthPx <= 0) {
+    return {
+      textX: rawRightBoxX + padX,
+      textY,
+      boxX: rawRightBoxX,
+      boxY,
+      boxWidth: fullBoxWidth,
+      boxHeight,
+      maxTextWidth: Math.max(0, fullBoxWidth - padX * 2),
+      side: "right",
+    };
+  }
+
+  const minX = edgeMargin;
+  const maxX = Math.max(minX, stageWidthPx - edgeMargin);
+  const maxStageBoxWidth = Math.max(0, maxX - minX);
+  const rightAnchorX = Math.max(minX, rawRightBoxX);
+  const availRight = Math.max(0, maxX - rightAnchorX);
+  const leftAnchorRight = Math.min(maxX, Math.round(nodeX - nodeSize - gap));
+  const availLeft = Math.max(0, leftAnchorRight - minX);
+
+  if (fullBoxWidth <= availRight) {
+    return {
+      textX: rightAnchorX + padX,
+      textY,
+      boxX: rightAnchorX,
+      boxY,
+      boxWidth: fullBoxWidth,
+      boxHeight,
+      maxTextWidth: Math.max(0, fullBoxWidth - padX * 2),
+      side: "right",
+    };
+  }
+
+  if (fullBoxWidth <= availLeft) {
+    const leftBoxX = leftAnchorRight - fullBoxWidth;
+    return {
+      textX: leftBoxX + padX,
+      textY,
+      boxX: leftBoxX,
+      boxY,
+      boxWidth: fullBoxWidth,
+      boxHeight,
+      maxTextWidth: Math.max(0, fullBoxWidth - padX * 2),
+      side: "left",
+    };
+  }
+
+  // Neither side fits the full label: pick the wider side (or full stage when both sides are tiny) and cap boxWidth inside [minX, maxX].
+  const minSideBudget = padX * 2 + 18;
+  if (availRight < minSideBudget && availLeft < minSideBudget) {
+    const clampedWidth = Math.min(fullBoxWidth, maxStageBoxWidth);
+    return {
+      textX: minX + padX,
+      textY,
+      boxX: minX,
+      boxY,
+      boxWidth: clampedWidth,
+      boxHeight,
+      maxTextWidth: Math.max(0, clampedWidth - padX * 2),
+      side: "right",
+    };
+  }
+
+  if (availRight >= availLeft) {
+    const clampedWidth = Math.min(fullBoxWidth, availRight);
+    return {
+      textX: rightAnchorX + padX,
+      textY,
+      boxX: rightAnchorX,
+      boxY,
+      boxWidth: clampedWidth,
+      boxHeight,
+      maxTextWidth: Math.max(0, clampedWidth - padX * 2),
+      side: "right",
+    };
+  }
+
+  const clampedWidth = Math.min(fullBoxWidth, availLeft);
+  const leftBoxX = leftAnchorRight - clampedWidth;
+  return {
+    textX: leftBoxX + padX,
+    textY,
+    boxX: leftBoxX,
+    boxY,
+    boxWidth: clampedWidth,
+    boxHeight,
+    maxTextWidth: Math.max(0, clampedWidth - padX * 2),
+    side: "left",
+  };
+}
+
+export function fitLabelTextToWidth(
+  label: string,
+  maxTextWidthPx: number,
+  measureWidth: (text: string) => number,
+): { readonly text: string; readonly width: number } {
+  const fullWidth = measureWidth(label);
+  if (fullWidth <= maxTextWidthPx) {
+    return { text: label, width: fullWidth };
+  }
+  if (maxTextWidthPx <= 0) {
+    return { text: "", width: 0 };
+  }
+  const ellipsis = "…";
+  const ellipsisWidth = measureWidth(ellipsis);
+  if (ellipsisWidth > maxTextWidthPx) {
+    return { text: "", width: 0 };
+  }
+  const glyphs = Array.from(label);
+  let lo = 0;
+  let hi = glyphs.length;
+  let bestText = ellipsis;
+  let bestWidth = ellipsisWidth;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const candidate = `${glyphs.slice(0, mid).join("")}${ellipsis}`;
+    const w = measureWidth(candidate);
+    if (w <= maxTextWidthPx) {
+      bestText = candidate;
+      bestWidth = w;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return { text: bestText, width: bestWidth };
+}
+
+function layoutFittedNodeLabel(
+  context: CanvasRenderingContext2D,
+  data: SigmaNodeRenderDataLike,
+  fontSize: number,
+): {
+  readonly text: string;
+  readonly placement: ClampedNodeLabelPlacement;
+} | null {
+  if (typeof data.label !== "string" || data.label.length === 0) {
+    return null;
+  }
+  const measure = (s: string) => context.measureText(s).width;
+  const rawWidth = measure(data.label);
+  const stageWidth = resolveCanvasCssWidth(context);
+  const initial = computeClampedLabelPlacement(
+    data.x,
+    data.y,
+    data.size,
+    rawWidth,
+    fontSize,
+    stageWidth,
+  );
+  if (stageWidth <= 0 || rawWidth <= initial.maxTextWidth) {
+    return { text: data.label, placement: initial };
+  }
+  const fitted = fitLabelTextToWidth(data.label, initial.maxTextWidth, measure);
+  if (fitted.text.length === 0) {
+    return null;
+  }
+  const padX = 5;
+  const fittedBoxWidth = Math.min(
+    initial.boxWidth,
+    Math.ceil(fitted.width + padX * 2),
+  );
+  const fittedBoxX =
+    initial.side === "left"
+      ? initial.boxX + (initial.boxWidth - fittedBoxWidth)
+      : initial.boxX;
+  return {
+    text: fitted.text,
+    placement: {
+      ...initial,
+      boxX: fittedBoxX,
+      boxWidth: fittedBoxWidth,
+      textX: fittedBoxX + padX,
+    },
+  };
+}
+
+export interface SigmaNodeRenderDataLike {
+  readonly x: number;
+  readonly y: number;
+  readonly size: number;
+  readonly label?: string | null;
+  readonly color: string;
+}
+
+export interface SigmaLabelSettingsLike {
+  readonly labelSize: number;
+  readonly labelFont: string;
+  readonly labelWeight: string;
+  readonly labelColor:
+    | { readonly attribute: string; readonly color?: string }
+    | { readonly color: string; readonly attribute?: undefined };
+}
+
+function resolveCanvasCssWidth(context: CanvasRenderingContext2D): number {
+  const canvas = context.canvas as
+    { clientWidth?: number; width?: number } | undefined;
+  if (
+    canvas &&
+    typeof canvas.clientWidth === "number" &&
+    canvas.clientWidth > 0
+  ) {
+    return canvas.clientWidth;
+  }
+  const dpr =
+    typeof window !== "undefined" && window.devicePixelRatio > 0
+      ? window.devicePixelRatio
+      : 1;
+  return canvas && typeof canvas.width === "number" ? canvas.width / dpr : 0;
+}
+
+export function drawSkgNodeLabel(
+  context: CanvasRenderingContext2D,
+  data: SigmaNodeRenderDataLike,
+  settings: SigmaLabelSettingsLike,
+): void {
+  const fontSize = settings.labelSize;
+  context.font = `${settings.labelWeight} ${fontSize}px ${settings.labelFont}`;
+  const fitted = layoutFittedNodeLabel(context, data, fontSize);
+  if (!fitted) {
+    return;
+  }
+  context.fillStyle = settings.labelColor.color ?? "#e2e8f0";
+  context.fillText(fitted.text, fitted.placement.textX, fitted.placement.textY);
+}
+
+export function drawSkgNodeHover(
+  context: CanvasRenderingContext2D,
+  data: SigmaNodeRenderDataLike,
+  settings: SigmaLabelSettingsLike,
+): void {
+  const fontSize = settings.labelSize;
+  context.save();
+  context.font = `${settings.labelWeight} ${fontSize}px ${settings.labelFont}`;
+  const accentColor = data.color || SKG_EDGE_PALETTE.uxs;
+
+  // Halo ring around highlighted/hovered node disc on dark theme.
+  context.beginPath();
+  context.arc(data.x, data.y, data.size + 3, 0, Math.PI * 2);
+  context.fillStyle = SKG_HOVER_PILL_FILL;
+  context.fill();
+  context.lineWidth = 1.5;
+  context.strokeStyle = accentColor;
+  context.stroke();
+
+  const fitted = layoutFittedNodeLabel(context, data, fontSize);
+  if (fitted) {
+    const { placement, text } = fitted;
+    context.fillStyle = SKG_HOVER_PILL_FILL;
+    context.fillRect(
+      placement.boxX,
+      placement.boxY,
+      placement.boxWidth,
+      placement.boxHeight,
+    );
+    context.lineWidth = 1.2;
+    context.strokeStyle = accentColor;
+    context.strokeRect(
+      placement.boxX,
+      placement.boxY,
+      placement.boxWidth,
+      placement.boxHeight,
+    );
+    context.fillStyle = SKG_HOVER_TEXT_HEX;
+    context.fillText(text, placement.textX, placement.textY);
+  }
+  context.restore();
+}

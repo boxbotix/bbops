@@ -29,6 +29,7 @@
     computeCrabAngleVectors,
     resolveContactPalette,
     resolveDomainGlyphKind,
+    resolveRangeRingLabelPosition,
     resolveVehicleSafetyTone,
   } from "$lib/viewport/ned-grid";
 
@@ -55,6 +56,7 @@
   let containerEl: HTMLDivElement | undefined = $state();
   let surfaceCanvasEl: HTMLCanvasElement | undefined = $state();
   let overlayCanvasEl: HTMLCanvasElement | undefined = $state();
+  let toolbarEl: HTMLDivElement | undefined = $state();
   let originAnchored = $state(false);
   let staleVehicleIdsCsv = $state("");
 
@@ -203,6 +205,10 @@
     const cx = widthPx * 0.5;
     const cy = heightPx * 0.5;
     const maxRadiusPx = Math.hypot(cx, cy);
+    const toolbarBottomPx =
+      toolbarEl && toolbarEl.offsetHeight > 0
+        ? toolbarEl.offsetTop + toolbarEl.offsetHeight
+        : 46;
 
     ctx.save();
     ctx.strokeStyle = "rgba(51, 65, 85, 0.45)";
@@ -219,7 +225,17 @@
       ctx.beginPath();
       ctx.arc(cx, cy, rPx, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.fillText(`${ringM}m`, cx + 6, cy - rPx + 13);
+      const labelPos = resolveRangeRingLabelPosition(
+        cx,
+        cy,
+        rPx,
+        widthPx,
+        heightPx,
+        toolbarBottomPx,
+      );
+      if (labelPos) {
+        ctx.fillText(`${ringM}m`, labelPos.x, labelPos.y);
+      }
     }
 
     // Cardinal North/East crosshair rotated by camera bearing.
@@ -247,9 +263,10 @@
     );
     ctx.stroke();
 
-    // North arrow marker on outer ring.
+    // North arrow marker on outer ring, kept below toolbar band.
     const nx = cx + Math.sin(northCourse) * (axisLen - 10);
-    const ny = cy - Math.cos(northCourse) * (axisLen - 10);
+    const rawNy = cy - Math.cos(northCourse) * (axisLen - 10);
+    const ny = Math.max(toolbarBottomPx + 14, rawNy);
     ctx.fillStyle = "#60a5fa";
     ctx.font = "bold 12px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "center";
@@ -658,8 +675,10 @@
       return;
     }
     const rect = containerEl.getBoundingClientRect();
-    const widthPx = Math.max(1, Math.floor(rect.width || 640));
-    const heightPx = Math.max(1, Math.floor(rect.height || 420));
+    const innerWidth = containerEl.clientWidth || rect.width || 640;
+    const innerHeight = containerEl.clientHeight || rect.height || 420;
+    const widthPx = Math.max(1, Math.floor(innerWidth));
+    const heightPx = Math.max(1, Math.floor(innerHeight));
     const dpr = Math.max(1, window.devicePixelRatio || 1);
 
     adapter.setViewportSize(widthPx, heightPx);
@@ -849,6 +868,8 @@
 
   <div
     class="viewport-toolbar"
+    bind:this={toolbarEl}
+    data-testid="viewport-toolbar"
     role="toolbar"
     aria-label="COP tactical controls"
   >

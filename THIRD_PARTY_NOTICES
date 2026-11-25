@@ -42,6 +42,10 @@
    - `graphology-utils` (`2.5.2`, `Copyright (c) 2017-2021 Guillaume Plique (Yomguithereal)`, MIT)
    - `events` (`3.3.0`, `Copyright Joyent, Inc. and other Node contributors.`, MIT)
 
+8. **Playwright Browser E2E Test Harness (`microsoft/playwright`) — Apache License 2.0**
+   Copyright (c) Microsoft Corporation
+   - Headless Chromium E2E test runner devDependencies (`@playwright/test`, `playwright`, and `playwright-core` `1.65.1`, licensed under the Apache License, Version 2.0, `http://www.apache.org/licenses/LICENSE-2.0`; development/test-only, not bundled in `bin/bbops` or `ui/build`).
+
 ---
 
 ### MIT License Text (Applicable to `C360Studio/ateam`, `boxbotix/bbstack` MIT election, `C360Studio/semboids`, `C360Studio/semengine`, `C360Studio/semstreams-ui`, `bluenviron/gomavlib`, `sigma`, and `graphology*`)

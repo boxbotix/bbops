@@ -183,7 +183,13 @@
         {onSyncHash}
       />
     {:else if viewportStore.workspace === "bench"}
-      <BenchWorkspace {telemetryStore} {skgStore} {viewportStore} {traceBook} />
+      <BenchWorkspace
+        {telemetryStore}
+        {skgStore}
+        {viewportStore}
+        {traceBook}
+        {onSyncHash}
+      />
     {:else}
       <CortexWorkspace
         {skgStore}

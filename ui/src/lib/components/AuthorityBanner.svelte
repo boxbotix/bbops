@@ -84,6 +84,10 @@
       <span class="contact-pill">feed: {presentation.feedStatus}</span>
       {#if compact}
         <span class="contact-pill">source: {presentation.source}</span>
+        <span class="contact-pill">expires: {presentation.expiresAt}</span>
+        <span class="contact-pill"
+          >uncertainty: {presentation.uncertaintyLabel}</span
+        >
       {/if}
     </div>
 
