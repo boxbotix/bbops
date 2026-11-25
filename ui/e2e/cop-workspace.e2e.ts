@@ -250,14 +250,17 @@ test.describe("Full-stack Chromium COP workspace end-to-end verification", () =>
   test("streams live multi-domain dual-WebSocket telemetry and SKG state across Canvas2D, WebGL Sigma, non-overlapping HUD readouts, 2-hop pathSearch, hotkeys, and Lane 3 transitions", async ({
     copStack,
   }, testInfo) => {
-    // 0. Checkout-scoped Playwright artifact directory never collides across git worktrees.
-    expect(testInfo.project.outputDir).toBe(path.join(uiRoot, "test-results"));
-    expect(testInfo.project.outputDir).not.toBe(
+    // 0. Checkout-scoped Playwright artifact default never collides across git worktrees, and live runner honors resolvePlaywrightOutputDir().
+    expect(resolvePlaywrightOutputDir(uiRoot, undefined)).toBe(
+      path.join(uiRoot, "test-results"),
+    );
+    expect(resolvePlaywrightOutputDir(uiRoot, undefined)).not.toBe(
       path.join(os.tmpdir(), "bbops-playwright-results"),
     );
-    expect(resolvePlaywrightOutputDir("/worktrees/wt-a/ui", "")).not.toBe(
-      resolvePlaywrightOutputDir("/worktrees/wt-b/ui", ""),
-    );
+    expect(
+      resolvePlaywrightOutputDir("/worktrees/wt-a/ui", undefined),
+    ).not.toBe(resolvePlaywrightOutputDir("/worktrees/wt-b/ui", undefined));
+    expect(testInfo.project.outputDir).toBe(resolvePlaywrightOutputDir());
 
     const { page, info } = copStack;
     await page.goto(info.baseURL);

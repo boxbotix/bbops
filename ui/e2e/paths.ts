@@ -14,8 +14,12 @@ export const repoRoot = path.resolve(uiRoot, "..");
  */
 export function resolvePlaywrightOutputDir(
   checkoutUiDir = uiRoot,
-  envOutputDir = process.env.BBOPS_PLAYWRIGHT_OUTPUT_DIR,
+  ...envOverrideArg: [envOutputDir?: string]
 ): string {
+  const envOutputDir =
+    envOverrideArg.length > 0
+      ? envOverrideArg[0]
+      : process.env.BBOPS_PLAYWRIGHT_OUTPUT_DIR;
   const trimmed = envOutputDir?.trim();
   if (trimmed) {
     return path.resolve(checkoutUiDir, trimmed);

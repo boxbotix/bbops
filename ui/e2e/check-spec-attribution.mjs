@@ -2,6 +2,7 @@
 // Copyright (c) 2026 boxbotix
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import console from "node:console";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,6 +20,17 @@ const HOOK_MEMBERS = new Set([
 
 const DECLARATION_MODIFIERS = new Set(["only", "skip", "fixme", "fail"]);
 const CONDITIONAL_MODIFIERS = new Set(["skip", "fixme", "fail"]);
+
+function isPlaywrightPackageSpecifier(specifier) {
+  const normalized = specifier.replace(/\\/g, "/");
+  return (
+    normalized === "@playwright/test" ||
+    normalized === "playwright/test" ||
+    normalized === "playwright" ||
+    normalized.endsWith("/@playwright/test") ||
+    normalized.endsWith("/playwright/test")
+  );
+}
 
 function collectMarkdownHeadings(markdownText) {
   const requirements = new Set();
@@ -120,21 +132,109 @@ function unwrapExpression(expr) {
   return current;
 }
 
-function isStringLike(expr) {
+const COMPARISON_OR_LOGICAL_OPERATORS = new Set([
+  ts.SyntaxKind.EqualsEqualsToken,
+  ts.SyntaxKind.EqualsEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+  ts.SyntaxKind.LessThanToken,
+  ts.SyntaxKind.LessThanEqualsToken,
+  ts.SyntaxKind.GreaterThanToken,
+  ts.SyntaxKind.GreaterThanEqualsToken,
+  ts.SyntaxKind.AmpersandAmpersandToken,
+  ts.SyntaxKind.BarBarToken,
+]);
+
+function isDirectStringExpr(expr) {
   const unwrapped = unwrapExpression(expr);
+  if (!unwrapped) {
+    return false;
+  }
+  if (
+    ts.isStringLiteral(unwrapped) ||
+    ts.isNoSubstitutionTemplateLiteral(unwrapped) ||
+    ts.isTemplateExpression(unwrapped)
+  ) {
+    return true;
+  }
   return (
-    !!unwrapped &&
-    (ts.isStringLiteral(unwrapped) ||
-      ts.isNoSubstitutionTemplateLiteral(unwrapped) ||
-      ts.isTemplateExpression(unwrapped))
+    ts.isCallExpression(unwrapped) &&
+    ts.isIdentifier(unwrapped.expression) &&
+    unwrapped.expression.text === "String"
   );
 }
 
-function isFunctionLike(expr) {
+function isDirectFunctionExpr(expr) {
   const unwrapped = unwrapExpression(expr);
   return (
     !!unwrapped &&
     (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped))
+  );
+}
+
+function isDirectBooleanExpr(expr) {
+  const unwrapped = unwrapExpression(expr);
+  if (!unwrapped) {
+    return false;
+  }
+  if (
+    unwrapped.kind === ts.SyntaxKind.TrueKeyword ||
+    unwrapped.kind === ts.SyntaxKind.FalseKeyword
+  ) {
+    return true;
+  }
+  if (
+    ts.isPrefixUnaryExpression(unwrapped) &&
+    unwrapped.operator === ts.SyntaxKind.ExclamationToken
+  ) {
+    return true;
+  }
+  if (
+    ts.isBinaryExpression(unwrapped) &&
+    COMPARISON_OR_LOGICAL_OPERATORS.has(unwrapped.operatorToken.kind)
+  ) {
+    return true;
+  }
+  return (
+    ts.isCallExpression(unwrapped) &&
+    ts.isIdentifier(unwrapped.expression) &&
+    unwrapped.expression.text === "Boolean"
+  );
+}
+
+function isStringLike(expr, bindings) {
+  if (isDirectStringExpr(expr)) {
+    return true;
+  }
+  const unwrapped = unwrapExpression(expr);
+  return (
+    !!unwrapped &&
+    ts.isIdentifier(unwrapped) &&
+    bindings.stringIds.has(unwrapped.text)
+  );
+}
+
+function isFunctionLike(expr, bindings) {
+  if (isDirectFunctionExpr(expr)) {
+    return true;
+  }
+  const unwrapped = unwrapExpression(expr);
+  return (
+    !!unwrapped &&
+    ts.isIdentifier(unwrapped) &&
+    bindings.functionIds.has(unwrapped.text)
+  );
+}
+
+function isBooleanLike(expr, bindings) {
+  if (isDirectBooleanExpr(expr)) {
+    return true;
+  }
+  const unwrapped = unwrapExpression(expr);
+  return (
+    !!unwrapped &&
+    ts.isIdentifier(unwrapped) &&
+    bindings.booleanIds.has(unwrapped.text)
   );
 }
 
@@ -148,19 +248,145 @@ function isTestRootExpression(expr, bindings) {
   }
   if (
     ts.isPropertyAccessExpression(unwrapped) &&
-    ts.isIdentifier(unwrapped.expression) &&
-    bindings.namespaces.has(unwrapped.expression.text) &&
-    unwrapped.name.text === "test"
+    ts.isIdentifier(unwrapped.expression)
   ) {
-    return true;
+    const ns = unwrapped.expression.text;
+    if (bindings.namespaces.has(ns) && unwrapped.name.text === "test") {
+      return true;
+    }
+    if (
+      bindings.defaultExportNamespaces.has(ns) &&
+      unwrapped.name.text === "default"
+    ) {
+      return true;
+    }
   }
   return false;
 }
 
-function collectPlaywrightBindings(sf) {
+function isExtendCallOfTestRoot(expr, bindings) {
+  const unwrapped = unwrapExpression(expr);
+  return (
+    !!unwrapped &&
+    ts.isCallExpression(unwrapped) &&
+    ts.isPropertyAccessExpression(unwrapped.expression) &&
+    unwrapped.expression.name.text === "extend" &&
+    isTestRootExpression(unwrapped.expression.expression, bindings)
+  );
+}
+
+function resolveRelativeModuleFile(fromAbsFile, relSpecifier) {
+  const base = path.resolve(path.dirname(fromAbsFile), relSpecifier);
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.mts`,
+    `${base}.js`,
+    `${base}.mjs`,
+    path.join(base, "index.ts"),
+    path.join(base, "index.js"),
+  ];
+  for (const cand of candidates) {
+    if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+function doesModuleDefaultExportTest(
+  specifier,
+  fromAbsFile,
+  visitedFiles = new Set(),
+) {
+  if (isPlaywrightPackageSpecifier(specifier)) {
+    return true;
+  }
+  if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
+    return false;
+  }
+  if (fromAbsFile && fs.existsSync(fromAbsFile)) {
+    const targetFile = resolveRelativeModuleFile(fromAbsFile, specifier);
+    if (targetFile) {
+      if (visitedFiles.has(targetFile)) {
+        return false;
+      }
+      const nextVisited = new Set(visitedFiles);
+      nextVisited.add(targetFile);
+      const childText = fs.readFileSync(targetFile, "utf8");
+      const childSf = ts.createSourceFile(
+        targetFile,
+        childText,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS,
+      );
+      const childBindings = collectPlaywrightBindings(
+        childSf,
+        targetFile,
+        nextVisited,
+      );
+      for (const stmt of childSf.statements) {
+        if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+          if (
+            isTestRootExpression(stmt.expression, childBindings) ||
+            isExtendCallOfTestRoot(stmt.expression, childBindings)
+          ) {
+            return true;
+          }
+        }
+        if (
+          ts.isExportDeclaration(stmt) &&
+          stmt.exportClause &&
+          ts.isNamedExports(stmt.exportClause)
+        ) {
+          const reexportSpec =
+            stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+              ? stmt.moduleSpecifier.text
+              : null;
+          for (const el of stmt.exportClause.elements) {
+            if (el.name.text !== "default") {
+              continue;
+            }
+            const origName = (el.propertyName ?? el.name).text;
+            if (reexportSpec) {
+              if (
+                origName === "test" ||
+                (origName === "default" &&
+                  doesModuleDefaultExportTest(
+                    reexportSpec,
+                    targetFile,
+                    nextVisited,
+                  ))
+              ) {
+                return true;
+              }
+            } else if (childBindings.testIds.has(origName)) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+  }
+  // Fallback for in-memory synthetic unit tests without on-disk sibling modules.
+  const baseName = path.basename(specifier).replace(/\.[cm]?[jt]sx?$/, "");
+  return baseName === "fixtures" || baseName.endsWith("-fixture");
+}
+
+function collectPlaywrightBindings(
+  sf,
+  absFilePath = null,
+  visitedFiles = new Set(),
+) {
   const testIds = new Set();
   const shadowedNonTestIds = new Set();
   const namespaces = new Set();
+  const defaultExportNamespaces = new Set();
+  const functionIds = new Set();
+  const stringIds = new Set();
+  const booleanIds = new Set();
 
   for (const stmt of sf.statements) {
     if (!ts.isImportDeclaration(stmt) || !stmt.importClause) {
@@ -169,12 +395,33 @@ function collectPlaywrightBindings(sf) {
     if (stmt.importClause.isTypeOnly) {
       continue;
     }
+    const specifier = ts.isStringLiteral(stmt.moduleSpecifier)
+      ? stmt.moduleSpecifier.text
+      : "";
+    const moduleHasDefaultTest = doesModuleDefaultExportTest(
+      specifier,
+      absFilePath,
+      visitedFiles,
+    );
+
+    if (stmt.importClause.name) {
+      const defaultLocal = stmt.importClause.name.text;
+      if (moduleHasDefaultTest) {
+        testIds.add(defaultLocal);
+      } else {
+        shadowedNonTestIds.add(defaultLocal);
+      }
+    }
+
     const namedBindings = stmt.importClause.namedBindings;
     if (!namedBindings) {
       continue;
     }
     if (ts.isNamespaceImport(namedBindings)) {
       namespaces.add(namedBindings.name.text);
+      if (moduleHasDefaultTest) {
+        defaultExportNamespaces.add(namedBindings.name.text);
+      }
       continue;
     }
     if (ts.isNamedImports(namedBindings)) {
@@ -184,7 +431,10 @@ function collectPlaywrightBindings(sf) {
         }
         const importedName = (spec.propertyName ?? spec.name).text;
         const localName = spec.name.text;
-        if (importedName === "test") {
+        if (
+          importedName === "test" ||
+          (importedName === "default" && moduleHasDefaultTest)
+        ) {
           testIds.add(localName);
         } else {
           shadowedNonTestIds.add(localName);
@@ -193,44 +443,65 @@ function collectPlaywrightBindings(sf) {
     }
   }
 
+  const varDecls = [];
+  const collectDecls = (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      functionIds.add(node.name.text);
+      if (node.name.text === "test") {
+        shadowedNonTestIds.add("test");
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      varDecls.push(node);
+    }
+    ts.forEachChild(node, collectDecls);
+  };
+  collectDecls(sf);
+
   if (!shadowedNonTestIds.has("test")) {
     testIds.add("test");
   }
 
-  const varDecls = [];
-  const collectVars = (node) => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
-      varDecls.push(node);
-    }
-    ts.forEachChild(node, collectVars);
+  const bindings = {
+    testIds,
+    namespaces,
+    defaultExportNamespaces,
+    functionIds,
+    stringIds,
+    booleanIds,
   };
-  collectVars(sf);
 
-  const bindings = { testIds, namespaces };
   let changed = true;
   while (changed) {
     changed = false;
     for (const decl of varDecls) {
       const localName = decl.name.text;
-      if (testIds.has(localName) || !decl.initializer) {
+      if (!decl.initializer) {
         continue;
       }
       const init = unwrapExpression(decl.initializer);
       if (!init) {
         continue;
       }
-      if (isTestRootExpression(init, bindings)) {
+      if (
+        !testIds.has(localName) &&
+        (isTestRootExpression(init, bindings) ||
+          isExtendCallOfTestRoot(init, bindings))
+      ) {
         testIds.add(localName);
         changed = true;
         continue;
       }
-      if (
-        ts.isCallExpression(init) &&
-        ts.isPropertyAccessExpression(init.expression) &&
-        init.expression.name.text === "extend" &&
-        isTestRootExpression(init.expression.expression, bindings)
-      ) {
-        testIds.add(localName);
+      if (!functionIds.has(localName) && isFunctionLike(init, bindings)) {
+        functionIds.add(localName);
+        changed = true;
+      }
+      if (!stringIds.has(localName) && isStringLike(init, bindings)) {
+        stringIds.add(localName);
+        changed = true;
+      }
+      if (!booleanIds.has(localName) && isBooleanLike(init, bindings)) {
+        booleanIds.add(localName);
         changed = true;
       }
     }
@@ -280,20 +551,62 @@ function classifyPlaywrightCall(callExpr, bindings, insideTestOrHook) {
     return "annotation";
   }
   const lastModifier = members.length > 0 ? members[members.length - 1] : null;
-  const firstArg = args[0];
-  const lastArg = args[args.length - 1];
   if (lastModifier && CONDITIONAL_MODIFIERS.has(lastModifier)) {
-    if (
-      isFunctionLike(lastArg) ||
-      (isStringLike(firstArg) &&
-        !isStringLike(lastArg) &&
-        unwrapExpression(lastArg)?.kind !== ts.SyntaxKind.UndefinedKeyword)
-    ) {
+    if (args.length >= 3) {
       return "declaration";
     }
-    return "annotation";
+    const firstArg = args[0];
+    const secondArg = args[1];
+    if (
+      (isBooleanLike(firstArg, bindings) ||
+        isFunctionLike(firstArg, bindings)) &&
+      !isFunctionLike(secondArg, bindings)
+    ) {
+      return "annotation";
+    }
+    if (
+      isStringLike(secondArg, bindings) ||
+      unwrapExpression(secondArg)?.kind === ts.SyntaxKind.UndefinedKeyword
+    ) {
+      return "annotation";
+    }
+    return "declaration";
   }
   return "declaration";
+}
+
+function getPlaywrightCallSite(sf, callExpr) {
+  const callee = unwrapExpression(callExpr.expression);
+  const targetNode = ts.isPropertyAccessExpression(callee)
+    ? callee.name
+    : callExpr;
+  const pos = sf.getLineAndCharacterOfPosition(targetNode.getStart(sf, false));
+  return `${pos.line + 1}:${pos.character + 1}`;
+}
+
+function countConciseDeclarationsInNode(rootNode, bindings, insideTestOrHook) {
+  let count = 0;
+  const walk = (node, inBody) => {
+    if (ts.isBlock(node)) {
+      return;
+    }
+    if (ts.isCallExpression(node)) {
+      const kind = classifyPlaywrightCall(node, bindings, inBody);
+      if (kind === "suite") {
+        return;
+      }
+      if (kind === "hook") {
+        return;
+      }
+      if (kind === "declaration") {
+        count += 1;
+        return;
+      }
+    }
+    ts.forEachChild(node, (child) => walk(child, inBody));
+  };
+  walk(rootNode, insideTestOrHook);
+  return count;
 }
 
 function extractAttachedLineComments(sourceText, statementStartPos) {
@@ -364,7 +677,12 @@ function validateCitationLine(commentLine, specIndex) {
   return `malformed // spec: citation '${target}'`;
 }
 
-export function validateSourceSpecAttribution(filePath, sourceText, specIndex) {
+export function validateSourceSpecAttribution(
+  filePath,
+  sourceText,
+  specIndex,
+  absFilePath = null,
+) {
   const sf = ts.createSourceFile(
     filePath,
     sourceText,
@@ -372,25 +690,59 @@ export function validateSourceSpecAttribution(filePath, sourceText, specIndex) {
     true,
     ts.ScriptKind.TS,
   );
-  const bindings = collectPlaywrightBindings(sf);
+  const bindings = collectPlaywrightBindings(sf, absFilePath);
   const errors = [];
+  const callSites = new Set();
   let testCount = 0;
 
-  const visit = (node, insideTestOrHook) => {
-    if (
-      ts.isExpressionStatement(node) &&
-      ts.isCallExpression(node.expression)
-    ) {
-      const kind = classifyPlaywrightCall(
-        node.expression,
-        bindings,
-        insideTestOrHook,
+  const visit = (node, insideTestOrHook, enclosingConciseStmt) => {
+    if (ts.isBlock(node)) {
+      ts.forEachChild(node, (child) => visit(child, insideTestOrHook, null));
+      return;
+    }
+
+    if (ts.isExpressionStatement(node)) {
+      const directCall = ts.isCallExpression(node.expression)
+        ? classifyPlaywrightCall(node.expression, bindings, insideTestOrHook)
+        : "other";
+      let nextConciseStmt = null;
+      if (
+        directCall !== "declaration" &&
+        directCall !== "suite" &&
+        directCall !== "hook" &&
+        countConciseDeclarationsInNode(
+          node.expression,
+          bindings,
+          insideTestOrHook,
+        ) === 1
+      ) {
+        nextConciseStmt = node;
+      }
+      ts.forEachChild(node, (child) =>
+        visit(child, insideTestOrHook, nextConciseStmt),
       );
+      return;
+    }
+
+    if (ts.isStatement(node) && !ts.isSourceFile(node)) {
+      ts.forEachChild(node, (child) => visit(child, insideTestOrHook, null));
+      return;
+    }
+
+    if (ts.isCallExpression(node)) {
+      const kind = classifyPlaywrightCall(node, bindings, insideTestOrHook);
       if (kind === "declaration") {
         testCount += 1;
-        const stmtStart = node.getStart(sf, false);
-        const { line } = sf.getLineAndCharacterOfPosition(stmtStart);
-        const comments = extractAttachedLineComments(sourceText, stmtStart);
+        callSites.add(getPlaywrightCallSite(sf, node));
+        const callStart = node.getStart(sf, false);
+        const { line } = sf.getLineAndCharacterOfPosition(callStart);
+        let comments = extractAttachedLineComments(sourceText, callStart);
+        if (comments.length === 0 && enclosingConciseStmt) {
+          comments = extractAttachedLineComments(
+            sourceText,
+            enclosingConciseStmt.getStart(sf, false),
+          );
+        }
         let validCitations = 0;
         for (const c of comments) {
           const err = validateCitationLine(c, specIndex);
@@ -408,19 +760,26 @@ export function validateSourceSpecAttribution(filePath, sourceText, specIndex) {
             `${filePath}:${line + 1}: Playwright test() missing attached '// spec:' or '//aip:verifies' citation`,
           );
         }
-        ts.forEachChild(node, (child) => visit(child, true));
+        ts.forEachChild(node, (child) => visit(child, true, null));
         return;
       }
       if (kind === "hook") {
-        ts.forEachChild(node, (child) => visit(child, true));
+        ts.forEachChild(node, (child) => visit(child, true, null));
+        return;
+      }
+      if (kind === "suite") {
+        ts.forEachChild(node, (child) => visit(child, insideTestOrHook, null));
         return;
       }
     }
-    ts.forEachChild(node, (child) => visit(child, insideTestOrHook));
+
+    ts.forEachChild(node, (child) =>
+      visit(child, insideTestOrHook, enclosingConciseStmt),
+    );
   };
 
-  visit(sf, false);
-  return { testCount, errors };
+  visit(sf, false, null);
+  return { testCount, errors, callSites };
 }
 
 function listE2eFiles(dir) {
@@ -439,6 +798,157 @@ function listE2eFiles(dir) {
   return found.sort();
 }
 
+function resolvePlaywrightCli(repoRoot) {
+  const localBin = path.join(
+    repoRoot,
+    "ui",
+    "node_modules",
+    ".bin",
+    "playwright",
+  );
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
+  const fallbackBin = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "node_modules",
+    ".bin",
+    "playwright",
+  );
+  return fs.existsSync(fallbackBin) ? fallbackBin : null;
+}
+
+export function collectPlaywrightListedSites(repoRoot) {
+  const playwrightBin = resolvePlaywrightCli(repoRoot);
+  if (!playwrightBin) {
+    return {
+      ok: false,
+      byFile: new Map(),
+      errors: [
+        "ui/e2e: Playwright CLI binary not found for --list verification",
+      ],
+    };
+  }
+
+  const uiDir = path.join(repoRoot, "ui");
+  const existingConfig = path.join(uiDir, "playwright.config.ts");
+  let tempConfigPath = null;
+  let configToUse = existingConfig;
+
+  if (!fs.existsSync(existingConfig)) {
+    tempConfigPath = path.join(
+      os.tmpdir(),
+      `bbops-pw-list-${process.pid}-${Date.now()}.config.mjs`,
+    );
+    const e2eTestDir = path.join(uiDir, "e2e");
+    fs.writeFileSync(
+      tempConfigPath,
+      `export default { testDir: ${JSON.stringify(e2eTestDir)}, testMatch: "**/*.e2e.ts" };\n`,
+      "utf8",
+    );
+    configToUse = tempConfigPath;
+  }
+
+  let rawJson = "";
+  try {
+    rawJson = execFileSync(
+      playwrightBin,
+      ["test", "-c", configToUse, "--list", "--reporter=json"],
+      {
+        cwd: fs.existsSync(uiDir) ? uiDir : repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch (err) {
+    const stdoutText =
+      err && typeof err === "object" && "stdout" in err && err.stdout
+        ? String(err.stdout)
+        : "";
+    if (stdoutText.trim().startsWith("{")) {
+      rawJson = stdoutText;
+    } else {
+      const stderrText =
+        err && typeof err === "object" && "stderr" in err && err.stderr
+          ? String(err.stderr).trim()
+          : String(err);
+      if (tempConfigPath) {
+        fs.rmSync(tempConfigPath, { force: true });
+      }
+      return {
+        ok: false,
+        byFile: new Map(),
+        errors: [`ui/e2e: playwright test --list failed: ${stderrText}`],
+      };
+    }
+  } finally {
+    if (tempConfigPath) {
+      fs.rmSync(tempConfigPath, { force: true });
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch (err) {
+    return {
+      ok: false,
+      byFile: new Map(),
+      errors: [
+        `ui/e2e: failed to parse playwright --list JSON: ${String(err)}`,
+      ],
+    };
+  }
+
+  const errors = [];
+  if (Array.isArray(parsed.errors)) {
+    for (const item of parsed.errors) {
+      const loc = item?.location
+        ? `${item.location.file}:${item.location.line}:${item.location.column}`
+        : "ui/e2e";
+      errors.push(`${loc}: ${item?.message ?? "Playwright collection error"}`);
+    }
+  }
+
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const rootDir = parsed?.config?.rootDir
+    ? path.resolve(parsed.config.rootDir)
+    : path.join(repoRoot, "ui", "e2e");
+  const byFile = new Map();
+
+  const walkSuite = (suite) => {
+    for (const spec of suite?.specs ?? []) {
+      const candidateAbs = path.resolve(rootDir, spec.file);
+      const realSpecPath = fs.existsSync(candidateAbs)
+        ? fs.realpathSync(candidateAbs)
+        : candidateAbs;
+      const relFile = path
+        .relative(realRepoRoot, realSpecPath)
+        .split(path.sep)
+        .join("/");
+      let fileMap = byFile.get(relFile);
+      if (!fileMap) {
+        fileMap = new Map();
+        byFile.set(relFile, fileMap);
+      }
+      const key = `${spec.line}:${spec.column}`;
+      if (!fileMap.has(key)) {
+        fileMap.set(key, spec.title);
+      }
+    }
+    for (const child of suite?.suites ?? []) {
+      walkSuite(child);
+    }
+  };
+
+  for (const topSuite of parsed?.suites ?? []) {
+    walkSuite(topSuite);
+  }
+
+  return { ok: errors.length === 0, byFile, errors };
+}
+
 export function validateRepoE2eAttribution(repoRoot) {
   const specIndex = loadOpenSpecIndex(repoRoot);
   const e2eDir = path.join(repoRoot, "ui", "e2e");
@@ -451,15 +961,19 @@ export function validateRepoE2eAttribution(repoRoot) {
     };
   }
   const allErrors = [];
+  const astSitesByFile = new Map();
   let totalTests = 0;
+
   for (const absFile of files) {
     const relFile = path.relative(repoRoot, absFile).split(path.sep).join("/");
     const text = fs.readFileSync(absFile, "utf8");
-    const { testCount, errors } = validateSourceSpecAttribution(
+    const { testCount, errors, callSites } = validateSourceSpecAttribution(
       relFile,
       text,
       specIndex,
+      absFile,
     );
+    astSitesByFile.set(relFile, callSites);
     if (testCount === 0) {
       allErrors.push(
         `${relFile}: zero Playwright test() declarations discovered in *.e2e.ts`,
@@ -468,9 +982,40 @@ export function validateRepoE2eAttribution(repoRoot) {
     totalTests += testCount;
     allErrors.push(...errors);
   }
+
   if (totalTests === 0) {
     allErrors.push("ui/e2e: zero test() declarations discovered in *.e2e.ts");
   }
+
+  // Independent oracle: cross-check AST declaration locations against Playwright's own test collector (`--list --reporter=json`).
+  const listed = collectPlaywrightListedSites(repoRoot);
+  allErrors.push(...listed.errors);
+  if (listed.ok) {
+    for (const absFile of files) {
+      const relFile = path
+        .relative(repoRoot, absFile)
+        .split(path.sep)
+        .join("/");
+      const collectedSites = listed.byFile.get(relFile);
+      if (!collectedSites || collectedSites.size === 0) {
+        if (!allErrors.some((e) => e.startsWith(`${relFile}:`))) {
+          allErrors.push(
+            `${relFile}: Playwright '--list' collected zero test declarations`,
+          );
+        }
+        continue;
+      }
+      const astSites = astSitesByFile.get(relFile) ?? new Set();
+      for (const [siteKey, title] of collectedSites.entries()) {
+        if (!astSites.has(siteKey)) {
+          allErrors.push(
+            `${relFile}:${siteKey}: Playwright collected test '${title}' via an unrecognized or unattributed declaration form`,
+          );
+        }
+      }
+    }
+  }
+
   return {
     ok: allErrors.length === 0,
     testCount: totalTests,
@@ -601,7 +1146,19 @@ scenario.describe("conditional suite", () => {
   assert.equal(spacedAipRes.errors.length >= 1, true);
   assert.match(spacedAipRes.errors[0], /malformed spaced/);
 
-  // Per-file zero-declaration gate: a second *.e2e.ts with 0 discovered tests must fail closed even when another *.e2e.ts has valid tests.
+  const pwModuleAbs = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "node_modules",
+    "@playwright",
+    "test",
+  );
+
+  // Full repo + Playwright `--list` oracle self-tests covering:
+  // 1) per-file zero-declaration gate,
+  // 2) expression-body declarations (`["boat", "rover"].forEach(name => test(name, async () => {}))`) failing uncited then passing cited,
+  // 3) default-imported test (`import scenario from ...`) + `scenario.skip(title, body)` with named values failing uncited then passing cited,
+  // 4) unrecognized indirect declaration caught by Playwright `--list` location oracle.
   const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), "bbops-e2e-spec-"));
   try {
     fs.mkdirSync(path.join(tmpRepo, "openspec", "specs", "cop-ui"), {
@@ -612,22 +1169,141 @@ scenario.describe("conditional suite", () => {
       "### Requirement: Full-stack browser E2E requirement\n#### Scenario: LiveBrowserSync\n",
       "utf8",
     );
-    fs.mkdirSync(path.join(tmpRepo, "ui", "e2e"), { recursive: true });
+    const tmpE2eDir = path.join(tmpRepo, "ui", "e2e");
+    fs.mkdirSync(tmpE2eDir, { recursive: true });
     fs.writeFileSync(
-      path.join(tmpRepo, "ui", "e2e", "valid.e2e.ts"),
-      `import { test } from "./fixtures";\n// spec: cop-ui / Full-stack browser E2E requirement\ntest("valid", async () => {});\n`,
+      path.join(tmpE2eDir, "local-default.ts"),
+      `import pwTest from ${JSON.stringify(pwModuleAbs)};\nexport default pwTest;\n`,
+      "utf8",
+    );
+
+    // Case A: empty *.e2e.ts alongside a valid *.e2e.ts fails closed.
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "valid.e2e.ts"),
+      `import { test } from ${JSON.stringify(pwModuleAbs)};\n// spec: cop-ui / Full-stack browser E2E requirement\ntest("valid", async () => {});\n`,
       "utf8",
     );
     fs.writeFileSync(
-      path.join(tmpRepo, "ui", "e2e", "empty.e2e.ts"),
+      path.join(tmpE2eDir, "empty.e2e.ts"),
       `export const helperOnly = 42;\n`,
       "utf8",
     );
-    const repoRes = validateRepoE2eAttribution(tmpRepo);
-    assert.equal(repoRes.ok, false);
+    const emptyRepoRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(emptyRepoRes.ok, false);
     assert.equal(
-      repoRes.errors.some((e) =>
+      emptyRepoRes.errors.some((e) =>
         e.includes("ui/e2e/empty.e2e.ts: zero Playwright test() declarations"),
+      ),
+      true,
+    );
+    fs.rmSync(path.join(tmpE2eDir, "empty.e2e.ts"));
+
+    // Case B: mixed file with cited baseline + uncited expression-body forEach declaration fails closed, then passes once cited.
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "foreach.e2e.ts"),
+      [
+        `import { test } from ${JSON.stringify(pwModuleAbs)};`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `test("cited baseline", async () => {});`,
+        `["boat", "rover"].forEach((name) => test(name, async () => {}));`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const uncitedForEachListed = collectPlaywrightListedSites(tmpRepo);
+    assert.equal(uncitedForEachListed.ok, true);
+    assert.equal(
+      uncitedForEachListed.byFile.get("ui/e2e/foreach.e2e.ts")?.size,
+      2,
+    );
+    const uncitedForEachRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(uncitedForEachRes.ok, false);
+    assert.equal(
+      uncitedForEachRes.errors.some(
+        (e) =>
+          e.includes("ui/e2e/foreach.e2e.ts:4:") &&
+          e.includes("missing attached"),
+      ),
+      true,
+    );
+
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "foreach.e2e.ts"),
+      [
+        `import { test } from ${JSON.stringify(pwModuleAbs)};`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `test("cited baseline", async () => {});`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `["boat", "rover"].forEach((name) => test(name, async () => {}));`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const citedForEachRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(citedForEachRes.ok, true, citedForEachRes.errors.join("\n"));
+
+    // Case C: default-imported test (both package default and relative module default) + test.skip(title, body) with named values fails uncited, then passes cited.
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "default-named.e2e.ts"),
+      [
+        `import pkgDefaultTest from ${JSON.stringify(pwModuleAbs)};`,
+        `import localDefaultTest from "./local-default";`,
+        `const skippedTitlePkg = "named package skip title";`,
+        `const skippedTitleLocal = "named relative skip title";`,
+        `const skippedBody = async () => {};`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `pkgDefaultTest("cited default baseline", async () => {});`,
+        `pkgDefaultTest.skip(skippedTitlePkg, skippedBody);`,
+        `localDefaultTest.skip(skippedTitleLocal, skippedBody);`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const uncitedDefaultRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(uncitedDefaultRes.ok, false);
+    assert.equal(
+      uncitedDefaultRes.errors.filter((e) =>
+        e.includes("ui/e2e/default-named.e2e.ts"),
+      ).length,
+      2,
+    );
+
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "default-named.e2e.ts"),
+      [
+        `import pkgDefaultTest from ${JSON.stringify(pwModuleAbs)};`,
+        `import localDefaultTest from "./local-default";`,
+        `const skippedTitlePkg = "named package skip title";`,
+        `const skippedTitleLocal = "named relative skip title";`,
+        `const skippedBody = async () => {};`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `pkgDefaultTest("cited default baseline", async () => {});`,
+        `//aip:verifies LiveBrowserSync`,
+        `pkgDefaultTest.skip(skippedTitlePkg, skippedBody);`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `localDefaultTest.skip(skippedTitleLocal, skippedBody);`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const citedDefaultRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(citedDefaultRes.ok, true, citedDefaultRes.errors.join("\n"));
+
+    // Case D: dynamic/unsupported wrapper hiding test() from static AST still fails closed via Playwright's `--list` location oracle.
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "dynamic.e2e.ts"),
+      [
+        `import { test } from ${JSON.stringify(pwModuleAbs)};`,
+        `const bag = { run: test };`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `test("cited baseline", async () => {});`,
+        `bag.run("hidden dynamic declaration", async () => {});`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const dynamicRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(dynamicRes.ok, false);
+    assert.equal(
+      dynamicRes.errors.some(
+        (e) =>
+          e.includes("ui/e2e/dynamic.e2e.ts:5:") &&
+          e.includes("unrecognized or unattributed declaration form"),
       ),
       true,
     );
