@@ -72,10 +72,10 @@
     label: string;
     keycap: string;
   }> = [
-    { mode: "cop", label: "COP", keycap: "G" },
-    { mode: "pilot", label: "Pilot", keycap: "D" },
-    { mode: "bench", label: "Bench", keycap: "B" },
-    { mode: "cortex", label: "Cortex", keycap: "K" },
+    { mode: "cop", label: "Fleet", keycap: "G" },
+    { mode: "pilot", label: "Vehicle", keycap: "D" },
+    { mode: "bench", label: "Diagnostics", keycap: "B" },
+    { mode: "cortex", label: "Analysis", keycap: "K" },
   ];
 
   function selectWorkspace(mode: WorkspaceMode): void {

@@ -788,7 +788,8 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       resolveHeldLexical = res;
     });
 
-    let fetchMode: "held-lexical" | "throw-error" | "duplicate-hybrid" =
+    let fetchMode:
+      "held-lexical" | "throw-error" | "throw-string" | "duplicate-hybrid" =
       "held-lexical";
 
     const mockGraphql: GraphQLClient = {
@@ -816,6 +817,9 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
         }
         if (fetchMode === "throw-error") {
           throw new TypeError("Failed to fetch");
+        }
+        if (fetchMode === "throw-string") {
+          throw "non-error rejection";
         }
         const body = JSON.parse(String(init?.body ?? "{}"));
         if (body.verb === "globalSearch" || body.verb === "localSearch") {
@@ -892,6 +896,10 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       },
     });
     flushSync();
+
+    expect(
+      hostEl.querySelector(".tier-pills")?.getAttribute("aria-label"),
+    ).toBe("Analysis SKG query tier");
 
     // 1. Submit Lexical, click Semantic while Lexical is held in flight, then release Lexical reply.
     // Single submission MUST NOT call entitiesByPredicate!
@@ -1003,6 +1011,19 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
     expect(
       hostEl.querySelector('[data-testid="cortex-citation-list"]')?.textContent,
     ).not.toContain("idx#25");
+
+    // Non-Error rejection uses updated "Analysis query failed" fallback copy.
+    fetchMode = "throw-string";
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() => {
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent,
+      ).toBe("Analysis query failed");
+    });
 
     // 3. Duplicate-ID Hybrid match (lexical score 1.4 @ idx#21 vs neural score 3.85 @ idx#34):
     // winning badge ("semantic"), score ("3.850"), AND citation revision ("idx#34") come from the same winning hit!

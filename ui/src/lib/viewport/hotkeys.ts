@@ -89,11 +89,11 @@ export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
 
 /**
  * Handles view-only workspace and COP tactical viewport hotkeys:
- * - G: switch to COP workspace ("cop")
- * - D: switch to Pilot workspace ("pilot")
- * - B: switch to Bench workspace ("bench")
- * - K: switch to Cortex workspace ("cortex")
- * - M: toggle Pilot layout ("map" <-> "split") when in Pilot workspace
+ * - G: switch to Fleet workspace ("cop")
+ * - D: switch to Vehicle workspace ("pilot")
+ * - B: switch to Diagnostics workspace ("bench")
+ * - K: switch to Analysis workspace ("cortex")
+ * - M: toggle Vehicle layout ("map" <-> "split") when in Vehicle workspace
  * - Tab: toggle Lights-Out chrome mode ONLY when an interactive viewport surface
  *   (`[data-viewport-hotkey-scope="true"]`) is explicitly focused, preserving
  *   normal Tab traversal from page entry and between toolbar/form controls

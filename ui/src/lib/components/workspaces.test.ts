@@ -125,6 +125,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
 
     viewportStore.selectEntity(quad1.id);
 
+    const syncedHashes: string[] = [];
     const hostEl = document.createElement("div");
     document.body.appendChild(hostEl);
     const app = mount(WorkspaceShell, {
@@ -133,8 +134,114 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
         telemetryStore,
         skgStore,
         viewportStore,
+        onSyncHash: (hash) => syncedHashes.push(hash),
       },
     });
+    flushSync();
+
+    // Navigation displays Fleet, Vehicle, Diagnostics, and Analysis in order while preserving mode IDs and keycaps.
+    const navButtons = Array.from(
+      hostEl.querySelectorAll<HTMLButtonElement>(
+        '.workspace-switcher [data-testid^="workspace-tab-"]',
+      ),
+    );
+    expect(
+      navButtons.map((btn) => ({
+        testId: btn.getAttribute("data-testid"),
+        label: btn.querySelector("span")?.textContent?.trim(),
+        keycap: btn.querySelector("kbd")?.textContent?.trim(),
+      })),
+    ).toEqual([
+      { testId: "workspace-tab-cop", label: "Fleet", keycap: "G" },
+      { testId: "workspace-tab-pilot", label: "Vehicle", keycap: "D" },
+      { testId: "workspace-tab-bench", label: "Diagnostics", keycap: "B" },
+      { testId: "workspace-tab-cortex", label: "Analysis", keycap: "K" },
+    ]);
+
+    // Fleet Solo-Mode inspector exposes updated accessible labels and cross-workspace jump actions.
+    expect(
+      hostEl
+        .querySelector('[data-testid="cop-solo-rail"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("Fleet Solo-Mode inspector");
+    expect(
+      hostEl.querySelector('[role="tablist"]')?.getAttribute("aria-label"),
+    ).toBe("Fleet inspector sections");
+
+    const summaryJumpBtns = Array.from(
+      hostEl.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="cop-solo-panel-summary"] .jump-btn',
+      ),
+    );
+    expect(summaryJumpBtns.map((btn) => btn.textContent?.trim())).toEqual([
+      "Vehicle [D]",
+      "Diagnostics [B]",
+      "Analysis [K]",
+    ]);
+
+    // Cross-workspace jump buttons navigate to the intended workspace and preserve #mode= URL tokens.
+    summaryJumpBtns[0]!.click();
+    flushSync();
+    expect(viewportStore.workspace).toBe("pilot");
+    expect(syncedHashes.at(-1)).toContain("mode=pilot");
+    expect(
+      hostEl.querySelector(".pilot-mode-label")?.textContent?.trim(),
+    ).toContain("VEHICLE WORKSPACE");
+
+    viewportStore.setWorkspace("cop");
+    flushSync();
+    (
+      hostEl.querySelector(
+        '[data-testid="cop-solo-panel-summary"] .jump-btn:nth-child(2)',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+    expect(viewportStore.workspace).toBe("bench");
+    expect(syncedHashes.at(-1)).toContain("mode=bench");
+
+    viewportStore.setWorkspace("cop");
+    flushSync();
+    (
+      hostEl.querySelector(
+        '[data-testid="cop-solo-tab-skg"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+    const openAnalysisBtn = hostEl.querySelector(
+      '[data-testid="cop-solo-panel-skg"] .jump-btn',
+    ) as HTMLButtonElement;
+    expect(openAnalysisBtn.textContent?.trim()).toBe("Open Analysis [K]");
+    openAnalysisBtn.click();
+    flushSync();
+    expect(viewportStore.workspace).toBe("cortex");
+    expect(syncedHashes.at(-1)).toContain("mode=cortex");
+
+    // External contact summary in Fleet links to "Inspect Provenance in Analysis [K]" while keeping domain COP label intact.
+    viewportStore.setWorkspace("cop");
+    viewportStore.selectEntity(contactId);
+    flushSync();
+    (
+      hostEl.querySelector(
+        '[data-testid="cop-solo-tab-summary"]',
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+    const contactJumpBtn = hostEl.querySelector(
+      '[data-testid="cop-contact-summary"] .jump-btn',
+    ) as HTMLButtonElement;
+    expect(contactJumpBtn.textContent?.trim()).toBe(
+      "Inspect Provenance in Analysis [K]",
+    );
+    expect(
+      hostEl
+        .querySelector('[data-testid="external-contact-banner"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("External COP contact provenance");
+    contactJumpBtn.click();
+    flushSync();
+    expect(viewportStore.workspace).toBe("cortex");
+
+    viewportStore.selectEntity(quad1.id);
     flushSync();
 
     // Switch through all 4 workspaces and verify unselected UXS #2 fault stays visible in topbar with zero WS reconnects.

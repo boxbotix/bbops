@@ -245,7 +245,7 @@ async function locateSigmaNodeViaWebGLPicking(
 test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification", () => {
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
   // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
-  test("streams live multi-domain dual-WebSocket telemetry and SKG state across COP, Pilot, Cortex, and Bench workspaces", async ({
+  test("streams live multi-domain dual-WebSocket telemetry and SKG state across Fleet, Vehicle, Analysis, and Diagnostics workspaces", async ({
     copStack,
   }) => {
     const { page, info } = copStack;
@@ -267,6 +267,39 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(page.locator(".stream-pill").nth(1)).toContainText("synced", {
       timeout: 15_000,
     });
+
+    // Verify approved workspace labels (Fleet, Vehicle, Diagnostics, Analysis) expose accessible names and render unclipped at 1440x900 and 1024x768.
+    const workspaceNav = page.getByRole("navigation", {
+      name: "Task workspaces",
+    });
+    const fleetTab = workspaceNav.getByRole("button", { name: /^Fleet\b/ });
+    const vehicleTab = workspaceNav.getByRole("button", { name: /^Vehicle\b/ });
+    const diagnosticsTab = workspaceNav.getByRole("button", {
+      name: /^Diagnostics\b/,
+    });
+    const analysisTab = workspaceNav.getByRole("button", {
+      name: /^Analysis\b/,
+    });
+    const workspaceTabs = [fleetTab, vehicleTab, diagnosticsTab, analysisTab];
+
+    for (const vp of [
+      { width: 1024, height: 768 },
+      { width: 1440, height: 900 },
+    ] as const) {
+      await page.setViewportSize(vp);
+      await assertZeroPairwiseOverlapWithinParent(workspaceNav, workspaceTabs);
+      for (const tab of workspaceTabs) {
+        const clipped = await tab.evaluate((el) => {
+          const btn = el as HTMLElement;
+          const span = btn.querySelector("span") as HTMLElement | null;
+          return (
+            btn.scrollWidth > btn.clientWidth + 1 ||
+            (span ? span.scrollWidth > span.clientWidth + 1 : false)
+          );
+        });
+        expect(clipped).toBe(false);
+      }
+    }
 
     // 2. COP TacticalCanvas DPR=2 layers paint non-blank NED grid & vehicle glyphs, and concentric range-ring labels clear .viewport-toolbar.
     await expect
@@ -396,6 +429,21 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(page.getByTestId("cop-solo-panel-summary")).toContainText(
       "UXS #1",
     );
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Vehicle [D]" }),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Diagnostics [B]" }),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByTestId("cop-solo-panel-summary")
+        .getByRole("button", { name: "Analysis [K]" }),
+    ).toBeVisible();
 
     // Exercise COP canvas double-click tether plus keyboard hotkeys T (Tether), C (Chase), H (Declutter), and Escape (Clear).
     const tetherBtn = page.getByRole("button", { name: "Tether [T]" });
@@ -441,13 +489,16 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(authBanner).toContainText("UXS #2 · rover");
     expect(new URL(page.url()).hash).not.toContain("tether=");
 
-    // 4. Switch to Pilot [D], select UXS #1 via FleetFilmstrip [1], and verify DPR=2 horizon, [M] split swap, and zero-overlap readouts.
+    // 4. Switch to Vehicle [D], select UXS #1 via FleetFilmstrip [1], and verify DPR=2 horizon, [M] split swap, and zero-overlap readouts.
     await page.keyboard.press("1");
     await expect(authBanner).toContainText("UXS #1 · quadcopter");
     await page.keyboard.press("d");
     await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
       "data-workspace",
       "pilot",
+    );
+    await expect(page.locator(".pilot-mode-label")).toContainText(
+      "VEHICLE WORKSPACE",
     );
     await expect(page.getByTestId("pilot-map-primary")).toBeVisible();
 
