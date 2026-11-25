@@ -223,9 +223,13 @@
     <aside
       class="cop-solo-rail"
       data-testid="cop-solo-rail"
-      aria-label="COP Solo-Mode inspector"
+      aria-label="Fleet Solo-Mode inspector"
     >
-      <div class="solo-tabs" role="tablist" aria-label="COP inspector sections">
+      <div
+        class="solo-tabs"
+        role="tablist"
+        aria-label="Fleet inspector sections"
+      >
         <button
           type="button"
           role="tab"
@@ -306,21 +310,21 @@
                 class="jump-btn"
                 onclick={() => switchWorkspace("pilot")}
               >
-                Pilot [D]
+                Vehicle [D]
               </button>
               <button
                 type="button"
                 class="jump-btn"
                 onclick={() => switchWorkspace("bench")}
               >
-                Bench [B]
+                Diagnostics [B]
               </button>
               <button
                 type="button"
                 class="jump-btn"
                 onclick={() => switchWorkspace("cortex")}
               >
-                Cortex [K]
+                Analysis [K]
               </button>
             </div>
           {:else if contactSummary}
@@ -365,7 +369,7 @@
                   class="jump-btn"
                   onclick={() => switchWorkspace("cortex")}
                 >
-                  Inspect Provenance in Cortex [K]
+                  Inspect Provenance in Analysis [K]
                 </button>
               </div>
             </div>
@@ -441,7 +445,7 @@
                 class="jump-btn"
                 onclick={() => switchWorkspace("cortex")}
               >
-                Open Cortex [K]
+                Open Analysis [K]
               </button>
             </div>
             <ul class="triple-list">

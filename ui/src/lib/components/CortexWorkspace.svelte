@@ -375,7 +375,7 @@
         damagedEntities = 0;
         answerSummary = null;
         errorBanner =
-          err instanceof Error ? err.message : "Cortex query failed";
+          err instanceof Error ? err.message : "Analysis query failed";
       }
     } finally {
       if (activeSearchController === controller) {
@@ -603,7 +603,7 @@
     data-testid="cortex-query-bar"
     onsubmit={executeSearch}
   >
-    <div class="tier-pills" role="group" aria-label="Cortex SKG query tier">
+    <div class="tier-pills" role="group" aria-label="Analysis SKG query tier">
       {#each CORTEX_QUERY_TIERS as tier (tier)}
         <button
           type="button"

@@ -118,7 +118,7 @@
     <div class="pilot-toolbar">
       <div class="pilot-toolbar-left">
         <span class="pilot-mode-label">
-          PILOT STAGE ·
+          VEHICLE WORKSPACE ·
           {viewportStore.pilotLayout === "map"
             ? "MAP-PRIMARY + ATTITUDE PIP"
             : "50/50 PFD + MAP SPLIT"}
