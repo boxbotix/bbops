@@ -926,6 +926,54 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     );
     await expect(page.getByTestId("fleet-nominal-badge")).toHaveCount(0);
 
+    // Empty fleet: every Fleet tab resolves aria-controls to its mounted tabpanel, Tab enters the read-only panel (never BODY), and Shift+Tab returns to the active tab.
+    await page.getByTestId("cop-solo-tab-summary").focus();
+    for (const [tabTestId, panelId, stepAfter] of [
+      ["cop-solo-tab-summary", "cop-solo-panel-summary", "ArrowRight"],
+      ["cop-solo-tab-alerts", "cop-solo-panel-alerts", "ArrowRight"],
+      ["cop-solo-tab-skg", "cop-solo-panel-skg", "Home"],
+    ] as const) {
+      const tabLoc = page.getByTestId(tabTestId);
+      await expect(tabLoc).toBeFocused();
+      const panelCheck = await page.evaluate(() => {
+        const ids = [
+          "cop-solo-tab-summary",
+          "cop-solo-tab-alerts",
+          "cop-solo-tab-skg",
+        ];
+        const panels = ids.map((id) => {
+          const tab = document.getElementById(id);
+          const ctrl = tab?.getAttribute("aria-controls") ?? "";
+          const panel = document.getElementById(ctrl);
+          return {
+            tabId: id,
+            panelId: panel?.id ?? null,
+            labelledBy: panel?.getAttribute("aria-labelledby") ?? null,
+            exposed: Boolean(
+              panel &&
+              !panel.hidden &&
+              window.getComputedStyle(panel).display !== "none",
+            ),
+          };
+        });
+        return {
+          allResolved: panels.every(
+            (p) => p.panelId !== null && p.labelledBy === p.tabId,
+          ),
+          exposedIds: panels.filter((p) => p.exposed).map((p) => p.panelId),
+        };
+      });
+      expect(panelCheck).toEqual({
+        allResolved: true,
+        exposedIds: [panelId],
+      });
+      await page.keyboard.press("Tab");
+      await expect(page.locator(`#${panelId}`)).toBeFocused();
+      await page.keyboard.press("Shift+Tab");
+      await expect(tabLoc).toBeFocused();
+      await page.keyboard.press(stepAfter);
+    }
+
     // 3. Simulated upstream drop across both WebSockets -> RECONNECTING FLEET DATA…, never FLEET NOMINAL.
     dropImmediately = true;
     for (const sock of [...heldTelemetrySockets, ...heldGraphSockets]) {
@@ -1060,18 +1108,74 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
     await expect(page.getByTestId("cop-roster")).toBeVisible();
 
-    // 3. Fleet inspector tablist: single Tab stop, Arrow/Home/End activation, and panel unmount focus recovery.
-    await page.keyboard.press("1");
+    // 3. Fleet inspector tablist: all 3 aria-controls targets stay mounted, read-only panels expose tabindex="0", and focus recovers on unmount.
     const summaryTab = page.getByTestId("cop-solo-tab-summary");
     const alertsTab = page.getByTestId("cop-solo-tab-alerts");
     const skgTab = page.getByTestId("cop-solo-tab-skg");
 
+    const assertMountedPanels = async (expectedExposedId: string) => {
+      const state = await page.evaluate(() => {
+        const ids = [
+          "cop-solo-tab-summary",
+          "cop-solo-tab-alerts",
+          "cop-solo-tab-skg",
+        ];
+        const entries = ids.map((id) => {
+          const tab = document.getElementById(id);
+          const ctrl = tab?.getAttribute("aria-controls") ?? "";
+          const panel = document.getElementById(ctrl);
+          return {
+            tabId: id,
+            panelId: panel?.id ?? null,
+            role: panel?.getAttribute("role") ?? null,
+            labelledBy: panel?.getAttribute("aria-labelledby") ?? null,
+            exposed: Boolean(
+              panel &&
+              !panel.hidden &&
+              window.getComputedStyle(panel).display !== "none",
+            ),
+          };
+        });
+        return {
+          allResolved: entries.every(
+            (e) =>
+              e.panelId !== null &&
+              e.role === "tabpanel" &&
+              e.labelledBy === e.tabId,
+          ),
+          exposedIds: entries.filter((e) => e.exposed).map((e) => e.panelId),
+        };
+      });
+      expect(state).toEqual({
+        allResolved: true,
+        exposedIds: [expectedExposedId],
+      });
+    };
+
+    // Healthy fleet with no entity selected & 0 exceptions: Tab enters each read-only tabpanel (never BODY) and Shift+Tab returns to active tab.
+    await summaryTab.focus();
+    for (const [tabLoc, panelId, nextKey] of [
+      [summaryTab, "cop-solo-panel-summary", "ArrowRight"],
+      [alertsTab, "cop-solo-panel-alerts", "ArrowRight"],
+      [skgTab, "cop-solo-panel-skg", "Home"],
+    ] as const) {
+      await expect(tabLoc).toBeFocused();
+      await assertMountedPanels(panelId);
+      await page.keyboard.press("Tab");
+      await expect(page.locator(`#${panelId}`)).toBeFocused();
+      await page.keyboard.press("Shift+Tab");
+      await expect(tabLoc).toBeFocused();
+      await page.keyboard.press(nextKey);
+    }
+
+    await page.keyboard.press("1");
     await summaryTab.focus();
     await expect(summaryTab).toHaveAttribute("tabindex", "0");
     await expect(alertsTab).toHaveAttribute("tabindex", "-1");
     await expect(skgTab).toHaveAttribute("tabindex", "-1");
+    await assertMountedPanels("cop-solo-panel-summary");
 
-    // Single Tab stop: pressing Tab from active Summary tab skips inactive tabs and lands inside Summary tabpanel.
+    // Single Tab stop: when Summary contains focusable buttons, pressing Tab skips inactive tabs and lands directly on the first jump button.
     await page.keyboard.press("Tab");
     await expect(
       page
@@ -1090,23 +1194,31 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     ).toHaveCount(0);
     await expect(summaryTab).toBeFocused();
 
+    // With UXS #1 selected in a healthy fleet (0 exceptions), Exceptions panel is still read-only -> Tab enters cop-solo-panel-alerts and Shift+Tab returns to alertsTab.
     await page.keyboard.press("1");
     await summaryTab.focus();
     await page.keyboard.press("ArrowRight");
     await expect(alertsTab).toBeFocused();
     await expect(alertsTab).toHaveAttribute("aria-selected", "true");
-    await expect(page.getByTestId("cop-solo-panel-alerts")).toHaveAttribute(
-      "role",
-      "tabpanel",
-    );
+    await assertMountedPanels("cop-solo-panel-alerts");
+    await page.keyboard.press("Tab");
+    await expect(page.getByTestId("cop-solo-panel-alerts")).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(alertsTab).toBeFocused();
 
     await page.keyboard.press("End");
     await expect(skgTab).toBeFocused();
     await expect(skgTab).toHaveAttribute("aria-selected", "true");
+    await assertMountedPanels("cop-solo-panel-skg");
+
+    await page.keyboard.press("ArrowLeft");
+    await expect(alertsTab).toBeFocused();
+    await assertMountedPanels("cop-solo-panel-alerts");
 
     await page.keyboard.press("Home");
     await expect(summaryTab).toBeFocused();
     await expect(summaryTab).toHaveAttribute("aria-selected", "true");
+    await assertMountedPanels("cop-solo-panel-summary");
 
     // 4. Cross-workspace jump button focuses destination stage (not document.body), and Bench/Cortex canvases preserve Tab order.
     await page.keyboard.press("Tab");
@@ -1158,7 +1270,7 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     );
     await expect(lightsOutBtn).toHaveAttribute("aria-pressed", "false");
 
-    // 5. Direct topbar click preserves button focus; disabling character shortcuts persists across reload while keeping Escape active.
+    // 5. Direct topbar click preserves button focus; declutter group describes H cycle only while shortcuts are enabled; Shortcuts: Off persists across reload.
     await fleetNavBtn.click();
     await expect(fleetNavBtn).toBeFocused();
     await expect(fleetNavBtn).toHaveAttribute("aria-current", "page");
@@ -1169,6 +1281,53 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
       .getByTestId("viewport-toolbar")
       .getByRole("button", { name: /^Tether\b/ });
     await expect(tetherRegularBtn).toHaveAttribute("aria-pressed", "true");
+
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Accessibility.enable");
+    const readDeclutterAx = async () => {
+      const { nodes } = await cdp.send("Accessibility.getFullAXTree");
+      const groupNode = nodes.find(
+        (n) => n.role?.value === "group" && n.name?.value === "HUD declutter",
+      );
+      const levelButtons = ["none", "minimal", "tactical"].map((lvl) => {
+        const btn = nodes.find(
+          (n) => n.role?.value === "button" && n.name?.value === lvl,
+        );
+        const keyshortcuts =
+          btn?.properties?.find((p) => p.name === "keyshortcuts")?.value
+            ?.value ?? null;
+        return {
+          name: lvl,
+          description: btn?.description?.value ?? "",
+          keyshortcuts,
+        };
+      });
+      return {
+        groupDescription: groupNode?.description?.value ?? "",
+        levelButtons,
+      };
+    };
+
+    expect(await readDeclutterAx()).toEqual({
+      groupDescription: "Press H to cycle HUD declutter levels",
+      levelButtons: [
+        {
+          name: "none",
+          description: "HUD declutter: none",
+          keyshortcuts: null,
+        },
+        {
+          name: "minimal",
+          description: "HUD declutter: minimal",
+          keyshortcuts: null,
+        },
+        {
+          name: "tactical",
+          description: "HUD declutter: tactical",
+          keyshortcuts: null,
+        },
+      ],
+    });
 
     const shortcutsBtn = page.getByTestId("character-shortcuts-toggle");
     await expect(shortcutsBtn).toHaveText("Shortcuts: On");
@@ -1186,6 +1345,28 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
         .getByTestId("viewport-toolbar")
         .getByRole("button", { name: "Tether", exact: true }),
     ).toBeVisible();
+
+    expect(await readDeclutterAx()).toEqual({
+      groupDescription: "",
+      levelButtons: [
+        {
+          name: "none",
+          description: "HUD declutter: none",
+          keyshortcuts: null,
+        },
+        {
+          name: "minimal",
+          description: "HUD declutter: minimal",
+          keyshortcuts: null,
+        },
+        {
+          name: "tactical",
+          description: "HUD declutter: tactical",
+          keyshortcuts: null,
+        },
+      ],
+    });
+    await cdp.detach();
 
     // Character keys are ignored when off; Escape still clears camera tether.
     for (const key of ["d", "b", "k", "l", "2", "c", "h"]) {
