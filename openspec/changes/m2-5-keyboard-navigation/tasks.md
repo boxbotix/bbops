@@ -1,6 +1,6 @@
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval (`OQ1`–`OQ3` rulings + `Approved-by: <name> (<YYYY-MM-DD>) sha256:<12 hex>` in `proposal.md`) (premise: `.agents/protocol.md:17`, `.agents/contracts/architect.md:3-6`). Check: `ateam state spec-check` exits `0` and `ateam state spec-queue` reports zero active holds.
+- [x] 1.1 Owner approved `sha256:a64a644f3a8c` (`2026-11-25`) and ruled **Option A** on `OQ1` (single-key `L` + `Lights-Out <kbd>L</kbd>`, gated with character-only shortcuts), `OQ2` (`ViewportStore.characterShortcutsEnabled` persisted in `localStorage`, `Escape` untether kept active, `<kbd>` / `[X]` hints hidden when off), and `OQ3` (automatic roving `tablist` activation on `ArrowLeft`/`ArrowRight`/`Home`/`End` + focus destination workspace stage on hotkey/jump switches) (premise: `.agents/protocol.md:17`, `.agents/contracts/architect.md:3-6`). Check: `ateam state spec-check` exits `0` and `ateam state spec-queue` reports zero active holds.
 
 ## 2. Implementation
 

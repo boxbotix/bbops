@@ -1,5 +1,5 @@
 # Proposal: m2-5-keyboard-navigation
-Approved-by:
+Approved-by: coby (2026-11-25) sha256:a64a644f3a8c
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track
