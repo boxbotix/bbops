@@ -16,9 +16,15 @@ import { createTelemetryStore } from "../stores/telemetry.svelte";
 import { MockWebSocketRig } from "../stores/test-helpers";
 import { createViewportStore } from "../stores/viewport.svelte";
 import type { WebSocketLike } from "../stores/ws-client";
-import { NedGridAdapter, resolveVehicleSafetyTone } from "../viewport/ned-grid";
 import {
+  NedGridAdapter,
+  computeCrabAngleVectors,
+  resolveVehicleSafetyTone,
+} from "../viewport/ned-grid";
+import {
+  HUD_READOUT_THROTTLE_MS,
   SKG_VEHICLE_FRESH_MS,
+  USV_HUD_CRAB_DEADBAND_MPS,
   buildExternalContactSummary,
   buildHealthStrip,
   buildVehicleBannerView,
@@ -27,8 +33,10 @@ import {
   formatArmedBadge,
   formatAuthorityBadge,
   formatLinkTierBadge,
+  formatVehicleHudReadouts,
   quaternionToEulerDeg,
   resolveLiveVehiclePose,
+  shouldRefreshHudReadout,
 } from "./view-model";
 
 function eulerRadToQuaternionWxyz(
@@ -556,7 +564,12 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushAnimationTicks();
 
       const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
-      expect(hudHost.querySelector('[data-testid="hud-readout"]')).toBeNull();
+      const hudCellText = (testId: string): string | null =>
+        hudHost.querySelector(`[data-testid="${testId}"] dd`)?.textContent ??
+        null;
+      expect(
+        hudHost.querySelector('[data-testid="hud-readout-strip"]'),
+      ).not.toBeNull();
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
       expect(hudPanel?.getAttribute("data-stale")).toBe("false");
 
@@ -591,11 +604,13 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
       expect(hudPanel?.getAttribute("data-stale")).toBe("false");
       expect(drawnTexts).toContain("045");
-      expect(drawnTexts).toContain("R 0° P 0° Y 45°");
-      expect(drawnTexts).toContain("GS 4.0m/s  VS +0.0m/s  ALT 10.0m");
+      expect(hudCellText("hud-readout-attitude")).toBe("0° / 0° / 45°");
+      expect(hudCellText("hud-readout-gs")).toBe("4.0 m/s");
+      expect(hudCellText("hud-readout-vs")).toBe("+0.0 m/s");
+      expect(hudCellText("hud-readout-alt")).toBe("10.0 m");
       expect(adapter.getCamera().centerNed).toEqual([12, -6]);
 
-      // Step 1B: 2nd WS1-only frame arrives at +150ms while WS2 remains quiet and HUD stays mounted.
+      // Step 1B: 2nd WS1-only frame arrives at +50ms (20 Hz cadence): canvas updates immediately while HTML readout throttles until +250ms (4 Hz).
       nowMs += 50;
       ws1Sockets[0]!.receive(
         JSON.stringify({
@@ -624,10 +639,16 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushAnimationTicks();
 
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
-      expect(drawnTexts).toContain("R 0° P 0° Y 90°");
-      expect(drawnTexts).not.toContain("R 0° P 0° Y 45°");
-      expect(drawnTexts).toContain("GS 7.5m/s  VS +0.0m/s  ALT 14.0m");
+      expect(drawnTexts).toContain("E");
       expect(adapter.getCamera().centerNed).toEqual([18, -9]);
+      // Within 250ms throttle window: HTML readout holds previous 4 Hz snapshot (zero 20 Hz DOM thrash).
+      expect(hudCellText("hud-readout-attitude")).toBe("0° / 0° / 45°");
+
+      nowMs += 200;
+      flushAnimationTicks();
+      expect(hudCellText("hud-readout-attitude")).toBe("0° / 0° / 90°");
+      expect(hudCellText("hud-readout-gs")).toBe("7.5 m/s");
+      expect(hudCellText("hud-readout-alt")).toBe("14.0 m");
 
       // Step 2: WS1 disconnects while WS2 stays open and delivers 2 distinct newer poses (HUD still never remounted).
       nowMs += 250;
@@ -652,8 +673,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
       expect(hudPanel?.getAttribute("data-stale")).toBe("false");
-      expect(drawnTexts).toContain("R 0° P 0° Y 120°");
-      expect(drawnTexts).toContain("GS 5.0m/s  VS +0.0m/s  ALT 22.0m");
+      expect(hudCellText("hud-readout-attitude")).toBe("0° / 0° / 120°");
+      expect(hudCellText("hud-readout-gs")).toBe("5.0 m/s");
+      expect(hudCellText("hud-readout-alt")).toBe("22.0 m");
       expect(adapter.getCamera().centerNed).toEqual([30, 15]);
 
       nowMs += 250;
@@ -674,8 +696,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
       expect(hudPanel?.getAttribute("data-stale")).toBe("false");
-      expect(drawnTexts).toContain("R 0° P 0° Y 215°");
-      expect(drawnTexts).toContain("GS 6.0m/s  VS +0.0m/s  ALT 34.0m");
+      expect(hudCellText("hud-readout-attitude")).toBe("0° / 0° / 215°");
+      expect(hudCellText("hud-readout-gs")).toBe("6.0 m/s");
+      expect(hudCellText("hud-readout-alt")).toBe("34.0 m");
       expect(adapter.getCamera().centerNed).toEqual([55, -20]);
 
       // Step 3: Neither feed updates past SKG_VEHICLE_FRESH_MS (and WS2 drops) -> STALE indicated on both HUD and canvas.
@@ -919,10 +942,14 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(drawnTexts.some((t) => t.text === "ATTITUDE UNAVAILABLE")).toBe(
         true,
       );
-      expect(drawnTexts.some((t) => t.text === "R -- P -- HDG 090°")).toBe(
-        true,
-      );
-      expect(drawnTexts.some((t) => t.text.includes("Y 0°"))).toBe(false);
+      expect(
+        hudHost.querySelector('[data-testid="hud-readout-attitude"] dt')
+          ?.textContent,
+      ).toBe("R / P / HDG");
+      expect(
+        hudHost.querySelector('[data-testid="hud-readout-attitude"] dd')
+          ?.textContent,
+      ).toBe("-- / -- / 090°");
       // East ("E") tick sits at center lubber bug (cx = 150 on default 300px HUD canvas).
       const eastTick = drawnTexts.find((t) => t.text === "E");
       expect(eastTick?.x).toBeCloseTo(150, 5);
@@ -973,7 +1000,14 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       ).toBeNull();
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
-      expect(drawnTexts.some((t) => t.text === "R 0° P 0° Y 0°")).toBe(true);
+      expect(
+        hudHost.querySelector('[data-testid="hud-readout-attitude"] dt')
+          ?.textContent,
+      ).toBe("R / P / Y");
+      expect(
+        hudHost.querySelector('[data-testid="hud-readout-attitude"] dd')
+          ?.textContent,
+      ).toBe("0° / 0° / 0°");
       const northTick = drawnTexts.find((t) => t.text === "N");
       expect(northTick?.x).toBeCloseTo(150, 5);
     } finally {
@@ -1831,6 +1865,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushTicks();
 
       const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
+      const hudAttitudeText = (): string | null =>
+        hudHost.querySelector('[data-testid="hud-readout-attitude"] dd')
+          ?.textContent ?? null;
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
       expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
       expect(
@@ -1839,9 +1876,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
           ?.textContent?.trim(),
       ).toBe("NO HDG");
       expect(drawnTexts).toContain("HDG UNAVAILABLE");
-      expect(drawnTexts).toContain("R -- P -- HDG ---");
+      expect(hudAttitudeText()).toBe("-- / -- / ---");
       expect(drawnTexts).not.toContain("N");
-      expect(drawnTexts).not.toContain("R -- P -- HDG 000°");
 
       // 2. WS1 frame arrives with unknown heading (has_heading: false, hdg_deg: 0) -> STILL unavailable!
       nowMs += 50;
@@ -1875,7 +1911,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
       expect(hudPanel?.getAttribute("data-heading")).toBe("unavailable");
       expect(drawnTexts).toContain("HDG UNAVAILABLE");
-      expect(drawnTexts).toContain("R -- P -- HDG ---");
+      expect(hudAttitudeText()).toBe("-- / -- / ---");
       expect(drawnTexts).not.toContain("N");
 
       // 3. WS1 frame arrives with genuinely measured 0° North (has_heading: true, hdg_deg: 0) -> renders N and HDG 000°!
@@ -1913,7 +1949,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         hudHost.querySelector('[data-testid="hud-heading-unavailable"]'),
       ).toBeNull();
       expect(drawnTexts).toContain("N");
-      expect(drawnTexts).toContain("R -- P -- HDG 000°");
+      expect(hudAttitudeText()).toBe("-- / -- / 000°");
 
       // 4. Disconnect WS1 and deliver a measured 0° North WS2 put -> SKG fallback ALSO renders N and HDG 000°!
       telemetryStore.disconnect();
@@ -1926,7 +1962,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("skg");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(drawnTexts).toContain("N");
-      expect(drawnTexts).toContain("R -- P -- HDG 000°");
+      expect(hudAttitudeText()).toBe("-- / -- / 000°");
 
       // 5. Post-synced higher KV revision carrying an hour-old 30° pose when WS1 is disconnected MUST mark stale=true!
       nowMs += 100;
@@ -1992,7 +2028,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       ).toBe("NO HDG");
       expect(drawnTexts).toContain("ATTITUDE UNAVAILABLE");
       expect(drawnTexts).toContain("HDG UNAVAILABLE");
-      expect(drawnTexts).toContain("R -- P -- HDG ---");
+      expect(hudAttitudeText()).toBe("-- / -- / ---");
       expect(drawnTexts).not.toContain("N");
 
       // 7. Unannotated legacy #31 level-North attitude clears both NO ATT and NO HDG,
@@ -2031,7 +2067,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         hudHost.querySelector('[data-testid="hud-heading-unavailable"]'),
       ).toBeNull();
       expect(drawnTexts).toContain("N");
-      expect(drawnTexts).toContain("R 0° P 0° Y 0°");
+      expect(hudAttitudeText()).toBe("0° / 0° / 0°");
 
       // 8. 50 ms later, unannotated #32 local-position carrying fused [1,0,0,0] keeps attitude + heading measured!
       nowMs += 50;
@@ -2061,7 +2097,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(drawnTexts).toContain("N");
-      expect(drawnTexts).toContain("R 0° P 0° Y 0°");
+      expect(hudAttitudeText()).toBe("0° / 0° / 0°");
 
       // 9. Another 50 ms later, unannotated #33 global-position carrying fused [1,0,0,0] also stays measured!
       nowMs += 50;
@@ -2612,6 +2648,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushTicks();
 
       const hudPanel = hudHost.querySelector('[data-testid="vehicle-hud"]');
+      const hudReadout = (testId: string): string | null =>
+        hudHost.querySelector(`[data-testid="${testId}"] dd`)?.textContent ??
+        null;
       const tacticalViewport = canvasHost.querySelector(
         '[data-testid="tactical-viewport"]',
       );
@@ -2621,7 +2660,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(
         hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]'),
       ).toBeNull();
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 2.0m");
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-vs")).toBe("+0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("2.0 m");
       expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
         "true",
       );
@@ -2712,8 +2753,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       ).toContain("NO POS");
       expect(hudTexts).toContain("ATTITUDE UNAVAILABLE");
       expect(hudTexts).toContain("HDG UNAVAILABLE");
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
-      expect(hudTexts).not.toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-vs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(adapter.getCamera().originLla).toBeNull();
       expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
         "false",
@@ -2768,7 +2810,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(vehAfterHealth.hasHeading).toBe(false);
       expect(vehAfterHealth.hasLocalPos).toBe(false);
       expect(vehAfterHealth.hasGlobalPos).toBe(true);
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(adapter.getCamera().originLla).toBeNull();
       expect(overlayTexts).toEqual([]);
 
@@ -2814,7 +2857,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(hudPanel?.getAttribute("data-attitude")).toBe("unavailable");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(adapter.getCamera().originLla).toBeNull();
       expect(overlayTexts).toEqual([]);
       expect(overlayTrailSegments).toHaveLength(0);
@@ -2861,8 +2905,9 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(
         hudHost.querySelector('[data-testid="hud-local-pos-unavailable"]'),
       ).toBeNull();
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
-      expect(hudTexts).not.toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-vs")).toBe("+0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("4.0 m");
       expect(tacticalViewport?.getAttribute("data-origin-anchored")).toBe(
         "true",
       );
@@ -2924,7 +2969,7 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(hudPanel?.getAttribute("data-attitude")).toBe("measured");
       expect(hudPanel?.getAttribute("data-heading")).toBe("measured");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
-      expect(hudTexts).toContain("R 0° P 0° Y 45°");
+      expect(hudReadout("hud-readout-attitude")).toBe("0° / 0° / 45°");
       expect(overlayTrailSegments).toHaveLength(1);
 
       // Session 3 (14:00:00.200Z): genuine measured [0, 0, 0] local position & zero velocity WITHOUT any global fix (SKG + WS1).
@@ -2973,7 +3018,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         canvasHost.querySelector('[data-testid="mixed-frame-withheld"]'),
       ).not.toBeNull();
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("0.0 m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 0.0m");
       expect(overlayTexts).not.toContain("Austin Beacon");
@@ -3022,7 +3068,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       expect(zeroNoGpsWs1Pose.lla).toBeNull();
       expect(zeroNoGpsWs1Pose.hasVerifiedFrameReference).toBe(false);
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("0.0 m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 0.0m");
 
@@ -3085,7 +3132,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushTicks();
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(overlayTexts).toEqual([]);
 
       // 4b. First legacy #32 LOCAL_POSITION_NED ([12, -5, -4], no GPS, omitted optional flags) -> rendered on HUD & map!
@@ -3115,7 +3163,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       flushTicks();
       expect(hudPanel?.getAttribute("data-pose-source")).toBe("ws1");
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("4.0 m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 4.0m");
 
@@ -3149,13 +3198,15 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
         resetDrawn();
         flushTicks();
         expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
-        expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 4.0m");
+        expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+        expect(hudReadout("hud-readout-alt")).toBe("4.0 m");
         expect(overlayTexts).toContain("#1 rover");
         expect(overlayTexts).toContain("0.0m/s · 4.0m");
       }
 
-      // 4d. Legacy #32 at measured zero ([0, 0, 0], no GPS, omitted flags) stays available.
-      nowMs = Date.parse("2026-11-24T15:00:00.250Z");
+      // 4d. Legacy #32 at measured zero ([0, 0, 0], no GPS, omitted flags) stays available;
+      // 150ms after 4c (.200Z -> .350Z) is gated by 4 Hz throttle, then refreshes at +250ms (.450Z).
+      nowMs = Date.parse("2026-11-24T15:00:00.350Z");
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
@@ -3180,12 +3231,17 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       resetDrawn();
       flushTicks();
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("measured");
-      expect(hudTexts).toContain("GS 0.0m/s  VS +0.0m/s  ALT 0.0m");
+      expect(hudReadout("hud-readout-alt")).toBe("4.0 m");
       expect(overlayTexts).toContain("#1 rover");
       expect(overlayTexts).toContain("0.0m/s · 0.0m");
 
+      nowMs = Date.parse("2026-11-24T15:00:00.450Z");
+      flushTicks();
+      expect(hudReadout("hud-readout-gs")).toBe("0.0 m/s");
+      expect(hudReadout("hud-readout-alt")).toBe("0.0 m");
+
       // 4e. Explicit modern has_local_pos: false remains authoritative even on msg_id=32.
-      nowMs = Date.parse("2026-11-24T15:00:00.300Z");
+      nowMs = Date.parse("2026-11-24T15:00:00.500Z");
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
@@ -3213,11 +3269,12 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       resetDrawn();
       flushTicks();
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(overlayTexts).toEqual([]);
 
       // 4f. Re-latch via legacy #32, then start a new vehicle session -> local position resets until a new #32 arrives.
-      nowMs = Date.parse("2026-11-24T15:00:00.350Z");
+      nowMs = Date.parse("2026-11-24T15:00:00.550Z");
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
@@ -3270,7 +3327,8 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       resetDrawn();
       flushTicks();
       expect(hudPanel?.getAttribute("data-local-pos")).toBe("unavailable");
-      expect(hudTexts).toContain("GS --  VS --  ALT --");
+      expect(hudReadout("hud-readout-gs")).toBe("--");
+      expect(hudReadout("hud-readout-alt")).toBe("--");
       expect(overlayTexts).toEqual([]);
     } finally {
       if (canvasApp) unmount(canvasApp);
@@ -3283,5 +3341,91 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
       rafSpy.mockRestore();
       cafSpy.mockRestore();
     }
+  });
+
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  it("gates semantic HUD readout refreshes to 4 Hz (250ms) and matches Fossen Ch. 2 USV crab angle across wraparound and deadband boundaries", () => {
+    expect(HUD_READOUT_THROTTLE_MS).toBe(250);
+    expect(USV_HUD_CRAB_DEADBAND_MPS).toBe(0.15);
+
+    // Boundary checks on 4 Hz (250ms) throttle gate.
+    expect(shouldRefreshHudReadout(null, 1_000, false)).toBe(true);
+    expect(shouldRefreshHudReadout(1_000, 1_249, false)).toBe(false);
+    expect(shouldRefreshHudReadout(1_000, 1_250, false)).toBe(true);
+    expect(shouldRefreshHudReadout(1_000, 1_050, true)).toBe(true);
+    expect(shouldRefreshHudReadout(1_000, 999, false)).toBe(true);
+
+    // Generated PRNG + explicit wraparound/deadband sweep checked against computeCrabAngleVectors oracle.
+    let state = 0x51a7_2301;
+    const nextRand = () => {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      return (state >>> 0) / 0x1_0000_0000;
+    };
+
+    const explicitCases: Array<{ hdgDeg: number; vn: number; ve: number }> = [
+      { hdgDeg: 175, vn: -2.0, ve: -0.35 }, // +/-180 deg wraparound positive crab
+      { hdgDeg: -175, vn: -2.0, ve: 0.35 }, // +/-180 deg wraparound negative crab
+      { hdgDeg: 100, vn: 0.9, ve: 2.3 }, // portside crab ~ -30.1 deg
+      { hdgDeg: 45, vn: 0.1, ve: 0.1 }, // just below 0.15 m/s deadband (0.1414 m/s)
+      { hdgDeg: 45, vn: 0.12, ve: 0.1 }, // just above 0.15 m/s deadband (0.1562 m/s)
+    ];
+
+    let belowDeadbandHits = 0;
+    let activeCrabHits = 0;
+
+    for (let i = 0; i < 120; i += 1) {
+      const sample =
+        i < explicitCases.length
+          ? explicitCases[i]!
+          : {
+              hdgDeg: nextRand() * 720 - 360,
+              vn: nextRand() * 8 - 4,
+              ve: nextRand() * 8 - 4,
+            };
+      const headingRad = (sample.hdgDeg * Math.PI) / 180;
+      const pose = {
+        source: "ws1" as const,
+        stale: false,
+        hasAttitude: true,
+        hasHeading: true,
+        hasLocalPos: true,
+        hasVerifiedFrameReference: true,
+        quat: eulerRadToQuaternionWxyz(0.05, -0.03, headingRad),
+        ned: [12, -8, -1.5] as [number, number, number],
+        vel: [sample.vn, sample.ve, -0.2] as [number, number, number],
+        headingDeg: sample.hdgDeg,
+        headingRad,
+        lla: [30.2672, -97.7431, 150] as [number, number, number],
+      };
+
+      const oracle = computeCrabAngleVectors(headingRad, sample.vn, sample.ve);
+      const boatReadout = formatVehicleHudReadouts(pose, "surface-boat");
+      const quadReadout = formatVehicleHudReadouts(pose, "quadcopter");
+      const roverReadout = formatVehicleHudReadouts(pose, "rover");
+
+      expect(quadReadout.crabAngleDeg).toBeNull();
+      expect(quadReadout.crabText).toBeNull();
+      expect(roverReadout.crabAngleDeg).toBeNull();
+      expect(roverReadout.crabText).toBeNull();
+
+      if (!oracle.hasCourseSplit) {
+        belowDeadbandHits += 1;
+        expect(boatReadout.crabAngleDeg).toBeNull();
+        expect(boatReadout.crabText).toBeNull();
+      } else {
+        activeCrabHits += 1;
+        const expectedDeg = (oracle.crabAngleRad * 180) / Math.PI;
+        expect(boatReadout.crabAngleDeg).not.toBeNull();
+        expect(boatReadout.crabAngleDeg!).toBeCloseTo(expectedDeg, 6);
+        expect(boatReadout.crabText).toBe(
+          `${expectedDeg >= 0 ? "+" : ""}${expectedDeg.toFixed(1)}°`,
+        );
+      }
+    }
+
+    expect(belowDeadbandHits).toBeGreaterThanOrEqual(1);
+    expect(activeCrabHits).toBeGreaterThanOrEqual(50);
   });
 });

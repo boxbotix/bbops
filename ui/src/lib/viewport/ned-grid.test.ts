@@ -25,6 +25,7 @@ import {
   resetSharedFrameOrigin,
   resolveContactPalette,
   resolveDomainGlyphKind,
+  resolveRangeRingLabelPosition,
   resolveVehicleSafetyTone,
   wrapAngleSignedRad,
 } from "./ned-grid";
@@ -3276,5 +3277,59 @@ describe("NedGridAdapter, tactical kinematics, and viewport hotkeys", () => {
       ]),
     ).toBe(true);
     expect(adapter.getCamera().originLla).not.toBeNull();
+  });
+
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  it("relocates concentric range-ring labels off northern arcs occluded by .viewport-toolbar across viewport geometries", () => {
+    const toolbarBottomPx = 46;
+    const minBaselineY = toolbarBottomPx + 16; // 62px
+
+    // Exact boundary: northY = cy - rPx + 13 = 300 - 251 + 13 = 62 -> unobstructed north placement.
+    const exactNorth = resolveRangeRingLabelPosition(
+      400,
+      300,
+      251,
+      800,
+      600,
+      toolbarBottomPx,
+    );
+    expect(exactNorth).toEqual({ x: 406, y: 62, placement: "north" });
+
+    // 1px higher (northY = 61 < 62): northern arc enters toolbar band -> shifts to East axis.
+    const shiftedEast = resolveRangeRingLabelPosition(
+      400,
+      300,
+      252,
+      800,
+      600,
+      toolbarBottomPx,
+    );
+    expect(shiftedEast).not.toBeNull();
+    expect(shiftedEast!.placement).toBe("east");
+    expect(shiftedEast!.y).toBeGreaterThanOrEqual(minBaselineY);
+
+    // Tall portrait viewport where East overflows widthPx - 44 -> falls back to southeast or south.
+    const portraitSe = resolveRangeRingLabelPosition(
+      200,
+      280,
+      235,
+      400,
+      700,
+      toolbarBottomPx,
+    );
+    expect(portraitSe).not.toBeNull();
+    expect(["southeast", "south"]).toContain(portraitSe!.placement);
+    expect(portraitSe!.y).toBeGreaterThanOrEqual(minBaselineY);
+
+    // Corner-only outer ring exceeding north, east, southeast, and south bounds -> suppressed cleanly.
+    const cornerOnly = resolveRangeRingLabelPosition(
+      200,
+      200,
+      275,
+      400,
+      400,
+      toolbarBottomPx,
+    );
+    expect(cornerOnly).toBeNull();
   });
 });

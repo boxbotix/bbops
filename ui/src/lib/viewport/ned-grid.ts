@@ -1269,3 +1269,80 @@ export class WakeTrailBook {
     this.trails.clear();
   }
 }
+
+export interface RangeRingLabelPosition {
+  readonly x: number;
+  readonly y: number;
+  readonly placement: "north" | "east" | "southeast" | "south";
+}
+
+/**
+ * Resolves an unobstructed screen coordinate for a concentric range-ring label
+ * so northern ring arcs never collide with the floating .viewport-toolbar band.
+ */
+export function resolveRangeRingLabelPosition(
+  cx: number,
+  cy: number,
+  radiusPx: number,
+  widthPx: number,
+  heightPx: number,
+  toolbarBottomPx: number,
+): RangeRingLabelPosition | null {
+  if (
+    !isFiniteNumber(cx) ||
+    !isFiniteNumber(cy) ||
+    !isFiniteNumber(radiusPx) ||
+    radiusPx <= 0
+  ) {
+    return null;
+  }
+  const safeToolbarBottom = isFiniteNumber(toolbarBottomPx)
+    ? Math.max(0, toolbarBottomPx)
+    : 0;
+  // 11px monospace ascenders + 5px breathing room beneath toolbar bottom.
+  const safeBaselineMinY = safeToolbarBottom + 16;
+  const maxLabelX = widthPx - 44;
+  const maxBaselineY = heightPx - 8;
+
+  const northX = cx + 6;
+  const northY = cy - radiusPx + 13;
+  if (
+    northY >= safeBaselineMinY &&
+    northY <= maxBaselineY &&
+    northX >= 6 &&
+    northX <= maxLabelX
+  ) {
+    return { x: northX, y: northY, placement: "north" };
+  }
+
+  const eastX = cx + radiusPx + 6;
+  const eastY = Math.max(safeBaselineMinY, cy - 5);
+  if (eastX >= 6 && eastX <= maxLabelX && eastY <= maxBaselineY) {
+    return { x: eastX, y: eastY, placement: "east" };
+  }
+
+  const diagOffset = radiusPx * Math.SQRT1_2;
+  const seX = cx + diagOffset + 5;
+  const seY = cy + diagOffset - 4;
+  if (
+    seX >= 6 &&
+    seX <= maxLabelX &&
+    seY >= safeBaselineMinY &&
+    seY <= maxBaselineY
+  ) {
+    return { x: seX, y: seY, placement: "southeast" };
+  }
+
+  const southX = cx + 6;
+  const southY = cy + radiusPx - 6;
+  if (
+    southY >= safeBaselineMinY &&
+    southY <= maxBaselineY &&
+    southX >= 6 &&
+    southX <= maxLabelX
+  ) {
+    return { x: southX, y: southY, placement: "south" };
+  }
+
+  return null;
+}

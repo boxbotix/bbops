@@ -37,7 +37,7 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/**/*.{test,spec}.{js,ts}"],
+    include: ["src/**/*.{test,spec}.{js,ts}", "e2e/**/*.{test,spec}.{js,ts}"],
     environment: "jsdom",
     globals: true,
   },
