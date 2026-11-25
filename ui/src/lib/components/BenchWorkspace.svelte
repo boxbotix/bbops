@@ -7,6 +7,7 @@
   import {
     type TelemetrySample,
     TelemetryTraceBook,
+    lookupMeasuredSysStatus,
   } from "$lib/bench/ring-buffer";
   import {
     BENCH_TUNING_SPECS,
@@ -66,14 +67,12 @@
     selectedContact ? buildExternalContactSummary(selectedContact) : null,
   );
   const poisonedOwnshipId = $derived(
-    !selectedVehicle && selectedEntity?.poisoned
-      ? parseVehicleEntityId(selectedEntity.id)
-      : null,
+    selectedEntity?.poisoned ? parseVehicleEntityId(selectedEntity.id) : null,
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
 
   const healthChips = $derived(
-    selectedVehicle
+    selectedVehicle && !selectedVehicle.poisoned
       ? buildHealthStrip(selectedVehicle.healthFlags, selectedVehicle.sysStatus)
       : [],
   );
@@ -278,10 +277,8 @@
   }
 
   $effect(() => {
-    return traceBook.attach(
-      telemetryStore,
-      (sysid) =>
-        skgStore.vehicles.find((v) => v.sysid === sysid)?.sysStatus ?? null,
+    return traceBook.attach(telemetryStore, (sysid) =>
+      lookupMeasuredSysStatus(skgStore, sysid),
     );
   });
 
@@ -339,7 +336,8 @@
           ctx.fillStyle = "#090d16";
           ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-          const sysid = selectedVehicle?.sysid ?? null;
+          const sysid =
+            selectedVehicle?.sysid ?? poisonedOwnshipId?.sysid ?? null;
           const samples =
             sysid !== null
               ? (traceBook.getBuffer(sysid)?.toChronologicalSamples() ?? [])
@@ -416,7 +414,7 @@
     aria-label="0xB1 MCU and companion trunk timing diagnostics"
   >
     <span class="bar-title">0xB1 MCU &amp; TRUNK DIAGNOSTICS</span>
-    {#if selectedVehicle}
+    {#if selectedVehicle && !selectedVehicle.poisoned}
       <div class="chip-row">
         {#each healthChips as chip (chip.key)}
           <span
@@ -456,7 +454,7 @@
       <div class="panel-head">
         <strong>20 HZ TELEMETRY OSCILLOSCOPE (15 S RING · 300 SAMPLES)</strong>
         <span class="muted">
-          {#if selectedVehicle}
+          {#if selectedVehicle && !selectedVehicle.poisoned}
             UXS #{selectedVehicle.sysid} · {selectedVehicle.domain}
           {:else if poisonedOwnshipId}
             UXS #{poisonedOwnshipId.sysid} · POISONED

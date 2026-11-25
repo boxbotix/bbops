@@ -71,6 +71,7 @@ export interface VehicleSysStatus {
   loopDtUs: number;
   maxLoopDtUs: number;
   rttUs: number;
+  hasSysStatus?: boolean;
 }
 
 export interface CopEntityBase {
@@ -115,6 +116,7 @@ export interface VehicleEntityState extends CopEntityBase {
     longitude: number;
     altitude: number;
   };
+  hasSysStatus?: boolean;
   hasAttitude?: boolean;
   hasLocalPos?: boolean;
   hasGlobalPos?: boolean;
@@ -541,11 +543,24 @@ export function parseCopEntityState(
         }
       }
 
+      const loopDtTriple = byPredicate["uxs.health.loopdtus"];
+      const maxLoopDtTriple = byPredicate["uxs.health.maxloopdtus"];
+      const rttTriple = byPredicate["uxs.health.rttus"];
       const quatTriple = byPredicate["uxs.attitude.quaternion"];
       const nedTriple = byPredicate["uxs.kinematics.ned"];
       const hdgTriple = byPredicate["uxs.kinematics.headingdeg"];
       const latTriple = byPredicate["geo.location.latitude"];
       const lonTriple = byPredicate["geo.location.longitude"];
+      const hasNonZeroTiming =
+        loopDtUs !== 0 || maxLoopDtUs !== 0 || rttUs !== 0;
+      const hasSysStatus =
+        isMeasuredAssertion(loopDtTriple) &&
+        isMeasuredAssertion(maxLoopDtTriple) &&
+        isMeasuredAssertion(rttTriple) &&
+        (loopDtTriple.context === "measured" ||
+          maxLoopDtTriple.context === "measured" ||
+          rttTriple.context === "measured" ||
+          hasNonZeroTiming);
       const quatNormSq =
         quat[0] * quat[0] +
         quat[1] * quat[1] +
@@ -614,6 +629,7 @@ export function parseCopEntityState(
         poseObservedAt,
         localPosObservedAt,
         globalPosObservedAt,
+        hasSysStatus,
         hasAttitude,
         hasLocalPos,
         hasGlobalPos,
@@ -634,6 +650,7 @@ export function parseCopEntityState(
           loopDtUs,
           maxLoopDtUs,
           rttUs,
+          hasSysStatus,
         },
         attitudeQuaternion: quat,
         attitudeRates: rates,

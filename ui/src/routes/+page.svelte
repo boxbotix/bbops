@@ -8,7 +8,7 @@
   import WorkspaceShell from "$lib/components/WorkspaceShell.svelte";
   import { createGraphSearchClient } from "$lib/cortex/search-client";
   import { createGraphQLClient } from "$lib/graphql";
-  import { buildFilmstripItems } from "$lib/hud/view-model";
+  import { selectFilmstripItems } from "$lib/hud/view-model";
   import { createSkgStore } from "$lib/stores/skg.svelte";
   import { createTelemetryStore } from "$lib/stores/telemetry.svelte";
   import { createViewportStore } from "$lib/stores/viewport.svelte";
@@ -21,10 +21,9 @@
   const searchClient = createGraphSearchClient();
   const traceBook = new TelemetryTraceBook();
 
+  const filmstripItems = $derived(selectFilmstripItems(skgStore));
   const filmstripEntityIds = $derived(
-    buildFilmstripItems(skgStore.vehicles, skgStore.externalContacts).map(
-      (item) => item.entityId,
-    ),
+    filmstripItems.map((item) => item.entityId),
   );
 
   function syncWindowHash(nextHash: string): void {
@@ -86,5 +85,6 @@
   {graphqlClient}
   {searchClient}
   {traceBook}
+  {filmstripItems}
   onSyncHash={syncWindowHash}
 />

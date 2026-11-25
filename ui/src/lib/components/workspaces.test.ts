@@ -15,11 +15,13 @@ import {
 import { createSkgStore } from "../stores/skg.svelte";
 import { createTelemetryStore } from "../stores/telemetry.svelte";
 import {
+  MockWebSocket,
   MockWebSocketRig,
   buildVehicleStoredPayload,
 } from "../stores/test-helpers";
 import { createViewportStore } from "../stores/viewport.svelte";
 import { handleViewportHotkey } from "../viewport/hotkeys";
+import Page from "../../routes/+page.svelte";
 import WorkspaceShell from "./WorkspaceShell.svelte";
 
 describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)", () => {
@@ -832,6 +834,177 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
     } finally {
       unmount(app);
       hostEl.remove();
+    }
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("mounts +page.svelte and maps every displayed filmstrip shortcut key to the same entity ID and URL hash when poisoned-first ownship vehicles are present", () => {
+    const sockets: MockWebSocket[] = [];
+    class StubWebSocket extends MockWebSocket {}
+    const FakeWebSocketCtor = function (url: string | URL) {
+      const sock = new StubWebSocket(String(url));
+      sockets.push(sock);
+      return sock;
+    } as unknown as typeof WebSocket;
+    vi.stubGlobal("WebSocket", FakeWebSocketCtor);
+
+    const originalHash = window.location.hash;
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}${window.location.search}`,
+    );
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    let app: ReturnType<typeof mount> | undefined;
+
+    try {
+      app = mount(Page, { target: hostEl });
+      flushSync();
+
+      const skgSocket = sockets.find((sock) => sock.url.includes("/ws/graph"));
+      expect(skgSocket).toBeDefined();
+      skgSocket!.serverOpen();
+
+      const poisonedFirstId = "boxbotix.local.robotics.uxs.vehicle.1";
+      const healthySecond = buildVehicleStoredPayload(2, {
+        "uxs.domain.kind": "rover",
+        "dc.terms.title": "Rover Two",
+      });
+      const contactThirdId = "boxbotix.local.tak.cop.contact.alpha";
+
+      skgSocket!.serverMessage(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key: poisonedFirstId,
+          revision: 1,
+          error: "corrupt first ownship payload",
+        }),
+      );
+      skgSocket!.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: healthySecond.id,
+          revision: 2,
+          payload: healthySecond,
+        }),
+      );
+      skgSocket!.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: contactThirdId,
+          revision: 3,
+          payload: {
+            id: contactThirdId,
+            triples: [
+              {
+                subject: contactThirdId,
+                predicate: "dc.terms.title",
+                object: "Alpha Buoy",
+                source: "ais",
+                timestamp: "2030-01-15T12:00:00Z",
+                confidence: 1,
+              },
+              {
+                subject: contactThirdId,
+                predicate: "cop.contact.source",
+                object: "ais-coastal",
+                source: "ais",
+                timestamp: "2030-01-15T12:00:00Z",
+                confidence: 1,
+              },
+              {
+                subject: contactThirdId,
+                predicate: "geo.location.latitude",
+                object: 37.801,
+                source: "ais",
+                timestamp: "2030-01-15T12:00:00Z",
+                confidence: 1,
+              },
+              {
+                subject: contactThirdId,
+                predicate: "geo.location.longitude",
+                object: -122.405,
+                source: "ais",
+                timestamp: "2030-01-15T12:00:00Z",
+                confidence: 1,
+              },
+            ],
+          },
+        }),
+      );
+      skgSocket!.serverMessage(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 3,
+        }),
+      );
+      flushSync();
+
+      const cards = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(
+          '[data-testid="filmstrip-item"]',
+        ),
+      );
+      expect(
+        cards.map((card) => ({
+          key: card.querySelector(".shortcut-key")?.textContent?.trim(),
+          entityId: card.getAttribute("data-entity-id"),
+        })),
+      ).toEqual([
+        { key: "1", entityId: poisonedFirstId },
+        { key: "2", entityId: healthySecond.id },
+        { key: "3", entityId: contactThirdId },
+      ]);
+
+      // Press each card's displayed shortcut key (3 -> 1 -> 2) on window and verify
+      // both the active selected card and window.location.hash match that card's entity ID.
+      for (const card of [cards[2]!, cards[0]!, cards[1]!]) {
+        const displayedKey = card
+          .querySelector(".shortcut-key")
+          ?.textContent?.trim();
+        const cardEntityId = card.getAttribute("data-entity-id");
+        expect(displayedKey).toBeTruthy();
+        expect(cardEntityId).toBeTruthy();
+
+        const keyEv = new KeyboardEvent("keydown", {
+          key: displayedKey!,
+          bubbles: true,
+          cancelable: true,
+        });
+        window.dispatchEvent(keyEv);
+        flushSync();
+        expect(keyEv.defaultPrevented).toBe(true);
+
+        const activeCards = hostEl.querySelectorAll<HTMLButtonElement>(
+          '[data-testid="filmstrip-item"][aria-pressed="true"]',
+        );
+        expect(activeCards).toHaveLength(1);
+        expect(activeCards[0]?.getAttribute("data-entity-id")).toBe(
+          cardEntityId,
+        );
+
+        const hashParams = new URLSearchParams(
+          window.location.hash.replace(/^#/, ""),
+        );
+        expect(hashParams.get("sel")).toBe(cardEntityId);
+      }
+    } finally {
+      if (app) {
+        unmount(app);
+      }
+      hostEl.remove();
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${window.location.search}${originalHash}`,
+      );
+      vi.unstubAllGlobals();
     }
   });
 });

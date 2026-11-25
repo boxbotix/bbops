@@ -13,6 +13,7 @@ import type {
   CopFeedStatus,
   ExternalContactEntityState,
   GeoLocation,
+  SkgStore,
   VehicleEntityState,
   VehicleSysStatus,
 } from "../stores/skg.svelte";
@@ -240,6 +241,7 @@ export function buildHealthStrip(
   flags: HealthFlags,
   sysStatus: VehicleSysStatus,
 ): readonly HealthChipView[] {
+  const hasTiming = sysStatus.hasSysStatus !== false;
   return [
     {
       key: "crsf_link_healthy",
@@ -280,19 +282,19 @@ export function buildHealthStrip(
     {
       key: "loop_dt_us",
       label: "Loop dt",
-      value: `${sysStatus.loopDtUs} us`,
+      value: hasTiming ? `${sysStatus.loopDtUs} us` : "--",
       severity: "nominal",
     },
     {
       key: "max_loop_dt_us",
       label: "Max dt",
-      value: `${sysStatus.maxLoopDtUs} us`,
+      value: hasTiming ? `${sysStatus.maxLoopDtUs} us` : "--",
       severity: "nominal",
     },
     {
       key: "rtt_us",
       label: "RTT",
-      value: `${sysStatus.rttUs} us`,
+      value: hasTiming ? `${sysStatus.rttUs} us` : "--",
       severity: "nominal",
     },
   ];
@@ -1170,6 +1172,21 @@ export function buildFilmstripItems(
   }
 
   return items;
+}
+
+/**
+ * Canonical SKG store selector for FleetFilmstrip cards and 1..9 keyboard
+ * shortcuts, ensuring poisoned-first ownship vehicle keys are ordered
+ * identically in both the top-level hotkey listener and rendered filmstrip.
+ */
+export function selectFilmstripItems(
+  skgStore: Pick<SkgStore, "vehicles" | "externalContacts" | "entities">,
+): readonly FilmstripItemView[] {
+  return buildFilmstripItems(
+    skgStore.vehicles,
+    skgStore.externalContacts,
+    skgStore.entities.values(),
+  );
 }
 
 export const COP_SOLO_SECTIONS = ["summary", "alerts", "skg"] as const;

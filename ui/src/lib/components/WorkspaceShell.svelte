@@ -3,7 +3,10 @@
   Copyright (c) 2026 boxbotix
 -->
 <script lang="ts">
-  import { TelemetryTraceBook } from "$lib/bench/ring-buffer";
+  import {
+    TelemetryTraceBook,
+    lookupMeasuredSysStatus,
+  } from "$lib/bench/ring-buffer";
   import { formatShellBanner } from "$lib/bootstrap";
   import AuthorityBanner from "$lib/components/AuthorityBanner.svelte";
   import BenchWorkspace from "$lib/components/BenchWorkspace.svelte";
@@ -17,7 +20,8 @@
   } from "$lib/cortex/search-client";
   import { type GraphQLClient, createGraphQLClient } from "$lib/graphql";
   import {
-    buildFilmstripItems,
+    type FilmstripItemView,
+    selectFilmstripItems,
     summarizeFleetFaults,
   } from "$lib/hud/view-model";
   import type { SkgStore } from "$lib/stores/skg.svelte";
@@ -34,6 +38,7 @@
     graphqlClient?: GraphQLClient;
     searchClient?: GraphSearchClient;
     traceBook?: TelemetryTraceBook;
+    filmstripItems?: readonly FilmstripItemView[];
     onSyncHash?: (hash: string) => void;
   }
 
@@ -44,6 +49,7 @@
     graphqlClient = createGraphQLClient(),
     searchClient = createGraphSearchClient(),
     traceBook = new TelemetryTraceBook(),
+    filmstripItems,
     onSyncHash,
   }: Props = $props();
 
@@ -51,19 +57,13 @@
   const fleetFaults = $derived(
     summarizeFleetFaults(skgStore.entities.values()),
   );
-  const filmstripItems = $derived(
-    buildFilmstripItems(
-      skgStore.vehicles,
-      skgStore.externalContacts,
-      skgStore.entities.values(),
-    ),
+  const resolvedFilmstripItems = $derived(
+    filmstripItems ?? selectFilmstripItems(skgStore),
   );
 
   $effect(() => {
-    return traceBook.attach(
-      telemetryStore,
-      (sysid) =>
-        skgStore.vehicles.find((v) => v.sysid === sysid)?.sysStatus ?? null,
+    return traceBook.attach(telemetryStore, (sysid) =>
+      lookupMeasuredSysStatus(skgStore, sysid),
     );
   });
 
@@ -208,7 +208,11 @@
   </div>
 
   {#if !viewportStore.lightsOut}
-    <FleetFilmstrip items={filmstripItems} {viewportStore} {onSyncHash} />
+    <FleetFilmstrip
+      items={resolvedFilmstripItems}
+      {viewportStore}
+      {onSyncHash}
+    />
   {/if}
 </main>
 

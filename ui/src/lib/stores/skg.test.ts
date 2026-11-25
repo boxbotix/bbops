@@ -171,6 +171,7 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
       loopDtUs: 2500,
       maxLoopDtUs: 3100,
       rttUs: 420,
+      hasSysStatus: true,
     });
     // Vehicle observedAt derives from uxs.* Triple.Timestamp, distinct from EntityState.updated_at!
     expect(parsed?.observedAt).toBe("2026-11-24T11:10:00.000Z");
@@ -1354,5 +1355,96 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(afterNorth.hasHeading).toBe(true);
     expect(afterNorth.headingDeg).toBe(0);
     expect(afterNorth.poseObservedAt).toBe(t4Iso);
+  });
+
+  // spec: cop-ui / Gapless ENTITY_STATES SKG store, external contact separation, and GraphQL client
+  it("preserves whether #1 SYS_STATUS has been observed across heartbeat-before-SYS_STATUS, measured zero, and healthy -> poisoned -> recovered updates", () => {
+    const store = createSkgStore();
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.7";
+
+    // 1. HEARTBEAT birth before #1 SYS_STATUS (confidence=0, 0/0/0) -> hasSysStatus=false.
+    const birthPayload = buildVehicleStoredPayload(
+      7,
+      {},
+      { hasSysStatus: false },
+    );
+    store.ingestRawFrame(putFrame(entityId, 1, birthPayload));
+    store.ingestRawFrame(syncedFrame(1));
+    const afterBirth = store.getCommandableVehicle(entityId);
+    expect(afterBirth?.sysStatus).toEqual({
+      failsafes: 0,
+      crcErrors: 1,
+      loopDtUs: 0,
+      maxLoopDtUs: 0,
+      rttUs: 0,
+      hasSysStatus: false,
+    });
+
+    // 2. Genuinely measured zero #1 SYS_STATUS (confidence=1, context="measured", 0/0/0) -> hasSysStatus=true.
+    const measuredZeroPayload = buildVehicleStoredPayload(
+      7,
+      {
+        "uxs.health.loopdtus": 0,
+        "uxs.health.maxloopdtus": 0,
+        "uxs.health.rttus": 0,
+      },
+      { hasSysStatus: true },
+    );
+    store.ingestRawFrame(putFrame(entityId, 2, measuredZeroPayload));
+    expect(store.getCommandableVehicle(entityId)?.sysStatus).toEqual({
+      failsafes: 0,
+      crcErrors: 1,
+      loopDtUs: 0,
+      maxLoopDtUs: 0,
+      rttUs: 0,
+      hasSysStatus: true,
+    });
+
+    // 3. Healthy nonzero -> poisoned -> recovered: commandableVehicles excludes poisoned entry until recovered.
+    const healthyPayload = buildVehicleStoredPayload(
+      7,
+      {
+        "uxs.health.loopdtus": 2500,
+        "uxs.health.maxloopdtus": 3100,
+        "uxs.health.rttus": 420,
+      },
+      { hasSysStatus: true },
+    );
+    store.ingestRawFrame(putFrame(entityId, 3, healthyPayload));
+    expect(store.commandableVehicles).toHaveLength(1);
+    expect(store.commandableVehicles[0]?.sysStatus.loopDtUs).toBe(2500);
+
+    store.ingestRawFrame(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: 4,
+        error: "corrupt kv entry",
+      }),
+    );
+    expect(store.vehicles[0]?.poisoned).toBe(true);
+    expect(store.commandableVehicles).toHaveLength(0);
+    expect(store.getCommandableVehicle(entityId)).toBeNull();
+
+    const recoveredPayload = buildVehicleStoredPayload(
+      7,
+      {
+        "uxs.health.loopdtus": 1800,
+        "uxs.health.maxloopdtus": 2200,
+        "uxs.health.rttus": 310,
+      },
+      { hasSysStatus: true },
+    );
+    store.ingestRawFrame(putFrame(entityId, 5, recoveredPayload));
+    expect(store.commandableVehicles).toHaveLength(1);
+    expect(store.getCommandableVehicle(entityId)?.sysStatus).toEqual({
+      failsafes: 0,
+      crcErrors: 1,
+      loopDtUs: 1800,
+      maxLoopDtUs: 2200,
+      rttUs: 310,
+      hasSysStatus: true,
+    });
   });
 });

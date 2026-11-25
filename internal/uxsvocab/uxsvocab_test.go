@@ -240,6 +240,7 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			Altitude:     142.75,
 			ObservedAt:   time.Date(2026, 11, 23, 21, 0, 0, 0, time.UTC),
 			PoseMetadata: true,
+			HasSysStatus: true,
 			HasAttitude:  true,
 			HasLocalPos:  true,
 			HasGlobalPos: true,
@@ -290,15 +291,15 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			t.Fatalf("uxs.kinematics.ned Object type = %T, want [3]float64", popTriples[13].Object)
 		}
 
-		// Birth snapshot marks unmeasured pose triples [11..20] with Confidence=0 and epoch-0 timestamp,
-		// while populated snapshot marks measured pose triples with Confidence=1 and Context="measured".
+		// Birth snapshot marks unmeasured SYS_STATUS timing & pose triples [8..20] with Confidence=0 and epoch-0 timestamp,
+		// while populated snapshot marks measured triples with Confidence=1 and Context="measured".
 		epochZero := time.Unix(0, 0).UTC()
-		for idx := 11; idx <= 20; idx++ {
+		for idx := 8; idx <= 20; idx++ {
 			if initTriples[idx].Confidence != 0 || !initTriples[idx].Timestamp.Equal(epochZero) || initTriples[idx].Context != "" {
-				t.Fatalf("initial pose triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
+				t.Fatalf("initial unmeasured triple[%d] (%s) = %+v, want Confidence=0 Timestamp=epoch0", idx, initTriples[idx].Predicate, initTriples[idx])
 			}
 			if popTriples[idx].Confidence != 1.0 || popTriples[idx].Context != "measured" {
-				t.Fatalf("populated pose triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
+				t.Fatalf("populated measured triple[%d] (%s) = %+v, want Confidence=1 Context=measured", idx, popTriples[idx].Predicate, popTriples[idx])
 			}
 		}
 
@@ -534,6 +535,8 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		t.Fatalf("NewVehicleSnapshot(measuredZeroSnap): %v", err)
 	}
 	measuredObs := time.Date(2026, 11, 23, 18, 5, 0, 0, time.UTC)
+	measuredZeroSnap.HasSysStatus = true
+	measuredZeroSnap.SysStatusObservedUnixNs = measuredObs.UnixNano()
 	measuredZeroSnap.HasLocalPos = true
 	measuredZeroSnap.LocalPosObservedUnixNs = measuredObs.UnixNano()
 	measuredZeroSnap.HasGlobalPos = true
@@ -561,6 +564,9 @@ func TestVehicleSnapshotJSONVectorDimensionsViaRegisteredDecoder(t *testing.T) {
 		measuredZeroByPred[tr.Predicate] = tr
 	}
 	for _, measuredPred := range []string{
+		PredicateHealthLoopDtUs,
+		PredicateHealthMaxLoopDtUs,
+		PredicateHealthRTTUs,
 		PredicateKinematicsNED,
 		PredicateKinematicsHeadingDeg,
 		vocabulary.GeoLocationLatitude,

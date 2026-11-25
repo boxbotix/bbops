@@ -84,10 +84,12 @@ type VehicleSnapshot struct {
 	ObservedAt time.Time `json:"observed_at"`
 
 	PoseMetadata            bool  `json:"pose_metadata,omitempty"`
+	HasSysStatus            bool  `json:"has_sys_status,omitempty"`
 	HasAttitude             bool  `json:"has_attitude,omitempty"`
 	HasLocalPos             bool  `json:"has_local_pos,omitempty"`
 	HasGlobalPos            bool  `json:"has_global_pos,omitempty"`
 	HasHeading              bool  `json:"has_heading,omitempty"`
+	SysStatusObservedUnixNs int64 `json:"sys_status_observed_unix_ns,omitempty"`
 	AttitudeObservedUnixNs  int64 `json:"attitude_observed_unix_ns,omitempty"`
 	LocalPosObservedUnixNs  int64 `json:"local_pos_observed_unix_ns,omitempty"`
 	GlobalPosObservedUnixNs int64 `json:"global_pos_observed_unix_ns,omitempty"`
@@ -101,12 +103,12 @@ var (
 )
 
 // NewVehicleSnapshot constructs a VehicleSnapshot initialized with neutral
-// finite defaults (PoseMetadata=true with Has*=false indicating no #31/#32/#33
+// finite defaults (PoseMetadata=true with Has*=false indicating no #1/#31/#32/#33
 // measurements yet, zero-norm quaternion [0, 0, 0, 0], zero kinematics/GPS/counters,
 // disarmed mode, mcu-failsafe authority, sitl-local link tier) so snapshots
 // emitted before SYS_STATUS (#1), ATTITUDE_QUATERNION (#31), LOCAL_POSITION_NED
 // (#32), or GLOBAL_POSITION_INT (#33) arrive carry the full 22-predicate set
-// without claiming unverified pose fixes.
+// without claiming unverified pose or MCU timing measurements.
 func NewVehicleSnapshot(org, platform string, sysid uint8, domain string) (*VehicleSnapshot, error) {
 	if _, err := VehicleEntityID(org, platform, sysid); err != nil {
 		return nil, err
@@ -166,7 +168,7 @@ func (s *VehicleSnapshot) Validate() error {
 	if s.Failsafes < 0 || s.CRCErrors < 0 || s.LoopDtUs < 0 || s.MaxLoopDtUs < 0 || s.RTTUs < 0 {
 		return errors.New("uxsvocab: health counters and durations must be non-negative")
 	}
-	if s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
+	if s.SysStatusObservedUnixNs < 0 || s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
 		return errors.New("uxsvocab: domain observation timestamps must be non-negative")
 	}
 
@@ -316,15 +318,18 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 	}
 
 	hasPoseMeta := s.PoseMetadata ||
+		s.HasSysStatus ||
 		s.HasAttitude ||
 		s.HasLocalPos ||
 		s.HasGlobalPos ||
 		s.HasHeading ||
+		s.SysStatusObservedUnixNs > 0 ||
 		s.AttitudeObservedUnixNs > 0 ||
 		s.LocalPosObservedUnixNs > 0 ||
 		s.GlobalPosObservedUnixNs > 0 ||
 		s.HeadingObservedUnixNs > 0
 
+	legacySysStatus := s.Failsafes != 0 || s.CRCErrors != 0 || s.LoopDtUs != 0 || s.MaxLoopDtUs != 0 || s.RTTUs != 0
 	quatNormSq := s.Quaternion[0]*s.Quaternion[0] +
 		s.Quaternion[1]*s.Quaternion[1] +
 		s.Quaternion[2]*s.Quaternion[2] +
@@ -387,9 +392,9 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		triple(PredicateHealthFlags, s.Flags),
 		triple(PredicateHealthFailsafes, s.Failsafes),
 		triple(PredicateHealthCRCErrors, s.CRCErrors),
-		triple(PredicateHealthLoopDtUs, s.LoopDtUs),
-		triple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs),
-		triple(PredicateHealthRTTUs, s.RTTUs),
+		poseTriple(PredicateHealthLoopDtUs, s.LoopDtUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
+		poseTriple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
+		poseTriple(PredicateHealthRTTUs, s.RTTUs, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
 		poseTriple(PredicateAttitudeQuaternion, s.Quaternion, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
 		poseTriple(PredicateAttitudeRates, s.BodyRates, s.HasAttitude, s.AttitudeObservedUnixNs, legacyAtt),
 		poseTriple(PredicateKinematicsNED, s.NED, s.HasLocalPos, s.LocalPosObservedUnixNs, legacyLocal),

@@ -99,7 +99,13 @@ export function makeTriple(
   subject: string,
   predicate: string,
   object: unknown,
-  opts: { source?: string; timestamp?: string; expires_at?: string } = {},
+  opts: {
+    source?: string;
+    timestamp?: string;
+    expires_at?: string;
+    confidence?: number;
+    context?: string;
+  } = {},
 ): SkgTriple {
   const triple: SkgTriple = {
     subject,
@@ -107,13 +113,22 @@ export function makeTriple(
     object,
     source: opts.source ?? "mavlink_0xb1",
     timestamp: opts.timestamp ?? "2026-11-24T11:00:00.250Z",
-    confidence: 1.0,
+    confidence: opts.confidence ?? 1.0,
   };
+  if (opts.context) {
+    triple.context = opts.context;
+  }
   if (opts.expires_at) {
     triple.expires_at = opts.expires_at;
   }
   return triple;
 }
+
+const SYS_STATUS_TIMING_PREDICATES = new Set([
+  "uxs.health.loopdtus",
+  "uxs.health.maxloopdtus",
+  "uxs.health.rttus",
+]);
 
 export function buildVehicleStoredPayload(
   sysid: number,
@@ -123,6 +138,7 @@ export function buildVehicleStoredPayload(
     platform?: string;
     observedAt?: string;
     updatedAt?: string;
+    hasSysStatus?: boolean;
   } = {},
 ): { id: string; triples: SkgTriple[]; updated_at: string } {
   const org = opts.org ?? "boxbotix";
@@ -143,9 +159,9 @@ export function buildVehicleStoredPayload(
     },
     "uxs.health.failsafes": 0,
     "uxs.health.crcerrors": 1,
-    "uxs.health.loopdtus": 2500,
-    "uxs.health.maxloopdtus": 3100,
-    "uxs.health.rttus": 420,
+    "uxs.health.loopdtus": opts.hasSysStatus === false ? 0 : 2500,
+    "uxs.health.maxloopdtus": opts.hasSysStatus === false ? 0 : 3100,
+    "uxs.health.rttus": opts.hasSysStatus === false ? 0 : 420,
     "uxs.attitude.quaternion": [1, 0, 0, 0],
     "uxs.attitude.rates": [0.01, -0.02, 0.03],
     "uxs.kinematics.ned": [12.5, -4.0, -25.0],
@@ -161,13 +177,19 @@ export function buildVehicleStoredPayload(
     ...overrides,
   };
 
-  const triples: SkgTriple[] = Object.entries(defaults).map(([pred, val]) =>
-    makeTriple(id, pred, val, {
+  const triples: SkgTriple[] = Object.entries(defaults).map(([pred, val]) => {
+    const isTimingPred = SYS_STATUS_TIMING_PREDICATES.has(pred);
+    const confidence = isTimingPred && opts.hasSysStatus === false ? 0.0 : 1.0;
+    const context =
+      isTimingPred && opts.hasSysStatus === true ? "measured" : undefined;
+    return makeTriple(id, pred, val, {
       source:
         pred === "entity.indexing.profile" ? "graph-ingest" : "mavlink_0xb1",
       timestamp: observedAt,
-    }),
-  );
+      confidence,
+      context,
+    });
+  });
 
   return {
     id,

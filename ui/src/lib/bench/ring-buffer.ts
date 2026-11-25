@@ -2,7 +2,7 @@
 // Copyright (c) 2026 boxbotix
 
 import { isFiniteNumber } from "../uxs";
-import type { VehicleSysStatus } from "../stores/skg.svelte";
+import type { SkgStore, VehicleSysStatus } from "../stores/skg.svelte";
 import type { VehicleKinematics } from "../stores/telemetry.svelte";
 
 const RAD_TO_DEG = 180 / Math.PI;
@@ -163,9 +163,28 @@ export interface TelemetryIngressSource {
   onFeedReset?(listener: () => void): () => void;
 }
 
-type SysStatusLookup = (
+export type MeasuredSysStatusSlice = Pick<
+  VehicleSysStatus,
+  "loopDtUs" | "rttUs" | "hasSysStatus"
+>;
+
+type SysStatusLookup = (sysid: number) => MeasuredSysStatusSlice | null;
+
+/**
+ * Resolves measured, non-poisoned 0xB1 MCU loop/RTT timing for a UXS sysid.
+ * Excludes poisoned vehicle entities (`commandableVehicles` filters `!v.poisoned`)
+ * and vehicles that have not yet reported `#1 SYS_STATUS` (`hasSysStatus === false`).
+ */
+export function lookupMeasuredSysStatus(
+  skgStore: Pick<SkgStore, "commandableVehicles">,
   sysid: number,
-) => Pick<VehicleSysStatus, "loopDtUs" | "rttUs"> | null;
+): VehicleSysStatus | null {
+  const vehicle = skgStore.commandableVehicles.find((v) => v.sysid === sysid);
+  if (!vehicle || vehicle.sysStatus.hasSysStatus === false) {
+    return null;
+  }
+  return vehicle.sysStatus;
+}
 
 export class TelemetryTraceBook {
   readonly capacityPerVehicle: number;
@@ -198,7 +217,7 @@ export class TelemetryTraceBook {
 
   recordKinematics(
     kinematics: VehicleKinematics,
-    sysStatus?: Pick<VehicleSysStatus, "loopDtUs" | "rttUs"> | null,
+    sysStatus?: MeasuredSysStatusSlice | null,
   ): boolean {
     const buf = this.getOrCreateBuffer(kinematics.sysid);
     const hasLocal = kinematics.has_local_pos === true;
@@ -206,6 +225,7 @@ export class TelemetryTraceBook {
     const hasTiming =
       sysStatus !== null &&
       sysStatus !== undefined &&
+      sysStatus.hasSysStatus !== false &&
       isFiniteNumber(sysStatus.loopDtUs) &&
       isFiniteNumber(sysStatus.rttUs);
 

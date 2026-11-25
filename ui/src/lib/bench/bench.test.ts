@@ -485,15 +485,19 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
     const traceBook = new TelemetryTraceBook();
     const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
 
-    // Seed vehicle #1 initially poisoned (no SKG timing available -> lookupSysStatus returns null),
-    // then select it by ID once healthy, then poison again for the trailing missing timing sample.
+    // Step 1 (HEARTBEAT before #1 SYS_STATUS): Go NewVehicleSnapshot emits loopdtus/maxloopdtus/rttus = 0 with confidence=0 -> hasSysStatus=false.
+    const birthBeforeSysStatus = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter" },
+      { hasSysStatus: false },
+    );
     skgStore.ingestRawFrame(
       JSON.stringify({
-        type: "poisoned",
+        type: "put",
         bucket: "ENTITY_STATES",
         key: vehicleId,
         revision: 1,
-        error: "no timing yet",
+        payload: birthBeforeSysStatus,
       }),
     );
     skgStore.ingestRawFrame(
@@ -505,6 +509,7 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
     );
 
     const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(vehicleId);
     const hostEl = document.createElement("div");
     document.body.appendChild(hostEl);
 
@@ -515,7 +520,16 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       });
       flushSync();
 
-      // Step 1 (Missing): has_attitude=false, has_local_pos=false, and no SKG sysStatus.
+      // Diagnostic chips show "--" before #1 SYS_STATUS has been observed (NOT "0 us").
+      const chipText = (key: string): string | undefined =>
+        hostEl.querySelector(
+          `[data-testid="bench-health-strip"] [data-chip-key="${key}"] strong`,
+        )?.textContent ?? undefined;
+      expect(chipText("loop_dt_us")).toBe("--");
+      expect(chipText("max_loop_dt_us")).toBe("--");
+      expect(chipText("rtt_us")).toBe("--");
+
+      // WS1 arrival while has_attitude=false, has_local_pos=false, and hasSysStatus=false -> all 7 channels record null!
       telemetryStore.ingestRawFrame(
         JSON.stringify({
           type: "data",
@@ -540,12 +554,17 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
         }),
       );
 
-      // Step 2 (Measured stationary zero): SKG arrives with loopDtUs=0 & rttUs=0, followed by WS1 with has_attitude=true & has_local_pos=true at 0.
-      const zeroTimingQuad = buildVehicleStoredPayload(1, {
-        "uxs.domain.kind": "quadcopter",
-        "uxs.health.loopdtus": 0,
-        "uxs.health.rttus": 0,
-      });
+      // Step 2 (Genuinely measured stationary zero): #1 SYS_STATUS arrives with measured 0/0/0 (confidence=1, context="measured").
+      const zeroTimingQuad = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.health.loopdtus": 0,
+          "uxs.health.maxloopdtus": 0,
+          "uxs.health.rttus": 0,
+        },
+        { hasSysStatus: true },
+      );
       skgStore.ingestRawFrame(
         JSON.stringify({
           type: "put",
@@ -555,8 +574,10 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
           payload: zeroTimingQuad,
         }),
       );
-      viewportStore.selectEntity(vehicleId);
       flushSync();
+      expect(chipText("loop_dt_us")).toBe("0 us");
+      expect(chipText("max_loop_dt_us")).toBe("0 us");
+      expect(chipText("rtt_us")).toBe("0 us");
 
       telemetryStore.ingestRawFrame(
         JSON.stringify({
@@ -589,28 +610,44 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       expect(drawnTexts).toContain("loop_dt:0.0");
       expect(drawnTexts).toContain("rtt:0.0");
 
-      // Step 3 (Missing again): clear SKG vehicle via delete (re-selecting after put or inspecting buffer),
-      // or record directly on traceBook with sysStatus=null and both flags false, then restore selection to render!
-      traceBook.recordKinematics(
-        {
-          sysid: 1,
-          domain: "quadcopter",
-          seq: 3,
-          msg_id: 33,
-          quat_wxyz: [0, 0, 0, 0],
-          has_attitude: false,
-          body_rates: [0, 0, 0],
-          ned_xyz: [0, 0, 0],
-          has_local_pos: false,
-          ned_vel: [0, 0, 0],
-          lat_lon_alt: [37.7749, -122.4194, 10],
-          has_global_pos: true,
-          hdg_deg: 0,
-          has_heading: false,
-          timestamp: 1_100,
-          receivedAtMs: 5_100,
-        },
-        null,
+      // Step 3 (Poisoned timing source + unmeasured WS1 motion): SKG marks vehicle #1 poisoned (retaining prior vehicle fields in skgStore.vehicles),
+      // and WS1 delivers seq=3 with has_attitude=false, has_local_pos=false -> ingress excludes poisoned timing and records null across all 7 channels!
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision: 3,
+          error: "corrupt entity payload",
+        }),
+      );
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-poisoned-notice"]'),
+      ).not.toBeNull();
+
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq: 3,
+            msg_id: 33,
+            quat_wxyz: [0, 0, 0, 0],
+            has_attitude: false,
+            body_rates: [0, 0, 0],
+            ned_xyz: [0, 0, 0],
+            has_local_pos: false,
+            ned_vel: [0, 0, 0],
+            lat_lon_alt: [37.7749, -122.4194, 10],
+            has_global_pos: true,
+            hdg_deg: 0,
+            has_heading: false,
+            timestamp: 1_100,
+          },
+        }),
       );
 
       const samples = traceBook.getBuffer(1)?.toChronologicalSamples() ?? [];
@@ -670,6 +707,165 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       getContextSpy.mockRestore();
       cafSpy.mockRestore();
       rafSpy.mockRestore();
+    }
+  });
+
+  // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
+  it("excludes poisoned timing sources across healthy -> poisoned -> recovered store transitions instead of recording stale nonzero MCU timing", () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore({ now: () => 5_000 });
+    const traceBook = new TelemetryTraceBook();
+    const vehicleId = "boxbotix.local.robotics.uxs.vehicle.1";
+
+    const pushWs1 = (seq: number, timestamp: number): void => {
+      telemetryStore.ingestRawFrame(
+        JSON.stringify({
+          type: "data",
+          subject: "bbops.telemetry.1",
+          payload: {
+            sysid: 1,
+            domain: "quadcopter",
+            seq,
+            msg_id: 30,
+            quat_wxyz: [1, 0, 0, 0],
+            has_attitude: true,
+            body_rates: [0.1, 0, 0],
+            ned_xyz: [1, 2, -5],
+            has_local_pos: true,
+            ned_vel: [1, 0, 0],
+            lat_lon_alt: [37.7749, -122.4194, 15],
+            has_global_pos: true,
+            hdg_deg: 90,
+            has_heading: true,
+            timestamp,
+          },
+        }),
+      );
+    };
+
+    // 1. Healthy vehicle (2500 us / 420 us).
+    const healthy = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.health.loopdtus": 2500,
+        "uxs.health.maxloopdtus": 3100,
+        "uxs.health.rttus": 420,
+      },
+      { hasSysStatus: true },
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: vehicleId,
+        revision: 1,
+        payload: healthy,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 1,
+      }),
+    );
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(vehicleId);
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    try {
+      const app = mount(BenchWorkspace, {
+        target: hostEl,
+        props: { telemetryStore, skgStore, viewportStore, traceBook },
+      });
+      flushSync();
+
+      pushWs1(1, 2_000);
+      expect(
+        hostEl.querySelector(
+          '[data-testid="bench-health-strip"] [data-chip-key="loop_dt_us"] strong',
+        )?.textContent,
+      ).toBe("2500 us");
+
+      // 2. Vehicle becomes poisoned: skgStore.vehicles still holds stale 2500/420 on the poisoned entry,
+      //    but Bench health strip switches to poisoned notice and WS1 ingress records null timing!
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision: 2,
+          error: "corrupt kv payload",
+        }),
+      );
+      flushSync();
+      expect(skgStore.vehicles[0]?.poisoned).toBe(true);
+      expect(skgStore.vehicles[0]?.sysStatus.loopDtUs).toBe(2500);
+      expect(
+        hostEl.querySelector('[data-testid="bench-poisoned-notice"]'),
+      ).not.toBeNull();
+      expect(
+        hostEl.querySelector(
+          '[data-testid="bench-health-strip"] [data-chip-key="loop_dt_us"]',
+        ),
+      ).toBeNull();
+
+      pushWs1(2, 2_050);
+
+      // 3. Vehicle recovers with fresh timing (1800 us / 310 us): diagnostics & trace recording resume!
+      const recovered = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.health.loopdtus": 1800,
+          "uxs.health.maxloopdtus": 2200,
+          "uxs.health.rttus": 310,
+        },
+        { hasSysStatus: true },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: vehicleId,
+          revision: 3,
+          payload: recovered,
+        }),
+      );
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-poisoned-notice"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector(
+          '[data-testid="bench-health-strip"] [data-chip-key="loop_dt_us"] strong',
+        )?.textContent,
+      ).toBe("1800 us");
+      expect(
+        hostEl.querySelector(
+          '[data-testid="bench-health-strip"] [data-chip-key="rtt_us"] strong',
+        )?.textContent,
+      ).toBe("310 us");
+
+      pushWs1(3, 2_100);
+
+      const timingHistory = (
+        traceBook.getBuffer(1)?.toChronologicalSamples() ?? []
+      ).map((s) => ({
+        timestamp: s.timestamp,
+        loopDtUs: s.loopDtUs,
+        rttUs: s.rttUs,
+      }));
+      expect(timingHistory).toEqual([
+        { timestamp: 2_000, loopDtUs: 2500, rttUs: 420 },
+        { timestamp: 2_050, loopDtUs: null, rttUs: null },
+        { timestamp: 2_100, loopDtUs: 1800, rttUs: 310 },
+      ]);
+
+      unmount(app);
+    } finally {
+      hostEl.remove();
     }
   });
 });
