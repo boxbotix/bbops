@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -956,6 +957,306 @@ func TestTrackerLinkLossSilenceThresholdsAndRestoration(t *testing.T) {
 	if evs := tracker.EvaluateSilence(tResumeST.Add(4 * time.Second)); len(evs) != 1 || evs[0].SysID != 2 || tracker.IsLinkLost(1) {
 		t.Fatalf("EvaluateSilence 2s after sysid=1 steady STATUSTEXT = %+v (lost1=%v), want only silent sysid=2 lost while sysid=1 stays fresh",
 			evs, tracker.IsLinkLost(1))
+	}
+}
+
+func hasMonotonicClock(ts time.Time) bool {
+	return strings.Contains(ts.String(), " m=")
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerMonotonicSilenceAcrossWallClockSteps(t *testing.T) {
+	tracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("NewTrackerWithTimeouts: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:45101")
+	hb := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityCompanionTeleop, mavcodec.ModeTeleopVelocity, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
+
+	// Verify public IngestDatagram(time.Now()) preserves Go's monotonic clock reading while publishing UTC ObservedAt.
+	liveTracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("NewTrackerWithTimeouts(live): %v", err)
+	}
+	liveTracker.IngestDatagram(encodeFrameBytes(t, 9, 1, 1, hb), peer, time.Now())
+	if sample, ok := liveTracker.lastPacketSample(9); !ok || !hasMonotonicClock(sample) {
+		t.Fatalf("lastPacketSample(9) = (%v, ok=%v), want preserved monotonic clock reading", sample, ok)
+	}
+	if snap9, ok := liveTracker.Snapshot(9); !ok || snap9.ObservedAt.Location() != time.UTC {
+		t.Fatalf("Snapshot(9).ObservedAt = %v, want UTC location", snap9.ObservedAt)
+	}
+
+	wall0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	mono0 := time.Now()
+	hbFrame1 := mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 1, Message: hb}
+	tracker.ingestFrameAt(hbFrame1, peer, wall0, mono0)
+
+	// Direction 1: 1-minute BACKWARD wall-clock step right after packet arrival.
+	// Silence MUST still fire at +3s monotonic (not delayed by 60s), while publishing the stepped UTC wall timestamp.
+	wallBack := wall0.Add(-1 * time.Minute)
+	if evs := tracker.evaluateSilenceAt(wallBack.Add(3*time.Second-time.Nanosecond), mono0.Add(3*time.Second-time.Nanosecond)); len(evs) != 0 {
+		t.Fatalf("backward step before 3s monotonic = %+v, want empty", evs)
+	}
+	backLossWall := wallBack.Add(3 * time.Second)
+	evsBack := tracker.evaluateSilenceAt(backLossWall, mono0.Add(3*time.Second))
+	var sys1Lost *TransitionEvent
+	for i := range evsBack {
+		if evsBack[i].SysID == 1 {
+			sys1Lost = &evsBack[i]
+		}
+	}
+	if sys1Lost == nil || sys1Lost.Kind != EventKindLinkLost || sys1Lost.Timestamp != backLossWall.UnixMilli() {
+		t.Fatalf("backward wall-step silence at +3s monotonic = %+v, want sysid=1 link_lost with stepped Timestamp=%d",
+			evsBack, backLossWall.UnixMilli())
+	}
+	if snap1, _ := tracker.Snapshot(1); !snap1.ObservedAt.Equal(wall0) {
+		t.Fatalf("backward wall-step link_lost mutated ObservedAt = %v, want %v", snap1.ObservedAt, wall0)
+	}
+
+	// Resuming packet while wall clock is still behind wall0 MUST update lastPacketAt monotonically and restore cleanly.
+	resumeBackWall := wall0.Add(-55 * time.Second)
+	resBack := tracker.ingestFrameAt(
+		mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 2, Message: mavcodec.LocalPositionNED{X: 7}},
+		peer,
+		resumeBackWall,
+		mono0.Add(4*time.Second),
+	)
+	if !resBack.Accepted || len(resBack.Events) != 1 || resBack.Events[0].Kind != EventKindLinkRestored ||
+		resBack.Events[0].Timestamp != resumeBackWall.UnixMilli() || resBack.Telemetry == nil ||
+		resBack.Telemetry.Timestamp != resumeBackWall.UnixMilli() {
+		t.Fatalf("resume under backward wall clock = %+v, want link_restored + Telemetry at %d", resBack, resumeBackWall.UnixMilli())
+	}
+	if evs := tracker.evaluateSilenceAt(wall0.Add(-53*time.Second), mono0.Add(6900*time.Millisecond)); len(evs) != 0 && slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 1 }) {
+		t.Fatalf("unexpected early re-loss after backward-wall resume: %+v", evs)
+	}
+	if evs := tracker.evaluateSilenceAt(wall0.Add(-52*time.Second), mono0.Add(7*time.Second)); !slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 1 && e.Kind == EventKindLinkLost }) {
+		t.Fatalf("missing +3s monotonic re-loss after backward-wall resume: %+v", evs)
+	}
+
+	// Direction 2: 1-minute FORWARD wall-clock step 100ms after admission MUST NOT cause a false link_lost.
+	hbFrame2 := mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 1, Message: hb}
+	tracker.ingestFrameAt(hbFrame2, peer, wall0, mono0)
+	wallFwdJump := wall0.Add(time.Minute)
+	if evs := tracker.evaluateSilenceAt(wallFwdJump, mono0.Add(100*time.Millisecond)); slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 2 }) || tracker.IsLinkLost(2) {
+		t.Fatalf("forward +1m wall step at +100ms monotonic caused false link_lost: evs=%+v lost=%v", evs, tracker.IsLinkLost(2))
+	}
+	if evs := tracker.evaluateSilenceAt(wallFwdJump.Add(2900*time.Millisecond-time.Nanosecond), mono0.Add(3*time.Second-time.Nanosecond)); slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 2 }) {
+		t.Fatalf("forward wall step fired before +3s monotonic: %+v", evs)
+	}
+	fwdLossWall := wallFwdJump.Add(2900 * time.Millisecond)
+	evsFwd := tracker.evaluateSilenceAt(fwdLossWall, mono0.Add(3*time.Second))
+	if !slices.ContainsFunc(evsFwd, func(e TransitionEvent) bool {
+		return e.SysID == 2 && e.Kind == EventKindLinkLost && e.Timestamp == fwdLossWall.UnixMilli()
+	}) {
+		t.Fatalf("forward wall step at +3s monotonic = %+v, want sysid=2 link_lost with Timestamp=%d", evsFwd, fwdLossWall.UnixMilli())
+	}
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestComponentSerializesSilenceLossBeforeConcurrentResumption(t *testing.T) {
+	srv, err := natsserver.NewServer(&natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		NoLog:     true,
+		NoSigs:    true,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.Start()
+	t.Cleanup(func() {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+	})
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatal("embedded NATS server not ready")
+	}
+
+	pubNC, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithMaxReconnects(0))
+	if err != nil {
+		t.Fatalf("NewClient(pub): %v", err)
+	}
+	if err := pubNC.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect(pub): %v", err)
+	}
+	t.Cleanup(func() { _ = pubNC.Close(context.Background()) })
+
+	subNC, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithMaxReconnects(0))
+	if err != nil {
+		t.Fatalf("NewClient(sub): %v", err)
+	}
+	if err := subNC.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect(sub): %v", err)
+	}
+	t.Cleanup(func() { _ = subNC.Close(context.Background()) })
+
+	sub, err := subNC.GetConnection().SubscribeSync("bbops.telemetry.>")
+	if err != nil {
+		t.Fatalf("SubscribeSync: %v", err)
+	}
+	if err := subNC.GetConnection().Flush(); err != nil {
+		t.Fatalf("Flush subscriber: %v", err)
+	}
+
+	udpPort := allocateLoopbackUDPPort(t)
+	rawCfg, err := json.Marshal(map[string]any{
+		"skg_hz":                 5,
+		"link_timeout_ms":        220,
+		"supervisory_timeout_ms": 1000,
+		"ports": map[string]any{
+			"inputs": []map[string]any{
+				{
+					"name":     "mavlink_udp",
+					"external": true,
+					"config": map[string]any{
+						"kind":     "network",
+						"protocol": "udp",
+						"host":     "127.0.0.1",
+						"port":     udpPort,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal rawCfg: %v", err)
+	}
+
+	comp, err := NewComponent(rawCfg, component.Dependencies{
+		NATSClient: pubNC,
+		Platform:   types.PlatformMeta{Org: "boxbotix", Platform: "bbops"},
+	})
+	if err != nil {
+		t.Fatalf("NewComponent: %v", err)
+	}
+
+	// Block JetStream acknowledgements on the SKG Publisher worker for the entire contention test
+	// to prove neither readLoop nor tickLoop blocks on JetStream acks.
+	releaseJetStream := make(chan struct{})
+	comp.publisher.publishBatch = func(ctx context.Context, _ string, _ [][]byte) error {
+		select {
+		case <-releaseJetStream:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	evalPaused := make(chan struct{})
+	readerAtBoundary := make(chan struct{})
+	var evalOnce sync.Once
+	var readerOnce sync.Once
+
+	comp.afterSilenceEval = func(ev TransitionEvent) {
+		if ev.SysID == 1 && ev.Kind == EventKindLinkLost {
+			evalOnce.Do(func() {
+				close(evalPaused)
+				select {
+				case <-readerAtBoundary:
+				case <-time.After(3 * time.Second):
+				}
+				// Give readLoop a window where, without per-sysid serialization, it would
+				// complete IngestFrame + publishCoreJSON([link_restored, telemetry]) before link_lost.
+				time.Sleep(15 * time.Millisecond)
+			})
+		}
+	}
+	comp.beforeIngestFrame = func(frame mavcodec.Frame) {
+		if frame.SystemID == 1 && frame.Message != nil && frame.Message.MessageID() == mavcodec.MsgIDLocalPositionNED {
+			readerOnce.Do(func() {
+				close(readerAtBoundary)
+			})
+		}
+	}
+
+	if err := comp.Initialize(); err != nil {
+		t.Fatalf("comp.Initialize: %v", err)
+	}
+	startCtx, startCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer startCancel()
+	if err := comp.Start(startCtx); err != nil {
+		t.Fatalf("comp.Start: %v", err)
+	}
+	defer func() {
+		close(releaseJetStream)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if stopErr := comp.Stop(stopCtx); stopErr != nil {
+			t.Errorf("comp.Stop: %v", stopErr)
+		}
+	}()
+
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP client: %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+	dest := net.UDPAddrFromAddrPort(comp.BoundAddr())
+
+	hb := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityCompanionTeleop, mavcodec.ModeTeleopVelocity, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
+	if _, err := udpClient.WriteToUDP(encodeFrameBytes(t, 1, 1, 1, hb), dest); err != nil {
+		t.Fatalf("WriteToUDP(HB): %v", err)
+	}
+
+	// Verify Component's live readLoop preserved Go's monotonic clock reading on lastPacketAt.
+	admitDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if sample, ok := comp.tracker.lastPacketSample(1); ok {
+			if !hasMonotonicClock(sample) {
+				t.Fatalf("Component readLoop stripped monotonic clock reading: %v", sample)
+			}
+			break
+		}
+		if time.Now().After(admitDeadline) {
+			t.Fatal("timed out waiting for sysid=1 admission")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait until tickLoop marks sysid=1 link-lost and pauses right before publishing link_lost.
+	select {
+	case <-evalPaused:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for tickLoop silence evaluation")
+	}
+
+	// Inject resuming #32 LOCAL_POSITION_NED while tickLoop is paused inside afterSilenceEval.
+	if _, err := udpClient.WriteToUDP(encodeFrameBytes(t, 1, 1, 2, mavcodec.LocalPositionNED{X: 42, Y: -3, Z: -10}), dest); err != nil {
+		t.Fatalf("WriteToUDP(LocalPositionNED): %v", err)
+	}
+
+	// Collect wire order while JetStream publishBatch remains blocked!
+	var wireOrder []string
+	for len(wireOrder) < 3 {
+		msg, nextErr := sub.NextMsg(3 * time.Second)
+		if nextErr != nil {
+			t.Fatalf("NextMsg(%d): %v (wireOrder so far: %v)", len(wireOrder), nextErr, wireOrder)
+		}
+		switch msg.Subject {
+		case "bbops.telemetry.events.1":
+			var ev TransitionEvent
+			if uErr := json.Unmarshal(msg.Data, &ev); uErr != nil {
+				t.Fatalf("unmarshal TransitionEvent: %v", uErr)
+			}
+			wireOrder = append(wireOrder, ev.Kind)
+		case "bbops.telemetry.1":
+			var tf TelemetryFrame
+			if uErr := json.Unmarshal(msg.Data, &tf); uErr != nil {
+				t.Fatalf("unmarshal TelemetryFrame: %v", uErr)
+			}
+			if !tf.HasLocalPos || tf.NEDXYZ[0] != 42 {
+				t.Fatalf("TelemetryFrame = %+v, want NEDXYZ[0]=42", tf)
+			}
+			wireOrder = append(wireOrder, "telemetry")
+		default:
+			t.Fatalf("unexpected NATS subject %q", msg.Subject)
+		}
+	}
+	wantOrder := []string{EventKindLinkLost, EventKindLinkRestored, "telemetry"}
+	if !slices.Equal(wireOrder, wantOrder) {
+		t.Fatalf("wire order = %v, want %v", wireOrder, wantOrder)
 	}
 }
 

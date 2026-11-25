@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/boxbotix/bbops/internal/mavcodec"
 	"github.com/c360studio/semengine/component"
 	"github.com/c360studio/semengine/types"
 )
@@ -32,6 +33,14 @@ type Component struct {
 
 	conn      atomic.Pointer[net.UDPConn]
 	boundAddr atomic.Pointer[netip.AddrPort]
+
+	// sysidMu serializes per-vehicle Tracker transitions with Core NATS Lane 1 / Lane 3
+	// publication across readLoop and tickLoop while keeping JetStream acks off both paths.
+	sysidMu [256]sync.Mutex
+
+	// Test-only synchronization hooks (nil in production).
+	beforeIngestFrame func(frame mavcodec.Frame)
+	afterSilenceEval  func(ev TransitionEvent)
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -269,26 +278,41 @@ func (c *Component) readLoop(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 
-		now := time.Now().UTC()
-		outcome := c.tracker.IngestDatagram(buf[:n], peerAddr, now)
-		if outcome.CountedError {
+		frame, decErr := mavcodec.DecodeFrame(buf[:n])
+		if decErr != nil {
 			c.lifecycle.CountError()
 			continue
 		}
-		if !outcome.Accepted {
-			continue
+		if c.beforeIngestFrame != nil {
+			c.beforeIngestFrame(frame)
 		}
-		c.lifecycle.CountInput(n)
+		c.ingestDecodedFrame(ctx, frame, peerAddr, n)
+	}
+}
 
-		for i := range outcome.Events {
-			c.publishCoreJSON(ctx, c.eventSubject(outcome.SysID), outcome.Events[i])
-		}
-		if outcome.Telemetry != nil {
-			c.publishCoreJSON(ctx, c.telemetrySubject(outcome.SysID), outcome.Telemetry)
-		}
-		if outcome.UrgentSKGSync {
-			c.publisher.NotifyUrgent(outcome.SysID)
-		}
+func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame, peerAddr netip.AddrPort, n int) {
+	mu := &c.sysidMu[frame.SystemID]
+	mu.Lock()
+	defer mu.Unlock()
+
+	outcome := c.tracker.IngestFrame(frame, peerAddr, time.Now())
+	if outcome.CountedError {
+		c.lifecycle.CountError()
+		return
+	}
+	if !outcome.Accepted {
+		return
+	}
+	c.lifecycle.CountInput(n)
+
+	for i := range outcome.Events {
+		c.publishCoreJSON(ctx, c.eventSubject(outcome.SysID), outcome.Events[i])
+	}
+	if outcome.Telemetry != nil {
+		c.publishCoreJSON(ctx, c.telemetrySubject(outcome.SysID), outcome.Telemetry)
+	}
+	if outcome.UrgentSKGSync {
+		c.publisher.NotifyUrgent(outcome.SysID)
 	}
 }
 
@@ -300,12 +324,24 @@ func (c *Component) tickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, ev := range c.tracker.EvaluateSilence(time.Now().UTC()) {
-				c.publishCoreJSON(ctx, c.eventSubject(ev.SysID), ev)
-			}
-			c.publisher.NotifyPeriodic()
+			c.evaluateSilenceTick(ctx)
 		}
 	}
+}
+
+func (c *Component) evaluateSilenceTick(ctx context.Context) {
+	for _, sysid := range c.tracker.admittedSysIDs() {
+		mu := &c.sysidMu[sysid]
+		mu.Lock()
+		if ev, lost := c.tracker.evaluateSilenceSysID(sysid, time.Now()); lost {
+			if c.afterSilenceEval != nil {
+				c.afterSilenceEval(ev)
+			}
+			c.publishCoreJSON(ctx, c.eventSubject(ev.SysID), ev)
+		}
+		mu.Unlock()
+	}
+	c.publisher.NotifyPeriodic()
 }
 
 func (c *Component) publishCoreJSON(ctx context.Context, subject string, v any) {
