@@ -5,6 +5,7 @@
 <script lang="ts">
   import TacticalCanvas from "$lib/components/TacticalCanvas.svelte";
   import {
+    COP_SOLO_SECTIONS,
     type CopSoloSection,
     type FleetFreshnessContext,
     type VehicleFreshnessView,
@@ -17,6 +18,7 @@
     resolveLiveVehiclePose,
     selectBannerPresentation,
     selectCopSoloSection,
+    stepTablistIndex,
     summarizeFleetHealth,
   } from "$lib/hud/view-model";
   import {
@@ -54,6 +56,11 @@
   }: Props = $props();
 
   let activeSection = $state<CopSoloSection>("summary");
+  let summaryTabEl: HTMLButtonElement | undefined = $state();
+  let alertsTabEl: HTMLButtonElement | undefined = $state();
+  let skgTabEl: HTMLButtonElement | undefined = $state();
+  let panelHostEl: HTMLDivElement | undefined = $state();
+  let hadPanelFocusBeforeUpdate = false;
 
   const resolvedFreshnessContext = $derived<FleetFreshnessContext | undefined>(
     freshnessContext
@@ -169,6 +176,18 @@
   );
   const tripleRows = $derived(formatEntityTriples(selectedEntity).slice(0, 16));
 
+  const panelFocusDeps = $derived(
+    `${activeSection}|${selectedEntity?.id ?? ""}|${selectedEntity?.poisoned ? "1" : "0"}|${faultedOwnshipEntries.map((entry) => entry.id).join(",")}|${tripleRows.length}`,
+  );
+
+  function getSoloTabElement(
+    section: CopSoloSection,
+  ): HTMLButtonElement | undefined {
+    if (section === "summary") return summaryTabEl;
+    if (section === "alerts") return alertsTabEl;
+    return skgTabEl;
+  }
+
   function handleSelectEntity(entityId: string): void {
     viewportStore.selectEntity(entityId);
     onSyncHash?.(viewportStore.toUrlHash());
@@ -182,12 +201,78 @@
   function setSoloSection(section: CopSoloSection): void {
     activeSection = selectCopSoloSection(activeSection, section);
   }
+
+  function handleSoloTabKeydown(
+    section: CopSoloSection,
+    ev: KeyboardEvent,
+  ): void {
+    if (ev.altKey || ev.ctrlKey || ev.metaKey) {
+      return;
+    }
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      setSoloSection(section);
+      return;
+    }
+    const currentIdx = COP_SOLO_SECTIONS.indexOf(section);
+    const nextIdx = stepTablistIndex(
+      currentIdx,
+      ev.key,
+      COP_SOLO_SECTIONS.length,
+    );
+    if (nextIdx === null) {
+      return;
+    }
+    ev.preventDefault();
+    const nextSection = COP_SOLO_SECTIONS[nextIdx] ?? "summary";
+    setSoloSection(nextSection);
+    getSoloTabElement(nextSection)?.focus({ preventScroll: true });
+  }
+
+  $effect.pre(() => {
+    void panelFocusDeps;
+    const activeEl =
+      typeof document !== "undefined" ? document.activeElement : null;
+    hadPanelFocusBeforeUpdate = Boolean(
+      activeEl &&
+      activeEl !== document.body &&
+      activeEl !== document.documentElement &&
+      panelHostEl?.contains(activeEl),
+    );
+  });
+
+  $effect(() => {
+    void panelFocusDeps;
+    const shouldCheck = hadPanelFocusBeforeUpdate;
+    hadPanelFocusBeforeUpdate = false;
+    if (
+      !shouldCheck ||
+      viewportStore.workspace !== "cop" ||
+      viewportStore.lightsOut
+    ) {
+      return;
+    }
+    const activeEl =
+      typeof document !== "undefined" ? document.activeElement : null;
+    if (
+      !activeEl ||
+      activeEl === document.body ||
+      activeEl === document.documentElement ||
+      !activeEl.isConnected
+    ) {
+      getSoloTabElement(activeSection)?.focus({ preventScroll: true });
+    }
+  });
 </script>
 
 <div
   class="cop-stage"
   class:lights-out={viewportStore.lightsOut}
   data-testid="cop-workspace"
+  data-workspace-stage="cop"
+  role="region"
+  aria-label="Fleet workspace"
+  tabindex="-1"
 >
   {#if !viewportStore.lightsOut}
     <aside
@@ -295,270 +380,321 @@
         aria-label="Fleet inspector sections"
       >
         <button
+          bind:this={summaryTabEl}
+          id="cop-solo-tab-summary"
           type="button"
           role="tab"
           class="solo-tab"
           class:active={activeSection === "summary"}
           aria-selected={activeSection === "summary"}
+          aria-controls="cop-solo-panel-summary"
+          tabindex={activeSection === "summary" ? 0 : -1}
           data-testid="cop-solo-tab-summary"
           onclick={() => setSoloSection("summary")}
+          onkeydown={(ev) => handleSoloTabKeydown("summary", ev)}
         >
           Summary
         </button>
         <button
+          bind:this={alertsTabEl}
+          id="cop-solo-tab-alerts"
           type="button"
           role="tab"
           class="solo-tab"
           class:active={activeSection === "alerts"}
           aria-selected={activeSection === "alerts"}
+          aria-controls="cop-solo-panel-alerts"
+          tabindex={activeSection === "alerts" ? 0 : -1}
           data-testid="cop-solo-tab-alerts"
           onclick={() => setSoloSection("alerts")}
+          onkeydown={(ev) => handleSoloTabKeydown("alerts", ev)}
         >
           Exceptions ({fleetHealth.faultedCount})
         </button>
         <button
+          bind:this={skgTabEl}
+          id="cop-solo-tab-skg"
           type="button"
           role="tab"
           class="solo-tab"
           class:active={activeSection === "skg"}
           aria-selected={activeSection === "skg"}
+          aria-controls="cop-solo-panel-skg"
+          tabindex={activeSection === "skg" ? 0 : -1}
           data-testid="cop-solo-tab-skg"
           onclick={() => setSoloSection("skg")}
+          onkeydown={(ev) => handleSoloTabKeydown("skg", ev)}
         >
           SKG ({tripleRows.length})
         </button>
       </div>
 
-      {#if activeSection === "summary"}
-        <section
-          class="solo-panel"
-          data-testid="cop-solo-panel-summary"
-          aria-label="Selected track summary"
-        >
-          {#if vehicleSummary && selectedVehicle}
-            <div class="summary-header">
-              <strong>UXS #{vehicleSummary.sysid}</strong>
-              <span class="muted">{vehicleSummary.domain}</span>
-            </div>
-
-            <dl class="kv-grid">
-              <div>
-                <dt>Authority</dt>
-                <dd>{vehicleSummary.authorityBadge.label}</dd>
-              </div>
-              <div>
-                <dt>Propulsion</dt>
-                <dd>{vehicleSummary.armedBadge.label}</dd>
-              </div>
-              <div>
-                <dt>Link Tier</dt>
-                <dd>{vehicleSummary.linkBadge.label}</dd>
-              </div>
-              <div>
-                <dt>Freshness</dt>
-                <dd data-testid="cop-summary-freshness">
-                  {selectedFreshness && !selectedFreshness.fresh
-                    ? selectedFreshness.statusLabel
-                    : "LIVE"}
-                </dd>
-              </div>
-              <div>
-                <dt>Kinematics</dt>
-                <dd>
-                  {#if liveMetrics}
-                    GS {liveMetrics.groundspeedMps.toFixed(1)} m/s · ALT {liveMetrics.altitudeRelM.toFixed(
-                      1,
-                    )} m
-                  {:else}
-                    NO POS
-                  {/if}
-                </dd>
-              </div>
-            </dl>
-
-            <div class="jump-actions">
-              <button
-                type="button"
-                class="jump-btn"
-                onclick={() => switchWorkspace("pilot")}
-              >
-                Vehicle [D]
-              </button>
-              <button
-                type="button"
-                class="jump-btn"
-                onclick={() => switchWorkspace("bench")}
-              >
-                Diagnostics [B]
-              </button>
-              <button
-                type="button"
-                class="jump-btn"
-                onclick={() => switchWorkspace("cortex")}
-              >
-                Analysis [K]
-              </button>
-            </div>
-          {:else if poisonedSummary}
-            <div class="summary-header">
-              <strong>UXS #{poisonedSummary.sysid}</strong>
-              <span class="chip-error">POISONED</span>
-            </div>
-            <dl class="kv-grid">
-              <div>
-                <dt>Status</dt>
-                <dd>{poisonedSummary.poisonError ?? "decode-error"}</dd>
-              </div>
-              <div>
-                <dt>Freshness</dt>
-                <dd data-testid="cop-summary-freshness">
-                  {poisonedSummary.freshness?.statusLabel ??
-                    "LAST KNOWN · age unknown"}
-                </dd>
-              </div>
-            </dl>
-          {:else if contactSummary}
-            <div class="contact-summary-card" data-testid="cop-contact-summary">
+      <div class="solo-panel-host" bind:this={panelHostEl}>
+        {#if activeSection === "summary"}
+          <div
+            id="cop-solo-panel-summary"
+            role="tabpanel"
+            aria-labelledby="cop-solo-tab-summary"
+            class="solo-panel"
+            data-testid="cop-solo-panel-summary"
+          >
+            {#if vehicleSummary && selectedVehicle}
               <div class="summary-header">
-                <span class="contact-badge">EXTERNAL CONTACT</span>
-                <strong>{contactSummary.title}</strong>
+                <strong>UXS #{vehicleSummary.sysid}</strong>
+                <span class="muted">{vehicleSummary.domain}</span>
               </div>
+
               <dl class="kv-grid">
                 <div>
-                  <dt>Type</dt>
-                  <dd>{contactSummary.contactType}</dd>
+                  <dt>Authority</dt>
+                  <dd>{vehicleSummary.authorityBadge.label}</dd>
                 </div>
                 <div>
-                  <dt>Source</dt>
-                  <dd>{contactSummary.source}</dd>
+                  <dt>Propulsion</dt>
+                  <dd>{vehicleSummary.armedBadge.label}</dd>
                 </div>
                 <div>
-                  <dt>Feed</dt>
-                  <dd>{contactSummary.feedStatus}</dd>
+                  <dt>Link Tier</dt>
+                  <dd>{vehicleSummary.linkBadge.label}</dd>
                 </div>
                 <div>
-                  <dt>Uncertainty</dt>
-                  <dd>{contactSummary.uncertaintyLabel}</dd>
+                  <dt>Freshness</dt>
+                  <dd data-testid="cop-summary-freshness">
+                    {selectedFreshness && !selectedFreshness.fresh
+                      ? selectedFreshness.statusLabel
+                      : "LIVE"}
+                  </dd>
                 </div>
                 <div>
-                  <dt>Observed</dt>
-                  <dd>{contactSummary.observedAt}</dd>
-                </div>
-                <div>
-                  <dt>Received</dt>
-                  <dd>{contactSummary.receivedAt}</dd>
-                </div>
-                <div>
-                  <dt>Expires</dt>
-                  <dd>{contactSummary.expiresAt}</dd>
+                  <dt>Kinematics</dt>
+                  <dd>
+                    {#if liveMetrics}
+                      GS {liveMetrics.groundspeedMps.toFixed(1)} m/s · ALT {liveMetrics.altitudeRelM.toFixed(
+                        1,
+                      )} m
+                    {:else}
+                      NO POS
+                    {/if}
+                  </dd>
                 </div>
               </dl>
+
               <div class="jump-actions">
                 <button
                   type="button"
                   class="jump-btn"
+                  aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+                    ? "D"
+                    : undefined}
+                  onclick={() => switchWorkspace("pilot")}
+                >
+                  {viewportStore.characterShortcutsEnabled
+                    ? "Vehicle [D]"
+                    : "Vehicle"}
+                </button>
+                <button
+                  type="button"
+                  class="jump-btn"
+                  aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+                    ? "B"
+                    : undefined}
+                  onclick={() => switchWorkspace("bench")}
+                >
+                  {viewportStore.characterShortcutsEnabled
+                    ? "Diagnostics [B]"
+                    : "Diagnostics"}
+                </button>
+                <button
+                  type="button"
+                  class="jump-btn"
+                  aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+                    ? "K"
+                    : undefined}
                   onclick={() => switchWorkspace("cortex")}
                 >
-                  Inspect Provenance in Analysis [K]
+                  {viewportStore.characterShortcutsEnabled
+                    ? "Analysis [K]"
+                    : "Analysis"}
                 </button>
               </div>
-            </div>
-          {:else}
-            <p class="rail-empty">
-              Select a UXS vehicle or external contact on the canvas, roster, or
-              filmstrip.
-            </p>
-          {/if}
-        </section>
-      {:else if activeSection === "alerts"}
-        <section
-          class="solo-panel"
-          data-testid="cop-solo-panel-alerts"
-          aria-label="Active fleet exceptions"
-        >
-          {#if faultedOwnshipEntries.length === 0}
-            <p class="rail-empty" data-testid="cop-exceptions-empty">
-              {fleetHealth.exceptionsEmptyCopy}
-            </p>
-          {:else}
-            <ul class="exception-list">
-              {#each faultedOwnshipEntries as entry (entry.id)}
-                <li class="exception-card">
+            {:else if poisonedSummary}
+              <div class="summary-header">
+                <strong>UXS #{poisonedSummary.sysid}</strong>
+                <span class="chip-error">POISONED</span>
+              </div>
+              <dl class="kv-grid">
+                <div>
+                  <dt>Status</dt>
+                  <dd>{poisonedSummary.poisonError ?? "decode-error"}</dd>
+                </div>
+                <div>
+                  <dt>Freshness</dt>
+                  <dd data-testid="cop-summary-freshness">
+                    {poisonedSummary.freshness?.statusLabel ??
+                      "LAST KNOWN · age unknown"}
+                  </dd>
+                </div>
+              </dl>
+            {:else if contactSummary}
+              <div
+                class="contact-summary-card"
+                data-testid="cop-contact-summary"
+              >
+                <div class="summary-header">
+                  <span class="contact-badge">EXTERNAL CONTACT</span>
+                  <strong>{contactSummary.title}</strong>
+                </div>
+                <dl class="kv-grid">
+                  <div>
+                    <dt>Type</dt>
+                    <dd>{contactSummary.contactType}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{contactSummary.source}</dd>
+                  </div>
+                  <div>
+                    <dt>Feed</dt>
+                    <dd>{contactSummary.feedStatus}</dd>
+                  </div>
+                  <div>
+                    <dt>Uncertainty</dt>
+                    <dd>{contactSummary.uncertaintyLabel}</dd>
+                  </div>
+                  <div>
+                    <dt>Observed</dt>
+                    <dd>{contactSummary.observedAt}</dd>
+                  </div>
+                  <div>
+                    <dt>Received</dt>
+                    <dd>{contactSummary.receivedAt}</dd>
+                  </div>
+                  <div>
+                    <dt>Expires</dt>
+                    <dd>{contactSummary.expiresAt}</dd>
+                  </div>
+                </dl>
+                <div class="jump-actions">
                   <button
                     type="button"
-                    class="exception-select"
-                    onclick={() => handleSelectEntity(entry.id)}
+                    class="jump-btn"
+                    aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+                      ? "K"
+                      : undefined}
+                    onclick={() => switchWorkspace("cortex")}
                   >
-                    <strong>UXS #{entry.sysid}</strong>
-                    <span>{entry.statusLabel}</span>
+                    {viewportStore.characterShortcutsEnabled
+                      ? "Inspect Provenance in Analysis [K]"
+                      : "Inspect Provenance in Analysis"}
                   </button>
-                  {#if entry.staleLabel}
-                    <span
-                      class="chip-warning"
-                      data-testid="cop-exception-stale"
+                </div>
+              </div>
+            {:else}
+              <p class="rail-empty">
+                Select a UXS vehicle or external contact on the canvas, roster,
+                or filmstrip.
+              </p>
+            {/if}
+          </div>
+        {:else if activeSection === "alerts"}
+          <div
+            id="cop-solo-panel-alerts"
+            role="tabpanel"
+            aria-labelledby="cop-solo-tab-alerts"
+            class="solo-panel"
+            data-testid="cop-solo-panel-alerts"
+          >
+            {#if faultedOwnshipEntries.length === 0}
+              <p class="rail-empty" data-testid="cop-exceptions-empty">
+                {fleetHealth.exceptionsEmptyCopy}
+              </p>
+            {:else}
+              <ul class="exception-list">
+                {#each faultedOwnshipEntries as entry (entry.id)}
+                  <li class="exception-card">
+                    <button
+                      type="button"
+                      class="exception-select"
+                      onclick={() => handleSelectEntity(entry.id)}
                     >
-                      {entry.staleLabel}
-                    </span>
-                  {/if}
-                  {#if entry.poisoned}
-                    <span class="chip-error">POISONED</span>
-                  {/if}
-                  <div class="chip-wrap">
-                    {#each entry.chips as chip (chip.key)}
-                      <span class="chip-{chip.severity}">
-                        {chip.label}: {chip.value}
+                      <strong>UXS #{entry.sysid}</strong>
+                      <span>{entry.statusLabel}</span>
+                    </button>
+                    {#if entry.staleLabel}
+                      <span
+                        class="chip-warning"
+                        data-testid="cop-exception-stale"
+                      >
+                        {entry.staleLabel}
                       </span>
-                    {/each}
-                  </div>
-                </li>
-              {/each}
-            </ul>
-          {/if}
+                    {/if}
+                    {#if entry.poisoned}
+                      <span class="chip-error">POISONED</span>
+                    {/if}
+                    <div class="chip-wrap">
+                      {#each entry.chips as chip (chip.key)}
+                        <span class="chip-{chip.severity}">
+                          {chip.label}: {chip.value}
+                        </span>
+                      {/each}
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
 
-          <h3 class="sub-heading">Recent Lane 3 Transitions</h3>
-          {#if recentEvents.length === 0}
-            <p class="rail-empty">No transition events recorded.</p>
-          {:else}
-            <ul class="event-list">
-              {#each recentEvents as row (row.key)}
-                <li class="event-item">
-                  <span>{row.headline}</span>
-                  <span class="muted">{row.detail}</span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        </section>
-      {:else}
-        <section
-          class="solo-panel"
-          data-testid="cop-solo-panel-skg"
-          aria-label="Quick SKG assertions"
-        >
-          {#if !selectedEntity}
-            <p class="rail-empty">Select an entity to inspect SKG triples.</p>
-          {:else}
-            <div class="skg-meta">
-              <span>rev #{selectedEntity.kvRevision}</span>
-              <button
-                type="button"
-                class="jump-btn"
-                onclick={() => switchWorkspace("cortex")}
-              >
-                Open Analysis [K]
-              </button>
-            </div>
-            <ul class="triple-list">
-              {#each tripleRows as row, idx (`${row.predicate}:${idx}`)}
-                <li class="triple-row">
-                  <span class="triple-pred">{row.predicate}</span>
-                  <strong class="triple-obj">{row.objectText}</strong>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        </section>
-      {/if}
+            <h3 class="sub-heading">Recent Lane 3 Transitions</h3>
+            {#if recentEvents.length === 0}
+              <p class="rail-empty">No transition events recorded.</p>
+            {:else}
+              <ul class="event-list">
+                {#each recentEvents as row (row.key)}
+                  <li class="event-item">
+                    <span>{row.headline}</span>
+                    <span class="muted">{row.detail}</span>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        {:else}
+          <div
+            id="cop-solo-panel-skg"
+            role="tabpanel"
+            aria-labelledby="cop-solo-tab-skg"
+            class="solo-panel"
+            data-testid="cop-solo-panel-skg"
+          >
+            {#if !selectedEntity}
+              <p class="rail-empty">Select an entity to inspect SKG triples.</p>
+            {:else}
+              <div class="skg-meta">
+                <span>rev #{selectedEntity.kvRevision}</span>
+                <button
+                  type="button"
+                  class="jump-btn"
+                  aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+                    ? "K"
+                    : undefined}
+                  onclick={() => switchWorkspace("cortex")}
+                >
+                  {viewportStore.characterShortcutsEnabled
+                    ? "Open Analysis [K]"
+                    : "Open Analysis"}
+                </button>
+              </div>
+              <ul class="triple-list">
+                {#each tripleRows as row, idx (`${row.predicate}:${idx}`)}
+                  <li class="triple-row">
+                    <span class="triple-pred">{row.predicate}</span>
+                    <strong class="triple-obj">{row.objectText}</strong>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        {/if}
+      </div>
     </aside>
   {/if}
 </div>
@@ -704,6 +840,12 @@
   .solo-tab.active {
     border-color: var(--ui-border-interactive, #3b82f6);
     color: var(--ui-text-primary, #e2e8f0);
+  }
+
+  .solo-panel-host {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
   }
 
   .solo-panel {

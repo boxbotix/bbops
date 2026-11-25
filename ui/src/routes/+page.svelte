@@ -11,12 +11,29 @@
   import { selectFilmstripItems } from "$lib/hud/view-model";
   import { createSkgStore } from "$lib/stores/skg.svelte";
   import { createTelemetryStore } from "$lib/stores/telemetry.svelte";
-  import { createViewportStore } from "$lib/stores/viewport.svelte";
+  import {
+    type ShortcutStorageLike,
+    createViewportStore,
+  } from "$lib/stores/viewport.svelte";
   import { handleViewportHotkey } from "$lib/viewport/hotkeys";
+
+  function resolveBrowserShortcutStorage(): ShortcutStorageLike | null {
+    if (typeof window === "undefined") {
+      return null;
+    }
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
 
   const telemetryStore = createTelemetryStore();
   const skgStore = createSkgStore();
-  const viewportStore = createViewportStore({ skgStore });
+  const viewportStore = createViewportStore({
+    skgStore,
+    storage: resolveBrowserShortcutStorage(),
+  });
   const graphqlClient = createGraphQLClient();
   const searchClient = createGraphSearchClient();
   const traceBook = new TelemetryTraceBook();

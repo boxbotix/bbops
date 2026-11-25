@@ -862,7 +862,6 @@
     bind:this={overlayCanvasEl}
     class="safety-hud-canvas"
     data-layer="safety-hud-overlay"
-    data-viewport-hotkey-scope="true"
     tabindex="-1"
     aria-label="Multi-domain tactical COP canvas"
     onpointerdown={handlePointerDown}
@@ -923,6 +922,9 @@
         type="button"
         class="chip"
         aria-pressed={viewportStore.tetheredEntityId !== null}
+        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+          ? "T"
+          : undefined}
         disabled={viewportStore.selectedEntityId === null &&
           viewportStore.tetheredEntityId === null}
         onclick={() => {
@@ -934,12 +936,15 @@
           onSyncHash?.(viewportStore.toUrlHash());
         }}
       >
-        Tether [T]
+        {viewportStore.characterShortcutsEnabled ? "Tether [T]" : "Tether"}
       </button>
       <button
         type="button"
         class="chip"
         aria-pressed={viewportStore.chaseLock}
+        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+          ? "C"
+          : undefined}
         disabled={viewportStore.selectedEntityId === null &&
           viewportStore.tetheredEntityId === null}
         onclick={() => {
@@ -947,13 +952,19 @@
           onSyncHash?.(viewportStore.toUrlHash());
         }}
       >
-        Chase [C]
+        {viewportStore.characterShortcutsEnabled ? "Chase [C]" : "Chase"}
       </button>
       {#each DECLUTTER_LEVELS as level (level)}
         <button
           type="button"
           class="chip"
           aria-pressed={viewportStore.declutter === level}
+          aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+            ? "H"
+            : undefined}
+          title={viewportStore.characterShortcutsEnabled
+            ? `HUD declutter: ${level} (cycle with H)`
+            : `HUD declutter: ${level}`}
           onclick={() => {
             viewportStore.setDeclutter(level);
             onSyncHash?.(viewportStore.toUrlHash());
@@ -997,6 +1008,10 @@
     z-index: 2;
     cursor: grab;
     touch-action: none;
+  }
+
+  .safety-hud-canvas:focus-visible {
+    outline-offset: -2px;
   }
 
   .safety-hud-canvas:active {

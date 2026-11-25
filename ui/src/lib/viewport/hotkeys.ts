@@ -11,6 +11,7 @@ export interface HotkeyTargetLike {
   readonly tagName?: string;
   readonly isContentEditable?: boolean;
   getAttribute?(name: string): string | null;
+  closest?(selector: string): unknown;
 }
 
 export interface HotkeyEventLike {
@@ -25,17 +26,27 @@ export interface HotkeyEventLike {
   preventDefault?(): void;
 }
 
-export const VIEWPORT_HOTKEY_SCOPE_ATTR = "data-viewport-hotkey-scope";
-
 const EDITABLE_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
-const INTERACTIVE_CONTROL_TAGS = new Set([
-  "BUTTON",
-  "A",
-  "INPUT",
-  "TEXTAREA",
-  "SELECT",
-  "SUMMARY",
+const EDITABLE_ARIA_ROLES = new Set([
+  "textbox",
+  "searchbox",
+  "combobox",
+  "spinbutton",
+  "slider",
 ]);
+const EDITABLE_CLOSEST_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  '[contenteditable=""]',
+  '[contenteditable="true"]',
+  '[contenteditable="plaintext-only"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="combobox"]',
+  '[role="spinbutton"]',
+  '[role="slider"]',
+].join(", ");
 
 export function isEditableHotkeyTarget(
   target: HotkeyTargetLike | null | undefined,
@@ -50,33 +61,28 @@ export function isEditableHotkeyTarget(
     const contentEditableAttr = target.getAttribute("contenteditable");
     if (
       contentEditableAttr !== null &&
-      contentEditableAttr.toLowerCase() !== "false"
+      contentEditableAttr.trim().toLowerCase() !== "false"
+    ) {
+      return true;
+    }
+    const roleAttr = target.getAttribute("role");
+    if (
+      roleAttr !== null &&
+      EDITABLE_ARIA_ROLES.has(roleAttr.trim().toLowerCase())
     ) {
       return true;
     }
   }
-  if (typeof target.tagName === "string") {
-    return EDITABLE_TAGS.has(target.tagName.toUpperCase());
-  }
-  return false;
-}
-
-export function isViewportScopeTarget(
-  target: HotkeyTargetLike | null | undefined,
-): boolean {
-  if (!target || isEditableHotkeyTarget(target)) {
-    return false;
-  }
   if (
     typeof target.tagName === "string" &&
-    INTERACTIVE_CONTROL_TAGS.has(target.tagName.toUpperCase())
+    EDITABLE_TAGS.has(target.tagName.toUpperCase())
   ) {
-    return false;
+    return true;
   }
-  return (
-    typeof target.getAttribute === "function" &&
-    target.getAttribute(VIEWPORT_HOTKEY_SCOPE_ATTR) === "true"
-  );
+  if (typeof target.closest === "function") {
+    return target.closest(EDITABLE_CLOSEST_SELECTOR) !== null;
+  }
+  return false;
 }
 
 export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
@@ -94,17 +100,18 @@ export function nextDeclutterLevel(current: DeclutterLevel): DeclutterLevel {
  * - B: switch to Diagnostics workspace ("bench")
  * - K: switch to Analysis workspace ("cortex")
  * - M: toggle Vehicle layout ("map" <-> "split") when in Vehicle workspace
- * - Tab: toggle Lights-Out chrome mode ONLY when an interactive viewport surface
- *   (`[data-viewport-hotkey-scope="true"]`) is explicitly focused, preserving
- *   normal Tab traversal from page entry and between toolbar/form controls
+ * - L: toggle Lights-Out chrome mode
  * - 1..9: select nth entity in FleetFilmstrip
  * - T: toggle tether on selected entity (or untether when already tethered)
  * - C: toggle chase heading lock (auto-tethers selected entity if untethered)
  * - H: cycle declutter level (none -> minimal -> tactical -> none)
- * - Escape: untether camera and clear chase lock
+ * - Escape: untether camera and clear chase lock (remains active when
+ *   character-only shortcuts are disabled)
  *
- * Ignores editable form/contenteditable targets, repeated keydowns, and
- * Ctrl/Meta/Alt/Shift modifier chords. Never triggers vehicle actuation.
+ * Never intercepts Tab or Shift+Tab focus traversal, ignores editable form,
+ * contenteditable, and ARIA widget targets, ignores repeated keydowns and
+ * Ctrl/Meta/Alt/Shift modifier chords, honors `viewport.characterShortcutsEnabled`,
+ * and never triggers vehicle actuation.
  */
 export function handleViewportHotkey(
   event: HotkeyEventLike,
@@ -123,6 +130,20 @@ export function handleViewportHotkey(
     return false;
   }
   if (isEditableHotkeyTarget(event.target)) {
+    return false;
+  }
+
+  if (event.key === "Escape") {
+    if (viewport.tetheredEntityId !== null || viewport.chaseLock) {
+      viewport.tetherEntity(null);
+      event.preventDefault?.();
+      onSyncHash?.(viewport.toUrlHash());
+      return true;
+    }
+    return false;
+  }
+
+  if (!viewport.characterShortcutsEnabled) {
     return false;
   }
 
@@ -158,11 +179,9 @@ export function handleViewportHotkey(
       }
       break;
     }
-    case "Tab": {
-      if (isViewportScopeTarget(event.target)) {
-        viewport.setLightsOut(!viewport.lightsOut);
-        mutated = true;
-      }
+    case "l": {
+      viewport.setLightsOut(!viewport.lightsOut);
+      mutated = true;
       break;
     }
     case "1":
@@ -210,13 +229,6 @@ export function handleViewportHotkey(
     case "h": {
       viewport.setDeclutter(nextDeclutterLevel(viewport.declutter));
       mutated = true;
-      break;
-    }
-    case "Escape": {
-      if (viewport.tetheredEntityId !== null || viewport.chaseLock) {
-        viewport.tetherEntity(null);
-        mutated = true;
-      }
       break;
     }
     default:

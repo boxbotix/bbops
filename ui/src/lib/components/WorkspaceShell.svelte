@@ -104,6 +104,14 @@
     );
   });
 
+  let shellEl: HTMLElement | undefined = $state();
+  let stageHostEl: HTMLDivElement | undefined = $state();
+  let lightsOutBtnEl: HTMLButtonElement | undefined = $state();
+  let lastWorkspace: WorkspaceMode | null = null;
+  let lastLightsOut: boolean | null = null;
+  let directNavSelection = false;
+  let hadShellFocusBeforeUpdate = false;
+
   const WORKSPACE_TABS: ReadonlyArray<{
     mode: WorkspaceMode;
     label: string;
@@ -116,6 +124,9 @@
   ];
 
   function selectWorkspace(mode: WorkspaceMode): void {
+    if (mode !== viewportStore.workspace) {
+      directNavSelection = true;
+    }
     viewportStore.setWorkspace(mode);
     onSyncHash?.(viewportStore.toUrlHash());
   }
@@ -124,6 +135,65 @@
     viewportStore.setLightsOut(!viewportStore.lightsOut);
     onSyncHash?.(viewportStore.toUrlHash());
   }
+
+  function toggleCharacterShortcuts(): void {
+    viewportStore.setCharacterShortcutsEnabled(
+      !viewportStore.characterShortcutsEnabled,
+    );
+  }
+
+  $effect.pre(() => {
+    void viewportStore.workspace;
+    void viewportStore.lightsOut;
+    const activeEl =
+      typeof document !== "undefined" ? document.activeElement : null;
+    hadShellFocusBeforeUpdate = Boolean(
+      activeEl &&
+      activeEl !== document.body &&
+      activeEl !== document.documentElement &&
+      shellEl?.contains(activeEl),
+    );
+  });
+
+  $effect(() => {
+    const currentWorkspace = viewportStore.workspace;
+    const currentLightsOut = viewportStore.lightsOut;
+    if (lastWorkspace === null || lastLightsOut === null) {
+      lastWorkspace = currentWorkspace;
+      lastLightsOut = currentLightsOut;
+      return;
+    }
+
+    const workspaceChanged = currentWorkspace !== lastWorkspace;
+    const lightsOutChanged = currentLightsOut !== lastLightsOut;
+    lastWorkspace = currentWorkspace;
+    lastLightsOut = currentLightsOut;
+
+    if (workspaceChanged) {
+      const preserveNavButton = directNavSelection;
+      directNavSelection = false;
+      if (!preserveNavButton) {
+        const stageEl = stageHostEl?.querySelector<HTMLElement>(
+          "[data-workspace-stage]",
+        );
+        stageEl?.focus({ preventScroll: true });
+        return;
+      }
+    }
+
+    if (lightsOutChanged && hadShellFocusBeforeUpdate) {
+      const activeEl =
+        typeof document !== "undefined" ? document.activeElement : null;
+      if (
+        !activeEl ||
+        activeEl === document.body ||
+        activeEl === document.documentElement ||
+        !activeEl.isConnected
+      ) {
+        lightsOutBtnEl?.focus({ preventScroll: true });
+      }
+    }
+  });
 
   function jumpToFirstFault(): void {
     if (!fleetHealth.firstFaultEntityId) {
@@ -135,6 +205,7 @@
 </script>
 
 <main
+  bind:this={shellEl}
   class="workspace-shell"
   data-testid="workspace-shell"
   data-workspace={viewportStore.workspace}
@@ -220,28 +291,61 @@
           class="mode-btn"
           class:active
           data-testid="workspace-tab-{tab.mode}"
-          aria-pressed={active}
+          aria-current={active ? "page" : undefined}
+          aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+            ? tab.keycap
+            : undefined}
           onclick={() => selectWorkspace(tab.mode)}
         >
           <span>{tab.label}</span>
-          <kbd>{tab.keycap}</kbd>
+          {#if viewportStore.characterShortcutsEnabled}
+            <kbd>{tab.keycap}</kbd>
+          {/if}
         </button>
       {/each}
 
       <button
+        bind:this={lightsOutBtnEl}
         type="button"
         class="chrome-btn"
         class:active={viewportStore.lightsOut}
         data-testid="lights-out-toggle"
         aria-pressed={viewportStore.lightsOut}
+        aria-keyshortcuts={viewportStore.characterShortcutsEnabled
+          ? "L"
+          : undefined}
+        title={viewportStore.characterShortcutsEnabled
+          ? "Toggle Lights-Out display mode (L)"
+          : "Toggle Lights-Out display mode"}
         onclick={toggleLightsOut}
       >
-        Lights-Out <kbd>Tab</kbd>
+        <span>Lights-Out</span>
+        {#if viewportStore.characterShortcutsEnabled}
+          <kbd>L</kbd>
+        {/if}
+      </button>
+
+      <button
+        type="button"
+        class="chrome-btn"
+        class:active={viewportStore.characterShortcutsEnabled}
+        data-testid="character-shortcuts-toggle"
+        aria-pressed={viewportStore.characterShortcutsEnabled}
+        title={viewportStore.characterShortcutsEnabled
+          ? "Single-character keyboard shortcuts active (click to disable)"
+          : "Single-character keyboard shortcuts disabled (Escape camera untether stays active)"}
+        onclick={toggleCharacterShortcuts}
+      >
+        <span>
+          {viewportStore.characterShortcutsEnabled
+            ? "Shortcuts: On"
+            : "Shortcuts: Off"}
+        </span>
       </button>
     </nav>
   </header>
 
-  <div class="workspace-stage-host">
+  <div class="workspace-stage-host" bind:this={stageHostEl}>
     {#if viewportStore.workspace === "cop"}
       <CopWorkspace
         {telemetryStore}

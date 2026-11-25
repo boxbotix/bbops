@@ -19,7 +19,10 @@ import {
   MockWebSocketRig,
   buildVehicleStoredPayload,
 } from "../stores/test-helpers";
-import { createViewportStore } from "../stores/viewport.svelte";
+import {
+  CHARACTER_SHORTCUTS_STORAGE_KEY,
+  createViewportStore,
+} from "../stores/viewport.svelte";
 import { handleViewportHotkey } from "../viewport/hotkeys";
 import Page from "../../routes/+page.svelte";
 import WorkspaceShell from "./WorkspaceShell.svelte";
@@ -517,7 +520,8 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
   });
 
   // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
-  it("cancels deferred Cortex searches across workspace switches without mutating COP selection/hash, and preserves Tab traversal between DOM toolbar buttons while scoping Lights-Out to focused viewports", async () => {
+  // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
+  it("cancels deferred Cortex searches across workspace switches without mutating COP selection/hash, preserves Tab/Shift+Tab traversal on focused canvases, and toggles Lights-Out via L", async () => {
     const skgStore = createSkgStore();
     const telemetryStore = createTelemetryStore();
     const quad1 = buildVehicleStoredPayload(1, {
@@ -648,31 +652,52 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       pilotTabBtn.focus();
       expect(document.activeElement).toBe(pilotTabBtn);
 
-      // Focusing the interactive tactical canvas surface scopes Tab to Lights-Out toggle.
-      const scopedCanvas = hostEl.querySelector(
-        '[data-viewport-hotkey-scope="true"]',
+      // Focusing the interactive tactical canvas surface preserves native Tab and Shift+Tab focus traversal; L toggles Lights-Out.
+      expect(
+        hostEl.querySelector('[data-viewport-hotkey-scope="true"]'),
+      ).toBeNull();
+      const tacticalCanvas = hostEl.querySelector(
+        ".safety-hud-canvas",
       ) as HTMLCanvasElement;
-      expect(scopedCanvas).not.toBeNull();
-      scopedCanvas.focus();
-      expect(document.activeElement).toBe(scopedCanvas);
+      expect(tacticalCanvas).not.toBeNull();
+      tacticalCanvas.focus();
+      expect(document.activeElement).toBe(tacticalCanvas);
       const canvasTab = new KeyboardEvent("keydown", {
         key: "Tab",
         bubbles: true,
         cancelable: true,
       });
-      scopedCanvas.dispatchEvent(canvasTab);
-      flushSync();
-      expect(canvasTab.defaultPrevented).toBe(true);
-      expect(viewportStore.lightsOut).toBe(true);
-
-      // Toggle Lights-Out back off via the same scoped viewport shortcut.
-      const canvasTabOff = new KeyboardEvent("keydown", {
+      tacticalCanvas.dispatchEvent(canvasTab);
+      const canvasShiftTab = new KeyboardEvent("keydown", {
         key: "Tab",
+        shiftKey: true,
         bubbles: true,
         cancelable: true,
       });
-      scopedCanvas.dispatchEvent(canvasTabOff);
+      tacticalCanvas.dispatchEvent(canvasShiftTab);
       flushSync();
+      expect(canvasTab.defaultPrevented).toBe(false);
+      expect(canvasShiftTab.defaultPrevented).toBe(false);
+      expect(viewportStore.lightsOut).toBe(false);
+
+      const lightsOutOn = new KeyboardEvent("keydown", {
+        key: "l",
+        bubbles: true,
+        cancelable: true,
+      });
+      tacticalCanvas.dispatchEvent(lightsOutOn);
+      flushSync();
+      expect(lightsOutOn.defaultPrevented).toBe(true);
+      expect(viewportStore.lightsOut).toBe(true);
+
+      const lightsOutOff = new KeyboardEvent("keydown", {
+        key: "L",
+        bubbles: true,
+        cancelable: true,
+      });
+      window.dispatchEvent(lightsOutOff);
+      flushSync();
+      expect(lightsOutOff.defaultPrevented).toBe(true);
       expect(viewportStore.lightsOut).toBe(false);
 
       // 2. Switch to Cortex, launch deferred lexical search, then switch back to COP before it resolves.
@@ -1683,6 +1708,438 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       telemetryStore.disconnect();
       skgStore.disconnect();
       vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
+  it("enforces WAI-ARIA roving tablist/tabpanel links, unmounted-child focus recovery, aria-current workspace focus targets, and synchronized character-shortcut disablement (#41)", () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Hawk 1",
+    });
+    const faultedRover = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Badger 2",
+      "uxs.authority.state": "mcu-failsafe",
+    });
+
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: quad1.id,
+        revision: 1,
+        payload: quad1,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: faultedRover.id,
+        revision: 2,
+        payload: faultedRover,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 2,
+      }),
+    );
+
+    const storageMap = new Map<string, string>();
+    const viewportStore = createViewportStore({
+      skgStore,
+      storage: {
+        getItem: (key) => storageMap.get(key) ?? null,
+        setItem: (key, val) => {
+          storageMap.set(key, val);
+        },
+      },
+    });
+    viewportStore.selectEntity(quad1.id);
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockResolvedValue({
+        data: { entities: [], paths: [], truncated: false },
+        damagedEntities: 0,
+      }),
+    };
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            entities: [],
+            communitySummaries: [],
+            relationships: [],
+            count: 0,
+            durationMs: 1,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )) as typeof fetch,
+    });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    const onKeyDown = (ev: KeyboardEvent): void => {
+      handleViewportHotkey(
+        {
+          key: ev.key,
+          ctrlKey: ev.ctrlKey,
+          metaKey: ev.metaKey,
+          altKey: ev.altKey,
+          shiftKey: ev.shiftKey,
+          repeat: ev.repeat,
+          defaultPrevented: ev.defaultPrevented,
+          target: ev.target as HTMLElement | null,
+          preventDefault: () => ev.preventDefault(),
+        },
+        viewportStore,
+        undefined,
+        [quad1.id, faultedRover.id],
+      );
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    const app = mount(WorkspaceShell, {
+      target: hostEl,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+      },
+    });
+    flushSync();
+
+    try {
+      // 1. Active workspace nav button exposes aria-current="page" exclusively.
+      const copNavBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-cop"]',
+      ) as HTMLButtonElement;
+      const pilotNavBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-pilot"]',
+      ) as HTMLButtonElement;
+      const benchNavBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-bench"]',
+      ) as HTMLButtonElement;
+      const cortexNavBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-cortex"]',
+      ) as HTMLButtonElement;
+      expect(copNavBtn.getAttribute("aria-current")).toBe("page");
+      expect(pilotNavBtn.getAttribute("aria-current")).toBeNull();
+      expect(benchNavBtn.getAttribute("aria-current")).toBeNull();
+      expect(cortexNavBtn.getAttribute("aria-current")).toBeNull();
+
+      // 2. Fleet inspector tablist enforces single Tab stop (roving tabindex 0/-1), panel links, and arrow/Home/End navigation.
+      const summaryTab = hostEl.querySelector(
+        '[data-testid="cop-solo-tab-summary"]',
+      ) as HTMLButtonElement;
+      const alertsTab = hostEl.querySelector(
+        '[data-testid="cop-solo-tab-alerts"]',
+      ) as HTMLButtonElement;
+      const skgTab = hostEl.querySelector(
+        '[data-testid="cop-solo-tab-skg"]',
+      ) as HTMLButtonElement;
+
+      expect(summaryTab.getAttribute("tabindex")).toBe("0");
+      expect(alertsTab.getAttribute("tabindex")).toBe("-1");
+      expect(skgTab.getAttribute("tabindex")).toBe("-1");
+      expect(summaryTab.getAttribute("aria-controls")).toBe(
+        "cop-solo-panel-summary",
+      );
+      const summaryPanel = hostEl.querySelector(
+        '[data-testid="cop-solo-panel-summary"]',
+      ) as HTMLElement;
+      expect(summaryPanel.getAttribute("role")).toBe("tabpanel");
+      expect(summaryPanel.getAttribute("aria-labelledby")).toBe(summaryTab.id);
+
+      summaryTab.focus();
+      summaryTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowRight",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(alertsTab);
+      expect(alertsTab.getAttribute("aria-selected")).toBe("true");
+      expect(alertsTab.getAttribute("tabindex")).toBe("0");
+      expect(summaryTab.getAttribute("tabindex")).toBe("-1");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cop-solo-panel-alerts"]')
+          ?.getAttribute("aria-labelledby"),
+      ).toBe(alertsTab.id);
+
+      // ArrowRight -> skg; ArrowRight -> wraps to summary; ArrowLeft -> wraps to skg; Home -> summary; End -> skg.
+      alertsTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowRight",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(skgTab);
+      expect(skgTab.getAttribute("aria-selected")).toBe("true");
+
+      skgTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowRight",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(summaryTab);
+
+      summaryTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowLeft",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(skgTab);
+
+      skgTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Home",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(summaryTab);
+
+      summaryTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "End",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(document.activeElement).toBe(skgTab);
+
+      // 3. Panel focus recovery when focused child inside tabpanel unmounts on selection or fault changes.
+      summaryTab.click();
+      flushSync();
+      const jumpPilotBtn = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(".jump-btn"),
+      ).find((btn) => btn.textContent?.includes("Vehicle"));
+      expect(jumpPilotBtn).toBeDefined();
+      jumpPilotBtn!.focus();
+      expect(document.activeElement).toBe(jumpPilotBtn);
+
+      // Deselecting entity unmounts jump buttons inside summary panel -> focus recovers to active summary tab.
+      viewportStore.selectEntity(null);
+      flushSync();
+      expect(document.activeElement).toBe(summaryTab);
+
+      // Switch to alerts tab, focus faultedRover's exception button, then resolve fault -> focus recovers to alerts tab.
+      alertsTab.click();
+      flushSync();
+      const exceptionBtn = hostEl.querySelector(
+        ".exception-select",
+      ) as HTMLButtonElement;
+      expect(exceptionBtn).not.toBeNull();
+      exceptionBtn.focus();
+      expect(document.activeElement).toBe(exceptionBtn);
+
+      const clearedRover = buildVehicleStoredPayload(2, {
+        "uxs.domain.kind": "rover",
+        "dc.terms.title": "Badger 2",
+        "uxs.authority.state": "companion-teleop",
+      });
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: clearedRover.id,
+          revision: 3,
+          payload: clearedRover,
+        }),
+      );
+      flushSync();
+      expect(hostEl.querySelector(".exception-select")).toBeNull();
+      expect(document.activeElement).toBe(alertsTab);
+
+      // 4. Post-workspace-switch focus: direct topbar nav click keeps button focused; jump button / hotkey focuses destination stage.
+      viewportStore.selectEntity(quad1.id);
+      summaryTab.click();
+      flushSync();
+
+      pilotNavBtn.focus();
+      pilotNavBtn.click();
+      flushSync();
+      expect(viewportStore.workspace).toBe("pilot");
+      expect(pilotNavBtn.getAttribute("aria-current")).toBe("page");
+      expect(copNavBtn.getAttribute("aria-current")).toBeNull();
+      expect(document.activeElement).toBe(pilotNavBtn);
+
+      // Hotkey G back to Fleet focuses [data-workspace-stage="cop"].
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "g",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(viewportStore.workspace).toBe("cop");
+      expect(document.activeElement).toBe(
+        hostEl.querySelector('[data-workspace-stage="cop"]'),
+      );
+
+      // Unmounting cross-workspace .jump-btn click ("Diagnostics [B]") focuses [data-workspace-stage="bench"].
+      const jumpBenchBtn = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(".jump-btn"),
+      ).find((btn) => btn.textContent?.includes("Diagnostics"));
+      expect(jumpBenchBtn).toBeDefined();
+      jumpBenchBtn!.focus();
+      jumpBenchBtn!.click();
+      flushSync();
+      expect(viewportStore.workspace).toBe("bench");
+      const benchStage = hostEl.querySelector('[data-workspace-stage="bench"]');
+      expect(document.activeElement).toBe(benchStage);
+      expect(
+        hostEl
+          .querySelector('[data-testid="bench-oscilloscope"]')
+          ?.getAttribute("data-viewport-hotkey-scope"),
+      ).toBeNull();
+
+      // Hotkey K -> Analysis focuses [data-workspace-stage="cortex"] and exposes aria-pressed on tier buttons.
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "k",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(viewportStore.workspace).toBe("cortex");
+      expect(document.activeElement).toBe(
+        hostEl.querySelector('[data-workspace-stage="cortex"]'),
+      );
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-tier-hybrid"]')
+          ?.getAttribute("aria-pressed"),
+      ).toBe("true");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-tier-lexical"]')
+          ?.getAttribute("aria-pressed"),
+      ).toBe("false");
+
+      // 5. Disabling character-only shortcuts hides <kbd>/[X] hints, blocks single-key hotkeys, and keeps Escape + pointer controls active.
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "g",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      viewportStore.tetherEntity(quad1.id);
+      flushSync();
+
+      const shortcutsToggle = hostEl.querySelector(
+        '[data-testid="character-shortcuts-toggle"]',
+      ) as HTMLButtonElement;
+      expect(shortcutsToggle.textContent).toContain("Shortcuts: On");
+      expect(shortcutsToggle.getAttribute("aria-pressed")).toBe("true");
+      expect(hostEl.querySelectorAll("kbd").length).toBeGreaterThan(0);
+
+      shortcutsToggle.click();
+      flushSync();
+      expect(shortcutsToggle.textContent).toContain("Shortcuts: Off");
+      expect(shortcutsToggle.getAttribute("aria-pressed")).toBe("false");
+      expect(storageMap.get(CHARACTER_SHORTCUTS_STORAGE_KEY)).toBe("false");
+
+      // Zero <kbd> hints remain in topbar or filmstrip, and [D]/[B]/[K]/[T]/[C] suffixes & aria-keyshortcuts are removed.
+      expect(hostEl.querySelectorAll("kbd").length).toBe(0);
+      expect(copNavBtn.getAttribute("aria-keyshortcuts")).toBeNull();
+      expect(
+        hostEl
+          .querySelector('[data-testid="lights-out-toggle"]')
+          ?.getAttribute("aria-keyshortcuts"),
+      ).toBeNull();
+      const jumpTextsWhenOff = Array.from(
+        hostEl.querySelectorAll(".jump-btn"),
+      ).map((el) => el.textContent?.trim());
+      expect(jumpTextsWhenOff).toEqual(["Vehicle", "Diagnostics", "Analysis"]);
+      const chipTextsWhenOff = Array.from(
+        hostEl.querySelectorAll('[data-testid="viewport-toolbar"] .chip'),
+      ).map((el) => el.textContent?.trim());
+      expect(chipTextsWhenOff).toContain("Tether");
+      expect(chipTextsWhenOff).toContain("Chase");
+      expect(chipTextsWhenOff).not.toContain("Tether [T]");
+      expect(chipTextsWhenOff).not.toContain("Chase [C]");
+
+      // Single-character hotkeys are ignored while disabled, whereas Escape untethers and pointer clicks still switch workspaces.
+      for (const blockedKey of ["d", "b", "k", "l", "2", "t", "c", "h"]) {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: blockedKey,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+      flushSync();
+      expect(viewportStore.workspace).toBe("cop");
+      expect(viewportStore.lightsOut).toBe(false);
+      expect(viewportStore.selectedEntityId).toBe(quad1.id);
+      expect(viewportStore.tetheredEntityId).toBe(quad1.id);
+
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(viewportStore.tetheredEntityId).toBeNull();
+
+      pilotNavBtn.click();
+      flushSync();
+      expect(viewportStore.workspace).toBe("pilot");
+      expect(
+        hostEl.querySelector('[data-testid="pilot-layout-toggle"]')
+          ?.textContent,
+      ).not.toContain("[M]");
+
+      // Re-enabling restores Shortcuts: On and <kbd>/[M] hints.
+      shortcutsToggle.click();
+      flushSync();
+      expect(shortcutsToggle.textContent).toContain("Shortcuts: On");
+      expect(
+        hostEl.querySelector('[data-testid="pilot-layout-toggle"]')
+          ?.textContent,
+      ).toContain("[M]");
+      expect(hostEl.querySelectorAll("kbd").length).toBeGreaterThan(0);
+    } finally {
+      window.removeEventListener("keydown", onKeyDown);
+      unmount(app);
+      hostEl.remove();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
     }
   });
 });

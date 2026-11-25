@@ -45,9 +45,13 @@
           data-entity-kind={item.kind}
           data-stale={item.stale ? "true" : "false"}
           aria-pressed={selected}
+          aria-keyshortcuts={item.shortcutKey &&
+          viewportStore.characterShortcutsEnabled
+            ? item.shortcutKey
+            : undefined}
           onclick={() => handleSelect(item.entityId)}
         >
-          {#if item.shortcutKey}
+          {#if item.shortcutKey && viewportStore.characterShortcutsEnabled}
             <kbd class="shortcut-key">{item.shortcutKey}</kbd>
           {/if}
 

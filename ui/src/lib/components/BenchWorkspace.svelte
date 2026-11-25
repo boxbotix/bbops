@@ -407,7 +407,14 @@
   });
 </script>
 
-<div class="bench-stage" data-testid="bench-workspace">
+<div
+  class="bench-stage"
+  data-testid="bench-workspace"
+  data-workspace-stage="bench"
+  role="region"
+  aria-label="Diagnostics workspace"
+  tabindex="-1"
+>
   <section
     class="bench-health-bar"
     data-testid="bench-health-strip"
@@ -467,7 +474,7 @@
         bind:this={scopeCanvasEl}
         class="scope-canvas"
         data-testid="bench-oscilloscope"
-        data-viewport-hotkey-scope="true"
+        aria-label="20 Hz telemetry oscilloscope canvas"
         tabindex="-1"
         onpointerdown={() => scopeCanvasEl?.focus?.({ preventScroll: true })}
       ></canvas>
