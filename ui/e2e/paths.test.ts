@@ -4,11 +4,13 @@
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import playwrightConfig from "../playwright.config";
 import { resolvePlaywrightOutputDir, uiRoot } from "./paths";
 
 describe("resolvePlaywrightOutputDir", () => {
   // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
   it("resolves a checkout-scoped test-results default without colliding across git worktrees or shared tmpdir", () => {
+    expect(playwrightConfig.outputDir).toBe(resolvePlaywrightOutputDir());
     expect(resolvePlaywrightOutputDir(uiRoot, undefined)).toBe(
       path.join(uiRoot, "test-results"),
     );

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 boxbotix
 
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import console from "node:console";
 import fs from "node:fs";
@@ -833,59 +834,72 @@ export function collectPlaywrightListedSites(repoRoot) {
 
   const uiDir = path.join(repoRoot, "ui");
   const existingConfig = path.join(uiDir, "playwright.config.ts");
-  let tempConfigPath = null;
+  const tempWorkDir = fs.mkdtempSync(path.join(os.tmpdir(), "bbops-pw-list-"));
+  const tempReportPath = path.join(tempWorkDir, "report.json");
   let configToUse = existingConfig;
-
-  if (!fs.existsSync(existingConfig)) {
-    tempConfigPath = path.join(
-      os.tmpdir(),
-      `bbops-pw-list-${process.pid}-${Date.now()}.config.mjs`,
-    );
-    const e2eTestDir = path.join(uiDir, "e2e");
-    fs.writeFileSync(
-      tempConfigPath,
-      `export default { testDir: ${JSON.stringify(e2eTestDir)}, testMatch: "**/*.e2e.ts" };\n`,
-      "utf8",
-    );
-    configToUse = tempConfigPath;
-  }
 
   let rawJson = "";
   try {
-    rawJson = execFileSync(
-      playwrightBin,
-      ["test", "-c", configToUse, "--list", "--reporter=json"],
-      {
-        cwd: fs.existsSync(uiDir) ? uiDir : repoRoot,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-  } catch (err) {
-    const stdoutText =
-      err && typeof err === "object" && "stdout" in err && err.stdout
-        ? String(err.stdout)
-        : "";
-    if (stdoutText.trim().startsWith("{")) {
-      rawJson = stdoutText;
-    } else {
-      const stderrText =
-        err && typeof err === "object" && "stderr" in err && err.stderr
-          ? String(err.stderr).trim()
-          : String(err);
-      if (tempConfigPath) {
-        fs.rmSync(tempConfigPath, { force: true });
+    if (!fs.existsSync(existingConfig)) {
+      const tempConfigPath = path.join(
+        tempWorkDir,
+        "playwright.list.config.mjs",
+      );
+      const e2eTestDir = path.join(uiDir, "e2e");
+      fs.writeFileSync(
+        tempConfigPath,
+        `export default { testDir: ${JSON.stringify(e2eTestDir)}, testMatch: "**/*.e2e.ts", outputDir: ${JSON.stringify(path.join(tempWorkDir, "results"))} };\n`,
+        "utf8",
+      );
+      configToUse = tempConfigPath;
+    }
+
+    const childEnv = { ...process.env };
+    for (const key of Object.keys(childEnv)) {
+      if (
+        (key.startsWith("PLAYWRIGHT_") &&
+          (key.includes("_OUTPUT_") || key === "PLAYWRIGHT_HTML_REPORT")) ||
+        key === "PW_TEST_REPORTER" ||
+        key === "PW_TEST_HTML_REPORT_OPEN" ||
+        key === "JEST_WORKER_ID"
+      ) {
+        delete childEnv[key];
       }
-      return {
-        ok: false,
-        byFile: new Map(),
-        errors: [`ui/e2e: playwright test --list failed: ${stderrText}`],
-      };
+    }
+    childEnv.PLAYWRIGHT_JSON_OUTPUT_FILE = tempReportPath;
+    childEnv.BBOPS_PLAYWRIGHT_OUTPUT_DIR = path.join(tempWorkDir, "results");
+
+    try {
+      execFileSync(
+        playwrightBin,
+        ["test", "-c", configToUse, "--list", "--reporter=json"],
+        {
+          cwd: fs.existsSync(uiDir) ? uiDir : repoRoot,
+          env: childEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      if (fs.existsSync(tempReportPath)) {
+        rawJson = fs.readFileSync(tempReportPath, "utf8");
+      }
+    } catch (err) {
+      if (fs.existsSync(tempReportPath)) {
+        rawJson = fs.readFileSync(tempReportPath, "utf8");
+      } else {
+        const stderrText =
+          err && typeof err === "object" && "stderr" in err && err.stderr
+            ? String(err.stderr).trim()
+            : String(err);
+        return {
+          ok: false,
+          byFile: new Map(),
+          errors: [`ui/e2e: playwright test --list failed: ${stderrText}`],
+        };
+      }
     }
   } finally {
-    if (tempConfigPath) {
-      fs.rmSync(tempConfigPath, { force: true });
-    }
+    fs.rmSync(tempWorkDir, { recursive: true, force: true });
   }
 
   let parsed;
@@ -950,8 +964,11 @@ export function collectPlaywrightListedSites(repoRoot) {
 }
 
 export function validateRepoE2eAttribution(repoRoot) {
-  const specIndex = loadOpenSpecIndex(repoRoot);
-  const e2eDir = path.join(repoRoot, "ui", "e2e");
+  const normalizedRepoRoot = fs.existsSync(repoRoot)
+    ? fs.realpathSync(repoRoot)
+    : path.resolve(repoRoot);
+  const specIndex = loadOpenSpecIndex(normalizedRepoRoot);
+  const e2eDir = path.join(normalizedRepoRoot, "ui", "e2e");
   const files = listE2eFiles(e2eDir);
   if (files.length === 0) {
     return {
@@ -965,7 +982,10 @@ export function validateRepoE2eAttribution(repoRoot) {
   let totalTests = 0;
 
   for (const absFile of files) {
-    const relFile = path.relative(repoRoot, absFile).split(path.sep).join("/");
+    const relFile = path
+      .relative(normalizedRepoRoot, absFile)
+      .split(path.sep)
+      .join("/");
     const text = fs.readFileSync(absFile, "utf8");
     const { testCount, errors, callSites } = validateSourceSpecAttribution(
       relFile,
@@ -988,14 +1008,10 @@ export function validateRepoE2eAttribution(repoRoot) {
   }
 
   // Independent oracle: cross-check AST declaration locations against Playwright's own test collector (`--list --reporter=json`).
-  const listed = collectPlaywrightListedSites(repoRoot);
+  const listed = collectPlaywrightListedSites(normalizedRepoRoot);
   allErrors.push(...listed.errors);
   if (listed.ok) {
-    for (const absFile of files) {
-      const relFile = path
-        .relative(repoRoot, absFile)
-        .split(path.sep)
-        .join("/");
+    for (const relFile of astSitesByFile.keys()) {
       const collectedSites = listed.byFile.get(relFile);
       if (!collectedSites || collectedSites.size === 0) {
         if (!allErrors.some((e) => e.startsWith(`${relFile}:`))) {
@@ -1003,13 +1019,23 @@ export function validateRepoE2eAttribution(repoRoot) {
             `${relFile}: Playwright '--list' collected zero test declarations`,
           );
         }
+      }
+    }
+
+    for (const [collectedFile, collectedSites] of listed.byFile.entries()) {
+      const astSites = astSitesByFile.get(collectedFile);
+      if (!astSites) {
+        for (const [siteKey, title] of collectedSites.entries()) {
+          allErrors.push(
+            `${collectedFile}:${siteKey}: Playwright collected test '${title}' outside supported ui/e2e/**/*.e2e.ts suite files`,
+          );
+        }
         continue;
       }
-      const astSites = astSitesByFile.get(relFile) ?? new Set();
       for (const [siteKey, title] of collectedSites.entries()) {
         if (!astSites.has(siteKey)) {
           allErrors.push(
-            `${relFile}:${siteKey}: Playwright collected test '${title}' via an unrecognized or unattributed declaration form`,
+            `${collectedFile}:${siteKey}: Playwright collected test '${title}' via an unrecognized or unattributed declaration form`,
           );
         }
       }
@@ -1304,6 +1330,82 @@ scenario.describe("conditional suite", () => {
         (e) =>
           e.includes("ui/e2e/dynamic.e2e.ts:5:") &&
           e.includes("unrecognized or unattributed declaration form"),
+      ),
+      true,
+    );
+    fs.rmSync(path.join(tmpE2eDir, "dynamic.e2e.ts"));
+
+    // Case E: caller PLAYWRIGHT_JSON_OUTPUT_FILE / PLAYWRIGHT_JSON_OUTPUT_DIR / PLAYWRIGHT_JSON_OUTPUT_NAME stay byte-identical while collection succeeds.
+    const callerReportDir = path.join(tmpRepo, "caller-reports");
+    fs.mkdirSync(callerReportDir, { recursive: true });
+    const callerReportFile = path.join(callerReportDir, "caller-report.json");
+    const sentinelBytes = Buffer.from(
+      '{"sentinel":"caller-report-must-stay-byte-identical"}\n',
+      "utf8",
+    );
+    fs.writeFileSync(callerReportFile, sentinelBytes);
+
+    const savedEnv = {
+      PLAYWRIGHT_JSON_OUTPUT_FILE: process.env.PLAYWRIGHT_JSON_OUTPUT_FILE,
+      PLAYWRIGHT_JSON_OUTPUT_DIR: process.env.PLAYWRIGHT_JSON_OUTPUT_DIR,
+      PLAYWRIGHT_JSON_OUTPUT_NAME: process.env.PLAYWRIGHT_JSON_OUTPUT_NAME,
+    };
+    process.env.PLAYWRIGHT_JSON_OUTPUT_FILE = callerReportFile;
+    process.env.PLAYWRIGHT_JSON_OUTPUT_DIR = callerReportDir;
+    process.env.PLAYWRIGHT_JSON_OUTPUT_NAME = "caller-report.json";
+    try {
+      const realCheckoutRoot = path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "..",
+      );
+      const isolatedTmpRes = validateRepoE2eAttribution(tmpRepo);
+      assert.equal(isolatedTmpRes.ok, true, isolatedTmpRes.errors.join("\n"));
+      const isolatedRealRes = validateRepoE2eAttribution(realCheckoutRoot);
+      assert.equal(isolatedRealRes.ok, true, isolatedRealRes.errors.join("\n"));
+      assert.equal(
+        Buffer.compare(fs.readFileSync(callerReportFile), sentinelBytes),
+        0,
+      );
+    } finally {
+      for (const [key, val] of Object.entries(savedEnv)) {
+        if (val === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = val;
+        }
+      }
+    }
+
+    // Case F: helper file outside *.e2e.ts registering an uncited test is rejected with its file path and line.
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "cases.ts"),
+      [
+        `import { test } from ${JSON.stringify(pwModuleAbs)};`,
+        `export function registerCases() {`,
+        `  test("uncited helper test", async () => {});`,
+        `}`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(tmpE2eDir, "helper-call.e2e.ts"),
+      [
+        `import { test } from ${JSON.stringify(pwModuleAbs)};`,
+        `import { registerCases } from "./cases";`,
+        `// spec: cop-ui / Full-stack browser E2E requirement`,
+        `test("cited baseline", async () => {});`,
+        `registerCases();`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const helperFileRes = validateRepoE2eAttribution(tmpRepo);
+    assert.equal(helperFileRes.ok, false);
+    assert.equal(
+      helperFileRes.errors.some(
+        (e) =>
+          e.includes("ui/e2e/cases.ts:3:") &&
+          e.includes("outside supported ui/e2e/**/*.e2e.ts suite files"),
       ),
       true,
     );
