@@ -1,5 +1,5 @@
 # Proposal: m1-link-loss-freshness
-Approved-by:
+Approved-by: coby (2026-11-25) sha256:9367ddd60dfe
 Architect: gemini (gemini-4-carbon, medium)
 
 ## Track

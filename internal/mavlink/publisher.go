@@ -4,11 +4,7 @@ import (
 	"context"
 	"slices"
 	"sync"
-	"sync/atomic"
 )
-
-// PeriodicQueueCap is the bounded drop-oldest channel capacity for periodic Lane 2 batches (`D3 Option A`).
-const PeriodicQueueCap = 2
 
 // BatchPublishFunc publishes a batch of serialized BaseMessage payloads onto a JetStream subject.
 type BatchPublishFunc func(ctx context.Context, subject string, msgs [][]byte) error
@@ -16,31 +12,36 @@ type BatchPublishFunc func(ctx context.Context, subject string, msgs [][]byte) e
 // UrgentBuildFunc builds serialized SnapshotBatchItems for a sorted slice of urgent sysids.
 type UrgentBuildFunc func(sysids []uint8) ([]SnapshotBatchItem, error)
 
-// Publisher decouples the UDP socket read loop from JetStream acknowledgements (`D3 Option A`),
-// pairing a cap-2 drop-oldest periodic batch channel with an urgent dirty-sysid set drained
-// strictly ahead of periodic batches and guarded by monotonic per-sysid state revisions.
+// PeriodicBuildFunc builds serialized SnapshotBatchItems at flush time for sessions
+// whose monotonic revision exceeds confirmedRevs[sysid].
+type PeriodicBuildFunc func(confirmedRevs map[uint8]uint64) ([]SnapshotBatchItem, error)
+
+// Publisher decouples UDP socket reads and periodic SKG ticks from JetStream acknowledgements,
+// draining urgent dirty sysids strictly ahead of coalesced periodic notifications and building
+// periodic batches at flush time filtered by lastConfirmedRev[sysid] (`OQ3 Option A`).
 type Publisher struct {
-	subject      string
-	publishBatch BatchPublishFunc
-	buildUrgent  UrgentBuildFunc
-	onError      func()
+	subject       string
+	publishBatch  BatchPublishFunc
+	buildUrgent   UrgentBuildFunc
+	buildPeriodic PeriodicBuildFunc
+	onError       func()
 
-	periodicCh chan []SnapshotBatchItem
-	urgentWake chan struct{}
+	wakeCh chan struct{}
 
-	urgentMu     sync.Mutex
-	urgentSysIDs map[uint8]struct{}
+	mu              sync.Mutex
+	urgentSysIDs    map[uint8]struct{}
+	periodicPending bool
+	flushing        bool
 
-	droppedPeriodic  atomic.Uint64
-	maxAttemptedRev  map[uint8]uint64
 	lastConfirmedRev map[uint8]uint64
 }
 
-// NewPublisher creates a bounded non-blocking SKG batch publisher for subject.
+// NewPublisher creates a non-blocking build-at-flush SKG batch publisher for subject.
 func NewPublisher(
 	subject string,
 	publishBatch BatchPublishFunc,
 	buildUrgent UrgentBuildFunc,
+	buildPeriodic PeriodicBuildFunc,
 	onError func(),
 ) *Publisher {
 	if onError == nil {
@@ -50,166 +51,149 @@ func NewPublisher(
 		subject:          subject,
 		publishBatch:     publishBatch,
 		buildUrgent:      buildUrgent,
+		buildPeriodic:    buildPeriodic,
 		onError:          onError,
-		periodicCh:       make(chan []SnapshotBatchItem, PeriodicQueueCap),
-		urgentWake:       make(chan struct{}, 1),
+		wakeCh:           make(chan struct{}, 1),
 		urgentSysIDs:     make(map[uint8]struct{}),
-		maxAttemptedRev:  make(map[uint8]uint64),
 		lastConfirmedRev: make(map[uint8]uint64),
 	}
 }
 
-// EnqueuePeriodic pushes a periodic Lane 2 batch onto the cap-2 queue without blocking,
-// dropping the oldest unconsumed periodic batch when full.
-func (p *Publisher) EnqueuePeriodic(batch []SnapshotBatchItem) {
-	if len(batch) == 0 {
-		return
-	}
-	for {
-		select {
-		case p.periodicCh <- batch:
-			return
-		default:
-			select {
-			case <-p.periodicCh:
-				p.droppedPeriodic.Add(1)
-			default:
-			}
-		}
+// NotifyPeriodic marks a coalesced Lane 2 periodic SKG flush pending without blocking
+// or marshaling snapshots on the ticker goroutine.
+func (p *Publisher) NotifyPeriodic() {
+	p.mu.Lock()
+	p.periodicPending = true
+	p.mu.Unlock()
+
+	select {
+	case p.wakeCh <- struct{}{}:
+	default:
 	}
 }
 
 // NotifyUrgent marks sysid dirty for an immediate out-of-band Lane 3 SKG flush
 // without blocking the UDP read loop.
 func (p *Publisher) NotifyUrgent(sysid uint8) {
-	p.urgentMu.Lock()
+	p.mu.Lock()
 	p.urgentSysIDs[sysid] = struct{}{}
-	p.urgentMu.Unlock()
+	p.mu.Unlock()
 
 	select {
-	case p.urgentWake <- struct{}{}:
+	case p.wakeCh <- struct{}{}:
 	default:
 	}
 }
 
-// DroppedPeriodic returns the total number of stale periodic batches evicted by drop-oldest backpressure.
-func (p *Publisher) DroppedPeriodic() uint64 {
-	return p.droppedPeriodic.Load()
+func (p *Publisher) hasPending() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.urgentSysIDs) > 0 || p.periodicPending || p.flushing
 }
 
-// Run drains urgent dirty sysids ahead of periodic batches until ctx is canceled.
+// Run drains urgent dirty sysids strictly ahead of coalesced periodic flushes until ctx is canceled.
 // Must be invoked by a single worker goroutine.
 func (p *Publisher) Run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if urgent := p.takeUrgentSysIDs(); len(urgent) > 0 {
-			_ = p.flushUrgent(ctx, urgent)
+		urgent, periodic := p.takeWork()
+		if len(urgent) > 0 {
+			p.flushUrgent(ctx, urgent)
+			p.finishWork()
+			continue
+		}
+		if periodic {
+			p.flushPeriodic(ctx)
+			p.finishWork()
 			continue
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-p.urgentWake:
-			continue
-		case batch := <-p.periodicCh:
-			if ctx.Err() != nil {
-				return
-			}
-			var flushedUrgent map[uint8]struct{}
-			if urgent := p.takeUrgentSysIDs(); len(urgent) > 0 {
-				flushedUrgent = p.flushUrgent(ctx, urgent)
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			p.flushItems(ctx, batch, flushedUrgent)
+		case <-p.wakeCh:
 		}
 	}
 }
 
-func (p *Publisher) takeUrgentSysIDs() []uint8 {
-	p.urgentMu.Lock()
-	if len(p.urgentSysIDs) == 0 {
-		p.urgentMu.Unlock()
-		return nil
+func (p *Publisher) takeWork() (urgent []uint8, periodic bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.urgentSysIDs) > 0 {
+		urgent = make([]uint8, 0, len(p.urgentSysIDs))
+		for sysid := range p.urgentSysIDs {
+			urgent = append(urgent, sysid)
+		}
+		clear(p.urgentSysIDs)
+		slices.Sort(urgent)
+		p.flushing = true
+		return urgent, false
 	}
-	out := make([]uint8, 0, len(p.urgentSysIDs))
-	for sysid := range p.urgentSysIDs {
-		out = append(out, sysid)
+	if p.periodicPending {
+		p.periodicPending = false
+		p.flushing = true
+		return nil, true
 	}
-	clear(p.urgentSysIDs)
-	p.urgentMu.Unlock()
-
-	// Drain any pending wake token now that urgentSysIDs was snapshotted.
-	select {
-	case <-p.urgentWake:
-	default:
-	}
-
-	slices.Sort(out)
-	return out
+	return nil, false
 }
 
-func (p *Publisher) flushUrgent(ctx context.Context, sysids []uint8) map[uint8]struct{} {
+func (p *Publisher) finishWork() {
+	p.mu.Lock()
+	p.flushing = false
+	p.mu.Unlock()
+}
+
+func (p *Publisher) flushUrgent(ctx context.Context, sysids []uint8) {
 	if p.buildUrgent == nil || len(sysids) == 0 {
-		return nil
+		return
 	}
 	items, err := p.buildUrgent(sysids)
 	if err != nil {
 		p.onError()
-		return nil
+		return
 	}
-	if !p.flushItems(ctx, items, nil) {
-		return nil
-	}
-	flushed := make(map[uint8]struct{}, len(items))
-	for _, it := range items {
-		flushed[it.SysID] = struct{}{}
-	}
-	return flushed
+	p.flushItems(ctx, items)
 }
 
-func (p *Publisher) flushItems(ctx context.Context, items []SnapshotBatchItem, skipEqualSysIDs map[uint8]struct{}) bool {
+func (p *Publisher) flushPeriodic(ctx context.Context) {
+	if p.buildPeriodic == nil {
+		return
+	}
+	items, err := p.buildPeriodic(p.lastConfirmedRev)
+	if err != nil {
+		p.onError()
+		return
+	}
+	p.flushItems(ctx, items)
+}
+
+func (p *Publisher) flushItems(ctx context.Context, items []SnapshotBatchItem) {
 	if len(items) == 0 || p.publishBatch == nil || ctx.Err() != nil {
-		return false
+		return
 	}
 	filtered := make([]SnapshotBatchItem, 0, len(items))
 	msgs := make([][]byte, 0, len(items))
 	for _, it := range items {
-		if it.Rev < p.maxAttemptedRev[it.SysID] {
-			continue
-		}
-		if _, skipEq := skipEqualSysIDs[it.SysID]; skipEq && it.Rev == p.lastConfirmedRev[it.SysID] {
+		if it.Rev <= p.lastConfirmedRev[it.SysID] {
 			continue
 		}
 		filtered = append(filtered, it)
 		msgs = append(msgs, it.Payload)
 	}
 	if len(msgs) == 0 {
-		return true
-	}
-	// Advance maxAttemptedRev BEFORE dispatch because PublishBatchToStream can
-	// acknowledge a prefix of msgs before returning an aggregate error; strictly
-	// older periodic revisions must never regress an already-acknowledged item,
-	// while equal revisions remain eligible for recovery retries.
-	for _, it := range filtered {
-		if it.Rev > p.maxAttemptedRev[it.SysID] {
-			p.maxAttemptedRev[it.SysID] = it.Rev
-		}
+		return
 	}
 	if err := p.publishBatch(ctx, p.subject, msgs); err != nil {
 		if ctx.Err() == nil {
 			p.onError()
 		}
-		return false
+		return
 	}
 	for _, it := range filtered {
 		if it.Rev > p.lastConfirmedRev[it.SysID] {
 			p.lastConfirmedRev[it.SysID] = it.Rev
 		}
 	}
-	return true
 }

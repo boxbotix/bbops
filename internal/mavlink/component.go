@@ -91,7 +91,7 @@ func NewComponent(rawConfig json.RawMessage, deps component.Dependencies) (*Comp
 	if platform == "" {
 		platform = "bbops"
 	}
-	tracker, err := NewTracker(org, platform)
+	tracker, err := NewTrackerWithTimeouts(org, platform, settings.linkTimeout, settings.supervisoryTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +111,7 @@ func NewComponent(rawConfig json.RawMessage, deps component.Dependencies) (*Comp
 			return c.deps.NATSClient.PublishBatchToStream(ctx, subject, msgs)
 		},
 		tracker.BuildUrgentBatch,
+		tracker.BuildPeriodicBatch,
 		c.lifecycle.CountError,
 	)
 	return c, nil
@@ -279,11 +280,11 @@ func (c *Component) readLoop(ctx context.Context, conn *net.UDPConn) {
 		}
 		c.lifecycle.CountInput(n)
 
+		for i := range outcome.Events {
+			c.publishCoreJSON(ctx, c.eventSubject(outcome.SysID), outcome.Events[i])
+		}
 		if outcome.Telemetry != nil {
 			c.publishCoreJSON(ctx, c.telemetrySubject(outcome.SysID), outcome.Telemetry)
-		}
-		if outcome.Event != nil {
-			c.publishCoreJSON(ctx, c.eventSubject(outcome.SysID), outcome.Event)
 		}
 		if outcome.UrgentSKGSync {
 			c.publisher.NotifyUrgent(outcome.SysID)
@@ -299,12 +300,10 @@ func (c *Component) tickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			batch, err := c.tracker.BuildPeriodicBatch()
-			if err != nil {
-				c.lifecycle.CountError()
-				continue
+			for _, ev := range c.tracker.EvaluateSilence(time.Now().UTC()) {
+				c.publishCoreJSON(ctx, c.eventSubject(ev.SysID), ev)
 			}
-			c.publisher.EnqueuePeriodic(batch)
+			c.publisher.NotifyPeriodic()
 		}
 	}
 }

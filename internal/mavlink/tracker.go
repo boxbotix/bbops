@@ -34,6 +34,13 @@ const (
 	EventKindHeartbeatEdge     = "heartbeat_edge"
 	EventKindFailsafeIncrement = "failsafe_increment"
 	EventKindStatusText        = "statustext"
+	EventKindLinkLost          = "link_lost"
+	EventKindLinkRestored      = "link_restored"
+
+	// DefaultLinkTimeout is the default silence threshold for bench and high-rate links (`3s`).
+	DefaultLinkTimeout = DefaultLinkTimeoutMs * time.Millisecond
+	// DefaultSupervisoryTimeout is the default silence threshold for mesh-supervisory links (`10s`).
+	DefaultSupervisoryTimeout = DefaultSupervisoryTimeoutMs * time.Millisecond
 )
 
 // TelemetryFrame is the compact Lane 1 kinematic JSON payload published uncoalesced
@@ -66,7 +73,8 @@ type StatusTextEvent struct {
 
 // TransitionEvent is the Lane 3 edge payload published immediately onto
 // `bbops.telemetry.events.<sysid>` whenever consecutive HEARTBEAT fields flip,
-// #1 SYS_STATUS failsafes increment, or #253 STATUSTEXT arrives.
+// #1 SYS_STATUS failsafes increment, #253 STATUSTEXT arrives, or per-sysid link
+// freshness crosses silence/restoration boundaries (`link_lost` / `link_restored`).
 type TransitionEvent struct {
 	SysID         uint8                `json:"sysid"`
 	EntityID      string               `json:"entity_id"`
@@ -87,8 +95,8 @@ type TransitionEvent struct {
 }
 
 // SnapshotBatchItem pairs a serialized BaseMessage(VehicleSnapshot) with its
-// monotonic per-sysid state revision so older periodic batches never overwrite
-// a newer out-of-band Lane 3 edge snapshot.
+// monotonic per-sysid state revision so confirmed revisions are not redundantly
+// re-upserted while silent or unchanged.
 type SnapshotBatchItem struct {
 	SysID   uint8
 	Rev     uint64
@@ -102,13 +110,17 @@ type IngestOutcome struct {
 	CountedError  bool
 	SysID         uint8
 	Telemetry     *TelemetryFrame
-	Event         *TransitionEvent
+	Events        []TransitionEvent
 	UrgentSKGSync bool
 }
 
 type vehicleSession struct {
 	snap         uxsvocab.VehicleSnapshot
 	rev          uint64
+	lastPacketAt time.Time
+	lastSeq      uint8
+	lastMsgID    uint32
+	linkLost     bool
 	hasSysStatus bool
 	hasAttitude  bool
 	hasLocalPos  bool
@@ -117,25 +129,73 @@ type vehicleSession struct {
 	peerAddr     netip.AddrPort
 }
 
+func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, now time.Time) {
+	if now.After(s.lastPacketAt) {
+		s.lastPacketAt = now
+	}
+	s.lastSeq = seq
+	s.lastMsgID = msgID
+	s.linkLost = false
+	if peer.IsValid() {
+		s.peerAddr = peer
+	}
+}
+
+func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, seq uint8, msgID uint32, kind, reason string, ts time.Time) TransitionEvent {
+	return TransitionEvent{
+		SysID:         snap.SysID,
+		EntityID:      snap.EntityID(),
+		Domain:        snap.Domain,
+		Seq:           seq,
+		MsgID:         msgID,
+		Kind:          kind,
+		Reasons:       []string{reason},
+		Armed:         snap.Armed,
+		Authority:     snap.Authority,
+		CompanionMode: snap.CompanionMode,
+		LinkTier:      snap.LinkTier,
+		Flags:         snap.Flags,
+		Failsafes:     snap.Failsafes,
+		Timestamp:     ts.UnixMilli(),
+	}
+}
+
 // Tracker maintains per-sysid (1..=254, compid == 1) vehicle state, peer UDP
-// endpoints (`D4 Option A`), packet sanitization, and 3-lane split decisions.
+// endpoints (`D4 Option A`), link-loss freshness (`OQ1`–`OQ2 Option A`), packet
+// sanitization, and 3-lane split decisions.
 type Tracker struct {
-	org      string
-	platform string
+	org                string
+	platform           string
+	linkTimeout        time.Duration
+	supervisoryTimeout time.Duration
 
 	mu       sync.RWMutex
 	sessions map[uint8]*vehicleSession
 }
 
-// NewTracker constructs a per-sysid MAVLink v2 state tracker scoped to org and platform.
+// NewTracker constructs a per-sysid MAVLink v2 state tracker with default silence timeouts.
 func NewTracker(org, platform string) (*Tracker, error) {
+	return NewTrackerWithTimeouts(org, platform, DefaultLinkTimeout, DefaultSupervisoryTimeout)
+}
+
+// NewTrackerWithTimeouts constructs a per-sysid MAVLink v2 state tracker with explicit
+// bench/high-rate and mesh-supervisory silence thresholds.
+func NewTrackerWithTimeouts(org, platform string, linkTimeout, supervisoryTimeout time.Duration) (*Tracker, error) {
 	if _, err := uxsvocab.VehicleEntityID(org, platform, 1); err != nil {
 		return nil, fmt.Errorf("mavlink: invalid platform identity (%q, %q): %w", org, platform, err)
 	}
+	if linkTimeout <= 0 {
+		return nil, fmt.Errorf("mavlink: linkTimeout (%v) must be > 0", linkTimeout)
+	}
+	if supervisoryTimeout < linkTimeout {
+		return nil, fmt.Errorf("mavlink: supervisoryTimeout (%v) must be >= linkTimeout (%v)", supervisoryTimeout, linkTimeout)
+	}
 	return &Tracker{
-		org:      org,
-		platform: platform,
-		sessions: make(map[uint8]*vehicleSession),
+		org:                org,
+		platform:           platform,
+		linkTimeout:        linkTimeout,
+		supervisoryTimeout: supervisoryTimeout,
+		sessions:           make(map[uint8]*vehicleSession),
 	}, nil
 }
 
@@ -245,9 +305,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			snap: *snap,
 			rev:  1,
 		}
-		if peer.IsValid() {
-			newSess.peerAddr = peer
-		}
+		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, peer, now)
 		t.sessions[sysid] = newSess
 		return IngestOutcome{
 			Accepted: true,
@@ -255,6 +313,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		}
 	}
 
+	wasLost := sess.linkLost
 	prev := sess.snap
 	next := prev
 	next.Domain = domainStr
@@ -273,20 +332,22 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 
 	sess.snap = next
 	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
-	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, peer, now)
 
 	out := IngestOutcome{
 		Accepted: true,
 		SysID:    sysid,
+	}
+	if wasLost {
+		out.Events = append(out.Events, newLinkTransitionEvent(next, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", now))
+		out.UrgentSKGSync = true
 	}
 	if len(reasons) > 0 {
 		prevAuth := ""
 		if prev.Authority != next.Authority {
 			prevAuth = prev.Authority
 		}
-		out.Event = &TransitionEvent{
+		out.Events = append(out.Events, TransitionEvent{
 			SysID:         sysid,
 			EntityID:      next.EntityID(),
 			Domain:        next.Domain,
@@ -302,7 +363,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			Flags:         next.Flags,
 			Failsafes:     next.Failsafes,
 			Timestamp:     now.UnixMilli(),
-		}
+		})
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -340,6 +401,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 		return IngestOutcome{}
 	}
 
+	wasLost := sess.linkLost
 	hadSysStatus := sess.hasSysStatus
 	prevFailsafes := sess.snap.Failsafes
 	next := sess.snap
@@ -359,16 +421,18 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	sess.snap = next
 	sess.hasSysStatus = true
 	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
-	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDSysStatus, peer, now)
 
 	out := IngestOutcome{
 		Accepted: true,
 		SysID:    sysid,
 	}
+	if wasLost {
+		out.Events = append(out.Events, newLinkTransitionEvent(next, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", now))
+		out.UrgentSKGSync = true
+	}
 	if hadSysStatus && next.Failsafes > prevFailsafes {
-		out.Event = &TransitionEvent{
+		out.Events = append(out.Events, TransitionEvent{
 			SysID:         sysid,
 			EntityID:      next.EntityID(),
 			Domain:        next.Domain,
@@ -383,7 +447,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 			Flags:         next.Flags,
 			Failsafes:     next.Failsafes,
 			Timestamp:     now.UnixMilli(),
-		}
+		})
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -423,6 +487,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		return IngestOutcome{}
 	}
 
+	wasLost := sess.linkLost
 	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Quaternion = unitQ
@@ -442,16 +507,19 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 	sess.hasAttitude = true
 	sess.hasHeading = true
 	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
-	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDAttitudeQuaternion, peer, now)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDAttitudeQuaternion, now)
-	return IngestOutcome{
+	out := IngestOutcome{
 		Accepted:  true,
 		SysID:     sysid,
 		Telemetry: &tf,
 	}
+	if wasLost {
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", now)}
+		out.UrgentSKGSync = true
+	}
+	return out
 }
 
 func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPositionNED, peer netip.AddrPort, now time.Time) IngestOutcome {
@@ -471,6 +539,7 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 		return IngestOutcome{}
 	}
 
+	wasLost := sess.linkLost
 	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.NED = ned
@@ -488,16 +557,19 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	sess.snap = next
 	sess.hasLocalPos = true
 	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
-	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDLocalPositionNED, peer, now)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDLocalPositionNED, now)
-	return IngestOutcome{
+	out := IngestOutcome{
 		Accepted:  true,
 		SysID:     sysid,
 		Telemetry: &tf,
 	}
+	if wasLost {
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", now)}
+		out.UrgentSKGSync = true
+	}
+	return out
 }
 
 func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPositionInt, peer netip.AddrPort, now time.Time) IngestOutcome {
@@ -523,6 +595,7 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		return IngestOutcome{}
 	}
 
+	wasLost := sess.linkLost
 	obsNs := unixNanoOrZero(now)
 	next := sess.snap
 	next.Latitude = lat
@@ -554,16 +627,19 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		sess.hasHeading = hasFallbackHdg
 	}
 	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
-	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDGlobalPositionInt, peer, now)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDGlobalPositionInt, now)
-	return IngestOutcome{
+	out := IngestOutcome{
 		Accepted:  true,
 		SysID:     sysid,
 		Telemetry: &tf,
 	}
+	if wasLost {
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", now)}
+		out.UrgentSKGSync = true
+	}
+	return out
 }
 
 func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, peer netip.AddrPort, now time.Time) IngestOutcome {
@@ -575,45 +651,54 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 		return IngestOutcome{}
 	}
 
-	next := sess.snap
-	next.ObservedAt = now
-	if err := next.Validate(); err != nil {
-		return IngestOutcome{CountedError: true}
-	}
+	wasLost := sess.linkLost
+	snap := sess.snap
+	var events []TransitionEvent
+	urgent := false
 
-	sess.snap = next
-	sess.rev++
-	if peer.IsValid() {
-		sess.peerAddr = peer
+	if wasLost {
+		next := sess.snap
+		next.ObservedAt = now
+		if err := next.Validate(); err != nil {
+			return IngestOutcome{CountedError: true}
+		}
+		sess.snap = next
+		sess.rev++
+		snap = next
+		urgent = true
+		events = append(events, newLinkTransitionEvent(snap, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", now))
 	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDStatusText, peer, now)
 
 	cleanText := strings.TrimRight(msg.Text, "\x00")
-	return IngestOutcome{
-		Accepted: true,
-		SysID:    sysid,
-		Event: &TransitionEvent{
-			SysID:         sysid,
-			EntityID:      next.EntityID(),
-			Domain:        next.Domain,
-			Seq:           seq,
-			MsgID:         mavcodec.MsgIDStatusText,
-			Kind:          EventKindStatusText,
-			Reasons:       []string{"statustext"},
-			Armed:         next.Armed,
-			Authority:     next.Authority,
-			CompanionMode: next.CompanionMode,
-			LinkTier:      next.LinkTier,
-			Flags:         next.Flags,
-			Failsafes:     next.Failsafes,
-			StatusText: &StatusTextEvent{
-				Severity: msg.Severity,
-				Text:     cleanText,
-				ID:       msg.ID,
-				ChunkSeq: msg.ChunkSeq,
-			},
-			Timestamp: now.UnixMilli(),
+	events = append(events, TransitionEvent{
+		SysID:         sysid,
+		EntityID:      snap.EntityID(),
+		Domain:        snap.Domain,
+		Seq:           seq,
+		MsgID:         mavcodec.MsgIDStatusText,
+		Kind:          EventKindStatusText,
+		Reasons:       []string{"statustext"},
+		Armed:         snap.Armed,
+		Authority:     snap.Authority,
+		CompanionMode: snap.CompanionMode,
+		LinkTier:      snap.LinkTier,
+		Flags:         snap.Flags,
+		Failsafes:     snap.Failsafes,
+		StatusText: &StatusTextEvent{
+			Severity: msg.Severity,
+			Text:     cleanText,
+			ID:       msg.ID,
+			ChunkSeq: msg.ChunkSeq,
 		},
-		UrgentSKGSync: true,
+		Timestamp: now.UnixMilli(),
+	})
+
+	return IngestOutcome{
+		Accepted:      true,
+		SysID:         sysid,
+		Events:        events,
+		UrgentSKGSync: urgent,
 	}
 }
 
@@ -664,6 +749,55 @@ func (t *Tracker) Snapshot(sysid uint8) (uxsvocab.VehicleSnapshot, bool) {
 	return sess.snap, true
 }
 
+// IsLinkLost reports whether an admitted sysid is currently marked link-lost.
+func (t *Tracker) IsLinkLost(sysid uint8) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	sess, ok := t.sessions[sysid]
+	return ok && sess.linkLost
+}
+
+// EvaluateSilence inspects all admitted sessions against their LinkTier silence
+// threshold (`OQ1 Option A`) at now, marking newly silent sessions link-lost without
+// mutating VehicleSnapshot timestamps (`OQ2 Option A`) and returning one `link_lost`
+// TransitionEvent per newly crossed session in ascending sysid order.
+func (t *Tracker) EvaluateSilence(now time.Time) []TransitionEvent {
+	evalAt := now.UTC()
+	if evalAt.IsZero() {
+		evalAt = time.Unix(0, 0).UTC()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var events []TransitionEvent
+	for _, sess := range t.sessions {
+		if sess.linkLost {
+			continue
+		}
+		threshold := t.linkTimeout
+		if sess.snap.LinkTier == uxsvocab.LinkTierMeshSupervisory {
+			threshold = t.supervisoryTimeout
+		}
+		if evalAt.Sub(sess.lastPacketAt) < threshold {
+			continue
+		}
+		sess.linkLost = true
+		events = append(events, newLinkTransitionEvent(
+			sess.snap,
+			sess.lastSeq,
+			sess.lastMsgID,
+			EventKindLinkLost,
+			"silence_timeout",
+			evalAt,
+		))
+	}
+	slices.SortFunc(events, func(a, b TransitionEvent) int {
+		return int(a.SysID) - int(b.SysID)
+	})
+	return events
+}
+
 // PeerAddr returns the latest validated UDP endpoint recorded for an admitted sysid.
 func (t *Tracker) PeerAddr(sysid uint8) (netip.AddrPort, bool) {
 	t.mu.RLock()
@@ -688,25 +822,30 @@ func (t *Tracker) Peers() map[uint8]netip.AddrPort {
 	return out
 }
 
-// BuildPeriodicBatch marshals BaseMessage(VehicleSnapshot) items for every currently
-// admitted sysid in ascending sysid order.
-func (t *Tracker) BuildPeriodicBatch() ([]SnapshotBatchItem, error) {
-	t.mu.RLock()
-	sysids := make([]uint8, 0, len(t.sessions))
-	for sysid := range t.sessions {
-		sysids = append(sysids, sysid)
-	}
-	slices.Sort(sysids)
+// BuildPeriodicBatch marshals BaseMessage(VehicleSnapshot) items at flush time in ascending
+// sysid order for admitted sessions whose revision exceeds confirmedRevs[sysid] (`OQ3 Option A`).
+func (t *Tracker) BuildPeriodicBatch(confirmedRevs map[uint8]uint64) ([]SnapshotBatchItem, error) {
 	type captured struct {
 		snap uxsvocab.VehicleSnapshot
 		rev  uint64
 	}
-	snaps := make([]captured, 0, len(sysids))
-	for _, sysid := range sysids {
-		sess := t.sessions[sysid]
+
+	t.mu.RLock()
+	snaps := make([]captured, 0, len(t.sessions))
+	for sysid, sess := range t.sessions {
+		if sess.rev <= confirmedRevs[sysid] {
+			continue
+		}
 		snaps = append(snaps, captured{snap: sess.snap, rev: sess.rev})
 	}
 	t.mu.RUnlock()
+
+	if len(snaps) == 0 {
+		return nil, nil
+	}
+	slices.SortFunc(snaps, func(a, b captured) int {
+		return int(a.snap.SysID) - int(b.snap.SysID)
+	})
 
 	items := make([]SnapshotBatchItem, 0, len(snaps))
 	for _, c := range snaps {
