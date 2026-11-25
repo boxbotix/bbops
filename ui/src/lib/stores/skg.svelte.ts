@@ -132,6 +132,7 @@ export interface VehicleEntityState extends CopEntityBase {
   stateIngestedAtMs?: number | null;
   stateIngestedLive?: boolean;
   stateReplayedUnchanged?: boolean;
+  stateProducerAgeMs?: number;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -545,34 +546,30 @@ export function parseCopEntityState(
         "geo.location.longitude",
         "geo.location.altitude",
       ] as const;
-      const requiredSafetyPredicates = [
-        "uxs.domain.kind",
-        "uxs.authority.state",
-        "uxs.mode.companion",
-        "uxs.link.tier",
-        "uxs.health.armed",
-        "uxs.health.flags",
-      ] as const;
-      const isMeasuredAssertion = (
-        triple: SkgTriple | undefined,
-      ): triple is SkgTriple =>
-        triple !== undefined &&
-        triple.confidence > 0 &&
-        normalizeKnownTimestamp(triple.timestamp) !== null;
 
+      const latestBySource = collectLatestTimestampNsBySource(triples);
       let hasMeasuredSafetyState = true;
       let oldestMeasuredSafetyTriple: SkgTriple | undefined;
-      for (const pred of requiredSafetyPredicates) {
+      let maxSafetyProducerLagMs = 0;
+      for (const pred of REQUIRED_SAFETY_PREDICATES) {
         const candidate = byPredicate[pred];
-        if (!isMeasuredAssertion(candidate)) {
+        if (!isMeasuredSkgAssertion(candidate)) {
           hasMeasuredSafetyState = false;
           oldestMeasuredSafetyTriple = undefined;
+          maxSafetyProducerLagMs = 0;
           break;
+        }
+        const candNs = parseTripleInstantNs(candidate.timestamp);
+        const latestSourceNs = latestBySource[candidate.source] ?? candNs;
+        if (latestSourceNs > candNs) {
+          const lagMs = Math.floor(Number(latestSourceNs - candNs) / 1_000_000);
+          if (lagMs > maxSafetyProducerLagMs) {
+            maxSafetyProducerLagMs = lagMs;
+          }
         }
         if (
           oldestMeasuredSafetyTriple === undefined ||
-          parseTripleInstantNs(candidate.timestamp) <
-            parseTripleInstantNs(oldestMeasuredSafetyTriple.timestamp)
+          candNs < parseTripleInstantNs(oldestMeasuredSafetyTriple.timestamp)
         ) {
           oldestMeasuredSafetyTriple = candidate;
         }
@@ -581,7 +578,7 @@ export function parseCopEntityState(
       let latestPoseTriple: SkgTriple | undefined;
       for (const pred of posePredicates) {
         const candidate = byPredicate[pred];
-        if (isMeasuredAssertion(candidate)) {
+        if (isMeasuredSkgAssertion(candidate)) {
           latestPoseTriple = selectWinningTriple(latestPoseTriple, candidate);
         }
       }
@@ -597,9 +594,9 @@ export function parseCopEntityState(
       const hasNonZeroTiming =
         loopDtUs !== 0 || maxLoopDtUs !== 0 || rttUs !== 0;
       const hasSysStatus =
-        isMeasuredAssertion(loopDtTriple) &&
-        isMeasuredAssertion(maxLoopDtTriple) &&
-        isMeasuredAssertion(rttTriple) &&
+        isMeasuredSkgAssertion(loopDtTriple) &&
+        isMeasuredSkgAssertion(maxLoopDtTriple) &&
+        isMeasuredSkgAssertion(rttTriple) &&
         (loopDtTriple.context === "measured" ||
           maxLoopDtTriple.context === "measured" ||
           rttTriple.context === "measured" ||
@@ -624,7 +621,7 @@ export function parseCopEntityState(
         Math.abs(quat[3]) < 1e-9 &&
         (headingDistFromNorth > 0.5 || !hasNonZeroRates);
       const hasAttitude =
-        isMeasuredAssertion(quatTriple) &&
+        isMeasuredSkgAssertion(quatTriple) &&
         quatNormSq >= 1e-6 &&
         !isUnmeasuredIdentityQuat;
       const hasNonZeroLocalKinematics =
@@ -635,17 +632,17 @@ export function parseCopEntityState(
         vy !== 0 ||
         vz !== 0;
       const hasLocalPos =
-        isMeasuredAssertion(nedTriple) &&
+        isMeasuredSkgAssertion(nedTriple) &&
         (nedTriple.context === "measured" || hasNonZeroLocalKinematics);
       const hasGlobalPos =
-        isMeasuredAssertion(latTriple) &&
-        isMeasuredAssertion(lonTriple) &&
+        isMeasuredSkgAssertion(latTriple) &&
+        isMeasuredSkgAssertion(lonTriple) &&
         (latTriple.context === "measured" ||
           lat !== 0 ||
           lon !== 0 ||
           alt !== 0);
       const hasHeading =
-        isMeasuredAssertion(hdgTriple) &&
+        isMeasuredSkgAssertion(hdgTriple) &&
         (hdgTriple.context === "measured" || headingDeg !== 0 || hasAttitude);
 
       const poseObservedAt = normalizeKnownTimestamp(
@@ -677,6 +674,7 @@ export function parseCopEntityState(
         observedAt: vehicleObservedAt,
         hasMeasuredSafetyState,
         stateObservedAt,
+        stateProducerAgeMs: maxSafetyProducerLagMs,
         poseObservedAt,
         localPosObservedAt,
         globalPosObservedAt,
@@ -923,33 +921,55 @@ function applyVehiclePoseReceipt(
   return highWater;
 }
 
-function didVehicleStateAdvance(
-  prior: VehicleEntityState,
-  next: VehicleEntityState,
-): boolean {
+const REQUIRED_SAFETY_PREDICATES = [
+  "uxs.domain.kind",
+  "uxs.authority.state",
+  "uxs.mode.companion",
+  "uxs.link.tier",
+  "uxs.health.armed",
+  "uxs.health.flags",
+] as const;
+
+type RequiredSafetyPredicate = (typeof REQUIRED_SAFETY_PREDICATES)[number];
+
+function isMeasuredSkgAssertion(
+  triple: SkgTriple | undefined,
+): triple is SkgTriple {
   return (
-    next.domain !== prior.domain ||
-    next.authority !== prior.authority ||
-    next.companionMode !== prior.companionMode ||
-    next.linkTier !== prior.linkTier ||
-    next.armed !== prior.armed ||
-    next.healthFlags.clock_sync_locked !==
-      prior.healthFlags.clock_sync_locked ||
-    next.healthFlags.teleop_deadman_clamped !==
-      prior.healthFlags.teleop_deadman_clamped ||
-    next.healthFlags.crsf_link_healthy !==
-      prior.healthFlags.crsf_link_healthy ||
-    next.healthFlags.companion_trunk_healthy !==
-      prior.healthFlags.companion_trunk_healthy
+    triple !== undefined &&
+    triple.confidence > 0 &&
+    normalizeKnownTimestamp(triple.timestamp) !== null
   );
 }
 
-interface VehicleStateHighWater {
+function collectLatestTimestampNsBySource(
+  triples: readonly SkgTriple[],
+): Record<string, bigint | undefined> {
+  const latestBySource: Record<string, bigint | undefined> = Object.create(
+    null,
+  ) as Record<string, bigint | undefined>;
+  for (const triple of triples) {
+    if (normalizeKnownTimestamp(triple.timestamp) === null) {
+      continue;
+    }
+    const tsNs = parseTripleInstantNs(triple.timestamp);
+    const prevNs = latestBySource[triple.source];
+    if (prevNs === undefined || tsNs > prevNs) {
+      latestBySource[triple.source] = tsNs;
+    }
+  }
+  return latestBySource;
+}
+
+interface SafetyPredicateReceipt {
   observedNs: bigint;
-  state: VehicleEntityState;
-  ingestedAtMs: number | null;
+  ingestedAtMs: number;
   ingestedLive: boolean;
   replayedUnchanged: boolean;
+}
+
+interface VehicleStateHighWater {
+  predicates: Record<RequiredSafetyPredicate, SafetyPredicateReceipt>;
   disconnectedSinceAdvance: boolean;
 }
 
@@ -962,90 +982,122 @@ function applyVehicleStateReceipt(
 ): VehicleStateHighWater | undefined {
   const nextStateObs =
     next.stateObservedAt !== undefined ? next.stateObservedAt : next.observedAt;
-  if (!nextStateObs) {
+  if (next.hasMeasuredSafetyState === false || !nextStateObs) {
     next.stateIngestedAtMs =
       highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
     next.stateIngestedLive = false;
     next.stateReplayedUnchanged = false;
-    return highWater;
-  }
-
-  const nextNs = parseTripleInstantNs(nextStateObs);
-  if (highWater === undefined || nextNs > highWater.observedNs) {
-    next.stateIngestedAtMs = receiptMs;
-    next.stateIngestedLive = isLivePostSync;
-    next.stateReplayedUnchanged = false;
-    return {
-      observedNs: nextNs,
-      state: next,
-      ingestedAtMs: next.stateIngestedAtMs,
-      ingestedLive: next.stateIngestedLive,
-      replayedUnchanged: false,
-      disconnectedSinceAdvance: false,
-    };
-  }
-
-  const crossedDisconnect =
-    hasPriorSyncedSession ||
-    highWater.disconnectedSinceAdvance ||
-    highWater.replayedUnchanged;
-
-  if (nextNs < highWater.observedNs) {
-    next.stateIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
-    next.stateIngestedLive = false;
-    next.stateReplayedUnchanged = crossedDisconnect;
+    next.stateProducerAgeMs = 0;
     if (
-      crossedDisconnect &&
-      (!highWater.replayedUnchanged || highWater.ingestedLive)
+      hasPriorSyncedSession &&
+      highWater !== undefined &&
+      !highWater.disconnectedSinceAdvance
     ) {
       return {
         ...highWater,
-        ingestedLive: false,
-        replayedUnchanged: true,
-        disconnectedSinceAdvance: false,
+        disconnectedSinceAdvance: true,
       };
     }
     return highWater;
   }
 
-  if (didVehicleStateAdvance(highWater.state, next)) {
-    next.stateIngestedAtMs = receiptMs;
-    next.stateIngestedLive = isLivePostSync;
-    next.stateReplayedUnchanged = false;
-    return {
-      observedNs: nextNs,
-      state: next,
-      ingestedAtMs: next.stateIngestedAtMs,
-      ingestedLive: next.stateIngestedLive,
-      replayedUnchanged: false,
-      disconnectedSinceAdvance: false,
-    };
+  const winningByPredicate: Record<string, SkgTriple | undefined> =
+    Object.create(null) as Record<string, SkgTriple | undefined>;
+  for (const triple of next.triples) {
+    winningByPredicate[triple.predicate] = selectWinningTriple(
+      winningByPredicate[triple.predicate],
+      triple,
+    );
+  }
+  for (const pred of REQUIRED_SAFETY_PREDICATES) {
+    if (!isMeasuredSkgAssertion(winningByPredicate[pred])) {
+      next.stateIngestedAtMs =
+        highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
+      next.stateIngestedLive = false;
+      next.stateReplayedUnchanged = false;
+      next.stateProducerAgeMs = 0;
+      return highWater;
+    }
   }
 
-  if (crossedDisconnect) {
-    next.stateIngestedAtMs = highWater.ingestedAtMs ?? EXPIRED_POSE_RECEIPT_MS;
-    next.stateIngestedLive = false;
-    next.stateReplayedUnchanged = true;
-    return {
-      observedNs: highWater.observedNs,
-      state: next,
-      ingestedAtMs: next.stateIngestedAtMs,
-      ingestedLive: false,
-      replayedUnchanged: true,
-      disconnectedSinceAdvance: false,
-    };
+  const latestBySource = collectLatestTimestampNsBySource(next.triples);
+  const crossedDisconnect =
+    hasPriorSyncedSession || Boolean(highWater?.disconnectedSinceAdvance);
+
+  const nextHighWaterPredicates = {} as Record<
+    RequiredSafetyPredicate,
+    SafetyPredicateReceipt
+  >;
+  let minIngestedAtMs = Number.POSITIVE_INFINITY;
+  let allIngestedLive = true;
+  let anyReplayedUnchanged = false;
+  let maxProducerLagMs = 0;
+
+  for (const pred of REQUIRED_SAFETY_PREDICATES) {
+    const candidate = winningByPredicate[pred]!;
+    const candNs = parseTripleInstantNs(candidate.timestamp);
+    const latestProducerNs = latestBySource[candidate.source] ?? candNs;
+    const producerLagMs =
+      latestProducerNs > candNs
+        ? Math.floor(Number(latestProducerNs - candNs) / 1_000_000)
+        : 0;
+    if (producerLagMs > maxProducerLagMs) {
+      maxProducerLagMs = producerLagMs;
+    }
+    const projectedReceiptMs = receiptMs - producerLagMs;
+    const priorPred = highWater?.predicates[pred];
+
+    let effectivePred: SafetyPredicateReceipt;
+    if (priorPred === undefined || candNs > priorPred.observedNs) {
+      effectivePred = {
+        observedNs: candNs,
+        ingestedAtMs: projectedReceiptMs,
+        ingestedLive: isLivePostSync,
+        replayedUnchanged: false,
+      };
+      nextHighWaterPredicates[pred] = effectivePred;
+    } else if (candNs < priorPred.observedNs) {
+      effectivePred = {
+        observedNs: candNs,
+        ingestedAtMs: EXPIRED_POSE_RECEIPT_MS,
+        ingestedLive: false,
+        replayedUnchanged: crossedDisconnect || priorPred.replayedUnchanged,
+      };
+      nextHighWaterPredicates[pred] = crossedDisconnect
+        ? {
+            ...priorPred,
+            ingestedLive: false,
+            replayedUnchanged: true,
+          }
+        : priorPred;
+    } else {
+      const replayed = crossedDisconnect || priorPred.replayedUnchanged;
+      effectivePred = {
+        observedNs: priorPred.observedNs,
+        ingestedAtMs: priorPred.ingestedAtMs,
+        ingestedLive: replayed ? false : priorPred.ingestedLive,
+        replayedUnchanged: replayed,
+      };
+      nextHighWaterPredicates[pred] = effectivePred;
+    }
+
+    if (effectivePred.ingestedAtMs < minIngestedAtMs) {
+      minIngestedAtMs = effectivePred.ingestedAtMs;
+    }
+    if (!effectivePred.ingestedLive) {
+      allIngestedLive = false;
+    }
+    if (effectivePred.replayedUnchanged) {
+      anyReplayedUnchanged = true;
+    }
   }
 
-  next.stateIngestedAtMs =
-    highWater.ingestedAtMs ?? (isLivePostSync ? null : EXPIRED_POSE_RECEIPT_MS);
-  next.stateIngestedLive = highWater.ingestedLive;
-  next.stateReplayedUnchanged = false;
+  next.stateIngestedAtMs = minIngestedAtMs;
+  next.stateIngestedLive = allIngestedLive;
+  next.stateReplayedUnchanged = anyReplayedUnchanged;
+  next.stateProducerAgeMs = maxProducerLagMs;
   return {
-    observedNs: highWater.observedNs,
-    state: next,
-    ingestedAtMs: next.stateIngestedAtMs,
-    ingestedLive: next.stateIngestedLive,
-    replayedUnchanged: false,
+    predicates: nextHighWaterPredicates,
     disconnectedSinceAdvance: false,
   };
 }

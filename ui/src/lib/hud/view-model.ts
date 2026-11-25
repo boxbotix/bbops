@@ -531,7 +531,12 @@ export function evaluateVehicleFreshness(
     | "stateReplayedUnchanged"
     | "ingestedAtMs"
   > &
-    Partial<Pick<VehicleEntityState, "poisoned" | "poisonedAtMs">>,
+    Partial<
+      Pick<
+        VehicleEntityState,
+        "poisoned" | "poisonedAtMs" | "stateProducerAgeMs"
+      >
+    >,
   options: VehicleFreshnessOptions = {},
 ): VehicleFreshnessView {
   const nowMs = options.nowMs ?? Date.now();
@@ -542,6 +547,13 @@ export function evaluateVehicleFreshness(
   const fleetDataLive = skgConnected && skgSynced;
 
   const safetyMeasured = vehicle.hasMeasuredSafetyState !== false;
+  const producerAgeMs =
+    safetyMeasured &&
+    vehicle.stateProducerAgeMs !== undefined &&
+    isFiniteNumber(vehicle.stateProducerAgeMs) &&
+    vehicle.stateProducerAgeMs > 0
+      ? vehicle.stateProducerAgeMs
+      : 0;
   const rawObs = !safetyMeasured
     ? null
     : vehicle.stateObservedAt !== undefined
@@ -573,12 +585,12 @@ export function evaluateVehicleFreshness(
     isFiniteNumber(skgReceiptMs) &&
     skgReceiptMs > 0
   ) {
-    skgElapsedMs = Math.max(0, nowMs - skgReceiptMs);
+    skgElapsedMs = Math.max(0, nowMs - skgReceiptMs, producerAgeMs);
   } else if (skgObsMs !== null && skgObsMs > 0) {
     skgElapsedMs =
       skgReceiptMs !== null && isFiniteNumber(skgReceiptMs) && skgReceiptMs > 0
-        ? Math.max(0, nowMs - skgObsMs, nowMs - skgReceiptMs)
-        : Math.max(0, nowMs - skgObsMs);
+        ? Math.max(0, nowMs - skgObsMs, nowMs - skgReceiptMs, producerAgeMs)
+        : Math.max(0, nowMs - skgObsMs, producerAgeMs);
   }
 
   const ageMs = skgElapsedMs;
@@ -668,6 +680,7 @@ export function evaluateVehicleFreshness(
     nowMs - skgReceiptMs <= thresholdMs;
   const skgStateFresh =
     safetyMeasured &&
+    producerAgeMs <= thresholdMs &&
     vehicle.stateReplayedUnchanged !== true &&
     (skgIngestedLive
       ? skgReceiptWindowOk
