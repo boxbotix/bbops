@@ -89,6 +89,7 @@ type VehicleSnapshot struct {
 	HasLocalPos             bool  `json:"has_local_pos,omitempty"`
 	HasGlobalPos            bool  `json:"has_global_pos,omitempty"`
 	HasHeading              bool  `json:"has_heading,omitempty"`
+	HeartbeatObservedUnixNs int64 `json:"heartbeat_observed_unix_ns,omitempty"`
 	SysStatusObservedUnixNs int64 `json:"sys_status_observed_unix_ns,omitempty"`
 	AttitudeObservedUnixNs  int64 `json:"attitude_observed_unix_ns,omitempty"`
 	LocalPosObservedUnixNs  int64 `json:"local_pos_observed_unix_ns,omitempty"`
@@ -168,7 +169,7 @@ func (s *VehicleSnapshot) Validate() error {
 	if s.Failsafes < 0 || s.CRCErrors < 0 || s.LoopDtUs < 0 || s.MaxLoopDtUs < 0 || s.RTTUs < 0 {
 		return errors.New("uxsvocab: health counters and durations must be non-negative")
 	}
-	if s.SysStatusObservedUnixNs < 0 || s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
+	if s.HeartbeatObservedUnixNs < 0 || s.SysStatusObservedUnixNs < 0 || s.AttitudeObservedUnixNs < 0 || s.LocalPosObservedUnixNs < 0 || s.GlobalPosObservedUnixNs < 0 || s.HeadingObservedUnixNs < 0 {
 		return errors.New("uxsvocab: domain observation timestamps must be non-negative")
 	}
 
@@ -306,13 +307,22 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		title = defaultVehicleTitle(s.SysID)
 	}
 
-	triple := func(predicate string, obj any) message.Triple {
+	hbTS := ts
+	if s.HeartbeatObservedUnixNs > 0 {
+		hbTS = time.Unix(0, s.HeartbeatObservedUnixNs).UTC()
+	}
+	sysCounterTS := hbTS
+	if s.HasSysStatus && s.SysStatusObservedUnixNs > 0 {
+		sysCounterTS = time.Unix(0, s.SysStatusObservedUnixNs).UTC()
+	}
+
+	tripleAt := func(predicate string, obj any, tripleTS time.Time) message.Triple {
 		return message.Triple{
 			Subject:    entityID,
 			Predicate:  predicate,
 			Object:     obj,
 			Source:     TripleSource,
-			Timestamp:  ts,
+			Timestamp:  tripleTS,
 			Confidence: 1.0,
 		}
 	}
@@ -379,18 +389,18 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 				Confidence: 0.0,
 			}
 		}
-		return triple(predicate, obj)
+		return tripleAt(predicate, obj, ts)
 	}
 
 	return []message.Triple{
-		triple(PredicateDomainKind, s.Domain),
-		triple(PredicateAuthorityState, s.Authority),
-		triple(PredicateModeCompanion, s.CompanionMode),
-		triple(PredicateLinkTier, s.LinkTier),
-		triple(PredicateHealthArmed, s.Armed),
-		triple(PredicateHealthFlags, s.Flags),
-		triple(PredicateHealthFailsafes, s.Failsafes),
-		triple(PredicateHealthCRCErrors, s.CRCErrors),
+		tripleAt(PredicateDomainKind, s.Domain, hbTS),
+		tripleAt(PredicateAuthorityState, s.Authority, hbTS),
+		tripleAt(PredicateModeCompanion, s.CompanionMode, hbTS),
+		tripleAt(PredicateLinkTier, s.LinkTier, hbTS),
+		tripleAt(PredicateHealthArmed, s.Armed, hbTS),
+		tripleAt(PredicateHealthFlags, s.Flags, hbTS),
+		tripleAt(PredicateHealthFailsafes, s.Failsafes, sysCounterTS),
+		tripleAt(PredicateHealthCRCErrors, s.CRCErrors, sysCounterTS),
 		domainTriple(PredicateHealthLoopDtUs, s.LoopDtUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
 		domainTriple(PredicateHealthMaxLoopDtUs, s.MaxLoopDtUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
 		domainTriple(PredicateHealthRTTUs, s.RTTUs, hasSysStatusMeta, s.HasSysStatus, s.SysStatusObservedUnixNs, legacySysStatus),
@@ -404,7 +414,7 @@ func (s *VehicleSnapshot) Triples() []message.Triple {
 		domainTriple(vocabulary.GeoLocationLatitude, s.Latitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
 		domainTriple(vocabulary.GeoLocationLongitude, s.Longitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
 		domainTriple(vocabulary.GeoLocationAltitude, s.Altitude, hasPoseMeta, s.HasGlobalPos, s.GlobalPosObservedUnixNs, legacyGlobal),
-		triple(vocabulary.DCTermsTitle, title),
+		tripleAt(vocabulary.DCTermsTitle, title, hbTS),
 	}
 }
 

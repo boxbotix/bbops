@@ -1198,8 +1198,9 @@ export function resolveVehicleSafetyTone(
     VehicleEntityState,
     "poisoned" | "authority" | "armed" | "healthFlags" | "sysStatus"
   >,
+  options?: { isStale?: boolean },
 ): TacticalPaletteColors {
-  return TACTICAL_TONE_PALETTE[evaluateVehicleSafetySeverity(vehicle)];
+  return TACTICAL_TONE_PALETTE[evaluateVehicleSafetySeverity(vehicle, options)];
 }
 
 export function resolveContactPalette(

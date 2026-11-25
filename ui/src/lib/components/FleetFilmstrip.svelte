@@ -39,9 +39,11 @@
           type="button"
           class="filmstrip-card"
           class:selected
+          class:stale={Boolean(item.stale)}
           data-testid="filmstrip-item"
           data-entity-id={item.entityId}
           data-entity-kind={item.kind}
+          data-stale={item.stale ? "true" : "false"}
           aria-pressed={selected}
           onclick={() => handleSelect(item.entityId)}
         >
@@ -118,6 +120,10 @@
     text-align: left;
     cursor: pointer;
     flex-shrink: 0;
+  }
+
+  .filmstrip-card.stale {
+    border-style: dashed;
   }
 
   .filmstrip-card.selected {

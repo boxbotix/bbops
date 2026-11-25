@@ -309,6 +309,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		snap.LinkTier = tierStr
 		snap.Flags = vh.Custom.HealthFlags
 		snap.PoseMetadata = true
+		snap.HeartbeatObservedUnixNs = obsNs
 		snap.SysStatusObservedUnixNs = obsNs
 		snap.AttitudeObservedUnixNs = obsNs
 		snap.LocalPosObservedUnixNs = obsNs
@@ -339,6 +340,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	next.CompanionMode = modeStr
 	next.LinkTier = tierStr
 	next.Flags = vh.Custom.HealthFlags
+	next.HeartbeatObservedUnixNs = unixNanoOrZero(wallUTC)
 	next.ObservedAt = wallUTC
 	if err := next.Validate(); err != nil {
 		return IngestOutcome{CountedError: true}

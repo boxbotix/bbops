@@ -21,9 +21,8 @@
   const searchClient = createGraphSearchClient();
   const traceBook = new TelemetryTraceBook();
 
-  const filmstripItems = $derived(selectFilmstripItems(skgStore));
   const filmstripEntityIds = $derived(
-    filmstripItems.map((item) => item.entityId),
+    selectFilmstripItems(skgStore).map((item) => item.entityId),
   );
 
   function syncWindowHash(nextHash: string): void {
@@ -85,6 +84,5 @@
   {graphqlClient}
   {searchClient}
   {traceBook}
-  {filmstripItems}
   onSyncHash={syncWindowHash}
 />

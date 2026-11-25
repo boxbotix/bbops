@@ -303,20 +303,47 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 			}
 		}
 
-		// Health-only ObservedAt advancement must not overwrite earlier per-domain pose timestamps.
+		// Health-only ObservedAt advancement must not overwrite earlier per-domain pose timestamps,
+		// and pose-only ObservedAt advancement must not overwrite HeartbeatObservedUnixNs on #0 HEARTBEAT predicates.
 		poseTS := time.Date(2026, 11, 23, 20, 55, 0, 0, time.UTC)
 		healthLater := *populated
 		healthLater.LocalPosObservedUnixNs = poseTS.UnixNano()
 		healthLater.ObservedAt = poseTS.Add(10 * time.Minute)
 		laterTriples := healthLater.Triples()
 		if !laterTriples[4].Timestamp.Equal(healthLater.ObservedAt) {
-			t.Fatalf("health triple timestamp = %v, want %v", laterTriples[4].Timestamp, healthLater.ObservedAt)
+			t.Fatalf("legacy health triple timestamp = %v, want %v", laterTriples[4].Timestamp, healthLater.ObservedAt)
 		}
 		if !laterTriples[13].Timestamp.Equal(poseTS) {
 			t.Fatalf("uxs.kinematics.ned timestamp = %v, want preserved %v", laterTriples[13].Timestamp, poseTS)
 		}
 
-		// JSON Marshal/Unmarshal round-trip.
+		hbTS := time.Date(2026, 11, 23, 21, 0, 0, 0, time.UTC)
+		sysTS := hbTS.Add(2 * time.Second)
+		posOnlyTS := hbTS.Add(6 * time.Second)
+		posOnly := *populated
+		posOnly.HeartbeatObservedUnixNs = hbTS.UnixNano()
+		posOnly.SysStatusObservedUnixNs = sysTS.UnixNano()
+		posOnly.LocalPosObservedUnixNs = posOnlyTS.UnixNano()
+		posOnly.ObservedAt = posOnlyTS
+		posOnlyTriples := posOnly.Triples()
+		for _, hbIdx := range []int{0, 1, 2, 3, 4, 5, 21} {
+			if !posOnlyTriples[hbIdx].Timestamp.Equal(hbTS) {
+				t.Fatalf("posOnly triple[%d] (%s) timestamp = %v, want preserved hbTS %v",
+					hbIdx, posOnlyTriples[hbIdx].Predicate, posOnlyTriples[hbIdx].Timestamp, hbTS)
+			}
+		}
+		for _, sysIdx := range []int{6, 7, 8, 9, 10} {
+			if !posOnlyTriples[sysIdx].Timestamp.Equal(sysTS) {
+				t.Fatalf("posOnly triple[%d] (%s) timestamp = %v, want preserved sysTS %v",
+					sysIdx, posOnlyTriples[sysIdx].Predicate, posOnlyTriples[sysIdx].Timestamp, sysTS)
+			}
+		}
+		if !posOnlyTriples[13].Timestamp.Equal(posOnlyTS) {
+			t.Fatalf("posOnly uxs.kinematics.ned timestamp = %v, want %v", posOnlyTriples[13].Timestamp, posOnlyTS)
+		}
+
+		// JSON Marshal/Unmarshal round-trip (including HeartbeatObservedUnixNs).
+		populated.HeartbeatObservedUnixNs = hbTS.UnixNano()
 		encoded, err := json.Marshal(populated)
 		if err != nil {
 			t.Fatalf("Marshal VehicleSnapshot: %v", err)
@@ -377,6 +404,7 @@ func TestVehicleSnapshotConstantPredicatesAndValidation(t *testing.T) {
 		{name: "negative loop dt", mutate: func(s *VehicleSnapshot) { s.LoopDtUs = -1 }},
 		{name: "negative max loop dt", mutate: func(s *VehicleSnapshot) { s.MaxLoopDtUs = -1 }},
 		{name: "negative rtt", mutate: func(s *VehicleSnapshot) { s.RTTUs = -1 }},
+		{name: "negative heartbeat obs ns", mutate: func(s *VehicleSnapshot) { s.HeartbeatObservedUnixNs = -1 }},
 		{name: "NaN quaternion", mutate: func(s *VehicleSnapshot) { s.Quaternion[2] = math.NaN() }},
 		{name: "+Inf body rate", mutate: func(s *VehicleSnapshot) { s.BodyRates[1] = math.Inf(1) }},
 		{name: "-Inf NED", mutate: func(s *VehicleSnapshot) { s.NED[0] = math.Inf(-1) }},

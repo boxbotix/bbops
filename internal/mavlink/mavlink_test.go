@@ -800,8 +800,8 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		t.Fatalf("STATUSTEXT NUL-trim outcome = %+v", stNulOut)
 	}
 
-	// Verify #0 HEARTBEAT (t0+8s) and #1 SYS_STATUS (t0+9..12s) advanced health/status ObservedAt to t0+12s
-	// while steady-state #253 STATUSTEXT (t0+13..14s) left VehicleSnapshot timestamps untouched and #32 stayed at t0+6s!
+	// Verify #0 HEARTBEAT (t0+8s) kept heartbeat triple timestamps at t0+8s, #1 SYS_STATUS (t0+9..12s) advanced
+	// SYS_STATUS counter/timing timestamps to t0+12s, #32 stayed at t0+6s, and steady-state #253 STATUSTEXT (t0+13..14s) left all untouched!
 	finalSnap, ok := tracker.Snapshot(2)
 	if !ok {
 		t.Fatal("missing final sysid=2 snapshot")
@@ -811,8 +811,13 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	for _, tr := range finalTriples {
 		byPred[tr.Predicate] = tr
 	}
-	if !byPred[uxsvocab.PredicateHealthArmed].Timestamp.Equal(t0.Add(12 * time.Second)) {
-		t.Fatalf("health triple timestamp = %v, want %v (untouched by steady-state STATUSTEXT)", byPred[uxsvocab.PredicateHealthArmed].Timestamp, t0.Add(12*time.Second))
+	if !byPred[uxsvocab.PredicateHealthArmed].Timestamp.Equal(t0.Add(8 * time.Second)) {
+		t.Fatalf("heartbeat triple timestamp = %v, want %v (from #0 HEARTBEAT at t0+8s)", byPred[uxsvocab.PredicateHealthArmed].Timestamp, t0.Add(8*time.Second))
+	}
+	if !byPred[uxsvocab.PredicateHealthFailsafes].Timestamp.Equal(t0.Add(12*time.Second)) ||
+		!byPred[uxsvocab.PredicateHealthLoopDtUs].Timestamp.Equal(t0.Add(12*time.Second)) {
+		t.Fatalf("SYS_STATUS triple timestamps = (%v, %v), want %v (untouched by steady-state STATUSTEXT)",
+			byPred[uxsvocab.PredicateHealthFailsafes].Timestamp, byPred[uxsvocab.PredicateHealthLoopDtUs].Timestamp, t0.Add(12*time.Second))
 	}
 	if !byPred[uxsvocab.PredicateKinematicsNED].Timestamp.Equal(t0.Add(6*time.Second)) ||
 		byPred[uxsvocab.PredicateKinematicsNED].Context != "measured" {
@@ -2518,4 +2523,105 @@ func FuzzTrackerIngestDatagram(f *testing.F) {
 			t.Fatalf("EvaluateSilence mutated VehicleSnapshot:\nbefore=%+v\nafter =%+v", after, silentSnap)
 		}
 	})
+}
+
+// spec: mavlink-ingest / Constant-predicate Graphable vehicle snapshot payload
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerPositionOnlyPacketsFreezeHeartbeatTripleTimestamps(t *testing.T) {
+	tracker, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:45210")
+	t0 := time.Date(2026, 11, 25, 19, 0, 0, 0, time.UTC)
+
+	hb := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierMeshHighRate,
+		uxsvocab.HealthFlags{
+			ClockSyncLocked:       true,
+			CRSFLinkHealthy:       true,
+			CompanionTrunkHealthy: true,
+		},
+	)
+	if out := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 1, hb), peer, t0); !out.Accepted {
+		t.Fatalf("initial HEARTBEAT rejected: %+v", out)
+	}
+
+	snap0, _ := tracker.Snapshot(1)
+	storedTriples := snap0.Triples()
+
+	heartbeatPredicates := []string{
+		uxsvocab.PredicateDomainKind,
+		uxsvocab.PredicateAuthorityState,
+		uxsvocab.PredicateModeCompanion,
+		uxsvocab.PredicateLinkTier,
+		uxsvocab.PredicateHealthArmed,
+		uxsvocab.PredicateHealthFlags,
+	}
+
+	// Feed 1 Hz #32 LOCAL_POSITION_NED for 6 seconds (plus #1 SYS_STATUS at T+5s) with zero heartbeats.
+	for sec := 1; sec <= 6; sec++ {
+		sampleTS := t0.Add(time.Duration(sec) * time.Second)
+		posOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, uint8(1+sec), mavcodec.LocalPositionNED{
+			X: float32(sec * 2), Y: -1.5, Z: -12.0, Vx: 2.0,
+		}), peer, sampleTS)
+		if !posOut.Accepted {
+			t.Fatalf("LOCAL_POSITION_NED at +%ds rejected: %+v", sec, posOut)
+		}
+		if sec == 5 {
+			sysOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 50, mavcodec.SysStatus{
+				Load: 1100, ErrorsComm: 0, ErrorsCount1: 0, ErrorsCount2: 1400, ErrorsCount3: 390,
+			}), peer, sampleTS)
+			if !sysOut.Accepted {
+				t.Fatalf("SYS_STATUS at +5s rejected: %+v", sysOut)
+			}
+		}
+
+		snap, _ := tracker.Snapshot(1)
+		rep := graph.ReplaceBySource(storedTriples, snap.Triples())
+		if len(rep.Stale) != 0 {
+			t.Fatalf("ReplaceBySource at +%ds rejected stale triples: %+v", sec, rep.Stale)
+		}
+		storedTriples = rep.Triples
+
+		byPred := make(map[string]message.Triple, len(storedTriples))
+		for _, tr := range storedTriples {
+			byPred[tr.Predicate] = tr
+		}
+		for _, pred := range heartbeatPredicates {
+			if !byPred[pred].Timestamp.Equal(t0) {
+				t.Fatalf("after +%ds without HEARTBEAT, %s Timestamp = %v, want frozen %v",
+					sec, pred, byPred[pred].Timestamp, t0)
+			}
+		}
+		if !byPred[uxsvocab.PredicateKinematicsNED].Timestamp.Equal(sampleTS) {
+			t.Fatalf("after +%ds, uxs.kinematics.ned Timestamp = %v, want %v",
+				sec, byPred[uxsvocab.PredicateKinematicsNED].Timestamp, sampleTS)
+		}
+	}
+
+	// Delivering a new #0 HEARTBEAT at T+7s advances all heartbeat safety predicates to T+7s.
+	t7 := t0.Add(7 * time.Second)
+	if out := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 60, hb), peer, t7); !out.Accepted {
+		t.Fatalf("recovery HEARTBEAT at +7s rejected: %+v", out)
+	}
+	snap7, _ := tracker.Snapshot(1)
+	rep7 := graph.ReplaceBySource(storedTriples, snap7.Triples())
+	if len(rep7.Stale) != 0 {
+		t.Fatalf("ReplaceBySource at +7s rejected stale triples: %+v", rep7.Stale)
+	}
+	storedTriples = rep7.Triples
+	byPred7 := make(map[string]message.Triple, len(storedTriples))
+	for _, tr := range storedTriples {
+		byPred7[tr.Predicate] = tr
+	}
+	for _, pred := range heartbeatPredicates {
+		if !byPred7[pred].Timestamp.Equal(t7) {
+			t.Fatalf("after +7s HEARTBEAT, %s Timestamp = %v, want %v", pred, byPred7[pred].Timestamp, t7)
+		}
+	}
 }

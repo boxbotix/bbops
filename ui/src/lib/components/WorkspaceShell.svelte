@@ -3,6 +3,7 @@
   Copyright (c) 2026 boxbotix
 -->
 <script lang="ts">
+  import { onMount } from "svelte";
   import {
     TelemetryTraceBook,
     lookupMeasuredSysStatus,
@@ -20,9 +21,12 @@
   } from "$lib/cortex/search-client";
   import { type GraphQLClient, createGraphQLClient } from "$lib/graphql";
   import {
+    FLEET_FRESHNESS_TICK_MS,
     type FilmstripItemView,
+    type FleetFreshnessContext,
     selectFilmstripItems,
-    summarizeFleetFaults,
+    summarizeFleetHealth,
+    summarizeStreamReadiness,
   } from "$lib/hud/view-model";
   import type { SkgStore } from "$lib/stores/skg.svelte";
   import type { TelemetryStore } from "$lib/stores/telemetry.svelte";
@@ -39,6 +43,7 @@
     searchClient?: GraphSearchClient;
     traceBook?: TelemetryTraceBook;
     filmstripItems?: readonly FilmstripItemView[];
+    now?: () => number;
     onSyncHash?: (hash: string) => void;
   }
 
@@ -50,15 +55,47 @@
     searchClient = createGraphSearchClient(),
     traceBook = new TelemetryTraceBook(),
     filmstripItems,
+    now = () => Date.now(),
     onSyncHash,
   }: Props = $props();
 
+  let freshnessTick = $state(0);
+  const clockNowMs = $derived.by(() => {
+    void freshnessTick;
+    return now();
+  });
+
+  onMount(() => {
+    const intervalId = setInterval(() => {
+      freshnessTick += 1;
+    }, FLEET_FRESHNESS_TICK_MS);
+    return () => clearInterval(intervalId);
+  });
+
   const banner = $derived(formatShellBanner("v0.1.0-dev"));
-  const fleetFaults = $derived(
-    summarizeFleetFaults(skgStore.entities.values()),
+  const freshnessContext = $derived<FleetFreshnessContext>({
+    telemetryStatus: telemetryStore.status,
+    getTelemetryLink: (sysid) => telemetryStore.getLinkState(sysid),
+    skgStatus: skgStore.status,
+    skgSynced: skgStore.synced,
+    skgLastSyncedRevision: skgStore.lastSyncedRevision,
+    nowMs: clockNowMs,
+  });
+  const streamPills = $derived(
+    summarizeStreamReadiness({
+      telemetryStatus: telemetryStore.status,
+      telemetryVehicleCount: telemetryStore.vehicleCount,
+      skgStatus: skgStore.status,
+      skgSynced: skgStore.synced,
+      skgLastSyncedRevision: skgStore.lastSyncedRevision,
+      skgEntityCount: skgStore.entities.size,
+    }),
+  );
+  const fleetHealth = $derived(
+    summarizeFleetHealth(skgStore.entities.values(), freshnessContext),
   );
   const resolvedFilmstripItems = $derived(
-    filmstripItems ?? selectFilmstripItems(skgStore),
+    filmstripItems ?? selectFilmstripItems(skgStore, freshnessContext),
   );
 
   $effect(() => {
@@ -89,10 +126,10 @@
   }
 
   function jumpToFirstFault(): void {
-    if (!fleetFaults.firstFaultEntityId) {
+    if (!fleetHealth.firstFaultEntityId) {
       return;
     }
-    viewportStore.selectEntity(fleetFaults.firstFaultEntityId);
+    viewportStore.selectEntity(fleetHealth.firstFaultEntityId);
     onSyncHash?.(viewportStore.toUrlHash());
   }
 </script>
@@ -111,42 +148,68 @@
       <h1 class="workspace-title">{banner}</h1>
 
       <div class="stream-pills" aria-label="Stream connection status">
-        <span class="stream-pill" data-status={telemetryStore.status}>
-          WS1: <strong>{telemetryStore.status}</strong>
-          ({telemetryStore.vehicleCount})
+        <span
+          class="stream-pill"
+          data-testid="stream-pill-telemetry"
+          data-stream="ws1"
+          data-status={streamPills.telemetry.status}
+          data-tone={streamPills.telemetry.tone}
+          title={streamPills.telemetry.detailLabel}
+        >
+          {streamPills.telemetry.label}:
+          <strong>{streamPills.telemetry.stateLabel}</strong>
         </span>
-        <span class="stream-pill" data-status={skgStore.status}>
-          WS2: <strong>{skgStore.status}</strong> ({skgStore.entities
-            .size}{skgStore.synced ? " · synced" : ""})
+        <span
+          class="stream-pill"
+          data-testid="stream-pill-fleet"
+          data-stream="ws2"
+          data-status={streamPills.fleetData.status}
+          data-tone={streamPills.fleetData.tone}
+          title={streamPills.fleetData.detailLabel}
+        >
+          {streamPills.fleetData.label}:
+          <strong>{streamPills.fleetData.stateLabel}</strong>
         </span>
       </div>
 
-      {#if fleetFaults.faultedCount > 0}
+      {#if fleetHealth.state === "fault"}
         <button
           type="button"
-          class="fleet-fault-btn {fleetFaults.errorCount > 0
+          class="fleet-fault-btn {fleetHealth.errorCount > 0
             ? 'severity-error'
             : 'severity-warning'}"
           data-testid="fleet-fault-badge"
+          data-fleet-state="fault"
+          data-stale-fault={fleetHealth.hasStaleFaultContext ? "true" : "false"}
           onclick={jumpToFirstFault}
         >
-          ! {fleetFaults.faultedCount} FLEET FAULT{fleetFaults.faultedCount ===
-          1
-            ? ""
-            : "S"}
-          {#if fleetFaults.firstFaultLabel}
-            ({fleetFaults.firstFaultLabel})
-          {/if}
+          {fleetHealth.badgeLabel}
         </button>
+      {:else if fleetHealth.state === "nominal"}
+        <span
+          class="fleet-nominal-pill"
+          data-testid="fleet-nominal-badge"
+          data-fleet-state="nominal"
+        >
+          {fleetHealth.badgeLabel}
+        </span>
       {:else}
-        <span class="fleet-nominal-pill" data-testid="fleet-nominal-badge">
-          FLEET NOMINAL ({fleetFaults.totalVehicles})
+        <span
+          class="fleet-status-pill state-{fleetHealth.state}"
+          data-testid="fleet-health-badge"
+          data-fleet-state={fleetHealth.state}
+        >
+          {fleetHealth.badgeLabel}
         </span>
       {/if}
     </div>
 
     <div class="topbar-authority-slot">
-      <AuthorityBanner entity={viewportStore.selectedEntity} compact={true} />
+      <AuthorityBanner
+        entity={viewportStore.selectedEntity}
+        {freshnessContext}
+        compact={true}
+      />
     </div>
 
     <nav class="workspace-switcher" aria-label="Task workspaces">
@@ -180,12 +243,21 @@
 
   <div class="workspace-stage-host">
     {#if viewportStore.workspace === "cop"}
-      <CopWorkspace {telemetryStore} {skgStore} {viewportStore} {onSyncHash} />
+      <CopWorkspace
+        {telemetryStore}
+        {skgStore}
+        {viewportStore}
+        {freshnessContext}
+        {now}
+        {onSyncHash}
+      />
     {:else if viewportStore.workspace === "pilot"}
       <PilotWorkspace
         {telemetryStore}
         {skgStore}
         {viewportStore}
+        {freshnessContext}
+        {now}
         {onSyncHash}
       />
     {:else if viewportStore.workspace === "bench"}
@@ -262,7 +334,8 @@
   }
 
   .stream-pill,
-  .fleet-nominal-pill {
+  .fleet-nominal-pill,
+  .fleet-status-pill {
     padding: 2px 8px;
     border-radius: 999px;
     background: var(--ui-surface-elevated, #172033);
@@ -272,9 +345,27 @@
     font-size: 11px;
   }
 
-  .stream-pill[data-status="connected"] {
+  .stream-pill[data-tone="connected"] {
     border-color: var(--ui-border-interactive, #3b82f6);
     color: var(--ui-text-primary, #e2e8f0);
+  }
+
+  .stream-pill[data-tone="degraded"] {
+    border-color: var(--status-warning, #f59e0b);
+    color: var(--status-warning, #f59e0b);
+  }
+
+  .fleet-nominal-pill {
+    border-color: rgba(34, 197, 94, 0.45);
+    color: var(--ui-text-primary, #e2e8f0);
+  }
+
+  .fleet-status-pill.state-stale,
+  .fleet-status-pill.state-unavailable {
+    color: var(--status-warning, #f59e0b);
+    background: var(--status-warning-bg, rgba(245, 158, 11, 0.14));
+    border-color: var(--status-warning, #f59e0b);
+    font-weight: 600;
   }
 
   .fleet-fault-btn {

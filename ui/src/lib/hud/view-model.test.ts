@@ -25,18 +25,30 @@ import {
   HUD_READOUT_THROTTLE_MS,
   SKG_VEHICLE_FRESH_MS,
   USV_HUD_CRAB_DEADBAND_MPS,
+  VEHICLE_FRESH_DEFAULT_MS,
+  VEHICLE_FRESH_SUPERVISORY_MS,
   buildExternalContactSummary,
+  buildFaultedOwnshipEntries,
+  buildFilmstripItems,
   buildHealthStrip,
   buildVehicleBannerView,
   computeFlightMetrics,
+  evaluatePoisonedVehicleFreshness,
+  evaluateVehicleFreshness,
   evaluateVehicleSafetySeverity,
   formatArmedBadge,
   formatAuthorityBadge,
   formatLinkTierBadge,
+  formatObservationAge,
   formatVehicleHudReadouts,
   quaternionToEulerDeg,
   resolveLiveVehiclePose,
+  resolveVehicleFreshnessThresholdMs,
+  selectBannerPresentation,
+  selectFilmstripItems,
   shouldRefreshHudReadout,
+  summarizeFleetHealth,
+  summarizeStreamReadiness,
 } from "./view-model";
 
 function eulerRadToQuaternionWxyz(
@@ -3427,5 +3439,1739 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
 
     expect(belowDeadbandHits).toBeGreaterThanOrEqual(1);
     expect(activeCrabHits).toBeGreaterThanOrEqual(50);
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("distinguishes stream readiness, LinkTier freshness, partial stream fallbacks, retained stale faults, and explicit ARMED/DISARMED labels", () => {
+    expect(VEHICLE_FRESH_DEFAULT_MS).toBe(4_000);
+    expect(VEHICLE_FRESH_SUPERVISORY_MS).toBe(11_000);
+    expect(resolveVehicleFreshnessThresholdMs("sitl-local")).toBe(4_000);
+    expect(resolveVehicleFreshnessThresholdMs("direct-bench")).toBe(4_000);
+    expect(resolveVehicleFreshnessThresholdMs("mesh-high-rate")).toBe(4_000);
+    expect(resolveVehicleFreshnessThresholdMs("mesh-supervisory")).toBe(11_000);
+
+    expect(formatObservationAge(null)).toBe("age unknown");
+    expect(formatObservationAge(450)).toBe("<1s ago");
+    expect(formatObservationAge(4_200)).toBe("4s ago");
+    expect(formatObservationAge(72_000)).toBe("1m 12s ago");
+    expect(formatObservationAge(7_500_000)).toBe("2h 5m ago");
+    expect(formatObservationAge(97_200_000)).toBe("1d 3h ago");
+
+    // 1. Pre-sync & empty-fleet states NEVER claim nominal health.
+    const preSyncConnecting = summarizeFleetHealth([], {
+      skgStatus: "connecting",
+      skgSynced: false,
+      skgLastSyncedRevision: null,
+    });
+    expect(preSyncConnecting.state).toBe("connecting");
+    expect(preSyncConnecting.badgeLabel).toBe("AWAITING FLEET DATA…");
+    expect(preSyncConnecting.badgeLabel).not.toContain("NOMINAL");
+
+    const preSyncReconnecting = summarizeFleetHealth([], {
+      skgStatus: "reconnecting",
+      skgSynced: false,
+      skgLastSyncedRevision: null,
+    });
+    expect(preSyncReconnecting.state).toBe("connecting");
+    expect(preSyncReconnecting.badgeLabel).toBe("RECONNECTING FLEET DATA…");
+
+    const preSyncOffline = summarizeFleetHealth([], {
+      skgStatus: "disconnected",
+      skgSynced: false,
+      skgLastSyncedRevision: null,
+    });
+    expect(preSyncOffline.state).toBe("unavailable");
+    expect(preSyncOffline.badgeLabel).toBe("FLEET DATA UNAVAILABLE");
+
+    // Synced with 0 UXS vehicles (even with an external COP contact) -> "empty", never nominal.
+    const syncedEmptyWithContact = summarizeFleetHealth(
+      [makeSampleExternalContact()],
+      {
+        skgStatus: "connected",
+        skgSynced: true,
+        skgLastSyncedRevision: 0,
+      },
+    );
+    expect(syncedEmptyWithContact.state).toBe("empty");
+    expect(syncedEmptyWithContact.badgeLabel).toBe("No vehicles detected");
+
+    // 2. Operator-facing stream pills name Telemetry and Fleet data; WS1/WS2 live in detailLabel.
+    const pillsDegraded = summarizeStreamReadiness({
+      telemetryStatus: "disconnected",
+      telemetryVehicleCount: 0,
+      skgStatus: "connected",
+      skgSynced: true,
+      skgLastSyncedRevision: 4,
+      skgEntityCount: 2,
+    });
+    expect(pillsDegraded.telemetry.label).toBe("Telemetry");
+    expect(pillsDegraded.telemetry.stateLabel).toBe("Offline");
+    expect(pillsDegraded.telemetry.detailLabel).toContain("WS1");
+    expect(pillsDegraded.fleetData.label).toBe("Fleet data");
+    expect(pillsDegraded.fleetData.stateLabel).toBe("Live · synced (2)");
+    expect(pillsDegraded.fleetData.detailLabel).toContain("WS2");
+
+    // 3. LinkTier scaling + partial stream degradation + explicit ARMED / DISARMED labels.
+    let nowMs = Date.parse("2026-11-25T15:00:00.000Z");
+    const highRateVehicle = makeSampleVehicle({
+      id: "boxbotix.local.robotics.uxs.vehicle.1",
+      sysid: 1,
+      armed: true,
+      linkTier: "mesh-high-rate",
+      observedAt: new Date(nowMs).toISOString(),
+      stateObservedAt: new Date(nowMs).toISOString(),
+      stateIngestedAtMs: nowMs,
+      stateIngestedLive: true,
+    });
+    const supervisoryDisarmed = makeSampleVehicle({
+      id: "boxbotix.local.robotics.uxs.vehicle.2",
+      sysid: 2,
+      title: "Boat-2",
+      domain: "surface-boat",
+      armed: false,
+      linkTier: "mesh-supervisory",
+      observedAt: new Date(nowMs).toISOString(),
+      stateObservedAt: new Date(nowMs).toISOString(),
+      stateIngestedAtMs: nowMs,
+      stateIngestedLive: true,
+    });
+
+    // Telemetry (WS1) offline while Fleet data (WS2) is connected+synced & fresh -> FLEET NOMINAL (2)!
+    const ws1OfflineFleetNominal = summarizeFleetHealth(
+      [highRateVehicle, supervisoryDisarmed],
+      {
+        telemetryStatus: "disconnected",
+        skgStatus: "connected",
+        skgSynced: true,
+        skgLastSyncedRevision: 2,
+        nowMs: nowMs + 2_000,
+      },
+    );
+    expect(ws1OfflineFleetNominal.state).toBe("nominal");
+    expect(ws1OfflineFleetNominal.badgeLabel).toBe("FLEET NOMINAL (2)");
+
+    // Explicit ARMED / DISARMED across banner and filmstrip (never "SAFE").
+    const liveStrip = buildFilmstripItems(
+      [highRateVehicle, supervisoryDisarmed],
+      [],
+      undefined,
+      {
+        skgStatus: "connected",
+        skgSynced: true,
+        nowMs: nowMs + 2_000,
+      },
+    );
+    expect(liveStrip[0]?.secondaryLabel).toBe("#1 · P2 · ARMED");
+    expect(liveStrip[0]?.safetySeverity).toBe("success");
+    expect(liveStrip[1]?.secondaryLabel).toBe("#2 · P2 · DISARMED");
+    expect(liveStrip[1]?.safetySeverity).toBe("nominal");
+
+    // Advance +9s: supervisory (#2, 11s threshold) is still fresh while high-rate (#1, 4s threshold) is stale!
+    const atNineSec = nowMs + 9_000;
+    const highRateFreshAt9s = evaluateVehicleFreshness(highRateVehicle, {
+      skgStatus: "connected",
+      skgSynced: true,
+      nowMs: atNineSec,
+    });
+    const supervisoryFreshAt9s = evaluateVehicleFreshness(supervisoryDisarmed, {
+      skgStatus: "connected",
+      skgSynced: true,
+      nowMs: atNineSec,
+    });
+    expect(highRateFreshAt9s.fresh).toBe(false);
+    expect(highRateFreshAt9s.ageLabel).toBe("9s ago");
+    expect(supervisoryFreshAt9s.fresh).toBe(true);
+
+    const partialStaleSummary = summarizeFleetHealth(
+      [highRateVehicle, supervisoryDisarmed],
+      {
+        skgStatus: "connected",
+        skgSynced: true,
+        skgLastSyncedRevision: 2,
+        nowMs: atNineSec,
+      },
+    );
+    expect(partialStaleSummary.state).toBe("stale");
+    expect(partialStaleSummary.badgeLabel).toBe(
+      "FLEET STALE (1/2 LAST KNOWN · 9s ago)",
+    );
+
+    // Stale fault-free ARMED vehicle (#1) withholds live green ("success") -> "warning" + LAST KNOWN.
+    const staleArmedBanner = selectBannerPresentation(highRateVehicle, {
+      skgStatus: "connected",
+      skgSynced: true,
+      nowMs: atNineSec,
+    });
+    expect(staleArmedBanner?.kind).toBe("uxs-vehicle");
+    if (staleArmedBanner?.kind === "uxs-vehicle") {
+      expect(staleArmedBanner.armedBadge.label).toBe("ARMED");
+      expect(staleArmedBanner.armedBadge.severity).toBe("warning");
+      expect(staleArmedBanner.freshness?.statusLabel).toBe(
+        "LAST KNOWN · 9s ago",
+      );
+    }
+    const staleStrip = buildFilmstripItems(
+      [highRateVehicle, supervisoryDisarmed],
+      [],
+      undefined,
+      { skgStatus: "connected", skgSynced: true, nowMs: atNineSec },
+    );
+    expect(staleStrip[0]?.secondaryLabel).toBe(
+      "#1 · P2 · ARMED · LAST KNOWN (9s ago)",
+    );
+    expect(staleStrip[0]?.safetySeverity).toBe("warning");
+    expect(
+      resolveVehicleSafetyTone(highRateVehicle, { isStale: true }).tone,
+    ).toBe("warning");
+
+    // 4. Fleet data (WS2) drops while Telemetry (WS1) streams fresh 20 Hz pose:
+    // pose stays live ("ws1", stale: false), while fleet health downgrades to "stale".
+    nowMs = atNineSec + 1_000;
+    const telemetryStore = createTelemetryStore({ now: () => nowMs });
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: nowMs,
+        payload: {
+          sysid: 1,
+          domain: "quadcopter",
+          seq: 1,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [12, -5, -20],
+          has_local_pos: true,
+          ned_vel: [1, 0, 0],
+          lat_lon_alt: [30.2672, -97.7431, 168],
+          has_global_pos: true,
+          hdg_deg: 45,
+          timestamp: nowMs,
+        },
+      }),
+    );
+    const liveWs1PoseUnderWs2Drop = resolveLiveVehiclePose(highRateVehicle, {
+      fast: telemetryStore.getKinematics(1),
+      telemetryLink: telemetryStore.getLinkState(1),
+      telemetryStatus: "connected",
+      skgStatus: "reconnecting",
+      nowMs: nowMs + 100,
+    });
+    expect(liveWs1PoseUnderWs2Drop.source).toBe("ws1");
+    expect(liveWs1PoseUnderWs2Drop.stale).toBe(false);
+
+    const ws2DropSummary = summarizeFleetHealth([highRateVehicle], {
+      telemetryStatus: "connected",
+      getTelemetryLink: (sysid) => telemetryStore.getLinkState(sysid),
+      skgStatus: "reconnecting",
+      skgSynced: false,
+      skgLastSyncedRevision: 2,
+      nowMs: nowMs + 100,
+    });
+    expect(ws2DropSummary.state).toBe("stale");
+    expect(ws2DropSummary.badgeLabel).toContain("FLEET STALE · LAST KNOWN");
+
+    // 5. Retained faults survive link_lost with LAST KNOWN age and do not clear on link loss.
+    const faultedP4 = makeSampleVehicle({
+      authority: "mcu-failsafe",
+      observedAt: new Date(nowMs).toISOString(),
+      stateObservedAt: new Date(nowMs).toISOString(),
+      stateIngestedAtMs: nowMs,
+      stateIngestedLive: true,
+    });
+    nowMs += 6_000;
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.events.1",
+        timestamp: nowMs,
+        payload: {
+          sysid: 1,
+          entity_id: "boxbotix.local.robotics.uxs.vehicle.1",
+          domain: "quadcopter",
+          seq: 2,
+          msg_id: 0,
+          kind: "link_lost",
+          reasons: ["link_timeout"],
+          armed: true,
+          authority: "mcu-failsafe",
+          companion_mode: "teleop-velocity",
+          link_tier: "mesh-high-rate",
+          flags: {
+            clock_sync_locked: true,
+            teleop_deadman_clamped: false,
+            crsf_link_healthy: true,
+            companion_trunk_healthy: true,
+          },
+          failsafes: 0,
+          timestamp: nowMs,
+        },
+      }),
+    );
+    expect(telemetryStore.malformedFrameCount).toBe(0);
+    expect(telemetryStore.getLinkState(1)?.linkLost).toBe(true);
+    const retainedFaultSummary = summarizeFleetHealth([faultedP4], {
+      telemetryStatus: "connected",
+      getTelemetryLink: (sysid) => telemetryStore.getLinkState(sysid),
+      skgStatus: "connected",
+      skgSynced: true,
+      skgLastSyncedRevision: 3,
+      nowMs,
+    });
+    expect(retainedFaultSummary.state).toBe("fault");
+    expect(retainedFaultSummary.faultedCount).toBe(1);
+    expect(retainedFaultSummary.hasStaleFaultContext).toBe(true);
+    expect(retainedFaultSummary.badgeLabel).toBe(
+      "! 1 FLEET FAULT (UXS #1 · P4) · LAST KNOWN 6s ago",
+    );
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("matches an independent reference model across 50 seeded multi-vehicle connection, link-loss, replay, and recovery histories", () => {
+    interface RefSkgVehicle {
+      sysid: number;
+      linkTier: "mesh-high-rate" | "mesh-supervisory";
+      armed: boolean;
+      fault: "none" | "p4" | "p1";
+      lastSkgObsMs: number;
+    }
+
+    interface RefWs1Vehicle {
+      lastWs1PacketMs: number | null;
+      linkLost: boolean;
+      linkLostAtMs: number | null;
+    }
+
+    const reach = {
+      connecting: 0,
+      unavailable: 0,
+      empty: 0,
+      nominal: 0,
+      stale: 0,
+      faultLive: 0,
+      faultLastKnown: 0,
+      supervisoryFreshPast4s: 0,
+      reconnectReplayStillStale: 0,
+    };
+
+    const mkEntityPut = (
+      revision: number,
+      v: RefSkgVehicle,
+      obsMs: number,
+    ): string => {
+      const entityId = `boxbotix.local.robotics.uxs.vehicle.${v.sysid}`;
+      const ts = new Date(obsMs).toISOString();
+      const authority =
+        v.fault === "p4"
+          ? "mcu-failsafe"
+          : v.fault === "p1"
+            ? "direct-crsf-override"
+            : "companion-teleop";
+      const mk = (predicate: string, object: unknown): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: ts,
+        confidence: 1,
+      });
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision,
+        payload: {
+          id: entityId,
+          updated_at: ts,
+          triples: [
+            mk(
+              "uxs.domain.kind",
+              v.sysid === 2 ? "surface-boat" : "quadcopter",
+            ),
+            mk("uxs.authority.state", authority),
+            mk("uxs.mode.companion", "teleop-velocity"),
+            mk("uxs.link.tier", v.linkTier),
+            mk("uxs.health.armed", v.armed),
+            mk("uxs.health.flags", {
+              clock_sync_locked: true,
+              teleop_deadman_clamped: false,
+              crsf_link_healthy: true,
+              companion_trunk_healthy: true,
+            }),
+            mk("uxs.health.failsafes", 0),
+            mk("uxs.health.crcerrors", 0),
+            mk("uxs.health.loopdtus", 1000),
+            mk("uxs.health.maxloopdtus", 1200),
+            mk("uxs.health.rttus", 400),
+            mk("uxs.attitude.quaternion", [1, 0, 0, 0]),
+            mk("uxs.attitude.rates", [0, 0, 0]),
+            mk("uxs.kinematics.ned", [v.sysid * 5, 0, -10]),
+            mk("uxs.kinematics.vx", 1),
+            mk("uxs.kinematics.vy", 0),
+            mk("uxs.kinematics.vz", 0),
+            mk("uxs.kinematics.headingdeg", 90),
+            mk("geo.location.latitude", 30.2672),
+            mk("geo.location.longitude", -97.7431),
+            mk("geo.location.altitude", 160),
+          ],
+        },
+      });
+    };
+
+    const mkLinkEventFrame = (
+      sysid: number,
+      kind: "link_lost" | "link_restored",
+      seq: number,
+      timestamp: number,
+    ): string =>
+      JSON.stringify({
+        type: "data",
+        subject: `bbops.telemetry.events.${sysid}`,
+        timestamp,
+        payload: {
+          sysid,
+          entity_id: `boxbotix.local.robotics.uxs.vehicle.${sysid}`,
+          domain: sysid === 2 ? "surface-boat" : "quadcopter",
+          seq: seq & 0xff,
+          msg_id: 0,
+          kind,
+          reasons: [kind],
+          armed: false,
+          authority: "companion-teleop",
+          companion_mode: "teleop-velocity",
+          link_tier: sysid === 2 ? "mesh-supervisory" : "mesh-high-rate",
+          flags: {
+            clock_sync_locked: true,
+            teleop_deadman_clamped: false,
+            crsf_link_healthy: true,
+            companion_trunk_healthy: true,
+          },
+          failsafes: 0,
+          timestamp,
+        },
+      });
+
+    for (let seed = 1; seed <= 50; seed += 1) {
+      let rng = (seed * 0x9e37_79b9) >>> 0;
+      const nextU32 = () => {
+        rng ^= rng << 13;
+        rng ^= rng >>> 17;
+        rng ^= rng << 5;
+        return rng >>> 0;
+      };
+      const pick = <T>(arr: readonly T[]): T =>
+        arr[nextU32() % arr.length] as T;
+
+      let nowMs = Date.parse("2026-11-25T16:00:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8080/ws/telemetry",
+        now: () => nowMs,
+        createSocket: ws1Rig.createSocket,
+        initialBackoffMs: 60_000,
+        maxBackoffMs: 60_000,
+      });
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8080/ws/graph",
+        now: () => nowMs,
+        createSocket: ws2Rig.createSocket,
+        initialBackoffMs: 60_000,
+        maxBackoffMs: 60_000,
+      });
+
+      let ws1Status:
+        "disconnected" | "connecting" | "connected" | "reconnecting" =
+        "disconnected";
+      let ws2Status:
+        "disconnected" | "connecting" | "connected" | "reconnecting" =
+        "disconnected";
+      let ws2Synced = false;
+      let hasEverSynced = false;
+      let kvRev = 0;
+
+      const serverSkg = new Map<number, RefSkgVehicle>();
+      let visibleSkg = new Map<number, RefSkgVehicle>();
+      const browserMaxObsBySysId = new Map<number, number>();
+      const awaitingAdvanceBySysId = new Set<number>();
+      const browserWs1 = new Map<number, RefWs1Vehicle>();
+
+      const cloneSkgMap = (src: Map<number, RefSkgVehicle>) => {
+        const out = new Map<number, RefSkgVehicle>();
+        for (const [k, v] of src) {
+          out.set(k, { ...v });
+        }
+        return out;
+      };
+
+      for (let step = 0; step < 60; step += 1) {
+        const action = nextU32() % 10;
+        let wasReconnectReplay = false;
+
+        if (action === 0) {
+          nowMs += 1_000 + (nextU32() % 6_001);
+        } else if (action === 1) {
+          if (ws1Status === "disconnected") {
+            telemetryStore.connect();
+            ws1Status = "connecting";
+          } else if (ws1Status === "connecting") {
+            ws1Rig.latest.serverOpen();
+            ws1Status = "connected";
+          } else if (ws1Status === "reconnecting") {
+            telemetryStore.connect();
+            ws1Rig.latest.serverOpen();
+            ws1Status = "connected";
+          } else if (nextU32() % 2 === 0) {
+            ws1Rig.latest.serverDrop(1006, "drop");
+            ws1Status = "reconnecting";
+          } else {
+            telemetryStore.disconnect();
+            ws1Status = "disconnected";
+          }
+        } else if (action === 2) {
+          if (ws2Status === "disconnected") {
+            skgStore.connect();
+            ws2Status = "connecting";
+            ws2Synced = false;
+          } else if (ws2Status === "connecting") {
+            ws2Rig.latest.serverOpen();
+            ws2Status = "connected";
+            ws2Synced = false;
+          } else if (ws2Status === "reconnecting") {
+            skgStore.connect();
+            ws2Rig.latest.serverOpen();
+            ws2Status = "connected";
+            ws2Synced = false;
+          } else if (nextU32() % 2 === 0) {
+            ws2Rig.latest.serverDrop(1006, "drop");
+            ws2Status = "reconnecting";
+            ws2Synced = false;
+          } else {
+            skgStore.disconnect();
+            ws2Status = "disconnected";
+            ws2Synced = false;
+          }
+        } else if (action === 3) {
+          if (ws2Status === "connected" && !ws2Synced) {
+            const hadPriorSync = hasEverSynced;
+            for (const v of serverSkg.values()) {
+              kvRev += 1;
+              ws2Rig.latest.serverMessage(
+                mkEntityPut(kvRev, v, v.lastSkgObsMs),
+              );
+            }
+            if (nextU32() % 3 === 0) {
+              kvRev += 1;
+              ws2Rig.latest.serverMessage(
+                JSON.stringify({
+                  type: "put",
+                  bucket: "ENTITY_STATES",
+                  key: "boxbotix.local.tak.cot.contact.bravo",
+                  revision: kvRev,
+                  payload: {
+                    id: "boxbotix.local.tak.cot.contact.bravo",
+                    triples: [
+                      {
+                        subject: "boxbotix.local.tak.cot.contact.bravo",
+                        predicate: "cop.contact.type",
+                        object: "a-f-G",
+                        source: "cot",
+                        timestamp: new Date(nowMs).toISOString(),
+                        confidence: 1,
+                      },
+                    ],
+                  },
+                }),
+              );
+            }
+            kvRev += 1;
+            ws2Rig.latest.serverMessage(
+              JSON.stringify({
+                type: "synced",
+                bucket: "ENTITY_STATES",
+                revision: kvRev,
+              }),
+            );
+            for (const existingSysid of Array.from(
+              browserMaxObsBySysId.keys(),
+            )) {
+              if (!serverSkg.has(existingSysid)) {
+                browserMaxObsBySysId.delete(existingSysid);
+                awaitingAdvanceBySysId.delete(existingSysid);
+              }
+            }
+            for (const v of serverSkg.values()) {
+              const priorMax = browserMaxObsBySysId.get(v.sysid);
+              if (priorMax === undefined || v.lastSkgObsMs > priorMax) {
+                browserMaxObsBySysId.set(v.sysid, v.lastSkgObsMs);
+                awaitingAdvanceBySysId.delete(v.sysid);
+              } else if (hadPriorSync) {
+                awaitingAdvanceBySysId.add(v.sysid);
+              }
+            }
+            ws2Synced = true;
+            hasEverSynced = true;
+            visibleSkg = cloneSkgMap(serverSkg);
+            wasReconnectReplay = hadPriorSync;
+          }
+        } else if (action === 4 || action === 5) {
+          const sysid = pick([1, 2] as const);
+          nowMs += 5;
+          const updated: RefSkgVehicle = {
+            sysid,
+            linkTier:
+              sysid === 2
+                ? "mesh-supervisory"
+                : pick(["mesh-high-rate", "mesh-supervisory"] as const),
+            armed: (nextU32() & 1) === 1,
+            fault: pick(["none", "none", "none", "p1", "p4"] as const),
+            lastSkgObsMs: nowMs,
+          };
+          serverSkg.set(sysid, updated);
+          if (ws2Status === "connected" && ws2Synced) {
+            kvRev += 1;
+            ws2Rig.latest.serverMessage(mkEntityPut(kvRev, updated, nowMs));
+            visibleSkg.set(sysid, { ...updated });
+            browserMaxObsBySysId.set(sysid, nowMs);
+            awaitingAdvanceBySysId.delete(sysid);
+          }
+        } else if (action === 6) {
+          const sysid = pick([1, 2] as const);
+          if (ws1Status === "connected" && serverSkg.has(sysid)) {
+            nowMs += 5;
+            telemetryStore.ingestRawFrame(
+              JSON.stringify({
+                type: "data",
+                subject: `bbops.telemetry.${sysid}`,
+                timestamp: nowMs,
+                payload: {
+                  sysid,
+                  domain: sysid === 2 ? "surface-boat" : "quadcopter",
+                  seq: (step + 1) & 0xff,
+                  msg_id: 32,
+                  quat_wxyz: [1, 0, 0, 0],
+                  has_attitude: true,
+                  body_rates: [0, 0, 0],
+                  ned_xyz: [10, 0, -5],
+                  has_local_pos: true,
+                  ned_vel: [1, 0, 0],
+                  lat_lon_alt: [30.2672, -97.7431, 160],
+                  has_global_pos: true,
+                  hdg_deg: 0,
+                  timestamp: nowMs,
+                },
+              }),
+            );
+            browserWs1.set(sysid, {
+              lastWs1PacketMs: nowMs,
+              linkLost: false,
+              linkLostAtMs: null,
+            });
+          }
+        } else if (action === 7) {
+          const sysid = pick([1, 2] as const);
+          if (ws1Status === "connected" && serverSkg.has(sysid)) {
+            nowMs += 10;
+            telemetryStore.ingestRawFrame(
+              mkLinkEventFrame(sysid, "link_lost", step + 1, nowMs),
+            );
+            const prevW1 = browserWs1.get(sysid);
+            browserWs1.set(sysid, {
+              lastWs1PacketMs: prevW1?.lastWs1PacketMs ?? null,
+              linkLost: true,
+              linkLostAtMs: nowMs,
+            });
+          }
+        } else if (action === 8) {
+          const sysid = pick([1, 2] as const);
+          const prevW1 = browserWs1.get(sysid);
+          if (ws1Status === "connected" && prevW1?.linkLost) {
+            nowMs += 10;
+            telemetryStore.ingestRawFrame(
+              mkLinkEventFrame(sysid, "link_restored", step + 1, nowMs),
+            );
+            browserWs1.set(sysid, {
+              lastWs1PacketMs: nowMs,
+              linkLost: false,
+              linkLostAtMs: null,
+            });
+          }
+        } else {
+          const sysid = pick([1, 2] as const);
+          if (ws2Status === "connected" && ws2Synced && serverSkg.has(sysid)) {
+            serverSkg.delete(sysid);
+            visibleSkg.delete(sysid);
+            browserMaxObsBySysId.delete(sysid);
+            awaitingAdvanceBySysId.delete(sysid);
+            kvRev += 1;
+            ws2Rig.latest.serverMessage(
+              JSON.stringify({
+                type: "delete",
+                bucket: "ENTITY_STATES",
+                key: `boxbotix.local.robotics.uxs.vehicle.${sysid}`,
+                revision: kvRev,
+              }),
+            );
+          }
+        }
+
+        expect(telemetryStore.malformedFrameCount).toBe(0);
+        expect(skgStore.malformedFrameCount).toBe(0);
+
+        const fleetLive = ws2Status === "connected" && ws2Synced;
+        let refFaultCount = 0;
+        let refStaleCount = 0;
+        let refAnyFaultStale = false;
+
+        for (const v of visibleSkg.values()) {
+          const threshold = v.linkTier === "mesh-supervisory" ? 11_000 : 4_000;
+          const w1 = browserWs1.get(v.sysid);
+          const effectiveLinkLost =
+            Boolean(w1?.linkLost) &&
+            !(
+              w1?.linkLostAtMs !== null &&
+              w1?.linkLostAtMs !== undefined &&
+              v.lastSkgObsMs > w1.linkLostAtMs
+            );
+          const isFresh =
+            fleetLive &&
+            !effectiveLinkLost &&
+            !awaitingAdvanceBySysId.has(v.sysid) &&
+            nowMs - v.lastSkgObsMs <= threshold;
+
+          if (
+            isFresh &&
+            v.linkTier === "mesh-supervisory" &&
+            nowMs - v.lastSkgObsMs > 4_000
+          ) {
+            reach.supervisoryFreshPast4s += 1;
+          }
+
+          if (!isFresh) {
+            refStaleCount += 1;
+          }
+          if (v.fault !== "none") {
+            refFaultCount += 1;
+            if (!isFresh) {
+              refAnyFaultStale = true;
+            }
+          }
+        }
+
+        const expectedState =
+          refFaultCount > 0
+            ? "fault"
+            : !hasEverSynced
+              ? ws2Status === "disconnected"
+                ? "unavailable"
+                : "connecting"
+              : visibleSkg.size === 0
+                ? fleetLive
+                  ? "empty"
+                  : ws2Status === "disconnected"
+                    ? "unavailable"
+                    : "connecting"
+                : !fleetLive || refStaleCount > 0
+                  ? "stale"
+                  : "nominal";
+
+        const context = {
+          telemetryStatus: telemetryStore.status,
+          getTelemetryLink: (s: number) => telemetryStore.getLinkState(s),
+          skgStatus: skgStore.status,
+          skgSynced: skgStore.synced,
+          skgLastSyncedRevision: skgStore.lastSyncedRevision,
+          nowMs,
+        };
+        const actual = summarizeFleetHealth(
+          skgStore.entities.values(),
+          context,
+        );
+
+        expect(actual.state, `seed=${seed} step=${step}`).toBe(expectedState);
+        expect(
+          actual.badgeLabel.startsWith("FLEET NOMINAL"),
+          `seed=${seed} step=${step}`,
+        ).toBe(expectedState === "nominal");
+        expect(actual.faultedCount, `seed=${seed} step=${step}`).toBe(
+          refFaultCount,
+        );
+
+        if (expectedState === "connecting") reach.connecting += 1;
+        if (expectedState === "unavailable") reach.unavailable += 1;
+        if (expectedState === "empty") reach.empty += 1;
+        if (expectedState === "nominal") reach.nominal += 1;
+        if (expectedState === "stale") {
+          reach.stale += 1;
+          if (wasReconnectReplay) {
+            reach.reconnectReplayStillStale += 1;
+          }
+        }
+        if (expectedState === "fault") {
+          const expectedStaleFault = !fleetLive || refAnyFaultStale;
+          expect(actual.hasStaleFaultContext, `seed=${seed} step=${step}`).toBe(
+            expectedStaleFault,
+          );
+          if (expectedStaleFault) {
+            reach.faultLastKnown += 1;
+            expect(actual.badgeLabel).toContain("LAST KNOWN");
+          } else {
+            reach.faultLive += 1;
+          }
+        }
+
+        const strip = selectFilmstripItems(skgStore, context);
+        for (const item of strip) {
+          expect(item.secondaryLabel).not.toContain("SAFE");
+          if (item.kind === "uxs-vehicle" && item.stale) {
+            expect(item.safetySeverity).not.toBe("success");
+          }
+        }
+      }
+
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    }
+
+    expect(reach.connecting).toBeGreaterThanOrEqual(10);
+    expect(reach.unavailable).toBeGreaterThanOrEqual(10);
+    expect(reach.empty).toBeGreaterThanOrEqual(5);
+    expect(reach.nominal).toBeGreaterThanOrEqual(10);
+    expect(reach.stale).toBeGreaterThanOrEqual(10);
+    expect(reach.faultLive).toBeGreaterThanOrEqual(10);
+    expect(reach.faultLastKnown).toBeGreaterThanOrEqual(10);
+    expect(reach.supervisoryFreshPast4s).toBeGreaterThanOrEqual(5);
+    expect(reach.reconnectReplayStillStale).toBeGreaterThanOrEqual(5);
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("rejects pose-only refresh of expired health, fast-reconnect unchanged snapshots, zero-confidence placeholders, out-of-order link_restored, and unverified poisoned-first freshness", () => {
+    let nowMs = Date.parse("2026-11-25T17:00:00.000Z");
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8080/ws/telemetry",
+      now: () => nowMs,
+      createSocket: ws1Rig.createSocket,
+    });
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8080/ws/graph",
+      now: () => nowMs,
+      createSocket: ws2Rig.createSocket,
+    });
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const mkVehiclePut = (
+      revision: number,
+      obsMs: number,
+      opts: { confidence?: number; armed?: boolean } = {},
+    ) => {
+      const ts = new Date(obsMs).toISOString();
+      const conf = opts.confidence ?? 1;
+      const armed = opts.armed ?? true;
+      const mk = (predicate: string, object: unknown): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: ts,
+        confidence: conf,
+      });
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision,
+        payload: {
+          id: entityId,
+          updated_at: ts,
+          triples: [
+            mk("uxs.domain.kind", "quadcopter"),
+            mk("uxs.authority.state", "companion-teleop"),
+            mk("uxs.mode.companion", "teleop-velocity"),
+            mk("uxs.link.tier", "mesh-high-rate"),
+            mk("uxs.health.armed", armed),
+            mk("uxs.health.flags", {
+              clock_sync_locked: true,
+              teleop_deadman_clamped: false,
+              crsf_link_healthy: true,
+              companion_trunk_healthy: true,
+            }),
+            mk("uxs.health.failsafes", 0),
+            mk("uxs.health.crcerrors", 0),
+            mk("uxs.health.loopdtus", 1000),
+            mk("uxs.health.maxloopdtus", 1200),
+            mk("uxs.health.rttus", 400),
+            mk("uxs.attitude.quaternion", [1, 0, 0, 0]),
+            mk("uxs.attitude.rates", [0, 0, 0]),
+            mk("uxs.kinematics.ned", [10, -4, -12]),
+            mk("uxs.kinematics.vx", 1),
+            mk("uxs.kinematics.vy", 0),
+            mk("uxs.kinematics.vz", 0),
+            mk("uxs.kinematics.headingdeg", 90),
+            mk("geo.location.latitude", 30.2672),
+            mk("geo.location.longitude", -97.7431),
+            mk("geo.location.altitude", 160),
+          ],
+        },
+      });
+    };
+    const currentContext = () => ({
+      telemetryStatus: telemetryStore.status,
+      getTelemetryLink: (s: number) => telemetryStore.getLinkState(s),
+      skgStatus: skgStore.status,
+      skgSynced: skgStore.synced,
+      skgLastSyncedRevision: skgStore.lastSyncedRevision,
+      nowMs,
+    });
+
+    telemetryStore.connect();
+    skgStore.connect();
+    ws1Rig.latest.serverOpen();
+    ws2Rig.latest.serverOpen();
+
+    // --- Scenario 3 (Zero-confidence placeholders): confidence=0 never qualifies as measured health ---
+    ws2Rig.latest.serverMessage(mkVehiclePut(1, nowMs, { confidence: 0 }));
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+    const zeroConfHealth = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(zeroConfHealth.state).toBe("stale");
+    expect(zeroConfHealth.badgeLabel).toBe("FLEET STALE · LAST KNOWN (1)");
+    const zeroConfVehicleFresh = evaluateVehicleFreshness(
+      skgStore.getCommandableVehicle(entityId)!,
+      currentContext(),
+    );
+    expect(zeroConfVehicleFresh.fresh).toBe(false);
+    expect(zeroConfVehicleFresh.ageMs).toBeNull();
+    expect(zeroConfVehicleFresh.ageLabel).toBe("age unknown");
+
+    // Measured health observation restores nominal:
+    nowMs += 500;
+    ws2Rig.latest.serverMessage(mkVehiclePut(2, nowMs, { confidence: 1 }));
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // --- Scenario 1 (Live WS #1 pose vs expired WS #2 health): 60s WS #2 silence + WS #1 pose packet ---
+    nowMs += 60_000;
+    ws1Rig.latest.serverMessage(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: nowMs,
+        payload: {
+          sysid: 1,
+          domain: "quadcopter",
+          seq: 1,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [25, -4, -15],
+          has_local_pos: true,
+          ned_vel: [2, 0, 0],
+          lat_lon_alt: [30.2672, -97.7431, 165],
+          has_global_pos: true,
+          hdg_deg: 90,
+          timestamp: nowMs,
+        },
+      }),
+    );
+    const livePoseOnStaleHealth = resolveLiveVehiclePose(
+      skgStore.getCommandableVehicle(entityId)!,
+      {
+        fast: telemetryStore.getKinematics(1),
+        telemetryLink: telemetryStore.getLinkState(1),
+        telemetryStatus: telemetryStore.status,
+        skgStatus: skgStore.status,
+        nowMs,
+      },
+    );
+    expect(livePoseOnStaleHealth.source).toBe("ws1");
+    expect(livePoseOnStaleHealth.stale).toBe(false);
+
+    const expiredHealthWithLivePose = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(expiredHealthWithLivePose.state).toBe("stale");
+    expect(expiredHealthWithLivePose.badgeLabel).toBe(
+      "FLEET STALE · LAST KNOWN (1 · 1m 0s ago)",
+    );
+
+    // New WS #2 health observation restores nominal:
+    nowMs += 250;
+    const tLiveObs = nowMs;
+    ws2Rig.latest.serverMessage(mkVehiclePut(3, tLiveObs, { armed: true }));
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // --- Scenario 2 (Fast reconnect inside 4_000 ms threshold with WS #1 absent): nominal -> stale -> stale ---
+    telemetryStore.disconnect();
+    nowMs = tLiveObs + 100;
+    ws2Rig.latest.serverDrop(1006, "fast-drop");
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("stale");
+
+    nowMs = tLiveObs + 600; // still < 4_000 ms threshold!
+    skgStore.connect();
+    ws2Rig.latest.serverOpen();
+    ws2Rig.latest.serverMessage(mkVehiclePut(3, tLiveObs, { armed: true }));
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 3 }),
+    );
+    const fastReconnectHealth = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(fastReconnectHealth.state).toBe("stale");
+    expect(fastReconnectHealth.badgeLabel).toContain(
+      "FLEET STALE · LAST KNOWN",
+    );
+
+    // Advancing health observation restores nominal:
+    nowMs = tLiveObs + 900;
+    ws2Rig.latest.serverMessage(mkVehiclePut(4, nowMs, { armed: false }));
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // --- Scenario 4 (Older link_restored does not clear newer link_lost) ---
+    telemetryStore.connect();
+    ws1Rig.latest.serverOpen();
+    const tBase = nowMs;
+    ws1Rig.latest.serverMessage(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.1",
+        timestamp: tBase,
+        payload: {
+          sysid: 1,
+          domain: "quadcopter",
+          seq: 2,
+          msg_id: 32,
+          quat_wxyz: [1, 0, 0, 0],
+          has_attitude: true,
+          body_rates: [0, 0, 0],
+          ned_xyz: [25, -4, -15],
+          has_local_pos: true,
+          ned_vel: [2, 0, 0],
+          lat_lon_alt: [30.2672, -97.7431, 165],
+          has_global_pos: true,
+          hdg_deg: 90,
+          timestamp: tBase,
+        },
+      }),
+    );
+    const mkLinkEv = (
+      kind: "link_lost" | "link_restored",
+      seq: number,
+      ts: number,
+    ) =>
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.events.1",
+        timestamp: ts,
+        payload: {
+          sysid: 1,
+          entity_id: entityId,
+          domain: "quadcopter",
+          seq,
+          msg_id: 0,
+          kind,
+          reasons: [kind],
+          armed: false,
+          authority: "companion-teleop",
+          companion_mode: "teleop-velocity",
+          link_tier: "mesh-high-rate",
+          flags: {
+            clock_sync_locked: true,
+            teleop_deadman_clamped: false,
+            crsf_link_healthy: true,
+            companion_trunk_healthy: true,
+          },
+          failsafes: 0,
+          timestamp: ts,
+        },
+      });
+    nowMs = tBase + 3_000;
+    ws1Rig.latest.serverMessage(mkLinkEv("link_lost", 3, tBase + 3_000));
+    ws1Rig.latest.serverMessage(mkLinkEv("link_restored", 4, tBase + 1_000));
+    expect(telemetryStore.getLinkState(1)?.linkLost).toBe(true);
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("stale");
+
+    nowMs = tBase + 4_000;
+    ws1Rig.latest.serverMessage(mkLinkEv("link_restored", 5, tBase + 4_000));
+    ws2Rig.latest.serverMessage(mkVehiclePut(5, nowMs, { armed: false }));
+    expect(telemetryStore.getLinkState(1)?.linkLost).toBe(false);
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // --- Scenario 5 (Poisoned-first vehicle silent for 60s with WS #2 open) ---
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({
+        type: "delete",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: 6,
+      }),
+    );
+    const poisonedKey = "boxbotix.local.robotics.uxs.vehicle.2";
+    const poisonedStartMs = nowMs;
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: poisonedKey,
+        revision: 7,
+        error: "corrupt uxs msgpack",
+      }),
+    );
+    nowMs = poisonedStartMs + 60_000;
+
+    const poisonedEntity = skgStore.getEntity(poisonedKey)!;
+    const pFresh = evaluatePoisonedVehicleFreshness(
+      poisonedEntity,
+      currentContext(),
+    );
+    expect(pFresh.fresh).toBe(false);
+    expect(pFresh.staleReason).toBe("poisoned_unverified");
+    expect(pFresh.ageMs).toBeNull();
+    expect(pFresh.ageLabel).toBe("age unknown");
+    expect(pFresh.decodeErrorAgeMs).toBe(60_000);
+    expect(pFresh.decodeErrorAgeLabel).toBe("1m 0s ago");
+    expect(pFresh.statusLabel).toBe(
+      "LAST KNOWN · age unknown (decode error 1m 0s ago)",
+    );
+
+    const poisonedSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(poisonedSummary.state).toBe("fault");
+    expect(poisonedSummary.hasStaleFaultContext).toBe(true);
+    expect(poisonedSummary.staleVehicleCount).toBe(1);
+    expect(poisonedSummary.oldestStaleAgeLabel).toBeNull();
+    // Summary badge includes LAST KNOWN without claiming "1m 0s ago" is observation age:
+    expect(poisonedSummary.badgeLabel).toBe(
+      "! 1 FLEET FAULT (UXS #2 · POISONED) · LAST KNOWN",
+    );
+
+    const poisonedBanner = selectBannerPresentation(
+      poisonedEntity,
+      currentContext(),
+    );
+    expect(poisonedBanner?.kind).toBe("poisoned-uxs-vehicle");
+    if (poisonedBanner?.kind === "poisoned-uxs-vehicle") {
+      expect(poisonedBanner.freshness?.statusLabel).toBe(
+        "LAST KNOWN · age unknown (decode error 1m 0s ago)",
+      );
+    }
+
+    const poisonedExceptions = buildFaultedOwnshipEntries(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(poisonedExceptions).toHaveLength(1);
+    expect(poisonedExceptions[0]?.poisoned).toBe(true);
+    expect(poisonedExceptions[0]?.staleLabel).toBe(
+      "LAST KNOWN · age unknown (decode error 1m 0s ago)",
+    );
+
+    const poisonedStrip = selectFilmstripItems(skgStore, currentContext());
+    expect(poisonedStrip).toHaveLength(1);
+    expect(poisonedStrip[0]?.stale).toBe(true);
+    expect(poisonedStrip[0]?.safetySeverity).toBe("error");
+    expect(poisonedStrip[0]?.ageLabel).toBe("age unknown");
+    expect(poisonedStrip[0]?.secondaryLabel).toBe(
+      "#2 · POISONED · LAST KNOWN (age unknown · decode error 1m 0s ago)",
+    );
+
+    telemetryStore.disconnect();
+    skgStore.disconnect();
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("expires FLEET NOMINAL past 4s under 1 Hz position-only and SYS_STATUS-only snapshots and rejects rttus-only mixed-confidence placeholders until a measured HEARTBEAT arrives", () => {
+    const t0Ms = Date.parse("2026-11-25T19:00:00.000Z");
+    let nowMs = t0Ms;
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8080/ws/telemetry",
+      now: () => nowMs,
+      createSocket: ws1Rig.createSocket,
+    });
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8080/ws/graph",
+      now: () => nowMs,
+      createSocket: ws2Rig.createSocket,
+    });
+    const entityId = "boxbotix.bbops.robotics.uxs.vehicle.1";
+    const currentContext = () => ({
+      telemetryStatus: telemetryStore.status,
+      getTelemetryLink: (s: number) => telemetryStore.getLinkState(s),
+      skgStatus: skgStore.status,
+      skgSynced: skgStore.synced,
+      skgLastSyncedRevision: skgStore.lastSyncedRevision,
+      nowMs,
+    });
+
+    // Producer-shaped VehicleSnapshot.Triples() builder matching internal/uxsvocab/snapshot.go:
+    const buildProducerSnapshotPut = (opts: {
+      revision: number;
+      hbObsMs: number;
+      sysObsMs?: number;
+      hasSysStatus?: boolean;
+      localPosObsMs?: number;
+      hasLocalPos?: boolean;
+      nedX?: number;
+      updatedAtMs: number;
+      safetyConfidence?: number;
+      flagsConfidence?: number;
+      rttConfidence?: number;
+    }) => {
+      const hbIso = new Date(opts.hbObsMs).toISOString();
+      const hasSys = opts.hasSysStatus ?? false;
+      const sysIso = hasSys
+        ? new Date(opts.sysObsMs ?? opts.hbObsMs).toISOString()
+        : hbIso;
+      const timingIso = hasSys
+        ? new Date(opts.sysObsMs ?? opts.hbObsMs).toISOString()
+        : "1970-01-01T00:00:00Z";
+      const hasLocal = opts.hasLocalPos ?? false;
+      const localIso = hasLocal
+        ? new Date(opts.localPosObsMs ?? opts.hbObsMs).toISOString()
+        : "1970-01-01T00:00:00Z";
+      const safetyConf = opts.safetyConfidence ?? 1;
+      const flagsConf = opts.flagsConfidence ?? safetyConf;
+      const rttConf = opts.rttConfidence ?? (hasSys ? 1 : 0);
+
+      const tr = (
+        predicate: string,
+        object: unknown,
+        timestamp: string,
+        confidence: number,
+        context?: string,
+      ): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp,
+        confidence,
+        ...(context ? { context } : {}),
+      });
+
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: opts.revision,
+        payload: {
+          id: entityId,
+          updated_at: new Date(opts.updatedAtMs).toISOString(),
+          triples: [
+            tr("uxs.domain.kind", "quadcopter", hbIso, safetyConf),
+            tr("uxs.authority.state", "companion-teleop", hbIso, safetyConf),
+            tr("uxs.mode.companion", "teleop-velocity", hbIso, safetyConf),
+            tr("uxs.link.tier", "mesh-high-rate", hbIso, safetyConf),
+            tr("uxs.health.armed", true, hbIso, safetyConf),
+            tr(
+              "uxs.health.flags",
+              {
+                clock_sync_locked: true,
+                teleop_deadman_clamped: false,
+                crsf_link_healthy: true,
+                companion_trunk_healthy: true,
+              },
+              hbIso,
+              flagsConf,
+            ),
+            tr("uxs.health.failsafes", 0, sysIso, safetyConf),
+            tr("uxs.health.crcerrors", 0, sysIso, safetyConf),
+            tr(
+              "uxs.health.loopdtus",
+              hasSys ? 1100 : 0,
+              timingIso,
+              hasSys ? 1 : 0,
+              hasSys ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.health.maxloopdtus",
+              hasSys ? 1400 : 0,
+              timingIso,
+              hasSys ? 1 : 0,
+              hasSys ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.health.rttus",
+              hasSys || rttConf > 0 ? 390 : 0,
+              rttConf > 0
+                ? new Date(opts.updatedAtMs).toISOString()
+                : timingIso,
+              rttConf,
+              rttConf > 0 ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.attitude.quaternion",
+              [0, 0, 0, 0],
+              "1970-01-01T00:00:00Z",
+              0,
+            ),
+            tr("uxs.attitude.rates", [0, 0, 0], "1970-01-01T00:00:00Z", 0),
+            tr(
+              "uxs.kinematics.ned",
+              [opts.nedX ?? 0, -1.5, -12],
+              localIso,
+              hasLocal ? 1 : 0,
+              hasLocal ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.kinematics.vx",
+              hasLocal ? 2 : 0,
+              localIso,
+              hasLocal ? 1 : 0,
+              hasLocal ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.kinematics.vy",
+              0,
+              localIso,
+              hasLocal ? 1 : 0,
+              hasLocal ? "measured" : undefined,
+            ),
+            tr(
+              "uxs.kinematics.vz",
+              0,
+              localIso,
+              hasLocal ? 1 : 0,
+              hasLocal ? "measured" : undefined,
+            ),
+            tr("uxs.kinematics.headingdeg", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.latitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.longitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.altitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("dc.terms.title", "UXS-1", hbIso, 1),
+          ],
+        },
+      });
+    };
+
+    telemetryStore.connect();
+    skgStore.connect();
+    ws1Rig.latest.serverOpen();
+    ws2Rig.latest.serverOpen();
+
+    // --- Part A (Mixed-confidence Finding 2): rttus confidence=1 while safety predicates have confidence=0 ---
+    ws2Rig.latest.serverMessage(
+      buildProducerSnapshotPut({
+        revision: 1,
+        hbObsMs: t0Ms,
+        updatedAtMs: t0Ms,
+        safetyConfidence: 0,
+        rttConfidence: 1,
+      }),
+    );
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+    const mixedTimingOnly = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(mixedTimingOnly.state).toBe("stale");
+    expect(mixedTimingOnly.badgeLabel).toBe("FLEET STALE · LAST KNOWN (1)");
+    expect(
+      evaluateVehicleFreshness(
+        skgStore.getCommandableVehicle(entityId)!,
+        currentContext(),
+      ).ageLabel,
+    ).toBe("age unknown");
+
+    // Partial safety measurement (5 of 6 predicates confidence=1, uxs.health.flags confidence=0) also stays stale:
+    ws2Rig.latest.serverMessage(
+      buildProducerSnapshotPut({
+        revision: 2,
+        hbObsMs: t0Ms,
+        updatedAtMs: t0Ms,
+        safetyConfidence: 1,
+        flagsConfidence: 0,
+        rttConfidence: 1,
+      }),
+    );
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("stale");
+
+    // --- Part B (Producer-derived position-only Finding 1): 1 HEARTBEAT at T, then 1 Hz #32 LOCAL_POSITION_NED for 6s ---
+    ws2Rig.latest.serverMessage(
+      buildProducerSnapshotPut({
+        revision: 3,
+        hbObsMs: t0Ms,
+        updatedAtMs: t0Ms,
+      }),
+    );
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET NOMINAL (1)");
+
+    for (let sec = 1; sec <= 6; sec += 1) {
+      nowMs = t0Ms + sec * 1_000;
+      ws2Rig.latest.serverMessage(
+        buildProducerSnapshotPut({
+          revision: 3 + sec,
+          hbObsMs: t0Ms,
+          hasSysStatus: sec >= 5,
+          sysObsMs: sec >= 5 ? t0Ms + 5_000 : undefined,
+          hasLocalPos: true,
+          localPosObsMs: nowMs,
+          nedX: sec * 2,
+          updatedAtMs: nowMs,
+        }),
+      );
+      const summary = summarizeFleetHealth(
+        skgStore.entities.values(),
+        currentContext(),
+      );
+      if (sec <= 4) {
+        expect(summary.state, `at T+${sec}s`).toBe("nominal");
+      } else {
+        expect(summary.state, `at T+${sec}s`).toBe("stale");
+        expect(summary.badgeLabel, `at T+${sec}s`).toBe(
+          `FLEET STALE · LAST KNOWN (1 · ${sec}s ago)`,
+        );
+      }
+    }
+
+    // Delivering a fresh #0 HEARTBEAT at T+7s restores FLEET NOMINAL (1):
+    nowMs = t0Ms + 7_000;
+    ws2Rig.latest.serverMessage(
+      buildProducerSnapshotPut({
+        revision: 10,
+        hbObsMs: nowMs,
+        hasSysStatus: true,
+        sysObsMs: t0Ms + 5_000,
+        hasLocalPos: true,
+        localPosObsMs: t0Ms + 6_000,
+        nedX: 12,
+        updatedAtMs: nowMs,
+      }),
+    );
+    const recoveredSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(recoveredSummary.state).toBe("nominal");
+    expect(recoveredSummary.badgeLabel).toBe("FLEET NOMINAL (1)");
+
+    telemetryStore.disconnect();
+    skgStore.disconnect();
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("withholds FLEET NOMINAL on first-sight post-sync delayed safety snapshots and partial safety updates until a complete new #0 HEARTBEAT arrives", () => {
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const producerT0Ms = Date.parse("2026-11-25T16:00:00.000Z");
+    // Exercise skewed browser clock (+30 minutes ahead of producer) so raw wall-clock difference cannot mask bugs:
+    let nowMs = producerT0Ms + 1_800_000;
+
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: ws1Rig.createSocket,
+      now: () => nowMs,
+    });
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: ws2Rig.createSocket,
+      now: () => nowMs,
+    });
+
+    const entityId = "boxbotix.local.robotics.uxs.vehicle.1";
+    const currentContext = () => ({
+      telemetryStatus: telemetryStore.status,
+      getTelemetryLink: (s: number) => telemetryStore.getLinkState(s),
+      skgStatus: skgStore.status,
+      skgSynced: skgStore.synced,
+      skgLastSyncedRevision: skgStore.lastSyncedRevision,
+      nowMs,
+    });
+
+    const buildSnapshotPut = (opts: {
+      revision: number;
+      safetyObsMs: number;
+      flagsObsMs?: number;
+      armed?: boolean;
+      armedObsMs?: number;
+      nedObsMs?: number;
+      updatedAtMs: number;
+    }): string => {
+      const safetyIso = new Date(opts.safetyObsMs).toISOString();
+      const flagsIso = new Date(
+        opts.flagsObsMs ?? opts.safetyObsMs,
+      ).toISOString();
+      const armedIso = new Date(
+        opts.armedObsMs ?? opts.safetyObsMs,
+      ).toISOString();
+      const hasNed = opts.nedObsMs !== undefined;
+      const nedIso = hasNed
+        ? new Date(opts.nedObsMs!).toISOString()
+        : "1970-01-01T00:00:00Z";
+      const tr = (
+        predicate: string,
+        object: unknown,
+        timestamp: string,
+        confidence = 1,
+        context?: string,
+      ): SkgTriple => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp,
+        confidence,
+        ...(context ? { context } : {}),
+      });
+      return JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: entityId,
+        revision: opts.revision,
+        payload: {
+          id: entityId,
+          updated_at: new Date(opts.updatedAtMs).toISOString(),
+          triples: [
+            tr("uxs.domain.kind", "quadcopter", safetyIso),
+            tr("uxs.authority.state", "companion-teleop", safetyIso),
+            tr("uxs.mode.companion", "teleop-velocity", safetyIso),
+            tr("uxs.link.tier", "mesh-high-rate", safetyIso),
+            tr("uxs.health.armed", opts.armed ?? true, armedIso),
+            tr(
+              "uxs.health.flags",
+              {
+                clock_sync_locked: true,
+                teleop_deadman_clamped: false,
+                crsf_link_healthy: true,
+                companion_trunk_healthy: true,
+              },
+              flagsIso,
+            ),
+            tr("uxs.health.failsafes", 0, safetyIso),
+            tr("uxs.health.crcerrors", 0, safetyIso),
+            tr("uxs.health.loopdtus", 0, "1970-01-01T00:00:00Z", 0),
+            tr("uxs.health.maxloopdtus", 0, "1970-01-01T00:00:00Z", 0),
+            tr("uxs.health.rttus", 0, "1970-01-01T00:00:00Z", 0),
+            tr(
+              "uxs.attitude.quaternion",
+              [0, 0, 0, 0],
+              "1970-01-01T00:00:00Z",
+              0,
+            ),
+            tr("uxs.attitude.rates", [0, 0, 0], "1970-01-01T00:00:00Z", 0),
+            tr(
+              "uxs.kinematics.ned",
+              [12, -2, -15],
+              nedIso,
+              hasNed ? 1 : 0,
+              hasNed ? "measured" : undefined,
+            ),
+            tr("uxs.kinematics.vx", hasNed ? 2 : 0, nedIso, hasNed ? 1 : 0),
+            tr("uxs.kinematics.vy", 0, nedIso, hasNed ? 1 : 0),
+            tr("uxs.kinematics.vz", 0, nedIso, hasNed ? 1 : 0),
+            tr("uxs.kinematics.headingdeg", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.latitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.longitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("geo.location.altitude", 0, "1970-01-01T00:00:00Z", 0),
+            tr("dc.terms.title", "UXS-1", safetyIso),
+          ],
+        },
+      });
+    };
+
+    telemetryStore.connect();
+    skgStore.connect();
+    ws1Rig.latest.serverOpen();
+    ws2Rig.latest.serverOpen();
+
+    // --- Sequence 1: Empty store syncs, then receives ONLY the T+6s producer position snapshot ---
+    ws2Rig.latest.serverMessage(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 0 }),
+    );
+    nowMs += 6_000;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 1,
+        safetyObsMs: producerT0Ms,
+        nedObsMs: producerT0Ms + 6_000,
+        updatedAtMs: producerT0Ms + 6_000,
+      }),
+    );
+
+    const firstSightSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(firstSightSummary.state).toBe("stale");
+    expect(firstSightSummary.badgeLabel).toBe(
+      "FLEET STALE · LAST KNOWN (1 · 6s ago)",
+    );
+
+    // Complete new #0 HEARTBEAT at T+7s recovers FLEET NOMINAL (1):
+    nowMs += 1_000;
+    const t7ProducerMs = producerT0Ms + 7_000;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 2,
+        safetyObsMs: t7ProducerMs,
+        nedObsMs: producerT0Ms + 6_000,
+        updatedAtMs: t7ProducerMs,
+      }),
+    );
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET NOMINAL (1)");
+
+    // --- Sequence 2: Healthy vehicle goes stale (+6s), then receives partial safety updates ---
+    nowMs += 6_000;
+    const t13ProducerMs = t7ProducerMs + 6_000;
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("stale");
+
+    // 2a. Value change (armed -> false) WITHOUT advancing safety timestamps stays stale:
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 3,
+        safetyObsMs: t7ProducerMs,
+        flagsObsMs: t7ProducerMs,
+        armed: false,
+        armedObsMs: t7ProducerMs,
+        nedObsMs: producerT0Ms + 6_000,
+        updatedAtMs: t13ProducerMs,
+      }),
+    );
+    expect(skgStore.getCommandableVehicle(entityId)?.armed).toBe(false);
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET STALE · LAST KNOWN (1 · 6s ago)");
+
+    // 2b. Partial timestamp advance (5 safety fields at T+13s, measured uxs.health.flags still at T+7s) ALSO stays stale:
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 4,
+        safetyObsMs: t13ProducerMs,
+        flagsObsMs: t7ProducerMs,
+        armed: true,
+        armedObsMs: t13ProducerMs,
+        nedObsMs: t13ProducerMs,
+        updatedAtMs: t13ProducerMs,
+      }),
+    );
+    const partialSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(partialSummary.state).toBe("stale");
+    expect(partialSummary.badgeLabel).toBe(
+      "FLEET STALE · LAST KNOWN (1 · 6s ago)",
+    );
+
+    // 2c. Complete new #0 HEARTBEAT at T+14s updating all 6 safety predicates (including uxs.health.flags) recovers FLEET NOMINAL (1):
+    nowMs += 1_000;
+    const t14ProducerMs = t7ProducerMs + 7_000;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 5,
+        safetyObsMs: t14ProducerMs,
+        flagsObsMs: t14ProducerMs,
+        armed: true,
+        nedObsMs: t13ProducerMs,
+        updatedAtMs: t14ProducerMs,
+      }),
+    );
+    const recoveredAfterPartial = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(recoveredAfterPartial.state).toBe("nominal");
+    expect(recoveredAfterPartial.badgeLabel).toBe("FLEET NOMINAL (1)");
+
+    // --- Sequence 3: Buffered delivery burst (HB at T, pos at T+1s, T+2s, T+3s delivered over 90 ms) + 1,100 ms silence ---
+    const burstHbProducerMs = t14ProducerMs + 10_000;
+    nowMs += 13_000;
+    const burstStartMs = nowMs;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 6,
+        safetyObsMs: burstHbProducerMs,
+        nedObsMs: burstHbProducerMs,
+        updatedAtMs: burstHbProducerMs,
+      }),
+    );
+    for (const sec of [1, 2, 3]) {
+      nowMs = burstStartMs + sec * 30;
+      const posProducerMs = burstHbProducerMs + sec * 1_000;
+      ws2Rig.latest.serverMessage(
+        buildSnapshotPut({
+          revision: 6 + sec,
+          safetyObsMs: burstHbProducerMs,
+          nedObsMs: posProducerMs,
+          updatedAtMs: posProducerMs,
+        }),
+      );
+    }
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext()).state,
+    ).toBe("nominal");
+
+    // After 1,100 ms of silence, the heartbeat is provably >= 4,100 ms old (> 4,000 ms threshold) -> stale!
+    nowMs += 1_100;
+    const afterSilenceSummary = summarizeFleetHealth(
+      skgStore.entities.values(),
+      currentContext(),
+    );
+    expect(afterSilenceSummary.state).toBe("stale");
+    expect(afterSilenceSummary.badgeLabel).toBe(
+      "FLEET STALE · LAST KNOWN (1 · 4s ago)",
+    );
+
+    // Indicated heartbeat age continues advancing as the browser clock ticks (+1,000 ms -> 5s ago):
+    nowMs += 1_000;
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET STALE · LAST KNOWN (1 · 5s ago)");
+
+    // Complete new #0 HEARTBEAT restores FLEET NOMINAL (1):
+    nowMs += 500;
+    const postBurstHbProducerMs = burstHbProducerMs + 6_000;
+    ws2Rig.latest.serverMessage(
+      buildSnapshotPut({
+        revision: 10,
+        safetyObsMs: postBurstHbProducerMs,
+        nedObsMs: postBurstHbProducerMs,
+        updatedAtMs: postBurstHbProducerMs,
+      }),
+    );
+    expect(
+      summarizeFleetHealth(skgStore.entities.values(), currentContext())
+        .badgeLabel,
+    ).toBe("FLEET NOMINAL (1)");
+
+    telemetryStore.disconnect();
+    skgStore.disconnect();
   });
 });
