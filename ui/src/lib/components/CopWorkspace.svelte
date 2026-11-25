@@ -7,17 +7,15 @@
   import {
     type CopSoloSection,
     type FleetFreshnessContext,
-    type HealthChipView,
     type VehicleFreshnessView,
     buildExternalContactSummary,
-    buildHealthStrip,
+    buildFaultedOwnshipEntries,
     buildVehicleBannerView,
     computeFlightMetrics,
-    evaluateActiveVehicleFault,
     evaluateVehicleFreshness,
     evaluateVehicleSafetySeverity,
-    extractAbnormalHealthChips,
     resolveLiveVehiclePose,
+    selectBannerPresentation,
     selectCopSoloSection,
     summarizeFleetHealth,
   } from "$lib/hud/view-model";
@@ -36,7 +34,6 @@
     ViewportStore,
     WorkspaceMode,
   } from "$lib/stores/viewport.svelte";
-  import { parseVehicleEntityId } from "$lib/uxs";
 
   interface Props {
     telemetryStore: TelemetryStore;
@@ -58,22 +55,40 @@
 
   let activeSection = $state<CopSoloSection>("summary");
 
+  const resolvedFreshnessContext = $derived<FleetFreshnessContext | undefined>(
+    freshnessContext
+      ? {
+          telemetryStatus:
+            freshnessContext.telemetryStatus ?? telemetryStore.status,
+          telemetryLink: freshnessContext.telemetryLink,
+          getTelemetryLink: (sysid) =>
+            freshnessContext.getTelemetryLink?.(sysid) ??
+            telemetryStore.getLinkState(sysid),
+          skgStatus: freshnessContext.skgStatus ?? skgStore.status,
+          skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
+          skgLastSyncedRevision:
+            freshnessContext.skgLastSyncedRevision !== undefined
+              ? freshnessContext.skgLastSyncedRevision
+              : skgStore.lastSyncedRevision,
+          nowMs: freshnessContext.nowMs,
+        }
+      : undefined,
+  );
+
   function getVehicleFreshness(
     vehicle: VehicleEntityState,
   ): VehicleFreshnessView | null {
-    if (!freshnessContext) {
+    if (!resolvedFreshnessContext) {
       return null;
     }
     return evaluateVehicleFreshness(vehicle, {
       telemetryLink:
-        freshnessContext.telemetryLink ??
-        freshnessContext.getTelemetryLink?.(vehicle.sysid) ??
-        telemetryStore.getLinkState(vehicle.sysid),
-      telemetryStatus:
-        freshnessContext.telemetryStatus ?? telemetryStore.status,
-      skgStatus: freshnessContext.skgStatus ?? skgStore.status,
-      skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
-      nowMs: freshnessContext.nowMs,
+        resolvedFreshnessContext.telemetryLink ??
+        resolvedFreshnessContext.getTelemetryLink?.(vehicle.sysid),
+      telemetryStatus: resolvedFreshnessContext.telemetryStatus,
+      skgStatus: resolvedFreshnessContext.skgStatus,
+      skgSynced: resolvedFreshnessContext.skgSynced,
+      nowMs: resolvedFreshnessContext.nowMs,
     });
   }
 
@@ -93,6 +108,16 @@
       ? buildVehicleBannerView(selectedVehicle, selectedFreshness)
       : null,
   );
+  const poisonedSummary = $derived.by(() => {
+    if (selectedVehicle || selectedContact || !selectedEntity) {
+      return null;
+    }
+    const banner = selectBannerPresentation(
+      selectedEntity,
+      resolvedFreshnessContext,
+    );
+    return banner?.kind === "poisoned-uxs-vehicle" ? banner : null;
+  });
   const contactSummary = $derived(
     selectedContact ? buildExternalContactSummary(selectedContact) : null,
   );
@@ -120,7 +145,7 @@
   const fleetHealth = $derived(
     summarizeFleetHealth(
       skgStore.entities.values(),
-      freshnessContext ?? {
+      resolvedFreshnessContext ?? {
         telemetryStatus: telemetryStore.status,
         getTelemetryLink: (sysid) => telemetryStore.getLinkState(sysid),
         skgStatus: skgStore.status,
@@ -129,54 +154,12 @@
       },
     ),
   );
-  const faultedOwnshipEntries = $derived.by(() => {
-    const rows: Array<{
-      id: string;
-      sysid: number;
-      statusLabel: string;
-      staleLabel: string | null;
-      poisoned: boolean;
-      chips: readonly HealthChipView[];
-    }> = [];
-    for (const entity of skgStore.entities.values()) {
-      if (entity.kind === "uxs-vehicle") {
-        const fault = evaluateActiveVehicleFault(entity);
-        if (fault.severity !== null) {
-          const freshView = getVehicleFreshness(entity);
-          rows.push({
-            id: entity.id,
-            sysid: entity.sysid,
-            statusLabel: entity.authority,
-            staleLabel:
-              freshView && !freshView.fresh ? freshView.statusLabel : null,
-            poisoned: entity.poisoned,
-            chips: extractAbnormalHealthChips(
-              buildHealthStrip(entity.healthFlags, entity.sysStatus),
-            ),
-          });
-        }
-      } else if (entity.poisoned) {
-        const parsed = parseVehicleEntityId(entity.id);
-        if (parsed !== null) {
-          const skgLive = skgStore.status === "connected" && skgStore.synced;
-          const linkLost = Boolean(
-            telemetryStore.getLinkState(parsed.sysid)?.linkLost,
-          );
-          rows.push({
-            id: entity.id,
-            sysid: parsed.sysid,
-            statusLabel: "decode-error",
-            staleLabel:
-              freshnessContext && (!skgLive || linkLost) ? "LAST KNOWN" : null,
-            poisoned: true,
-            chips: [],
-          });
-        }
-      }
-    }
-    rows.sort((a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id));
-    return rows;
-  });
+  const faultedOwnshipEntries = $derived(
+    buildFaultedOwnshipEntries(
+      skgStore.entities.values(),
+      resolvedFreshnessContext,
+    ),
+  );
 
   const recentEvents = $derived(
     [...telemetryStore.events]
@@ -416,6 +399,24 @@
                 Analysis [K]
               </button>
             </div>
+          {:else if poisonedSummary}
+            <div class="summary-header">
+              <strong>UXS #{poisonedSummary.sysid}</strong>
+              <span class="chip-error">POISONED</span>
+            </div>
+            <dl class="kv-grid">
+              <div>
+                <dt>Status</dt>
+                <dd>{poisonedSummary.poisonError ?? "decode-error"}</dd>
+              </div>
+              <div>
+                <dt>Freshness</dt>
+                <dd data-testid="cop-summary-freshness">
+                  {poisonedSummary.freshness?.statusLabel ??
+                    "LAST KNOWN · age unknown"}
+                </dd>
+              </div>
+            </dl>
           {:else if contactSummary}
             <div class="contact-summary-card" data-testid="cop-contact-summary">
               <div class="summary-header">

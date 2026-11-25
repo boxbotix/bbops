@@ -992,4 +992,103 @@ describe("telemetry.svelte.ts — WS #1 kinematic & transition event store", () 
     expect(store.getLinkState(1)).toBeUndefined();
     store.disconnect();
   });
+
+  // spec: cop-ui / Latest-wins kinematic store and bounded transition event ring buffer
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("ignores delayed older link_restored and link_lost transitions until a genuinely newer transition arrives", () => {
+    const rig = new MockWebSocketRig();
+    let nowMs = 1_732_510_000_000;
+    const store = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: rig.createSocket,
+      now: () => nowMs,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    // 1. Live kinematics at T.
+    const t0 = nowMs;
+    rig.latest.serverMessage(
+      buildKinematicEnvelope(1, {
+        seq: 1,
+        msg_id: 32,
+        has_local_pos: true,
+        ned_xyz: [10, -4, -8],
+        timestamp: t0,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(false);
+
+    // 2. link_lost at T + 3000 ms latches linkLost = true.
+    nowMs = t0 + 3_000;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 2,
+        kind: "link_lost",
+        reasons: ["silence_timeout"],
+        timestamp: t0 + 3_000,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: true,
+      linkLostAtMs: t0 + 3_000,
+      linkLostTimestamp: t0 + 3_000,
+      lastPacketTimestamp: t0,
+      lastPacketReceivedAtMs: t0,
+    });
+
+    // 3. Delayed out-of-order link_restored stamped T + 1000 ms (>= T, < T + 3000 ms) MUST NOT clear linkLost.
+    nowMs = t0 + 3_200;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 3,
+        kind: "link_restored",
+        reasons: ["link_restored"],
+        timestamp: t0 + 1_000,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: true,
+      linkLostAtMs: t0 + 3_000,
+      linkLostTimestamp: t0 + 3_000,
+      lastPacketTimestamp: t0,
+      lastPacketReceivedAtMs: t0,
+    });
+
+    // 4. Genuinely newer link_restored stamped T + 4000 ms clears linkLost.
+    nowMs = t0 + 4_000;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 4,
+        kind: "link_restored",
+        reasons: ["link_restored"],
+        timestamp: t0 + 4_000,
+      }),
+    );
+    expect(store.getLinkState(1)).toEqual({
+      sysid: 1,
+      linkLost: false,
+      linkLostAtMs: null,
+      linkLostTimestamp: null,
+      lastPacketTimestamp: t0 + 4_000,
+      lastPacketReceivedAtMs: t0 + 4_000,
+    });
+
+    // 5. Delayed out-of-order link_lost stamped T + 3500 ms (< T + 4000 ms) MUST NOT re-latch linkLost.
+    nowMs = t0 + 4_100;
+    rig.latest.serverMessage(
+      buildTransitionEnvelope(1, {
+        seq: 5,
+        kind: "link_lost",
+        reasons: ["silence_timeout"],
+        timestamp: t0 + 3_500,
+      }),
+    );
+    expect(store.getLinkState(1)?.linkLost).toBe(false);
+
+    store.disconnect();
+  });
 });

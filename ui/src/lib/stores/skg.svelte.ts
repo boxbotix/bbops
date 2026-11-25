@@ -91,6 +91,7 @@ export interface CopEntityBase {
   uncertaintyMeters: number | null;
   feedStatus: CopFeedStatus;
   ingestedAtMs?: number;
+  poisonedAtMs?: number | null;
   triples: readonly SkgTriple[];
 }
 
@@ -129,6 +130,7 @@ export interface VehicleEntityState extends CopEntityBase {
   stateObservedAt?: string | null;
   stateIngestedAtMs?: number | null;
   stateIngestedLive?: boolean;
+  stateReplayedUnchanged?: boolean;
 }
 
 export interface ExternalContactEntityState extends CopEntityBase {
@@ -407,6 +409,7 @@ function extractCommonMetadata(
     updatedAt,
     poisoned: false,
     poisonError: null,
+    poisonedAtMs: null,
     indexingProfile,
     source: explicitSource,
     observedAt: explicitObserved,
@@ -541,12 +544,35 @@ export function parseCopEntityState(
         "geo.location.longitude",
         "geo.location.altitude",
       ] as const;
+      const healthStatePredicates = [
+        "uxs.authority.state",
+        "uxs.mode.companion",
+        "uxs.link.tier",
+        "uxs.health.armed",
+        "uxs.health.flags",
+        "uxs.health.failsafes",
+        "uxs.health.crcerrors",
+        "uxs.health.loopdtus",
+        "uxs.health.maxloopdtus",
+        "uxs.health.rttus",
+      ] as const;
       const isMeasuredAssertion = (
         triple: SkgTriple | undefined,
       ): triple is SkgTriple =>
         triple !== undefined &&
         triple.confidence > 0 &&
         normalizeKnownTimestamp(triple.timestamp) !== null;
+
+      let latestMeasuredHealthTriple: SkgTriple | undefined;
+      for (const pred of healthStatePredicates) {
+        const candidate = byPredicate[pred];
+        if (isMeasuredAssertion(candidate)) {
+          latestMeasuredHealthTriple = selectWinningTriple(
+            latestMeasuredHealthTriple,
+            candidate,
+          );
+        }
+      }
 
       let latestPoseTriple: SkgTriple | undefined;
       for (const pred of posePredicates) {
@@ -631,17 +657,18 @@ export function parseCopEntityState(
       const globalPosObservedAt = hasGlobalPos
         ? normalizeKnownTimestamp(latestGlobalPosTriple?.timestamp)
         : null;
-      const rawExplicitObs =
-        normalizeNonEmptyString(byPredicate["cop.time.observed"]?.object) ??
-        normalizeNonEmptyString(
-          byPredicate["cop.contact.observed-at"]?.object,
-        ) ??
-        normalizeNonEmptyString(byPredicate["cop.contact.observed_at"]?.object);
+      const explicitObsTriple =
+        byPredicate["cop.time.observed"] ??
+        byPredicate["cop.contact.observed-at"] ??
+        byPredicate["cop.contact.observed_at"];
+      const rawExplicitObs = isMeasuredAssertion(explicitObsTriple)
+        ? normalizeNonEmptyString(explicitObsTriple.object)
+        : null;
       const stateObservedAt =
         rawExplicitObs !== null &&
         normalizeKnownTimestamp(rawExplicitObs) !== null
           ? rawExplicitObs
-          : (latestMeasuredUxsTriple?.timestamp.trim() ?? null);
+          : (latestMeasuredHealthTriple?.timestamp.trim() ?? null);
       const vehicleObservedAt =
         base.observedAt ??
         normalizeKnownTimestamp(
@@ -722,12 +749,19 @@ function buildPoisonedEntity(
   errorMessage: string,
   ingestedAtMs?: number,
 ): CopEntityState {
+  const poisonedAtMs =
+    prior?.poisoned &&
+    prior.kvRevision === revision &&
+    prior.poisonedAtMs !== undefined
+      ? prior.poisonedAtMs
+      : (ingestedAtMs ?? null);
   if (prior !== undefined) {
     return {
       ...prior,
       kvRevision: revision,
       poisoned: true,
       poisonError: errorMessage,
+      poisonedAtMs,
       ...(ingestedAtMs !== undefined ? { ingestedAtMs } : {}),
     };
   }
@@ -743,6 +777,7 @@ function buildPoisonedEntity(
       updatedAt: null,
       poisoned: true,
       poisonError: errorMessage,
+      poisonedAtMs,
       indexingProfile: null,
       source: null,
       observedAt: null,
@@ -763,6 +798,7 @@ function buildPoisonedEntity(
     updatedAt: null,
     poisoned: true,
     poisonError: errorMessage,
+    poisonedAtMs,
     indexingProfile: null,
     source: null,
     observedAt: null,
@@ -914,8 +950,7 @@ function didVehicleStateAdvance(
     next.sysStatus.crcErrors !== prior.sysStatus.crcErrors ||
     next.sysStatus.loopDtUs !== prior.sysStatus.loopDtUs ||
     next.sysStatus.maxLoopDtUs !== prior.sysStatus.maxLoopDtUs ||
-    next.sysStatus.rttUs !== prior.sysStatus.rttUs ||
-    didVehiclePoseAdvance(prior, next)
+    next.sysStatus.rttUs !== prior.sysStatus.rttUs
   );
 }
 
@@ -924,6 +959,8 @@ interface VehicleStateHighWater {
   state: VehicleEntityState;
   ingestedAtMs: number | null;
   ingestedLive: boolean;
+  replayedUnchanged: boolean;
+  disconnectedSinceAdvance: boolean;
 }
 
 function applyVehicleStateReceipt(
@@ -931,12 +968,15 @@ function applyVehicleStateReceipt(
   next: VehicleEntityState,
   receiptMs: number,
   isLivePostSync: boolean,
+  hasPriorSyncedSession: boolean,
 ): VehicleStateHighWater | undefined {
-  const nextStateObs = next.stateObservedAt ?? next.observedAt;
+  const nextStateObs =
+    next.stateObservedAt !== undefined ? next.stateObservedAt : next.observedAt;
   if (!nextStateObs) {
     next.stateIngestedAtMs =
       highWater !== undefined ? EXPIRED_POSE_RECEIPT_MS : null;
     next.stateIngestedLive = false;
+    next.stateReplayedUnchanged = false;
     return highWater;
   }
 
@@ -944,39 +984,79 @@ function applyVehicleStateReceipt(
   if (highWater === undefined || nextNs > highWater.observedNs) {
     next.stateIngestedAtMs = receiptMs;
     next.stateIngestedLive = isLivePostSync;
+    next.stateReplayedUnchanged = false;
     return {
       observedNs: nextNs,
       state: next,
       ingestedAtMs: next.stateIngestedAtMs,
       ingestedLive: next.stateIngestedLive,
+      replayedUnchanged: false,
+      disconnectedSinceAdvance: false,
     };
   }
+
+  const crossedDisconnect =
+    hasPriorSyncedSession ||
+    highWater.disconnectedSinceAdvance ||
+    highWater.replayedUnchanged;
 
   if (nextNs < highWater.observedNs) {
     next.stateIngestedAtMs = EXPIRED_POSE_RECEIPT_MS;
     next.stateIngestedLive = false;
+    next.stateReplayedUnchanged = crossedDisconnect;
+    if (
+      crossedDisconnect &&
+      (!highWater.replayedUnchanged || highWater.ingestedLive)
+    ) {
+      return {
+        ...highWater,
+        ingestedLive: false,
+        replayedUnchanged: true,
+        disconnectedSinceAdvance: false,
+      };
+    }
     return highWater;
   }
 
   if (didVehicleStateAdvance(highWater.state, next)) {
     next.stateIngestedAtMs = receiptMs;
     next.stateIngestedLive = isLivePostSync;
+    next.stateReplayedUnchanged = false;
     return {
       observedNs: nextNs,
       state: next,
       ingestedAtMs: next.stateIngestedAtMs,
       ingestedLive: next.stateIngestedLive,
+      replayedUnchanged: false,
+      disconnectedSinceAdvance: false,
+    };
+  }
+
+  if (crossedDisconnect) {
+    next.stateIngestedAtMs = highWater.ingestedAtMs ?? EXPIRED_POSE_RECEIPT_MS;
+    next.stateIngestedLive = false;
+    next.stateReplayedUnchanged = true;
+    return {
+      observedNs: highWater.observedNs,
+      state: next,
+      ingestedAtMs: next.stateIngestedAtMs,
+      ingestedLive: false,
+      replayedUnchanged: true,
+      disconnectedSinceAdvance: false,
     };
   }
 
   next.stateIngestedAtMs =
     highWater.ingestedAtMs ?? (isLivePostSync ? null : EXPIRED_POSE_RECEIPT_MS);
   next.stateIngestedLive = highWater.ingestedLive;
+  next.stateReplayedUnchanged = false;
   return {
     observedNs: highWater.observedNs,
     state: next,
     ingestedAtMs: next.stateIngestedAtMs,
     ingestedLive: next.stateIngestedLive,
+    replayedUnchanged: false,
+    disconnectedSinceAdvance: false,
   };
 }
 
@@ -1151,6 +1231,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
             entity,
             receiptMs,
             false,
+            maxStateByKey.has(key),
           );
           if (nextStateHighWater !== undefined) {
             stagedMaxStateByKey.set(key, nextStateHighWater);
@@ -1181,6 +1262,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
           entity,
           receiptMs,
           true,
+          false,
         );
         if (nextStateHighWater !== undefined) {
           maxStateByKey.set(key, nextStateHighWater);
@@ -1252,6 +1334,16 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     malformedFrames += 1;
   }
 
+  function markSessionBoundary(): void {
+    synced = false;
+    stagedSnapshot.clear();
+    stagedMaxPoseByKey.clear();
+    stagedMaxStateByKey.clear();
+    for (const hw of maxStateByKey.values()) {
+      hw.disconnectedSinceAdvance = true;
+    }
+  }
+
   const wsClient = new ManagedWebSocketClient({
     url: options.url,
     envUrl,
@@ -1266,17 +1358,11 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     },
     onOpen() {
       // Begin staging pre-synced snapshot without clearing live `entities` (gapless reconnect).
-      synced = false;
-      stagedSnapshot.clear();
-      stagedMaxPoseByKey.clear();
-      stagedMaxStateByKey.clear();
+      markSessionBoundary();
     },
     onMessage: ingestRawFrame,
     onDisconnect() {
-      synced = false;
-      stagedSnapshot.clear();
-      stagedMaxPoseByKey.clear();
-      stagedMaxStateByKey.clear();
+      markSessionBoundary();
     },
     onEndpointChange(nextUrl) {
       currentUrl = nextUrl;
@@ -1318,10 +1404,7 @@ export function createSkgStore(options: SkgStoreOptions = {}): SkgStore {
     },
     disconnect() {
       wsClient.disconnect();
-      synced = false;
-      stagedSnapshot.clear();
-      stagedMaxPoseByKey.clear();
-      stagedMaxStateByKey.clear();
+      markSessionBoundary();
     },
     getEntity(entityId: string | null | undefined) {
       if (!entityId) {

@@ -1556,6 +1556,137 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
     expect(vRecovered.stateObservedAt).toBe(recoveredIso);
     expect(vRecovered.stateIngestedAtMs).toBe(recoveredReceiptMs);
     expect(vRecovered.stateIngestedLive).toBe(true);
+    expect(vRecovered.stateReplayedUnchanged).toBe(false);
+
+    store.disconnect();
+  });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("excludes zero-confidence placeholders and pose-only updates from stateObservedAt, flags fast-reconnect unchanged snapshots, and preserves poisonedAtMs", () => {
+    const rig = new MockWebSocketRig();
+    let browserNowMs = Date.parse("2026-11-25T13:00:00.000Z");
+    const store = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: rig.createSocket,
+      now: () => browserNowMs,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    // 1. All-zero-confidence triples decode stateObservedAt = null and stateIngestedAtMs = null.
+    const currentIso = new Date(browserNowMs).toISOString();
+    const baseZero = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter" },
+      { observedAt: currentIso, updatedAt: currentIso },
+    );
+    const zeroConfidencePayload = {
+      ...baseZero,
+      triples: baseZero.triples.map((t) => ({ ...t, confidence: 0 })),
+    };
+    const poisonedKey = "boxbotix.local.robotics.uxs.vehicle.2";
+    rig.latest.serverMessage(putFrame(baseZero.id, 1, zeroConfidencePayload));
+    rig.latest.serverMessage(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: poisonedKey,
+        revision: 2,
+        error: "corrupt msgpack triple",
+      }),
+    );
+    rig.latest.serverMessage(syncedFrame(2));
+
+    const vZero = store.getCommandableVehicle(baseZero.id)!;
+    expect(vZero.stateObservedAt).toBeNull();
+    expect(vZero.stateIngestedAtMs).toBeNull();
+    expect(vZero.stateIngestedLive).toBe(false);
+    expect(store.getEntity(poisonedKey)?.poisonedAtMs).toBe(browserNowMs);
+    const initialPoisonedAtMs = browserNowMs;
+
+    // 2. Measured health update advances stateObservedAt and sets stateIngestedLive = true.
+    browserNowMs += 1_000;
+    const measuredHealthMs = browserNowMs;
+    const measuredHealthIso = new Date(measuredHealthMs).toISOString();
+    const measuredPayload = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter", "uxs.health.armed": true },
+      { observedAt: measuredHealthIso, updatedAt: measuredHealthIso },
+    );
+    rig.latest.serverMessage(putFrame(baseZero.id, 3, measuredPayload));
+    const vMeasured = store.getCommandableVehicle(baseZero.id)!;
+    expect(vMeasured.stateObservedAt).toBe(measuredHealthIso);
+    expect(vMeasured.stateIngestedAtMs).toBe(measuredHealthMs);
+    expect(vMeasured.stateIngestedLive).toBe(true);
+    expect(vMeasured.stateReplayedUnchanged).toBe(false);
+
+    // 3. Pose-only SKG update advances poseObservedAt without advancing stateObservedAt or stateIngestedAtMs.
+    browserNowMs += 1_500;
+    const poseOnlyIso = new Date(browserNowMs).toISOString();
+    const poseOnlyPayload = {
+      ...measuredPayload,
+      updated_at: poseOnlyIso,
+      triples: measuredPayload.triples.map((t) =>
+        t.predicate === "uxs.kinematics.ned" ||
+        t.predicate === "uxs.kinematics.vx"
+          ? {
+              ...t,
+              object:
+                t.predicate === "uxs.kinematics.ned" ? [25, -4, -25] : 4.5,
+              timestamp: poseOnlyIso,
+            }
+          : t,
+      ),
+    };
+    rig.latest.serverMessage(putFrame(baseZero.id, 4, poseOnlyPayload));
+    const vPoseOnly = store.getCommandableVehicle(baseZero.id)!;
+    expect(vPoseOnly.poseObservedAt).toBe(poseOnlyIso);
+    expect(vPoseOnly.poseIngestedAtMs).toBe(browserNowMs);
+    expect(vPoseOnly.stateObservedAt).toBe(measuredHealthIso);
+    expect(vPoseOnly.stateIngestedAtMs).toBe(measuredHealthMs);
+
+    // 4. Fast reconnect (+100 ms drop, +500 ms reconnect — inside 4_000 ms threshold)
+    // replaying identical snapshot sets stateReplayedUnchanged = true and preserves poisonedAtMs.
+    browserNowMs = measuredHealthMs + 100;
+    rig.latest.serverDrop(1006);
+    browserNowMs = measuredHealthMs + 600;
+    store.connect();
+    rig.latest.serverOpen();
+    rig.latest.serverMessage(putFrame(baseZero.id, 4, poseOnlyPayload));
+    rig.latest.serverMessage(
+      JSON.stringify({
+        type: "poisoned",
+        bucket: "ENTITY_STATES",
+        key: poisonedKey,
+        revision: 2,
+        error: "corrupt msgpack triple",
+      }),
+    );
+    rig.latest.serverMessage(syncedFrame(4));
+
+    const vFastReplay = store.getCommandableVehicle(baseZero.id)!;
+    expect(vFastReplay.stateIngestedAtMs).toBe(measuredHealthMs);
+    expect(vFastReplay.stateIngestedLive).toBe(false);
+    expect(vFastReplay.stateReplayedUnchanged).toBe(true);
+    expect(store.getEntity(poisonedKey)?.poisonedAtMs).toBe(
+      initialPoisonedAtMs,
+    );
+
+    // 5. Advancing health observation clears stateReplayedUnchanged = false.
+    browserNowMs += 200;
+    const nextHealthIso = new Date(browserNowMs).toISOString();
+    const advancingHealthPayload = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter", "uxs.health.armed": false },
+      { observedAt: nextHealthIso, updatedAt: nextHealthIso },
+    );
+    rig.latest.serverMessage(putFrame(baseZero.id, 5, advancingHealthPayload));
+    const vAdvanced = store.getCommandableVehicle(baseZero.id)!;
+    expect(vAdvanced.stateObservedAt).toBe(nextHealthIso);
+    expect(vAdvanced.stateIngestedAtMs).toBe(browserNowMs);
+    expect(vAdvanced.stateIngestedLive).toBe(true);
+    expect(vAdvanced.stateReplayedUnchanged).toBe(false);
 
     store.disconnect();
   });

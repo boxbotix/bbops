@@ -426,6 +426,8 @@ export function createTelemetryStore(
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const linkStateBySysId = new Map<number, MutableTelemetryLinkState>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const lastLinkTransitionTsBySysId = new Map<number, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const legacyAttitudeLatchedBySysId = new Set<number>();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const legacyLocalPosLatchedAtBySysId = new Map<number, number>();
@@ -453,11 +455,41 @@ export function createTelemetryStore(
   let reconnectCount = $state(0);
   let lastDisconnectedAt = $state<number | null>(null);
 
+  function latestLinkWatermark(sysid: number): number | null {
+    let maxTs: number | null = null;
+    const kin = kinematicsBySysId.get(sysid);
+    if (kin !== undefined) {
+      maxTs = kin.timestamp;
+    }
+    const entry = linkStateBySysId.get(sysid);
+    if (entry !== undefined) {
+      if (
+        entry.lastPacketTimestamp !== null &&
+        (maxTs === null || entry.lastPacketTimestamp > maxTs)
+      ) {
+        maxTs = entry.lastPacketTimestamp;
+      }
+      if (
+        entry.linkLostTimestamp !== null &&
+        (maxTs === null || entry.linkLostTimestamp > maxTs)
+      ) {
+        maxTs = entry.linkLostTimestamp;
+      }
+    }
+    const lastTransitionTs = lastLinkTransitionTsBySysId.get(sysid);
+    if (
+      lastTransitionTs !== undefined &&
+      (maxTs === null || lastTransitionTs > maxTs)
+    ) {
+      maxTs = lastTransitionTs;
+    }
+    return maxTs;
+  }
+
   function recordPacketLinkReceipt(
     sysid: number,
     packetTimestamp: number,
     receivedAtMs: number,
-    forceRestore = false,
   ): void {
     const entry = linkStateBySysId.get(sysid);
     if (entry === undefined) {
@@ -472,18 +504,21 @@ export function createTelemetryStore(
       linkStateVersion += 1;
       return;
     }
+    const predatesActiveLoss =
+      entry.linkLost &&
+      entry.linkLostTimestamp !== null &&
+      packetTimestamp < entry.linkLostTimestamp;
     if (
-      forceRestore ||
-      entry.lastPacketTimestamp === null ||
-      packetTimestamp >= entry.lastPacketTimestamp
+      !predatesActiveLoss &&
+      (entry.lastPacketTimestamp === null ||
+        packetTimestamp >= entry.lastPacketTimestamp)
     ) {
       entry.lastPacketTimestamp = packetTimestamp;
       entry.lastPacketReceivedAtMs = receivedAtMs;
     }
     if (
       entry.linkLost &&
-      (forceRestore ||
-        entry.linkLostTimestamp === null ||
+      (entry.linkLostTimestamp === null ||
         packetTimestamp >= entry.linkLostTimestamp)
     ) {
       entry.linkLost = false;
@@ -503,6 +538,13 @@ export function createTelemetryStore(
       entry !== undefined &&
       entry.lastPacketTimestamp !== null &&
       lossTimestamp < entry.lastPacketTimestamp
+    ) {
+      return;
+    }
+    if (
+      entry !== undefined &&
+      entry.linkLostTimestamp !== null &&
+      lossTimestamp < entry.linkLostTimestamp
     ) {
       return;
     }
@@ -675,28 +717,24 @@ export function createTelemetryStore(
         malformedFrames += 1;
         return;
       }
-      const existing = kinematicsBySysId.get(sysid);
-      const notOlderThanKinematics =
-        existing === undefined || transition.timestamp >= existing.timestamp;
+      const watermark = latestLinkWatermark(sysid);
+      const notOlderThanLinkState =
+        watermark === null || transition.timestamp >= watermark;
       if (
         (transition.kind === "link_lost" ||
           transition.kind === "link_restored") &&
-        notOlderThanKinematics
+        notOlderThanLinkState
       ) {
+        lastLinkTransitionTsBySysId.set(sysid, transition.timestamp);
         clearSysIdSessionLatches(sysid);
       }
       if (transition.kind === "link_lost") {
-        if (notOlderThanKinematics) {
+        if (notOlderThanLinkState) {
           recordLinkLostTransition(sysid, transition.timestamp, receivedAtMs);
         }
       } else if (transition.kind === "link_restored") {
-        if (notOlderThanKinematics) {
-          recordPacketLinkReceipt(
-            sysid,
-            transition.timestamp,
-            receivedAtMs,
-            true,
-          );
+        if (notOlderThanLinkState) {
+          recordPacketLinkReceipt(sysid, transition.timestamp, receivedAtMs);
         }
       } else {
         recordPacketLinkReceipt(sysid, transition.timestamp, receivedAtMs);
@@ -712,6 +750,7 @@ export function createTelemetryStore(
     const hadLinkState = linkStateBySysId.size > 0;
     kinematicsBySysId.clear();
     linkStateBySysId.clear();
+    lastLinkTransitionTsBySysId.clear();
     clearAllSessionLatches();
     eventRing.fill(undefined);
     ringWriteIdx = 0;

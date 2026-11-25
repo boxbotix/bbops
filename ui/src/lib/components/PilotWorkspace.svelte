@@ -10,6 +10,7 @@
     type FleetFreshnessContext,
     buildExternalContactSummary,
     buildHealthStrip,
+    evaluatePoisonedVehicleFreshness,
     evaluateVehicleFreshness,
     extractAbnormalHealthChips,
   } from "$lib/hud/view-model";
@@ -52,12 +53,13 @@
     isExternalContactEntity(selectedEntity) ? selectedEntity : null,
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
+  const poisonedOwnshipId = $derived(
+    selectedEntity?.poisoned && !selectedVehicle
+      ? parseVehicleEntityId(selectedEntity.id)
+      : null,
+  );
   const isPoisonedOwnshipSelected = $derived(
-    Boolean(
-      selectedVehicle?.poisoned ||
-      (selectedEntity?.poisoned &&
-        parseVehicleEntityId(selectedEntity.id) !== null),
-    ),
+    Boolean(selectedVehicle?.poisoned || poisonedOwnshipId !== null),
   );
 
   const contactSummary = $derived(
@@ -65,23 +67,36 @@
   );
 
   const selectedFreshness = $derived.by(() => {
-    if (!selectedVehicle) {
-      return null;
-    }
     if (!freshnessContext) {
       return null;
     }
-    return evaluateVehicleFreshness(selectedVehicle, {
-      telemetryLink:
-        freshnessContext.telemetryLink ??
-        freshnessContext.getTelemetryLink?.(selectedVehicle.sysid) ??
-        telemetryStore.getLinkState(selectedVehicle.sysid),
-      telemetryStatus:
-        freshnessContext.telemetryStatus ?? telemetryStore.status,
-      skgStatus: freshnessContext.skgStatus ?? skgStore.status,
-      skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
-      nowMs: freshnessContext.nowMs,
-    });
+    if (selectedVehicle) {
+      return evaluateVehicleFreshness(selectedVehicle, {
+        telemetryLink:
+          freshnessContext.telemetryLink ??
+          freshnessContext.getTelemetryLink?.(selectedVehicle.sysid) ??
+          telemetryStore.getLinkState(selectedVehicle.sysid),
+        telemetryStatus:
+          freshnessContext.telemetryStatus ?? telemetryStore.status,
+        skgStatus: freshnessContext.skgStatus ?? skgStore.status,
+        skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
+        nowMs: freshnessContext.nowMs,
+      });
+    }
+    if (selectedEntity && poisonedOwnshipId !== null) {
+      return evaluatePoisonedVehicleFreshness(selectedEntity, {
+        telemetryLink:
+          freshnessContext.telemetryLink ??
+          freshnessContext.getTelemetryLink?.(poisonedOwnshipId.sysid) ??
+          telemetryStore.getLinkState(poisonedOwnshipId.sysid),
+        telemetryStatus:
+          freshnessContext.telemetryStatus ?? telemetryStore.status,
+        skgStatus: freshnessContext.skgStatus ?? skgStore.status,
+        skgSynced: freshnessContext.skgSynced ?? skgStore.synced,
+        nowMs: freshnessContext.nowMs,
+      });
+    }
+    return null;
   });
 
   const abnormalChips = $derived(

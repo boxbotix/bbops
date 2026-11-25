@@ -25,7 +25,11 @@ const RAD_TO_DEG = 180 / Math.PI;
 export type SafetyBadgeSeverity = "error" | "warning" | "success" | "nominal";
 
 export type VehicleStaleReason =
-  "link_lost" | "fleet_disconnected" | "observation_timeout" | "feed_stale";
+  | "link_lost"
+  | "fleet_disconnected"
+  | "observation_timeout"
+  | "feed_stale"
+  | "poisoned_unverified";
 
 export interface VehicleFreshnessView {
   readonly fresh: boolean;
@@ -35,6 +39,8 @@ export interface VehicleFreshnessView {
   readonly statusLabel: string;
   readonly lastObservedAt: string | null;
   readonly thresholdMs: number;
+  readonly decodeErrorAgeMs?: number | null;
+  readonly decodeErrorAgeLabel?: string | null;
 }
 
 export interface EulerAttitudeDeg {
@@ -508,9 +514,9 @@ function didSkgObservationSupersedeLinkLoss(
 
 /**
  * Evaluates per-vehicle health/observation freshness across WS #1 link-loss
- * signals (`#27`) and LinkTier-scaled WS #2 `uxs.*` observation timestamps
- * (`#29`), preserving stale observation age across socket reconnects and
- * snapshot replays.
+ * signals (`#27`) and LinkTier-scaled WS #2 measured `uxs.*` health timestamps
+ * (`#29`), preserving stale observation age across socket reconnects, fast
+ * snapshot replays, and pose-only updates.
  */
 export function evaluateVehicleFreshness(
   vehicle: Pick<
@@ -521,8 +527,10 @@ export function evaluateVehicleFreshness(
     | "stateObservedAt"
     | "stateIngestedAtMs"
     | "stateIngestedLive"
+    | "stateReplayedUnchanged"
     | "ingestedAtMs"
-  >,
+  > &
+    Partial<Pick<VehicleEntityState, "poisoned" | "poisonedAtMs">>,
   options: VehicleFreshnessOptions = {},
 ): VehicleFreshnessView {
   const nowMs = options.nowMs ?? Date.now();
@@ -532,13 +540,18 @@ export function evaluateVehicleFreshness(
   const skgSynced = options.skgSynced ?? true;
   const fleetDataLive = skgConnected && skgSynced;
 
-  const rawObs = vehicle.stateObservedAt ?? vehicle.observedAt ?? null;
+  const rawObs =
+    vehicle.stateObservedAt !== undefined
+      ? vehicle.stateObservedAt
+      : (vehicle.observedAt ?? null);
   const skgObsMs = parseIsoEpochMs(rawObs);
   const skgReceiptMs =
-    vehicle.stateIngestedAtMs !== undefined
-      ? vehicle.stateIngestedAtMs
-      : (vehicle.ingestedAtMs ?? null);
-  const skgIngestedLive = vehicle.stateIngestedLive === true;
+    rawObs === null
+      ? null
+      : vehicle.stateIngestedAtMs !== undefined
+        ? vehicle.stateIngestedAtMs
+        : (vehicle.ingestedAtMs ?? null);
+  const skgIngestedLive = rawObs !== null && vehicle.stateIngestedLive === true;
   const link = options.telemetryLink;
 
   const effectiveLinkLost =
@@ -565,27 +578,28 @@ export function evaluateVehicleFreshness(
         : Math.max(0, nowMs - skgObsMs);
   }
 
-  const ws1ElapsedMs =
-    link?.lastPacketReceivedAtMs !== null &&
-    link?.lastPacketReceivedAtMs !== undefined &&
-    isFiniteNumber(link.lastPacketReceivedAtMs)
-      ? Math.max(0, nowMs - link.lastPacketReceivedAtMs)
-      : null;
-
-  const ageMs = effectiveLinkLost
-    ? (ws1ElapsedMs ?? skgElapsedMs)
-    : !fleetDataLive
-      ? skgElapsedMs
-      : skgElapsedMs !== null && ws1ElapsedMs !== null
-        ? Math.min(skgElapsedMs, ws1ElapsedMs)
-        : (skgElapsedMs ?? ws1ElapsedMs);
-
+  const ageMs = skgElapsedMs;
   const ageLabel = formatObservationAge(ageMs);
   const lastObservedAt =
-    vehicle.observedAt ??
-    (rawObs !== null && skgObsMs !== null
+    rawObs !== null && skgObsMs !== null && skgObsMs > 0
       ? new Date(skgObsMs).toISOString()
-      : null);
+      : null;
+
+  const decodeErrorAgeMs =
+    vehicle.poisoned &&
+    vehicle.poisonedAtMs !== null &&
+    vehicle.poisonedAtMs !== undefined &&
+    isFiniteNumber(vehicle.poisonedAtMs) &&
+    vehicle.poisonedAtMs > 0
+      ? Math.max(0, nowMs - vehicle.poisonedAtMs)
+      : null;
+  const decodeErrorAgeLabel =
+    decodeErrorAgeMs !== null ? formatObservationAge(decodeErrorAgeMs) : null;
+  const staleStatusLabel = decodeErrorAgeLabel
+    ? `LAST KNOWN · ${ageLabel} (decode error ${decodeErrorAgeLabel})`
+    : `LAST KNOWN · ${ageLabel}`;
+  const poisonMeta =
+    decodeErrorAgeMs !== null ? { decodeErrorAgeMs, decodeErrorAgeLabel } : {};
 
   if (vehicle.feedStatus === "stale" || vehicle.feedStatus === "disconnected") {
     return {
@@ -593,9 +607,10 @@ export function evaluateVehicleFreshness(
       staleReason: "feed_stale",
       ageMs,
       ageLabel,
-      statusLabel: `LAST KNOWN · ${ageLabel}`,
+      statusLabel: staleStatusLabel,
       lastObservedAt,
       thresholdMs,
+      ...poisonMeta,
     };
   }
 
@@ -605,9 +620,10 @@ export function evaluateVehicleFreshness(
       staleReason: "link_lost",
       ageMs,
       ageLabel,
-      statusLabel: `LAST KNOWN · ${ageLabel}`,
+      statusLabel: staleStatusLabel,
       lastObservedAt,
       thresholdMs,
+      ...poisonMeta,
     };
   }
 
@@ -617,9 +633,23 @@ export function evaluateVehicleFreshness(
       staleReason: "fleet_disconnected",
       ageMs,
       ageLabel,
-      statusLabel: `LAST KNOWN · ${ageLabel}`,
+      statusLabel: staleStatusLabel,
       lastObservedAt,
       thresholdMs,
+      ...poisonMeta,
+    };
+  }
+
+  if (vehicle.poisoned) {
+    return {
+      fresh: false,
+      staleReason: "poisoned_unverified",
+      ageMs,
+      ageLabel,
+      statusLabel: staleStatusLabel,
+      lastObservedAt,
+      thresholdMs,
+      ...poisonMeta,
     };
   }
 
@@ -628,31 +658,81 @@ export function evaluateVehicleFreshness(
     isFiniteNumber(skgReceiptMs) &&
     nowMs - skgReceiptMs >= -thresholdMs &&
     nowMs - skgReceiptMs <= thresholdMs;
-  const skgStateFresh = skgIngestedLive
-    ? skgReceiptWindowOk
-    : skgObsMs !== null &&
-      skgObsMs > 0 &&
-      nowMs - skgObsMs >= -thresholdMs &&
-      nowMs - skgObsMs <= thresholdMs &&
-      (skgReceiptMs === null || skgReceiptWindowOk);
+  const skgStateFresh =
+    vehicle.stateReplayedUnchanged !== true &&
+    (skgIngestedLive
+      ? skgReceiptWindowOk
+      : skgObsMs !== null &&
+        skgObsMs > 0 &&
+        nowMs - skgObsMs >= -thresholdMs &&
+        nowMs - skgObsMs <= thresholdMs &&
+        (skgReceiptMs === null || skgReceiptWindowOk));
 
-  const ws1PacketFresh =
-    options.telemetryStatus === "connected" &&
-    link !== undefined &&
-    !link.linkLost &&
-    link.lastPacketReceivedAtMs !== null &&
-    nowMs - link.lastPacketReceivedAtMs >= -thresholdMs &&
-    nowMs - link.lastPacketReceivedAtMs <= thresholdMs;
-
-  const fresh = skgStateFresh || ws1PacketFresh;
+  const fresh = skgStateFresh;
   return {
     fresh,
     staleReason: fresh ? null : "observation_timeout",
     ageMs,
     ageLabel,
-    statusLabel: fresh ? "LIVE" : `LAST KNOWN · ${ageLabel}`,
+    statusLabel: fresh ? "LIVE" : staleStatusLabel,
     lastObservedAt,
     thresholdMs,
+  };
+}
+
+/**
+ * Evaluates conservative freshness for a poisoned-first ownship vehicle key
+ * whose KV payload never produced a decoded `uxs.*` record. Because observation
+ * timestamps and LinkTier are unverified, `fresh` is always `false` and unknown
+ * observation age (`ageMs: null`, `"age unknown"`) is kept strictly distinct
+ * from elapsed time since the decode error (`decodeErrorAgeMs`).
+ */
+export function evaluatePoisonedVehicleFreshness(
+  entity: Pick<CopEntityState, "observedAt" | "poisonedAtMs">,
+  options: VehicleFreshnessOptions = {},
+): VehicleFreshnessView {
+  const nowMs = options.nowMs ?? Date.now();
+  const skgConnected =
+    options.skgStatus === undefined || options.skgStatus === "connected";
+  const skgSynced = options.skgSynced ?? true;
+  const fleetDataLive = skgConnected && skgSynced;
+  const link = options.telemetryLink;
+
+  const obsMs = parseIsoEpochMs(entity.observedAt);
+  const ageMs = obsMs !== null && obsMs > 0 ? Math.max(0, nowMs - obsMs) : null;
+  const ageLabel = formatObservationAge(ageMs);
+
+  const decodeErrorAgeMs =
+    entity.poisonedAtMs !== null &&
+    entity.poisonedAtMs !== undefined &&
+    isFiniteNumber(entity.poisonedAtMs) &&
+    entity.poisonedAtMs > 0
+      ? Math.max(0, nowMs - entity.poisonedAtMs)
+      : null;
+  const decodeErrorAgeLabel =
+    decodeErrorAgeMs !== null ? formatObservationAge(decodeErrorAgeMs) : null;
+
+  const staleReason: VehicleStaleReason = link?.linkLost
+    ? "link_lost"
+    : !fleetDataLive
+      ? "fleet_disconnected"
+      : "poisoned_unverified";
+
+  const statusLabel = decodeErrorAgeLabel
+    ? `LAST KNOWN · ${ageLabel} (decode error ${decodeErrorAgeLabel})`
+    : `LAST KNOWN · ${ageLabel}`;
+
+  return {
+    fresh: false,
+    staleReason,
+    ageMs,
+    ageLabel,
+    statusLabel,
+    lastObservedAt:
+      obsMs !== null && obsMs > 0 ? new Date(obsMs).toISOString() : null,
+    thresholdMs: VEHICLE_FRESH_DEFAULT_MS,
+    decodeErrorAgeMs,
+    decodeErrorAgeLabel,
   };
 }
 
@@ -1025,6 +1105,22 @@ function resolveVehicleFreshnessFromContext(
   });
 }
 
+function resolvePoisonedVehicleFreshnessFromContext(
+  entity: Pick<CopEntityState, "observedAt" | "poisonedAtMs">,
+  sysid: number,
+  context: FleetFreshnessContext,
+): VehicleFreshnessView {
+  const telemetryLink =
+    context.telemetryLink ?? context.getTelemetryLink?.(sysid);
+  return evaluatePoisonedVehicleFreshness(entity, {
+    telemetryLink,
+    telemetryStatus: context.telemetryStatus,
+    skgStatus: context.skgStatus,
+    skgSynced: context.skgSynced,
+    nowMs: context.nowMs,
+  });
+}
+
 export function buildVehicleBannerView(
   vehicle: VehicleEntityState,
   freshness: VehicleFreshnessView | null = null,
@@ -1104,47 +1200,13 @@ export function selectBannerPresentation(
   if (entity.poisoned) {
     const parsed = parseVehicleEntityId(entity.id);
     if (parsed !== null) {
-      let freshness: VehicleFreshnessView | null = null;
-      if (freshnessContext) {
-        const skgConnected =
-          freshnessContext.skgStatus === undefined ||
-          freshnessContext.skgStatus === "connected";
-        const skgSynced = freshnessContext.skgSynced ?? true;
-        const link =
-          freshnessContext.telemetryLink ??
-          freshnessContext.getTelemetryLink?.(parsed.sysid);
-        const nowMs = freshnessContext.nowMs ?? Date.now();
-        const obsMs = parseIsoEpochMs(entity.observedAt);
-        const ageMs =
-          link?.lastPacketReceivedAtMs !== null &&
-          link?.lastPacketReceivedAtMs !== undefined
-            ? Math.max(0, nowMs - link.lastPacketReceivedAtMs)
-            : obsMs !== null
-              ? Math.max(0, nowMs - obsMs)
-              : null;
-        const ageLabel = formatObservationAge(ageMs);
-        if (link?.linkLost) {
-          freshness = {
-            fresh: false,
-            staleReason: "link_lost",
-            ageMs,
-            ageLabel,
-            statusLabel: `LAST KNOWN · ${ageLabel}`,
-            lastObservedAt: entity.observedAt,
-            thresholdMs: VEHICLE_FRESH_DEFAULT_MS,
-          };
-        } else if (!skgConnected || !skgSynced) {
-          freshness = {
-            fresh: false,
-            staleReason: "fleet_disconnected",
-            ageMs,
-            ageLabel,
-            statusLabel: `LAST KNOWN · ${ageLabel}`,
-            lastObservedAt: entity.observedAt,
-            thresholdMs: VEHICLE_FRESH_DEFAULT_MS,
-          };
-        }
-      }
+      const freshness = freshnessContext
+        ? resolvePoisonedVehicleFreshnessFromContext(
+            entity,
+            parsed.sysid,
+            freshnessContext,
+          )
+        : null;
       return {
         kind: "poisoned-uxs-vehicle",
         entityId: entity.id,
@@ -1596,22 +1658,16 @@ export function summarizeFleetHealth(
     } else if (entity.poisoned) {
       const parsed = parseVehicleEntityId(entity.id);
       if (parsed !== null) {
-        const link =
-          context.telemetryLink ?? context.getTelemetryLink?.(parsed.sysid);
-        const nowMs = context.nowMs ?? Date.now();
-        const obsMs = parseIsoEpochMs(entity.observedAt);
-        const ageMs =
-          link?.lastPacketReceivedAtMs !== null &&
-          link?.lastPacketReceivedAtMs !== undefined
-            ? Math.max(0, nowMs - link.lastPacketReceivedAtMs)
-            : obsMs !== null
-              ? Math.max(0, nowMs - obsMs)
-              : null;
+        const freshness = resolvePoisonedVehicleFreshnessFromContext(
+          entity,
+          parsed.sysid,
+          context,
+        );
         ownshipEntries.set(entity.id, {
           sysid: parsed.sysid,
           id: entity.id,
-          fresh: fleetDataLive && !link?.linkLost,
-          ageMs,
+          fresh: freshness.fresh,
+          ageMs: freshness.ageMs,
           hasFault: true,
         });
       }
@@ -1793,6 +1849,73 @@ export function extractAbnormalHealthChips(
   return [...errors, ...warnings];
 }
 
+export interface FaultedOwnshipEntryView {
+  readonly id: string;
+  readonly sysid: number;
+  readonly statusLabel: string;
+  readonly staleLabel: string | null;
+  readonly freshness: VehicleFreshnessView | null;
+  readonly poisoned: boolean;
+  readonly chips: readonly HealthChipView[];
+}
+
+/**
+ * Builds deterministic COP Exceptions rows across decoded and poisoned-first
+ * ownship UXS vehicles, applying the same conservative freshness rules as
+ * `summarizeFleetHealth`, `selectBannerPresentation`, and `buildFilmstripItems`.
+ */
+export function buildFaultedOwnshipEntries(
+  entities: Iterable<CopEntityState>,
+  freshnessContext?: FleetFreshnessContext,
+): readonly FaultedOwnshipEntryView[] {
+  const rows: FaultedOwnshipEntryView[] = [];
+  for (const entity of entities) {
+    if (entity.kind === "uxs-vehicle") {
+      const fault = evaluateActiveVehicleFault(entity);
+      if (fault.severity !== null) {
+        const freshView = freshnessContext
+          ? resolveVehicleFreshnessFromContext(entity, freshnessContext)
+          : null;
+        rows.push({
+          id: entity.id,
+          sysid: entity.sysid,
+          statusLabel: entity.authority,
+          staleLabel:
+            freshView && !freshView.fresh ? freshView.statusLabel : null,
+          freshness: freshView,
+          poisoned: entity.poisoned,
+          chips: extractAbnormalHealthChips(
+            buildHealthStrip(entity.healthFlags, entity.sysStatus),
+          ),
+        });
+      }
+    } else if (entity.poisoned) {
+      const parsed = parseVehicleEntityId(entity.id);
+      if (parsed !== null) {
+        const freshView = freshnessContext
+          ? resolvePoisonedVehicleFreshnessFromContext(
+              entity,
+              parsed.sysid,
+              freshnessContext,
+            )
+          : null;
+        rows.push({
+          id: entity.id,
+          sysid: parsed.sysid,
+          statusLabel: "decode-error",
+          staleLabel:
+            freshView && !freshView.fresh ? freshView.statusLabel : null,
+          freshness: freshView,
+          poisoned: true,
+          chips: [],
+        });
+      }
+    }
+  }
+  rows.sort((a, b) => a.sysid - b.sysid || a.id.localeCompare(b.id));
+  return rows;
+}
+
 export interface FilmstripItemView {
   readonly entityId: string;
   readonly shortcutKey: string | null;
@@ -1876,13 +1999,19 @@ export function buildFilmstripItems(
       const stale = freshness !== null && !freshness.fresh;
       const armLabel = vehicle.armed ? "ARMED" : "DISARMED";
       const baseSecondary = `#${vehicle.sysid} · ${authCode} · ${armLabel}`;
+      const staleDetail =
+        stale && freshness.decodeErrorAgeLabel
+          ? `${freshness.ageLabel} · decode error ${freshness.decodeErrorAgeLabel}`
+          : stale
+            ? freshness.ageLabel
+            : null;
       items.push({
         entityId: vehicle.id,
         shortcutKey,
         kind: "uxs-vehicle",
         primaryLabel: vehicle.title ?? `UXS #${vehicle.sysid}`,
-        secondaryLabel: stale
-          ? `${baseSecondary} · LAST KNOWN (${freshness.ageLabel})`
+        secondaryLabel: staleDetail
+          ? `${baseSecondary} · LAST KNOWN (${staleDetail})`
           : baseSecondary,
         safetySeverity:
           activeFault.severity ??
@@ -1892,28 +2021,32 @@ export function buildFilmstripItems(
         ageLabel: stale ? freshness.ageLabel : null,
       });
     } else {
-      const skgConnected =
-        freshnessContext?.skgStatus === undefined ||
-        freshnessContext.skgStatus === "connected";
-      const skgSynced = freshnessContext?.skgSynced ?? true;
-      const linkLost = Boolean(
-        freshnessContext?.getTelemetryLink?.(entry.sysid)?.linkLost,
-      );
-      const stale =
-        freshnessContext !== undefined &&
-        (!skgConnected || !skgSynced || linkLost);
+      const pFresh = freshnessContext
+        ? resolvePoisonedVehicleFreshnessFromContext(
+            entry.poisonedEntity,
+            entry.sysid,
+            freshnessContext,
+          )
+        : null;
+      const stale = pFresh !== null && !pFresh.fresh;
+      const staleDetail =
+        stale && pFresh.decodeErrorAgeLabel
+          ? `${pFresh.ageLabel} · decode error ${pFresh.decodeErrorAgeLabel}`
+          : stale
+            ? pFresh.ageLabel
+            : null;
       items.push({
         entityId: entry.id,
         shortcutKey,
         kind: "uxs-vehicle",
         primaryLabel: entry.poisonedEntity.title ?? `UXS #${entry.sysid}`,
-        secondaryLabel: stale
-          ? `#${entry.sysid} · POISONED · LAST KNOWN`
+        secondaryLabel: staleDetail
+          ? `#${entry.sysid} · POISONED · LAST KNOWN (${staleDetail})`
           : `#${entry.sysid} · POISONED`,
         safetySeverity: "error",
         contactFeedStatus: null,
         stale,
-        ageLabel: null,
+        ageLabel: stale ? pFresh.ageLabel : null,
       });
     }
   }

@@ -1584,6 +1584,99 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       expect(
         hostEl.querySelector('[data-testid="vehicle-freshness-badge"]'),
       ).toBeNull();
+
+      // 8. Poisoned-first ownship vehicle with WS #2 open across 60s silence:
+      // fault remains visible with LAST KNOWN qualifier across topbar summary, banner,
+      // COP Summary & Exceptions, Pilot, and filmstrip, keeping unknown observation age
+      // strictly distinct from elapsed decode-error time.
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "delete",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 7,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "delete",
+          bucket: "ENTITY_STATES",
+          key: boat2.id,
+          revision: 8,
+        }),
+      );
+      const poisonedOnlyId = "boxbotix.local.robotics.uxs.vehicle.3";
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key: poisonedOnlyId,
+          revision: 9,
+          error: "corrupt uxs triple",
+        }),
+      );
+      flushSync();
+
+      vi.advanceTimersByTime(60_000);
+      flushSync();
+
+      const poisonedFaultBadge = hostEl.querySelector(
+        '[data-testid="fleet-fault-badge"]',
+      ) as HTMLButtonElement;
+      expect(poisonedFaultBadge?.getAttribute("data-stale-fault")).toBe("true");
+      expect(poisonedFaultBadge?.textContent?.trim()).toBe(
+        "! 1 FLEET FAULT (UXS #3 · POISONED) · LAST KNOWN",
+      );
+
+      poisonedFaultBadge.click();
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="poisoned-badge"]')?.textContent,
+      ).toContain("POISONED: corrupt uxs triple");
+      expect(
+        hostEl.querySelector('[data-testid="vehicle-freshness-badge"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · age unknown (decode error 1m 0s ago)");
+
+      viewportStore.setWorkspace("cop");
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-summary"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-freshness"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · age unknown (decode error 1m 0s ago)");
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-alerts"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cop-exception-stale"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · age unknown (decode error 1m 0s ago)");
+
+      viewportStore.setWorkspace("pilot");
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="pilot-freshness-chip"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN · age unknown (decode error 1m 0s ago)");
+
+      const poisonedCard = hostEl.querySelector(
+        `[data-testid="filmstrip-item"][data-entity-id="${poisonedOnlyId}"]`,
+      );
+      expect(poisonedCard?.getAttribute("data-stale")).toBe("true");
+      expect(poisonedCard?.textContent).toContain(
+        "#3 · POISONED · LAST KNOWN (age unknown · decode error 1m 0s ago)",
+      );
     } finally {
       unmount(app);
       hostEl.remove();
