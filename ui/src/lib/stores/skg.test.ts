@@ -1690,4 +1690,104 @@ describe("skg.svelte.ts — WS #2 ENTITY_STATES kv-watch store", () => {
 
     store.disconnect();
   });
+
+  // spec: cop-ui / Fleet health readiness, per-vehicle observation freshness, and last-known fault retention
+  it("requires all #0 HEARTBEAT safety predicates to be measured, selects the oldest safety timestamp, and ignores #1 SYS_STATUS timing-only updates", () => {
+    const rig = new MockWebSocketRig();
+    let browserNowMs = Date.parse("2026-11-25T14:00:00.000Z");
+    const store = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: rig.createSocket,
+      now: () => browserNowMs,
+    });
+
+    store.connect();
+    rig.latest.serverOpen();
+
+    const t0Iso = new Date(browserNowMs).toISOString();
+    const base = buildVehicleStoredPayload(
+      1,
+      { "uxs.domain.kind": "quadcopter" },
+      { observedAt: t0Iso, updatedAt: t0Iso },
+    );
+
+    // 1. Only uxs.health.rttus has confidence=1 while safety predicates have confidence=0 -> unmeasured!
+    const timingOnlyMeasured = {
+      ...base,
+      triples: base.triples.map((t) => ({
+        ...t,
+        confidence: t.predicate === "uxs.health.rttus" ? 1 : 0,
+      })),
+    };
+    rig.latest.serverMessage(putFrame(base.id, 1, timingOnlyMeasured));
+    rig.latest.serverMessage(syncedFrame(1));
+
+    const vTimingOnly = store.getCommandableVehicle(base.id)!;
+    expect(vTimingOnly.hasMeasuredSafetyState).toBe(false);
+    expect(vTimingOnly.stateObservedAt).toBeNull();
+    expect(vTimingOnly.stateIngestedAtMs).toBeNull();
+    expect(vTimingOnly.stateIngestedLive).toBe(false);
+
+    // 2. Five of six safety predicates have confidence=1, but uxs.health.flags has confidence=0 -> still unmeasured!
+    browserNowMs += 500;
+    const partialSafety = {
+      ...base,
+      triples: base.triples.map((t) => ({
+        ...t,
+        confidence: t.predicate === "uxs.health.flags" ? 0 : 1,
+      })),
+    };
+    rig.latest.serverMessage(putFrame(base.id, 2, partialSafety));
+    const vPartial = store.getCommandableVehicle(base.id)!;
+    expect(vPartial.hasMeasuredSafetyState).toBe(false);
+    expect(vPartial.stateObservedAt).toBeNull();
+    expect(vPartial.stateIngestedAtMs).toBeNull();
+
+    // 3. All 6 safety predicates measured with skewed timestamps -> stateObservedAt equals the OLDEST safety timestamp.
+    browserNowMs += 500;
+    const tHbReceiptMs = browserNowMs;
+    const olderFlagsIso = "2026-11-25T14:00:00.250Z";
+    const newerAuthIso = "2026-11-25T14:00:01.000Z";
+    const skewedMeasured = {
+      ...base,
+      updated_at: newerAuthIso,
+      triples: base.triples.map((t) => ({
+        ...t,
+        confidence: 1,
+        timestamp:
+          t.predicate === "uxs.health.flags" ? olderFlagsIso : newerAuthIso,
+      })),
+    };
+    rig.latest.serverMessage(putFrame(base.id, 3, skewedMeasured));
+    const vSkewed = store.getCommandableVehicle(base.id)!;
+    expect(vSkewed.hasMeasuredSafetyState).toBe(true);
+    expect(vSkewed.stateObservedAt).toBe(olderFlagsIso);
+    expect(vSkewed.stateIngestedAtMs).toBe(tHbReceiptMs);
+
+    // 4. #1 SYS_STATUS-only update (rttUs/loopDtUs/failsafes) advances timing timestamps without advancing stateObservedAt or stateIngestedAtMs!
+    browserNowMs += 2_000;
+    const sysStatusOnlyIso = new Date(browserNowMs).toISOString();
+    const sysStatusOnly = {
+      ...skewedMeasured,
+      updated_at: sysStatusOnlyIso,
+      triples: skewedMeasured.triples.map((t) =>
+        t.predicate === "uxs.health.rttus" ||
+        t.predicate === "uxs.health.loopdtus" ||
+        t.predicate === "uxs.health.failsafes"
+          ? {
+              ...t,
+              object: t.predicate === "uxs.health.rttus" ? 275 : 1400,
+              timestamp: sysStatusOnlyIso,
+            }
+          : t,
+      ),
+    };
+    rig.latest.serverMessage(putFrame(base.id, 4, sysStatusOnly));
+    const vAfterSysStatus = store.getCommandableVehicle(base.id)!;
+    expect(vAfterSysStatus.sysStatus.rttUs).toBe(275);
+    expect(vAfterSysStatus.stateObservedAt).toBe(olderFlagsIso);
+    expect(vAfterSysStatus.stateIngestedAtMs).toBe(tHbReceiptMs);
+
+    store.disconnect();
+  });
 });

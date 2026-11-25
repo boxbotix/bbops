@@ -524,6 +524,7 @@ export function evaluateVehicleFreshness(
     | "linkTier"
     | "feedStatus"
     | "observedAt"
+    | "hasMeasuredSafetyState"
     | "stateObservedAt"
     | "stateIngestedAtMs"
     | "stateIngestedLive"
@@ -540,8 +541,10 @@ export function evaluateVehicleFreshness(
   const skgSynced = options.skgSynced ?? true;
   const fleetDataLive = skgConnected && skgSynced;
 
-  const rawObs =
-    vehicle.stateObservedAt !== undefined
+  const safetyMeasured = vehicle.hasMeasuredSafetyState !== false;
+  const rawObs = !safetyMeasured
+    ? null
+    : vehicle.stateObservedAt !== undefined
       ? vehicle.stateObservedAt
       : (vehicle.observedAt ?? null);
   const skgObsMs = parseIsoEpochMs(rawObs);
@@ -653,20 +656,22 @@ export function evaluateVehicleFreshness(
     };
   }
 
+  const skgObsWindowOk =
+    skgObsMs !== null &&
+    skgObsMs > 0 &&
+    nowMs - skgObsMs >= -thresholdMs &&
+    nowMs - skgObsMs <= thresholdMs;
   const skgReceiptWindowOk =
     skgReceiptMs !== null &&
     isFiniteNumber(skgReceiptMs) &&
     nowMs - skgReceiptMs >= -thresholdMs &&
     nowMs - skgReceiptMs <= thresholdMs;
   const skgStateFresh =
+    safetyMeasured &&
     vehicle.stateReplayedUnchanged !== true &&
     (skgIngestedLive
       ? skgReceiptWindowOk
-      : skgObsMs !== null &&
-        skgObsMs > 0 &&
-        nowMs - skgObsMs >= -thresholdMs &&
-        nowMs - skgObsMs <= thresholdMs &&
-        (skgReceiptMs === null || skgReceiptWindowOk));
+      : skgObsWindowOk && (skgReceiptMs === null || skgReceiptWindowOk));
 
   const fresh = skgStateFresh;
   return {

@@ -127,6 +127,7 @@ export interface VehicleEntityState extends CopEntityBase {
   globalPosObservedAt?: string | null;
   poseIngestedAtMs?: number | null;
   poseIngestedLive?: boolean;
+  hasMeasuredSafetyState?: boolean;
   stateObservedAt?: string | null;
   stateIngestedAtMs?: number | null;
   stateIngestedLive?: boolean;
@@ -544,17 +545,13 @@ export function parseCopEntityState(
         "geo.location.longitude",
         "geo.location.altitude",
       ] as const;
-      const healthStatePredicates = [
+      const requiredSafetyPredicates = [
+        "uxs.domain.kind",
         "uxs.authority.state",
         "uxs.mode.companion",
         "uxs.link.tier",
         "uxs.health.armed",
         "uxs.health.flags",
-        "uxs.health.failsafes",
-        "uxs.health.crcerrors",
-        "uxs.health.loopdtus",
-        "uxs.health.maxloopdtus",
-        "uxs.health.rttus",
       ] as const;
       const isMeasuredAssertion = (
         triple: SkgTriple | undefined,
@@ -563,14 +560,21 @@ export function parseCopEntityState(
         triple.confidence > 0 &&
         normalizeKnownTimestamp(triple.timestamp) !== null;
 
-      let latestMeasuredHealthTriple: SkgTriple | undefined;
-      for (const pred of healthStatePredicates) {
+      let hasMeasuredSafetyState = true;
+      let oldestMeasuredSafetyTriple: SkgTriple | undefined;
+      for (const pred of requiredSafetyPredicates) {
         const candidate = byPredicate[pred];
-        if (isMeasuredAssertion(candidate)) {
-          latestMeasuredHealthTriple = selectWinningTriple(
-            latestMeasuredHealthTriple,
-            candidate,
-          );
+        if (!isMeasuredAssertion(candidate)) {
+          hasMeasuredSafetyState = false;
+          oldestMeasuredSafetyTriple = undefined;
+          break;
+        }
+        if (
+          oldestMeasuredSafetyTriple === undefined ||
+          parseTripleInstantNs(candidate.timestamp) <
+            parseTripleInstantNs(oldestMeasuredSafetyTriple.timestamp)
+        ) {
+          oldestMeasuredSafetyTriple = candidate;
         }
       }
 
@@ -657,18 +661,9 @@ export function parseCopEntityState(
       const globalPosObservedAt = hasGlobalPos
         ? normalizeKnownTimestamp(latestGlobalPosTriple?.timestamp)
         : null;
-      const explicitObsTriple =
-        byPredicate["cop.time.observed"] ??
-        byPredicate["cop.contact.observed-at"] ??
-        byPredicate["cop.contact.observed_at"];
-      const rawExplicitObs = isMeasuredAssertion(explicitObsTriple)
-        ? normalizeNonEmptyString(explicitObsTriple.object)
+      const stateObservedAt = hasMeasuredSafetyState
+        ? (oldestMeasuredSafetyTriple?.timestamp.trim() ?? null)
         : null;
-      const stateObservedAt =
-        rawExplicitObs !== null &&
-        normalizeKnownTimestamp(rawExplicitObs) !== null
-          ? rawExplicitObs
-          : (latestMeasuredHealthTriple?.timestamp.trim() ?? null);
       const vehicleObservedAt =
         base.observedAt ??
         normalizeKnownTimestamp(
@@ -680,6 +675,7 @@ export function parseCopEntityState(
         ...base,
         source: vehicleSource,
         observedAt: vehicleObservedAt,
+        hasMeasuredSafetyState,
         stateObservedAt,
         poseObservedAt,
         localPosObservedAt,
@@ -937,7 +933,6 @@ function didVehicleStateAdvance(
     next.companionMode !== prior.companionMode ||
     next.linkTier !== prior.linkTier ||
     next.armed !== prior.armed ||
-    next.hasSysStatus !== prior.hasSysStatus ||
     next.healthFlags.clock_sync_locked !==
       prior.healthFlags.clock_sync_locked ||
     next.healthFlags.teleop_deadman_clamped !==
@@ -945,12 +940,7 @@ function didVehicleStateAdvance(
     next.healthFlags.crsf_link_healthy !==
       prior.healthFlags.crsf_link_healthy ||
     next.healthFlags.companion_trunk_healthy !==
-      prior.healthFlags.companion_trunk_healthy ||
-    next.sysStatus.failsafes !== prior.sysStatus.failsafes ||
-    next.sysStatus.crcErrors !== prior.sysStatus.crcErrors ||
-    next.sysStatus.loopDtUs !== prior.sysStatus.loopDtUs ||
-    next.sysStatus.maxLoopDtUs !== prior.sysStatus.maxLoopDtUs ||
-    next.sysStatus.rttUs !== prior.sysStatus.rttUs
+      prior.healthFlags.companion_trunk_healthy
   );
 }
 
