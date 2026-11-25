@@ -1356,6 +1356,349 @@ func TestRuntimeMAVLinkThreeLaneUDPIngest(t *testing.T) {
 	}
 }
 
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+// spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
+// spec: host-runtime / ADR-115 GraphQL front door and dual output/websocket streaming planes
+func TestRuntimeMAVLinkLinkLossSilenceAndRestoration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	flowCfg, err := config.NewLoader().LoadFromBytes(configs.DefaultFlowJSON)
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+	ingestCompCfg := flowCfg.Components[host.MAVLinkIngestComponent]
+	var rawIngest map[string]any
+	if uErr := json.Unmarshal(ingestCompCfg.Config, &rawIngest); uErr != nil {
+		t.Fatalf("Unmarshal mavlink-ingest config: %v", uErr)
+	}
+	rawIngest["skg_hz"] = 5
+	rawIngest["link_timeout_ms"] = 800
+	rawIngest["supervisory_timeout_ms"] = 1800
+	patchedIngest, err := json.Marshal(rawIngest)
+	if err != nil {
+		t.Fatalf("Marshal patched mavlink-ingest config: %v", err)
+	}
+	ingestCompCfg.Config = patchedIngest
+	flowCfg.Components[host.MAVLinkIngestComponent] = ingestCompCfg
+
+	rawFlow, err := json.Marshal(flowCfg)
+	if err != nil {
+		t.Fatalf("Marshal patched flow: %v", err)
+	}
+	flowPath := filepath.Join(t.TempDir(), "flow-link-loss.json")
+	if wErr := os.WriteFile(flowPath, rawFlow, 0o600); wErr != nil {
+		t.Fatalf("WriteFile(%q): %v", flowPath, wErr)
+	}
+
+	rt, err := host.StartEphemeral(ctx, host.Options{
+		ConfigPath: flowPath,
+		DataDir:    t.TempDir(),
+		UIDir:      t.TempDir(),
+		Version:    "v0.1.0-link-loss-test",
+	}, 3)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		if stopErr := rt.Stop(stopCtx); stopErr != nil {
+			t.Errorf("Stop: %v", stopErr)
+		}
+	})
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer readyCancel()
+	if err := rt.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	endpoints := rt.Endpoints()
+	serverUDPAddr, err := net.ResolveUDPAddr("udp", endpoints.MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr(%q): %v", endpoints.MAVLinkUDPAddr, err)
+	}
+	telWS := dialWebSocketWithRetry(ctx, t, endpoints.TelemetryWS)
+	defer func() { _ = telWS.Close() }()
+
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+
+	sendFrame := func(sysid, seq uint8, msg mavcodec.Message) {
+		t.Helper()
+		raw, encErr := mavcodec.EncodeFrame(mavcodec.Frame{
+			Sequence:    seq,
+			SystemID:    sysid,
+			ComponentID: 1,
+			Message:     msg,
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeFrame: %v", encErr)
+		}
+		if _, wErr := udpClient.WriteToUDP(raw, serverUDPAddr); wErr != nil {
+			t.Fatalf("WriteToUDP: %v", wErr)
+		}
+	}
+
+	// Admit sysid=1 (sitl-local, 800ms timeout, DirectCRSFOverride + Failsafes=2) and
+	// sysid=2 (mesh-supervisory, 1800ms timeout, CompanionAutonomous).
+	hb1, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainQuadcopter,
+			ControlAuthority: mavcodec.AuthorityDirectCRSFOverride,
+			CompanionMode:    mavcodec.ModeHoldPosition,
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+			HealthFlags:      uxsvocab.HealthFlags{TeleopDeadmanClamped: true, CRSFLinkHealthy: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat(1): %v", err)
+	}
+	hb2, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed: true,
+		Custom: mavcodec.CustomMode{
+			Domain:           mavcodec.DomainRover,
+			ControlAuthority: mavcodec.AuthorityCompanionAutonomous,
+			CompanionMode:    mavcodec.ModeAutonomousVelocity,
+			LinkTier:         mavcodec.LinkTierMeshSupervisory,
+			HealthFlags:      uxsvocab.HealthFlags{ClockSyncLocked: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat(2): %v", err)
+	}
+	sendFrame(1, 1, hb1)
+	sendFrame(1, 2, mavcodec.SysStatus{Load: 950, ErrorsCount1: 2})
+	sendFrame(2, 1, hb2)
+
+	platform := rt.Platform()
+	vehicle1ID, _ := uxsvocab.VehicleEntityID(platform.Org, platform.Platform, 1)
+	vehicle2ID, _ := uxsvocab.VehicleEntityID(platform.Org, platform.Platform, 2)
+	entityBucket, err := rt.NATSClient().GetKeyValueBucket(ctx, graph.BucketEntityStates)
+	if err != nil {
+		t.Fatalf("lookup ENTITY_STATES: %v", err)
+	}
+	gqlURL := endpoints.HTTPBaseURL + "/graph-gateway/graphql"
+
+	queryEntityPredicates := func(id string) (map[string]any, uint64, bool) {
+		reqBody, _ := json.Marshal(map[string]any{
+			"query":     `query($id: String!) { entity(id: $id) { kvRevision entity { triples { predicate object } } } }`,
+			"variables": map[string]any{"id": id},
+		})
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, gqlURL, bytes.NewReader(reqBody))
+		if reqErr != nil {
+			return nil, 0, false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			return nil, 0, false
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, 0, false
+		}
+		var decoded struct {
+			Data struct {
+				Entity *struct {
+					KVRevision uint64 `json:"kvRevision"`
+					Entity     struct {
+						Triples []struct {
+							Predicate string `json:"predicate"`
+							Object    any    `json:"object"`
+						} `json:"triples"`
+					} `json:"entity"`
+				} `json:"entity"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(raw, &decoded) != nil || decoded.Data.Entity == nil {
+			return nil, 0, false
+		}
+		byPred := make(map[string]any, len(decoded.Data.Entity.Entity.Triples))
+		for _, tr := range decoded.Data.Entity.Entity.Triples {
+			byPred[tr.Predicate] = tr.Object
+		}
+		return byPred, decoded.Data.Entity.KVRevision, true
+	}
+
+	waitForCondition(t, 5*time.Second, "initial SKG materialization for vehicle.1 (Failsafes=2) and vehicle.2", func() bool {
+		preds1, _, ok1 := queryEntityPredicates(vehicle1ID)
+		preds2, _, ok2 := queryEntityPredicates(vehicle2ID)
+		return ok1 && ok2 &&
+			preds1[uxsvocab.PredicateAuthorityState] == uxsvocab.AuthorityDirectCRSFOverride &&
+			preds1[uxsvocab.PredicateHealthFailsafes] == float64(2) &&
+			preds2[uxsvocab.PredicateLinkTier] == uxsvocab.LinkTierMeshSupervisory
+	})
+
+	entry1Initial, err := entityBucket.Get(ctx, vehicle1ID)
+	if err != nil {
+		t.Fatalf("ENTITY_STATES.Get(%q) initial: %v", vehicle1ID, err)
+	}
+	entry2Initial, err := entityBucket.Get(ctx, vehicle2ID)
+	if err != nil {
+		t.Fatalf("ENTITY_STATES.Get(%q) initial: %v", vehicle2ID, err)
+	}
+	rev1Initial := entry1Initial.Revision()
+	maxInitialRev := max(rev1Initial, entry2Initial.Revision())
+
+	// Phase 1 — LinkTier-scaled silence ordering & silent SKG non-re-upsert:
+	// - sysid=1 (`sitl-local`, 800ms) MUST emit `link_lost` first while sysid=2 (`mesh-supervisory`, 1800ms) stays alive.
+	// - sysid=2 MUST emit `link_lost` after ~1800ms with zero duplicate `link_lost` for sysid=1.
+	var lostOrder []mavlink.TransitionEvent
+	for len(lostOrder) < 2 {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+			t.Fatalf("unmarshal link_lost TransitionEvent: %v", uErr)
+		}
+		if ev.Kind != mavlink.EventKindLinkLost {
+			t.Fatalf("unexpected Lane 3 event during initial silence = %+v, want link_lost", ev)
+		}
+		lostOrder = append(lostOrder, ev)
+	}
+	if lostOrder[0].SysID != 1 || lostOrder[0].Seq != 2 ||
+		lostOrder[0].Authority != uxsvocab.AuthorityDirectCRSFOverride || lostOrder[0].Failsafes != 2 {
+		t.Fatalf("first link_lost = %+v, want sysid=1 seq=2 preserving DirectCRSFOverride and Failsafes=2", lostOrder[0])
+	}
+	if lostOrder[1].SysID != 2 || lostOrder[1].Seq != 1 || lostOrder[1].LinkTier != uxsvocab.LinkTierMeshSupervisory {
+		t.Fatalf("second link_lost = %+v, want sysid=2 seq=1 mesh-supervisory", lostOrder[1])
+	}
+
+	// Across ~1800ms of 5 Hz periodic ticks while silent, vehicle.1 MUST NOT have been redundantly
+	// re-upserted into ENTITY_STATES, while retaining all 23 predicates in GraphQL.
+	entry1DuringSilence, err := entityBucket.Get(ctx, vehicle1ID)
+	if err != nil {
+		t.Fatalf("ENTITY_STATES.Get(%q) during silence: %v", vehicle1ID, err)
+	}
+	if entry1DuringSilence.Revision() != rev1Initial {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision advanced while silent (%d -> %d), want %d",
+			rev1Initial, entry1DuringSilence.Revision(), rev1Initial)
+	}
+	predsSilent, _, okSilent := queryEntityPredicates(vehicle1ID)
+	if !okSilent || len(predsSilent) != 23 ||
+		predsSilent[uxsvocab.PredicateAuthorityState] != uxsvocab.AuthorityDirectCRSFOverride ||
+		predsSilent[uxsvocab.PredicateHealthFailsafes] != float64(2) {
+		t.Fatalf("retained GraphQL predicates during silence = (%+v, ok=%v), want 23 predicates with DirectCRSFOverride & Failsafes=2",
+			predsSilent, okSilent)
+	}
+
+	// Phase 2 — Restoring #253 STATUSTEXT followed immediately by steady-state #253 STATUSTEXT:
+	// Sent back-to-back before waiting on WebSocket or KV so slow KV reads can never race the silence timer.
+	// WS #1 MUST deliver [link_restored(seq=3), statustext(seq=3), statustext(seq=4)], and ENTITY_STATES
+	// MUST advance by exactly 1 bucket revision (`maxInitialRev + 1`) for the pair.
+	sendFrame(1, 3, mavcodec.StatusText{Severity: 5, Text: "RESTORE VIA STATUSTEXT"})
+	sendFrame(1, 4, mavcodec.StatusText{Severity: 6, Text: "BENCH READY"})
+
+	var pairEvents []mavlink.TransitionEvent
+	for len(pairEvents) < 3 {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+			t.Fatalf("unmarshal STATUSTEXT pair TransitionEvent: %v", uErr)
+		}
+		pairEvents = append(pairEvents, ev)
+	}
+	if pairEvents[0].SysID != 1 || pairEvents[0].Kind != mavlink.EventKindLinkRestored || pairEvents[0].Seq != 3 ||
+		pairEvents[1].SysID != 1 || pairEvents[1].Kind != mavlink.EventKindStatusText || pairEvents[1].Seq != 3 ||
+		pairEvents[1].StatusText == nil || pairEvents[1].StatusText.Text != "RESTORE VIA STATUSTEXT" ||
+		pairEvents[2].SysID != 1 || pairEvents[2].Kind != mavlink.EventKindStatusText || pairEvents[2].Seq != 4 ||
+		pairEvents[2].StatusText == nil || pairEvents[2].StatusText.Text != "BENCH READY" {
+		t.Fatalf("STATUSTEXT [restore, steady] pair events = %+v, want [link_restored(3), statustext(3), statustext(4)]", pairEvents)
+	}
+
+	var rev1AfterPair uint64
+	waitForCondition(t, 5*time.Second, "vehicle.1 ENTITY_STATES single urgent flush on STATUSTEXT pair", func() bool {
+		entry1, err1 := entityBucket.Get(ctx, vehicle1ID)
+		if err1 != nil || entry1.Revision() <= maxInitialRev {
+			return false
+		}
+		rev1AfterPair = entry1.Revision()
+		return true
+	})
+	if rev1AfterPair != maxInitialRev+1 {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision after [restoring, steady] STATUSTEXT pair = %d, want %d (single upsert)",
+			rev1AfterPair, maxInitialRev+1)
+	}
+
+	// Phase 3 — Await sysid=1's next silence timeout (seq=4), confirm neither steady-state STATUSTEXT
+	// nor subsequent periodic ticks wrote a second upsert, then verify #32 LOCAL_POSITION_NED restoration order.
+	for {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" || !strings.HasPrefix(wsFrame.Subject, "bbops.telemetry.events.") {
+			continue
+		}
+		var ev mavlink.TransitionEvent
+		if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+			t.Fatalf("unmarshal post-pair silence TransitionEvent: %v", uErr)
+		}
+		if ev.SysID != 1 || ev.Kind != mavlink.EventKindLinkLost || ev.Seq != 4 {
+			t.Fatalf("post-pair silence event = %+v, want sysid=1 link_lost seq=4 (with zero duplicate sysid=2 link_lost)", ev)
+		}
+		break
+	}
+	entry1SecondSilence, err := entityBucket.Get(ctx, vehicle1ID)
+	if err != nil {
+		t.Fatalf("ENTITY_STATES.Get(%q) post-pair silence: %v", vehicle1ID, err)
+	}
+	if entry1SecondSilence.Revision() != rev1AfterPair {
+		t.Fatalf("vehicle.1 ENTITY_STATES revision advanced after steady STATUSTEXT / second silence (%d -> %d), want %d",
+			rev1AfterPair, entry1SecondSilence.Revision(), rev1AfterPair)
+	}
+
+	// Phase 4 — Resume UDP traffic on sysid=1 with #32 LOCAL_POSITION_NED:
+	// 1. WS #1 MUST deliver `link_restored` (`bbops.telemetry.events.1`) BEFORE the resuming TelemetryFrame (`bbops.telemetry.1`).
+	// 2. Urgent SKG sync on `link_restored` MUST immediately advance vehicle.1 in ENTITY_STATES.
+	sendFrame(1, 5, mavcodec.LocalPositionNED{X: 33, Y: -4, Z: -12})
+
+	var resumeSubjects []string
+	for len(resumeSubjects) < 2 {
+		wsFrame := readWSFrame(t, telWS, 5*time.Second)
+		if wsFrame.Type != "data" {
+			continue
+		}
+		switch wsFrame.Subject {
+		case "bbops.telemetry.events.1":
+			var ev mavlink.TransitionEvent
+			if uErr := json.Unmarshal(wsFrame.Payload, &ev); uErr != nil {
+				t.Fatalf("unmarshal link_restored: %v", uErr)
+			}
+			if ev.Kind != mavlink.EventKindLinkRestored || ev.Seq != 5 {
+				t.Fatalf("event on resume = %+v, want link_restored seq=5", ev)
+			}
+			resumeSubjects = append(resumeSubjects, wsFrame.Subject)
+		case "bbops.telemetry.1":
+			var tf mavlink.TelemetryFrame
+			if uErr := json.Unmarshal(wsFrame.Payload, &tf); uErr != nil {
+				t.Fatalf("unmarshal TelemetryFrame on resume: %v", uErr)
+			}
+			if !tf.HasLocalPos || tf.NEDXYZ[0] != 33 {
+				t.Fatalf("resuming TelemetryFrame = %+v, want NEDXYZ[0]=33", tf)
+			}
+			resumeSubjects = append(resumeSubjects, wsFrame.Subject)
+		}
+	}
+	if !slices.Equal(resumeSubjects, []string{"bbops.telemetry.events.1", "bbops.telemetry.1"}) {
+		t.Fatalf("WS #1 resume ordering = %v, want [bbops.telemetry.events.1, bbops.telemetry.1]", resumeSubjects)
+	}
+
+	waitForCondition(t, 5*time.Second, "vehicle.1 ENTITY_STATES revision advances on link_restored", func() bool {
+		entry, getErr := entityBucket.Get(ctx, vehicle1ID)
+		return getErr == nil && entry.Revision() > rev1AfterPair
+	})
+}
+
 // spec: host-runtime / Embedded NATS JetStream and SemEngine SKG pipeline lifecycle
 // spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
 func TestRuntimeUpgradeFromM02PersistedFlowPreservesOperatorSettings(t *testing.T) {

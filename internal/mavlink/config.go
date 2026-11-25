@@ -31,6 +31,17 @@ const (
 	// MaxSKGHz is the maximum supported Lane 2 SKG snapshot rate (5 Hz).
 	MaxSKGHz = 5.0
 
+	// DefaultLinkTimeoutMs is the default per-sysid silence timeout (3000 ms = 3x 1 Hz HEARTBEAT)
+	// for sitl-local, direct-bench, and mesh-high-rate links.
+	DefaultLinkTimeoutMs = 3000
+	// DefaultSupervisoryTimeoutMs is the default per-sysid silence timeout (10000 ms = 2x 0.2 Hz LoRa)
+	// for mesh-supervisory links.
+	DefaultSupervisoryTimeoutMs = 10000
+	// MinLinkTimeoutMs is the minimum configurable per-sysid silence timeout (200 ms = 1 / MaxSKGHz).
+	MinLinkTimeoutMs = 200
+	// MaxLinkTimeoutMs is the maximum configurable per-sysid silence timeout (5 minutes).
+	MaxLinkTimeoutMs = 300_000
+
 	// DefaultTelemetrySubject is the core NATS output wildcard covering Lane 1 and Lane 3.
 	DefaultTelemetrySubject = "bbops.telemetry.>"
 	// DefaultTelemetryPrefix is the concrete subject prefix derived from DefaultTelemetrySubject.
@@ -44,27 +55,33 @@ const (
 
 // Config describes the JSON configuration accepted by the "mavlink-udp" SemEngine input factory.
 type Config struct {
-	SKGHz float64              `json:"skg_hz,omitempty" schema:"type:float,description:Coalesced SKG snapshot publish rate in Hz (1..5),default:1,min:1,max:5"`
-	Ports component.PortConfig `json:"ports" schema:"type:ports,description:External MAVLink UDP input and NATS/JetStream outputs"`
+	SKGHz                float64              `json:"skg_hz,omitempty" schema:"type:float,description:Coalesced SKG snapshot publish rate in Hz (1..5),default:1,min:1,max:5"`
+	LinkTimeoutMs        int                  `json:"link_timeout_ms,omitempty" schema:"type:int,description:Per-sysid silence timeout in ms for bench and high-rate links (200..300000),default:3000,min:200,max:300000"`
+	SupervisoryTimeoutMs int                  `json:"supervisory_timeout_ms,omitempty" schema:"type:int,description:Per-sysid silence timeout in ms for mesh-supervisory links (>= link_timeout_ms),default:10000,min:200,max:300000"`
+	Ports                component.PortConfig `json:"ports" schema:"type:ports,description:External MAVLink UDP input and NATS/JetStream outputs"`
 }
 
 var configSchema = component.GenerateConfigSchema(reflect.TypeOf(Config{}))
 
 type resolvedSettings struct {
-	udpHost         string
-	udpPort         int
-	skgHz           float64
-	skgInterval     time.Duration
-	telemetryPrefix string
-	entitySubject   string
-	inputPort       component.Port
-	outputPorts     []component.Port
+	udpHost            string
+	udpPort            int
+	skgHz              float64
+	skgInterval        time.Duration
+	linkTimeout        time.Duration
+	supervisoryTimeout time.Duration
+	telemetryPrefix    string
+	entitySubject      string
+	inputPort          component.Port
+	outputPorts        []component.Port
 }
 
 func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 	var wire struct {
-		SKGHz *float64              `json:"skg_hz"`
-		Ports *component.PortConfig `json:"ports"`
+		SKGHz                *float64              `json:"skg_hz"`
+		LinkTimeoutMs        *int                  `json:"link_timeout_ms"`
+		SupervisoryTimeoutMs *int                  `json:"supervisory_timeout_ms"`
+		Ports                *component.PortConfig `json:"ports"`
 	}
 	trimmed := bytes.TrimSpace(rawConfig)
 	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
@@ -81,6 +98,25 @@ func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 	}
 	if math.IsNaN(skgHz) || math.IsInf(skgHz, 0) || skgHz < MinSKGHz || skgHz > MaxSKGHz {
 		return resolvedSettings{}, fmt.Errorf("mavlink: skg_hz %v out of range [%v, %v]", skgHz, MinSKGHz, MaxSKGHz)
+	}
+
+	linkTimeoutMs := DefaultLinkTimeoutMs
+	if wire.LinkTimeoutMs != nil {
+		linkTimeoutMs = *wire.LinkTimeoutMs
+	}
+	if linkTimeoutMs < MinLinkTimeoutMs || linkTimeoutMs > MaxLinkTimeoutMs {
+		return resolvedSettings{}, fmt.Errorf("mavlink: link_timeout_ms %d out of range [%d, %d]", linkTimeoutMs, MinLinkTimeoutMs, MaxLinkTimeoutMs)
+	}
+
+	supervisoryTimeoutMs := max(DefaultSupervisoryTimeoutMs, linkTimeoutMs)
+	if wire.SupervisoryTimeoutMs != nil {
+		supervisoryTimeoutMs = *wire.SupervisoryTimeoutMs
+	}
+	if supervisoryTimeoutMs < MinLinkTimeoutMs || supervisoryTimeoutMs > MaxLinkTimeoutMs {
+		return resolvedSettings{}, fmt.Errorf("mavlink: supervisory_timeout_ms %d out of range [%d, %d]", supervisoryTimeoutMs, MinLinkTimeoutMs, MaxLinkTimeoutMs)
+	}
+	if supervisoryTimeoutMs < linkTimeoutMs {
+		return resolvedSettings{}, fmt.Errorf("mavlink: supervisory_timeout_ms (%d) must be >= link_timeout_ms (%d)", supervisoryTimeoutMs, linkTimeoutMs)
 	}
 
 	var portCfg component.PortConfig
@@ -177,14 +213,16 @@ func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 
 	intervalNs := math.Round(float64(time.Second) / skgHz)
 	return resolvedSettings{
-		udpHost:         netCfg.Host,
-		udpPort:         netCfg.Port,
-		skgHz:           skgHz,
-		skgInterval:     time.Duration(intervalNs),
-		telemetryPrefix: telemetryPrefix,
-		entitySubject:   entitySubject,
-		inputPort:       inPort,
-		outputPorts:     outputs,
+		udpHost:            netCfg.Host,
+		udpPort:            netCfg.Port,
+		skgHz:              skgHz,
+		skgInterval:        time.Duration(intervalNs),
+		linkTimeout:        time.Duration(linkTimeoutMs) * time.Millisecond,
+		supervisoryTimeout: time.Duration(supervisoryTimeoutMs) * time.Millisecond,
+		telemetryPrefix:    telemetryPrefix,
+		entitySubject:      entitySubject,
+		inputPort:          inPort,
+		outputPorts:        outputs,
 	}, nil
 }
 

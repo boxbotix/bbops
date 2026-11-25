@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,9 +89,28 @@ func TestConfigAndComponentLifecycle(t *testing.T) {
 			if s.skgHz != 1.0 || s.skgInterval != time.Second {
 				t.Fatalf("default skg = (%v, %v), want (1.0, 1s)", s.skgHz, s.skgInterval)
 			}
+			if s.linkTimeout != 3*time.Second || s.supervisoryTimeout != 10*time.Second {
+				t.Fatalf("default timeouts = (%v, %v), want (3s, 10s)", s.linkTimeout, s.supervisoryTimeout)
+			}
 			if s.telemetryPrefix != DefaultTelemetryPrefix || s.entitySubject != DefaultEntitySubject {
 				t.Fatalf("default subjects = (%q, %q)", s.telemetryPrefix, s.entitySubject)
 			}
+		}
+
+		sCustomTimeouts, err := resolveConfig(json.RawMessage(`{"link_timeout_ms":400,"supervisory_timeout_ms":1200}`))
+		if err != nil {
+			t.Fatalf("resolveConfig custom timeouts: %v", err)
+		}
+		if sCustomTimeouts.linkTimeout != 400*time.Millisecond || sCustomTimeouts.supervisoryTimeout != 1200*time.Millisecond {
+			t.Fatalf("custom timeouts = (%v, %v), want (400ms, 1200ms)", sCustomTimeouts.linkTimeout, sCustomTimeouts.supervisoryTimeout)
+		}
+
+		sAutoRaisedSup, err := resolveConfig(json.RawMessage(`{"link_timeout_ms":15000}`))
+		if err != nil {
+			t.Fatalf("resolveConfig raised link_timeout_ms: %v", err)
+		}
+		if sAutoRaisedSup.linkTimeout != 15*time.Second || sAutoRaisedSup.supervisoryTimeout != 15*time.Second {
+			t.Fatalf("auto-raised supervisory timeout = (%v, %v), want (15s, 15s)", sAutoRaisedSup.linkTimeout, sAutoRaisedSup.supervisoryTimeout)
 		}
 
 		for _, validHz := range []struct {
@@ -134,6 +154,12 @@ func TestConfigAndComponentLifecycle(t *testing.T) {
 			`{"skg_hz": 0.99}`,
 			`{"skg_hz": 5.01}`,
 			`{"skg_hz": -1}`,
+			`{"link_timeout_ms": 0}`,
+			`{"link_timeout_ms": 199}`,
+			`{"link_timeout_ms": 300001}`,
+			`{"supervisory_timeout_ms": 199}`,
+			`{"supervisory_timeout_ms": 300001}`,
+			`{"link_timeout_ms": 4000, "supervisory_timeout_ms": 3999}`,
 			`{"ports":{"inputs":[{"name":"a","config":{"kind":"network","protocol":"udp","port":14550}},{"name":"b","config":{"kind":"network","protocol":"udp","port":14551}}]}}`,
 			`{"ports":{"inputs":[{"name":"mavlink_udp","config":{"kind":"network","protocol":"tcp","port":14550}}]}}`,
 			`{"ports":{"inputs":[{"name":"mavlink_udp","config":{"kind":"network","protocol":"udp","port":1023}}]}}`,
@@ -155,6 +181,13 @@ func TestConfigAndComponentLifecycle(t *testing.T) {
 			if _, err := declarePorts(json.RawMessage(bad), DefaultInstanceName); err == nil {
 				t.Fatalf("expected declarePorts error for %s", bad)
 			}
+		}
+
+		if _, err := NewTrackerWithTimeouts("boxbotix", "bbops", 0, time.Second); err == nil {
+			t.Fatal("expected NewTrackerWithTimeouts error for non-positive linkTimeout")
+		}
+		if _, err := NewTrackerWithTimeouts("boxbotix", "bbops", 4*time.Second, 3*time.Second); err == nil {
+			t.Fatal("expected NewTrackerWithTimeouts error when supervisoryTimeout < linkTimeout")
 		}
 	})
 
@@ -436,7 +469,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	}
 	for _, msg := range prePackets {
 		out := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 1, msg), peerA, t0)
-		if out.Accepted || out.CountedError || out.Telemetry != nil || out.Event != nil || out.UrgentSKGSync {
+		if out.Accepted || out.CountedError || out.Telemetry != nil || len(out.Events) != 0 || out.UrgentSKGSync {
 			t.Fatalf("pre-admission %T unexpected outcome: %+v", msg, out)
 		}
 	}
@@ -497,7 +530,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	// 3. First valid 0xB1 HEARTBEAT admits sysid=2 without a spurious edge event.
 	admitOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 3, validRoverHB), peerA, t0)
-	if !admitOut.Accepted || admitOut.CountedError || admitOut.Event != nil || admitOut.UrgentSKGSync || admitOut.Telemetry != nil {
+	if !admitOut.Accepted || admitOut.CountedError || len(admitOut.Events) != 0 || admitOut.UrgentSKGSync || admitOut.Telemetry != nil {
 		t.Fatalf("admission HEARTBEAT outcome = %+v", admitOut)
 	}
 	if gotPeer, ok := tracker.PeerAddr(2); !ok || gotPeer != peerA {
@@ -506,7 +539,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	// Identical HEARTBEAT from rotated peerB updates PeerAddr without emitting an edge event.
 	steadyOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 4, validRoverHB), peerB, t0.Add(time.Second))
-	if !steadyOut.Accepted || steadyOut.Event != nil || steadyOut.UrgentSKGSync {
+	if !steadyOut.Accepted || len(steadyOut.Events) != 0 || steadyOut.UrgentSKGSync {
 		t.Fatalf("steady HEARTBEAT outcome = %+v", steadyOut)
 	}
 	if gotPeer, ok := tracker.PeerAddr(2); !ok || gotPeer != peerB {
@@ -672,7 +705,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	evilPeer := netip.MustParseAddrPort("127.0.0.1:59999")
 	for i, badMsg := range badPayloads {
 		out := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, uint8(20+i), badMsg), evilPeer, t0.Add(7*time.Second))
-		if out.Accepted || !out.CountedError || out.Telemetry != nil || out.Event != nil || out.UrgentSKGSync {
+		if out.Accepted || !out.CountedError || out.Telemetry != nil || len(out.Events) != 0 || out.UrgentSKGSync {
 			t.Fatalf("bad payload %d (%T) outcome = %+v, want rejected", i, badMsg, out)
 		}
 	}
@@ -684,7 +717,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		t.Fatalf("rejected packet overwrote PeerAddr: got %v, want %v", gotPeer, peerB)
 	}
 
-	// 6. Lane 3 edge transitions: HEARTBEAT preemption, #1 SYS_STATUS failsafe increment, #253 STATUSTEXT.
+	// 6. Lane 3 edge transitions: HEARTBEAT preemption, #1 SYS_STATUS failsafe increment, and event-only #253 STATUSTEXT.
 	preemptHB := makeVehicleHB(
 		mavcodec.DomainRover,
 		true,
@@ -694,16 +727,16 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		uxsvocab.HealthFlags{TeleopDeadmanClamped: true},
 	)
 	hbEdge := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 40, preemptHB), peerB, t0.Add(8*time.Second))
-	if !hbEdge.Accepted || !hbEdge.UrgentSKGSync || hbEdge.Event == nil {
+	if !hbEdge.Accepted || !hbEdge.UrgentSKGSync || len(hbEdge.Events) != 1 {
 		t.Fatalf("HEARTBEAT preemption outcome = %+v", hbEdge)
 	}
-	if hbEdge.Event.Kind != EventKindHeartbeatEdge || hbEdge.Event.PrevAuthority != uxsvocab.AuthorityMCUFailsafe ||
-		hbEdge.Event.Authority != uxsvocab.AuthorityDirectCRSFOverride {
-		t.Fatalf("HEARTBEAT edge event = %+v", hbEdge.Event)
+	if hbEdge.Events[0].Kind != EventKindHeartbeatEdge || hbEdge.Events[0].PrevAuthority != uxsvocab.AuthorityMCUFailsafe ||
+		hbEdge.Events[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
+		t.Fatalf("HEARTBEAT edge event = %+v", hbEdge.Events[0])
 	}
 	wantReasons := []string{"armed_changed", "authority_changed", "companion_mode_changed", "link_tier_changed", "health_flags_changed"}
-	if !slices.Equal(hbEdge.Event.Reasons, wantReasons) {
-		t.Fatalf("HEARTBEAT edge reasons = %v, want %v", hbEdge.Event.Reasons, wantReasons)
+	if !slices.Equal(hbEdge.Events[0].Reasons, wantReasons) {
+		t.Fatalf("HEARTBEAT edge reasons = %v, want %v", hbEdge.Events[0].Reasons, wantReasons)
 	}
 
 	// #1 SYS_STATUS: initial nonzero baseline (7) and steady sample (7) update snapshot without a false alert;
@@ -711,7 +744,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	sysBaseline := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 41, mavcodec.SysStatus{
 		Load: 1200, ErrorsComm: 3, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 900,
 	}), peerB, t0.Add(9*time.Second))
-	if !sysBaseline.Accepted || sysBaseline.UrgentSKGSync || sysBaseline.Event != nil {
+	if !sysBaseline.Accepted || sysBaseline.UrgentSKGSync || len(sysBaseline.Events) != 0 {
 		t.Fatalf("SYS_STATUS initial baseline(7) outcome = %+v, want no false failsafe alert", sysBaseline)
 	}
 	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 7 || snap.LoopDtUs != 1200 {
@@ -721,7 +754,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	sysSteady := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 42, mavcodec.SysStatus{
 		Load: 1100, ErrorsComm: 4, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 850,
 	}), peerB, t0.Add(10*time.Second))
-	if !sysSteady.Accepted || sysSteady.UrgentSKGSync || sysSteady.Event != nil {
+	if !sysSteady.Accepted || sysSteady.UrgentSKGSync || len(sysSteady.Events) != 0 {
 		t.Fatalf("SYS_STATUS steady(7->7) outcome = %+v, want no edge event", sysSteady)
 	}
 	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 7 || snap.LoopDtUs != 1100 {
@@ -731,7 +764,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	sysInc := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 43, mavcodec.SysStatus{
 		Load: 1050, ErrorsComm: 5, ErrorsCount1: 8, ErrorsCount2: 1900, ErrorsCount3: 820,
 	}), peerB, t0.Add(11*time.Second))
-	if !sysInc.Accepted || !sysInc.UrgentSKGSync || sysInc.Event == nil || sysInc.Event.Kind != EventKindFailsafeIncrement || sysInc.Event.Failsafes != 8 {
+	if !sysInc.Accepted || !sysInc.UrgentSKGSync || len(sysInc.Events) != 1 || sysInc.Events[0].Kind != EventKindFailsafeIncrement || sysInc.Events[0].Failsafes != 8 {
 		t.Fatalf("SYS_STATUS increment(7->8) outcome = %+v, want failsafe_increment(8)", sysInc)
 	}
 	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 8 || snap.LoopDtUs != 1050 {
@@ -741,34 +774,34 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	sysDec := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 44, mavcodec.SysStatus{
 		Load: 1000, ErrorsComm: 5, ErrorsCount1: 6, ErrorsCount2: 1900, ErrorsCount3: 800,
 	}), peerB, t0.Add(12*time.Second))
-	if !sysDec.Accepted || sysDec.UrgentSKGSync || sysDec.Event != nil {
+	if !sysDec.Accepted || sysDec.UrgentSKGSync || len(sysDec.Events) != 0 {
 		t.Fatalf("SYS_STATUS decrement(8->6) outcome = %+v, want no edge event", sysDec)
 	}
 	if snap, _ := tracker.Snapshot(2); snap.Failsafes != 6 || snap.LoopDtUs != 1000 {
 		t.Fatalf("SYS_STATUS decrement(8->6) snapshot = %+v, want Failsafes=6 LoopDtUs=1000", snap)
 	}
 
-	// #253 STATUSTEXT over wire + NUL-padded IngestFrame triggers immediate Lane 3 edge + SKG flush.
+	// Steady-state #253 STATUSTEXT emits immediate Lane 3 statustext event WITHOUT triggering an urgent or periodic SKG rewrite (`OQ3 Option A`).
 	stOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 45, mavcodec.StatusText{
 		Severity: 2,
 		Text:     "CRSF OVERRIDE ENGAGED",
 		ID:       7,
 		ChunkSeq: 0,
 	}), peerB, t0.Add(13*time.Second))
-	if !stOut.Accepted || !stOut.UrgentSKGSync || stOut.Event == nil || stOut.Event.Kind != EventKindStatusText ||
-		stOut.Event.StatusText == nil || stOut.Event.StatusText.Text != "CRSF OVERRIDE ENGAGED" {
-		t.Fatalf("STATUSTEXT wire outcome = %+v", stOut)
+	if !stOut.Accepted || stOut.UrgentSKGSync || len(stOut.Events) != 1 || stOut.Events[0].Kind != EventKindStatusText ||
+		stOut.Events[0].StatusText == nil || stOut.Events[0].StatusText.Text != "CRSF OVERRIDE ENGAGED" {
+		t.Fatalf("STATUSTEXT wire outcome = %+v, want UrgentSKGSync=false and statustext event", stOut)
 	}
 	stNulOut := tracker.IngestFrame(mavcodec.Frame{
 		SystemID: 2, ComponentID: 1, Sequence: 46,
 		Message: mavcodec.StatusText{Severity: 4, Text: "PADDED\x00\x00"},
 	}, peerB, t0.Add(14*time.Second))
-	if !stNulOut.Accepted || stNulOut.Event == nil || stNulOut.Event.StatusText.Text != "PADDED" {
+	if !stNulOut.Accepted || stNulOut.UrgentSKGSync || len(stNulOut.Events) != 1 || stNulOut.Events[0].StatusText.Text != "PADDED" {
 		t.Fatalf("STATUSTEXT NUL-trim outcome = %+v", stNulOut)
 	}
 
-	// Verify #0 HEARTBEAT (t0+8s), #1 SYS_STATUS (t0+9..12s), and #253 STATUSTEXT (t0+13..14s)
-	// advanced health/status ObservedAt to t0+14s WITHOUT advancing #32/#33 kinematic triple timestamps!
+	// Verify #0 HEARTBEAT (t0+8s) and #1 SYS_STATUS (t0+9..12s) advanced health/status ObservedAt to t0+12s
+	// while steady-state #253 STATUSTEXT (t0+13..14s) left VehicleSnapshot timestamps untouched and #32 stayed at t0+6s!
 	finalSnap, ok := tracker.Snapshot(2)
 	if !ok {
 		t.Fatal("missing final sysid=2 snapshot")
@@ -778,13 +811,452 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	for _, tr := range finalTriples {
 		byPred[tr.Predicate] = tr
 	}
-	if !byPred[uxsvocab.PredicateHealthArmed].Timestamp.Equal(t0.Add(14 * time.Second)) {
-		t.Fatalf("health triple timestamp = %v, want %v", byPred[uxsvocab.PredicateHealthArmed].Timestamp, t0.Add(14*time.Second))
+	if !byPred[uxsvocab.PredicateHealthArmed].Timestamp.Equal(t0.Add(12 * time.Second)) {
+		t.Fatalf("health triple timestamp = %v, want %v (untouched by steady-state STATUSTEXT)", byPred[uxsvocab.PredicateHealthArmed].Timestamp, t0.Add(12*time.Second))
 	}
 	if !byPred[uxsvocab.PredicateKinematicsNED].Timestamp.Equal(t0.Add(6*time.Second)) ||
 		byPred[uxsvocab.PredicateKinematicsNED].Context != "measured" {
 		t.Fatalf("NED triple after health/status updates = %+v, want Timestamp=%v Context=measured",
 			byPred[uxsvocab.PredicateKinematicsNED], t0.Add(6*time.Second))
+	}
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerLinkLossSilenceThresholdsAndRestoration(t *testing.T) {
+	tracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("NewTrackerWithTimeouts: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:45100")
+	t0 := time.Date(2026, 11, 25, 1, 0, 0, 0, time.UTC)
+
+	// Admit sysid=1 on mesh-high-rate (3s threshold) and sysid=2 on mesh-supervisory (10s threshold).
+	hbHigh := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityCompanionTeleop, mavcodec.ModeTeleopVelocity, mavcodec.LinkTierMeshHighRate, uxsvocab.HealthFlags{ClockSyncLocked: true})
+	hbSup := makeVehicleHB(mavcodec.DomainRover, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierMeshSupervisory, uxsvocab.HealthFlags{})
+	tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 10, hbHigh), peer, t0)
+	tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 20, hbSup), peer, t0)
+
+	initBatch, err := tracker.BuildPeriodicBatch(nil)
+	if err != nil || len(initBatch) != 2 {
+		t.Fatalf("initial BuildPeriodicBatch = (%d, %v), want 2 items", len(initBatch), err)
+	}
+	confirmed := map[uint8]uint64{
+		initBatch[0].SysID: initBatch[0].Rev,
+		initBatch[1].SysID: initBatch[1].Rev,
+	}
+
+	// Rejected datagrams (GCS HB, bad sysid/compid, NaN #31, out-of-bounds #33, outbound #76) MUST NOT refresh lastPacketAt.
+	tReject := t0.Add(2500 * time.Millisecond)
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 255, 190, 1, mavcodec.Heartbeat{Type: 6, Autopilot: 8}), peer, tReject)
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 1, 2, 11, hbHigh), peer, tReject)
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 12, mavcodec.AttitudeQuaternion{Q1: float32(math.NaN())}), peer, tReject)
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 13, mavcodec.GlobalPositionInt{Lat: 900_000_001}), peer, tReject)
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 14, mavcodec.CommandLong{Command: 400}), peer, tReject)
+
+	// Boundary 1: threshold - 1ns emits zero link_lost events.
+	if evs := tracker.EvaluateSilence(t0.Add(3*time.Second - time.Nanosecond)); len(evs) != 0 {
+		t.Fatalf("EvaluateSilence(3s - 1ns) = %+v, want empty", evs)
+	}
+	if tracker.IsLinkLost(1) || tracker.IsLinkLost(2) {
+		t.Fatal("unexpected IsLinkLost before threshold")
+	}
+
+	// Boundary 2: exact 3s threshold marks sysid=1 lost once while keeping mesh-supervisory sysid=2 online
+	// and freezing sysid=1's VehicleSnapshot.ObservedAt at t0 (`OQ2 Option A`).
+	evs3s := tracker.EvaluateSilence(t0.Add(3 * time.Second))
+	if len(evs3s) != 1 || evs3s[0].SysID != 1 || evs3s[0].Kind != EventKindLinkLost ||
+		evs3s[0].Seq != 10 || evs3s[0].MsgID != mavcodec.MsgIDHeartbeat ||
+		!slices.Equal(evs3s[0].Reasons, []string{"silence_timeout"}) ||
+		evs3s[0].Timestamp != t0.Add(3*time.Second).UnixMilli() {
+		t.Fatalf("EvaluateSilence(3s) = %+v, want single sysid=1 link_lost event", evs3s)
+	}
+	if !tracker.IsLinkLost(1) || tracker.IsLinkLost(2) {
+		t.Fatalf("IsLinkLost at 3s = (sys1=%v, sys2=%v), want (true, false)", tracker.IsLinkLost(1), tracker.IsLinkLost(2))
+	}
+	if snap1, _ := tracker.Snapshot(1); !snap1.ObservedAt.Equal(t0) {
+		t.Fatalf("link_lost mutated sysid=1 ObservedAt = %v, want frozen %v", snap1.ObservedAt, t0)
+	}
+	if silentBatch, bErr := tracker.BuildPeriodicBatch(confirmed); bErr != nil || len(silentBatch) != 0 {
+		t.Fatalf("BuildPeriodicBatch while silent = (%+v, %v), want empty", silentBatch, bErr)
+	}
+
+	// Repeated silent ticks emit zero duplicate link_lost events for sysid=1, and sysid=2 stays online through 10s - 1ns.
+	for _, ts := range []time.Time{
+		t0.Add(4 * time.Second),
+		t0.Add(9 * time.Second),
+		t0.Add(10*time.Second - time.Nanosecond),
+	} {
+		if evs := tracker.EvaluateSilence(ts); len(evs) != 0 {
+			t.Fatalf("EvaluateSilence(%v) = %+v, want zero events", ts.Sub(t0), evs)
+		}
+	}
+
+	// Boundary 3: exact 10s supervisory threshold marks sysid=2 lost.
+	evs10s := tracker.EvaluateSilence(t0.Add(10 * time.Second))
+	if len(evs10s) != 1 || evs10s[0].SysID != 2 || evs10s[0].Kind != EventKindLinkLost || evs10s[0].LinkTier != uxsvocab.LinkTierMeshSupervisory {
+		t.Fatalf("EvaluateSilence(10s) = %+v, want sysid=2 mesh-supervisory link_lost", evs10s)
+	}
+
+	// Rejected datagram while lost MUST NOT clear linkLost or emit link_restored.
+	badWhileLost := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 15, mavcodec.AttitudeQuaternion{}), peer, t0.Add(10500*time.Millisecond))
+	if badWhileLost.Accepted || !badWhileLost.CountedError || !tracker.IsLinkLost(1) {
+		t.Fatalf("rejected #31 while lost cleared linkLost: out=%+v lost=%v", badWhileLost, tracker.IsLinkLost(1))
+	}
+
+	// Resumption A: sysid=1 resumes with #32 LOCAL_POSITION_NED -> emits link_restored + Telemetry + UrgentSKGSync.
+	tResume := t0.Add(11 * time.Second)
+	res1 := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 16, mavcodec.LocalPositionNED{X: 4, Y: -2, Z: -8}), peer, tResume)
+	if !res1.Accepted || !res1.UrgentSKGSync || res1.Telemetry == nil || len(res1.Events) != 1 ||
+		res1.Events[0].Kind != EventKindLinkRestored || tracker.IsLinkLost(1) {
+		t.Fatalf("sysid=1 kinematic resume outcome = %+v (lost=%v)", res1, tracker.IsLinkLost(1))
+	}
+	if snap1, _ := tracker.Snapshot(1); !snap1.ObservedAt.Equal(tResume) {
+		t.Fatalf("sysid=1 ObservedAt on resume = %v, want %v", snap1.ObservedAt, tResume)
+	}
+
+	// Resumption B: sysid=2 resumes with #0 HEARTBEAT that ALSO flips authority (MCUFailsafe -> DirectCRSFOverride)
+	// and cuts LinkTier over from mesh-supervisory (10s) to mesh-high-rate (3s) -> emits [link_restored, heartbeat_edge]!
+	hbCutover := makeVehicleHB(mavcodec.DomainRover, true, mavcodec.AuthorityDirectCRSFOverride, mavcodec.ModeHoldPosition, mavcodec.LinkTierMeshHighRate, uxsvocab.HealthFlags{TeleopDeadmanClamped: true})
+	res2 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 21, hbCutover), peer, tResume)
+	if !res2.Accepted || !res2.UrgentSKGSync || len(res2.Events) != 2 ||
+		res2.Events[0].Kind != EventKindLinkRestored || res2.Events[1].Kind != EventKindHeartbeatEdge ||
+		res2.Events[1].PrevAuthority != uxsvocab.AuthorityMCUFailsafe || res2.Events[1].Authority != uxsvocab.AuthorityDirectCRSFOverride {
+		t.Fatalf("sysid=2 concurrent HEARTBEAT resume outcome = %+v, want [link_restored, heartbeat_edge]", res2)
+	}
+
+	// Verify dynamic LinkTier cutover: sysid=2 now times out after 3s (tResume + 3s) instead of 10s!
+	// Establish SYS_STATUS baseline on sysid=2 at tResume + 1s first so we can test concurrent failsafe_increment on resume.
+	_ = tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 22, mavcodec.SysStatus{Load: 900, ErrorsCount1: 2}), peer, tResume.Add(time.Second))
+	if evs := tracker.EvaluateSilence(tResume.Add(4*time.Second - time.Nanosecond)); len(evs) != 1 || evs[0].SysID != 1 {
+		t.Fatalf("EvaluateSilence(tResume + 4s - 1ns) = %+v, want only sysid=1 lost while sysid=2 is 1ns short", evs)
+	}
+	if evs := tracker.EvaluateSilence(tResume.Add(4 * time.Second)); len(evs) != 1 || evs[0].SysID != 2 {
+		t.Fatalf("EvaluateSilence(tResume + 4s) = %+v, want sysid=2 lost at new 3s mesh-high-rate threshold", evs)
+	}
+
+	// Resumption C: sysid=2 resumes with #1 SYS_STATUS incrementing failsafes (2 -> 3) -> [link_restored, failsafe_increment].
+	tResumeFS := tResume.Add(5 * time.Second)
+	resFS := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 23, mavcodec.SysStatus{Load: 950, ErrorsCount1: 3}), peer, tResumeFS)
+	if !resFS.Accepted || !resFS.UrgentSKGSync || len(resFS.Events) != 2 ||
+		resFS.Events[0].Kind != EventKindLinkRestored || resFS.Events[1].Kind != EventKindFailsafeIncrement {
+		t.Fatalf("sysid=2 concurrent SYS_STATUS resume = %+v, want [link_restored, failsafe_increment]", resFS)
+	}
+
+	// Resumption D: sysid=1 (still lost from tResume + 4s - 1ns) resumes via #253 STATUSTEXT -> [link_restored, statustext] + UrgentSKGSync,
+	// whereas a follow-up steady-state #253 STATUSTEXT refreshes lastPacketAt without UrgentSKGSync.
+	tResumeST := tResume.Add(6 * time.Second)
+	resST := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 17, mavcodec.StatusText{Severity: 5, Text: "REJOINED"}), peer, tResumeST)
+	if !resST.Accepted || !resST.UrgentSKGSync || len(resST.Events) != 2 ||
+		resST.Events[0].Kind != EventKindLinkRestored || resST.Events[1].Kind != EventKindStatusText {
+		t.Fatalf("sysid=1 STATUSTEXT resume = %+v, want [link_restored, statustext] + UrgentSKGSync", resST)
+	}
+	steadyST := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 18, mavcodec.StatusText{Severity: 6, Text: "KEEPALIVE"}), peer, tResumeST.Add(2*time.Second))
+	if !steadyST.Accepted || steadyST.UrgentSKGSync || len(steadyST.Events) != 1 || steadyST.Events[0].Kind != EventKindStatusText {
+		t.Fatalf("sysid=1 steady STATUSTEXT = %+v, want event-only without UrgentSKGSync", steadyST)
+	}
+	if evs := tracker.EvaluateSilence(tResumeST.Add(4 * time.Second)); len(evs) != 1 || evs[0].SysID != 2 || tracker.IsLinkLost(1) {
+		t.Fatalf("EvaluateSilence 2s after sysid=1 steady STATUSTEXT = %+v (lost1=%v), want only silent sysid=2 lost while sysid=1 stays fresh",
+			evs, tracker.IsLinkLost(1))
+	}
+}
+
+func hasMonotonicClock(ts time.Time) bool {
+	return strings.Contains(ts.String(), " m=")
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerMonotonicSilenceAcrossWallClockSteps(t *testing.T) {
+	tracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("NewTrackerWithTimeouts: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:45101")
+	hb := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityCompanionTeleop, mavcodec.ModeTeleopVelocity, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
+
+	// Verify public IngestDatagram(time.Now()) preserves Go's monotonic clock reading while publishing UTC ObservedAt.
+	liveTracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("NewTrackerWithTimeouts(live): %v", err)
+	}
+	liveTracker.IngestDatagram(encodeFrameBytes(t, 9, 1, 1, hb), peer, time.Now())
+	if sample, ok := liveTracker.lastPacketSample(9); !ok || !hasMonotonicClock(sample) {
+		t.Fatalf("lastPacketSample(9) = (%v, ok=%v), want preserved monotonic clock reading", sample, ok)
+	}
+	if snap9, ok := liveTracker.Snapshot(9); !ok || snap9.ObservedAt.Location() != time.UTC {
+		t.Fatalf("Snapshot(9).ObservedAt = %v, want UTC location", snap9.ObservedAt)
+	}
+
+	wall0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	mono0 := time.Now()
+	hbFrame1 := mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 1, Message: hb}
+	tracker.ingestFrameAt(hbFrame1, peer, wall0, mono0)
+
+	// Direction 1: 1-minute BACKWARD wall-clock step right after packet arrival.
+	// Silence MUST still fire at +3s monotonic (not delayed by 60s), while publishing the stepped UTC wall timestamp.
+	wallBack := wall0.Add(-1 * time.Minute)
+	if evs := tracker.evaluateSilenceAt(wallBack.Add(3*time.Second-time.Nanosecond), mono0.Add(3*time.Second-time.Nanosecond)); len(evs) != 0 {
+		t.Fatalf("backward step before 3s monotonic = %+v, want empty", evs)
+	}
+	backLossWall := wallBack.Add(3 * time.Second)
+	evsBack := tracker.evaluateSilenceAt(backLossWall, mono0.Add(3*time.Second))
+	var sys1Lost *TransitionEvent
+	for i := range evsBack {
+		if evsBack[i].SysID == 1 {
+			sys1Lost = &evsBack[i]
+		}
+	}
+	if sys1Lost == nil || sys1Lost.Kind != EventKindLinkLost || sys1Lost.Timestamp != backLossWall.UnixMilli() {
+		t.Fatalf("backward wall-step silence at +3s monotonic = %+v, want sysid=1 link_lost with stepped Timestamp=%d",
+			evsBack, backLossWall.UnixMilli())
+	}
+	if snap1, _ := tracker.Snapshot(1); !snap1.ObservedAt.Equal(wall0) {
+		t.Fatalf("backward wall-step link_lost mutated ObservedAt = %v, want %v", snap1.ObservedAt, wall0)
+	}
+
+	// Resuming packet while wall clock is still behind wall0 MUST update lastPacketAt monotonically and restore cleanly.
+	resumeBackWall := wall0.Add(-55 * time.Second)
+	resBack := tracker.ingestFrameAt(
+		mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 2, Message: mavcodec.LocalPositionNED{X: 7}},
+		peer,
+		resumeBackWall,
+		mono0.Add(4*time.Second),
+	)
+	if !resBack.Accepted || len(resBack.Events) != 1 || resBack.Events[0].Kind != EventKindLinkRestored ||
+		resBack.Events[0].Timestamp != resumeBackWall.UnixMilli() || resBack.Telemetry == nil ||
+		resBack.Telemetry.Timestamp != resumeBackWall.UnixMilli() {
+		t.Fatalf("resume under backward wall clock = %+v, want link_restored + Telemetry at %d", resBack, resumeBackWall.UnixMilli())
+	}
+	if evs := tracker.evaluateSilenceAt(wall0.Add(-53*time.Second), mono0.Add(6900*time.Millisecond)); len(evs) != 0 && slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 1 }) {
+		t.Fatalf("unexpected early re-loss after backward-wall resume: %+v", evs)
+	}
+	if evs := tracker.evaluateSilenceAt(wall0.Add(-52*time.Second), mono0.Add(7*time.Second)); !slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 1 && e.Kind == EventKindLinkLost }) {
+		t.Fatalf("missing +3s monotonic re-loss after backward-wall resume: %+v", evs)
+	}
+
+	// Direction 2: 1-minute FORWARD wall-clock step 100ms after admission MUST NOT cause a false link_lost.
+	hbFrame2 := mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 1, Message: hb}
+	tracker.ingestFrameAt(hbFrame2, peer, wall0, mono0)
+	wallFwdJump := wall0.Add(time.Minute)
+	if evs := tracker.evaluateSilenceAt(wallFwdJump, mono0.Add(100*time.Millisecond)); slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 2 }) || tracker.IsLinkLost(2) {
+		t.Fatalf("forward +1m wall step at +100ms monotonic caused false link_lost: evs=%+v lost=%v", evs, tracker.IsLinkLost(2))
+	}
+	if evs := tracker.evaluateSilenceAt(wallFwdJump.Add(2900*time.Millisecond-time.Nanosecond), mono0.Add(3*time.Second-time.Nanosecond)); slices.ContainsFunc(evs, func(e TransitionEvent) bool { return e.SysID == 2 }) {
+		t.Fatalf("forward wall step fired before +3s monotonic: %+v", evs)
+	}
+	fwdLossWall := wallFwdJump.Add(2900 * time.Millisecond)
+	evsFwd := tracker.evaluateSilenceAt(fwdLossWall, mono0.Add(3*time.Second))
+	if !slices.ContainsFunc(evsFwd, func(e TransitionEvent) bool {
+		return e.SysID == 2 && e.Kind == EventKindLinkLost && e.Timestamp == fwdLossWall.UnixMilli()
+	}) {
+		t.Fatalf("forward wall step at +3s monotonic = %+v, want sysid=2 link_lost with Timestamp=%d", evsFwd, fwdLossWall.UnixMilli())
+	}
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestComponentSerializesSilenceLossBeforeConcurrentResumption(t *testing.T) {
+	srv, err := natsserver.NewServer(&natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		NoLog:     true,
+		NoSigs:    true,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.Start()
+	t.Cleanup(func() {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+	})
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatal("embedded NATS server not ready")
+	}
+
+	pubNC, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithMaxReconnects(0))
+	if err != nil {
+		t.Fatalf("NewClient(pub): %v", err)
+	}
+	if err := pubNC.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect(pub): %v", err)
+	}
+	t.Cleanup(func() { _ = pubNC.Close(context.Background()) })
+
+	subNC, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithMaxReconnects(0))
+	if err != nil {
+		t.Fatalf("NewClient(sub): %v", err)
+	}
+	if err := subNC.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect(sub): %v", err)
+	}
+	t.Cleanup(func() { _ = subNC.Close(context.Background()) })
+
+	sub, err := subNC.GetConnection().SubscribeSync("bbops.telemetry.>")
+	if err != nil {
+		t.Fatalf("SubscribeSync: %v", err)
+	}
+	if err := subNC.GetConnection().Flush(); err != nil {
+		t.Fatalf("Flush subscriber: %v", err)
+	}
+
+	udpPort := allocateLoopbackUDPPort(t)
+	rawCfg, err := json.Marshal(map[string]any{
+		"skg_hz":                 5,
+		"link_timeout_ms":        220,
+		"supervisory_timeout_ms": 1000,
+		"ports": map[string]any{
+			"inputs": []map[string]any{
+				{
+					"name":     "mavlink_udp",
+					"external": true,
+					"config": map[string]any{
+						"kind":     "network",
+						"protocol": "udp",
+						"host":     "127.0.0.1",
+						"port":     udpPort,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal rawCfg: %v", err)
+	}
+
+	comp, err := NewComponent(rawCfg, component.Dependencies{
+		NATSClient: pubNC,
+		Platform:   types.PlatformMeta{Org: "boxbotix", Platform: "bbops"},
+	})
+	if err != nil {
+		t.Fatalf("NewComponent: %v", err)
+	}
+
+	// Block JetStream acknowledgements on the SKG Publisher worker for the entire contention test
+	// to prove neither readLoop nor tickLoop blocks on JetStream acks.
+	releaseJetStream := make(chan struct{})
+	comp.publisher.publishBatch = func(ctx context.Context, _ string, _ [][]byte) error {
+		select {
+		case <-releaseJetStream:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	evalPaused := make(chan struct{})
+	readerAtBoundary := make(chan struct{})
+	var evalOnce sync.Once
+	var readerOnce sync.Once
+
+	comp.afterSilenceEval = func(ev TransitionEvent) {
+		if ev.SysID == 1 && ev.Kind == EventKindLinkLost {
+			evalOnce.Do(func() {
+				close(evalPaused)
+				select {
+				case <-readerAtBoundary:
+				case <-time.After(3 * time.Second):
+				}
+				// Give readLoop a window where, without per-sysid serialization, it would
+				// complete IngestFrame + publishCoreJSON([link_restored, telemetry]) before link_lost.
+				time.Sleep(15 * time.Millisecond)
+			})
+		}
+	}
+	comp.beforeIngestFrame = func(frame mavcodec.Frame) {
+		if frame.SystemID == 1 && frame.Message != nil && frame.Message.MessageID() == mavcodec.MsgIDLocalPositionNED {
+			readerOnce.Do(func() {
+				close(readerAtBoundary)
+			})
+		}
+	}
+
+	if err := comp.Initialize(); err != nil {
+		t.Fatalf("comp.Initialize: %v", err)
+	}
+	startCtx, startCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer startCancel()
+	if err := comp.Start(startCtx); err != nil {
+		t.Fatalf("comp.Start: %v", err)
+	}
+	defer func() {
+		close(releaseJetStream)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if stopErr := comp.Stop(stopCtx); stopErr != nil {
+			t.Errorf("comp.Stop: %v", stopErr)
+		}
+	}()
+
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP client: %v", err)
+	}
+	defer func() { _ = udpClient.Close() }()
+	dest := net.UDPAddrFromAddrPort(comp.BoundAddr())
+
+	hb := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityCompanionTeleop, mavcodec.ModeTeleopVelocity, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
+	if _, err := udpClient.WriteToUDP(encodeFrameBytes(t, 1, 1, 1, hb), dest); err != nil {
+		t.Fatalf("WriteToUDP(HB): %v", err)
+	}
+
+	// Verify Component's live readLoop preserved Go's monotonic clock reading on lastPacketAt.
+	admitDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if sample, ok := comp.tracker.lastPacketSample(1); ok {
+			if !hasMonotonicClock(sample) {
+				t.Fatalf("Component readLoop stripped monotonic clock reading: %v", sample)
+			}
+			break
+		}
+		if time.Now().After(admitDeadline) {
+			t.Fatal("timed out waiting for sysid=1 admission")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait until tickLoop marks sysid=1 link-lost and pauses right before publishing link_lost.
+	select {
+	case <-evalPaused:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for tickLoop silence evaluation")
+	}
+
+	// Inject resuming #32 LOCAL_POSITION_NED while tickLoop is paused inside afterSilenceEval.
+	if _, err := udpClient.WriteToUDP(encodeFrameBytes(t, 1, 1, 2, mavcodec.LocalPositionNED{X: 42, Y: -3, Z: -10}), dest); err != nil {
+		t.Fatalf("WriteToUDP(LocalPositionNED): %v", err)
+	}
+
+	// Collect wire order while JetStream publishBatch remains blocked!
+	var wireOrder []string
+	for len(wireOrder) < 3 {
+		msg, nextErr := sub.NextMsg(3 * time.Second)
+		if nextErr != nil {
+			t.Fatalf("NextMsg(%d): %v (wireOrder so far: %v)", len(wireOrder), nextErr, wireOrder)
+		}
+		switch msg.Subject {
+		case "bbops.telemetry.events.1":
+			var ev TransitionEvent
+			if uErr := json.Unmarshal(msg.Data, &ev); uErr != nil {
+				t.Fatalf("unmarshal TransitionEvent: %v", uErr)
+			}
+			wireOrder = append(wireOrder, ev.Kind)
+		case "bbops.telemetry.1":
+			var tf TelemetryFrame
+			if uErr := json.Unmarshal(msg.Data, &tf); uErr != nil {
+				t.Fatalf("unmarshal TelemetryFrame: %v", uErr)
+			}
+			if !tf.HasLocalPos || tf.NEDXYZ[0] != 42 {
+				t.Fatalf("TelemetryFrame = %+v, want NEDXYZ[0]=42", tf)
+			}
+			wireOrder = append(wireOrder, "telemetry")
+		default:
+			t.Fatalf("unexpected NATS subject %q", msg.Subject)
+		}
+	}
+	wantOrder := []string{EventKindLinkLost, EventKindLinkRestored, "telemetry"}
+	if !slices.Equal(wireOrder, wantOrder) {
+		t.Fatalf("wire order = %v, want %v", wireOrder, wantOrder)
 	}
 }
 
@@ -828,11 +1300,26 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 	peer := netip.MustParseAddrPort("127.0.0.1:46001")
 	t0 := time.Date(2026, 11, 24, 2, 0, 0, 0, time.UTC)
 
+	// Periodic notification with zero admitted vehicles is a clean no-op.
+	emptyTracker, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker empty: %v", err)
+	}
+	if emptyItems, bErr := emptyTracker.BuildPeriodicBatch(nil); bErr != nil || len(emptyItems) != 0 {
+		t.Fatalf("empty BuildPeriodicBatch = (%+v, %v), want empty", emptyItems, bErr)
+	}
+
 	// Admit sysid=1 (Quadcopter) and sysid=2 (Rover).
 	hb1 := makeVehicleHB(mavcodec.DomainQuadcopter, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
 	hb2 := makeVehicleHB(mavcodec.DomainRover, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
 	tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 1, Message: hb1}, peer, t0)
 	tracker.IngestFrame(mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 1, Message: hb2}, peer, t0)
+	if skippedAll, bErr := tracker.BuildPeriodicBatch(map[uint8]uint64{1: 1, 2: 1}); bErr != nil || len(skippedAll) != 0 {
+		t.Fatalf("BuildPeriodicBatch with all revisions confirmed = (%+v, %v), want empty pre-marshal skip", skippedAll, bErr)
+	}
+	if only2, bErr := tracker.BuildPeriodicBatch(map[uint8]uint64{1: 1}); bErr != nil || len(only2) != 1 || only2[0].SysID != 2 {
+		t.Fatalf("BuildPeriodicBatch with sysid=1 confirmed = (%+v, %v), want only sysid=2", only2, bErr)
+	}
 
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
@@ -855,6 +1342,7 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 			return nil
 		},
 		tracker.BuildUrgentBatch,
+		tracker.BuildPeriodicBatch,
 		func() { errCount.Add(1) },
 	)
 
@@ -872,13 +1360,8 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		}
 	})
 
-	// Enqueue empty batch (no-op), then batch #0 which stalls inside publishBatch.
-	pub.EnqueuePeriodic(nil)
-	b0, err := tracker.BuildPeriodicBatch()
-	if err != nil {
-		t.Fatalf("BuildPeriodicBatch b0: %v", err)
-	}
-	pub.EnqueuePeriodic(b0)
+	// Trigger initial periodic flush (#0), which stalls inside publishBatch.
+	pub.NotifyPeriodic()
 
 	select {
 	case <-firstEntered:
@@ -886,8 +1369,9 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		t.Fatal("timed out waiting for first batch to enter publishBatch")
 	}
 
-	// While publishBatch is stalled, enqueue 5 periodic batches (LoopDtUs = 100..500) without blocking!
-	enqueueStart := time.Now()
+	// While publishBatch is stalled, advance state 5 times (LoopDtUs = 100..500) and call NotifyPeriodic
+	// without blocking or building stale intermediate snapshots on the caller goroutine!
+	notifyStart := time.Now()
 	for step := 1; step <= 5; step++ {
 		tracker.IngestFrame(mavcodec.Frame{
 			SystemID:    1,
@@ -901,26 +1385,19 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 			Sequence:    uint8(10 + step),
 			Message:     mavcodec.SysStatus{Load: uint16(step * 100)},
 		}, peer, t0.Add(time.Duration(step)*time.Second))
-		batch, bErr := tracker.BuildPeriodicBatch()
-		if bErr != nil {
-			t.Fatalf("BuildPeriodicBatch step %d: %v", step, bErr)
-		}
-		pub.EnqueuePeriodic(batch)
+		pub.NotifyPeriodic()
 	}
-	if elapsed := time.Since(enqueueStart); elapsed > 100*time.Millisecond {
-		t.Fatalf("EnqueuePeriodic blocked under stalled publisher (%v)", elapsed)
-	}
-	if gotDropped := pub.DroppedPeriodic(); gotDropped != 3 {
-		t.Fatalf("DroppedPeriodic = %d, want 3 (5 queued into cap-%d channel)", gotDropped, PeriodicQueueCap)
+	if elapsed := time.Since(notifyStart); elapsed > 100*time.Millisecond {
+		t.Fatalf("NotifyPeriodic blocked under stalled publisher (%v)", elapsed)
 	}
 
-	// Now trigger a Lane 3 urgent edge ONLY on sysid=1 (Armed=true, Authority=DirectCRSFOverride, LoopDtUs stays 500)
-	// AFTER periodic batches 4 & 5 were already snapshotted into periodicCh!
+	// Trigger a Lane 3 urgent edge ONLY on sysid=1 (Armed=true, Authority=DirectCRSFOverride, LoopDtUs stays 500)
+	// while periodicPending is already set.
 	edgeHB := makeVehicleHB(mavcodec.DomainQuadcopter, true, mavcodec.AuthorityDirectCRSFOverride, mavcodec.ModeHoldPosition, mavcodec.LinkTierMeshHighRate, uxsvocab.HealthFlags{TeleopDeadmanClamped: true})
 	tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 99, Message: edgeHB}, peer, t0.Add(10*time.Second))
 	pub.NotifyUrgent(1)
 
-	// Release batch #0 and wait for urgent + remaining cap-2 periodic batches to flush.
+	// Release stalled call #0 and wait for urgent flush (#1) + coalesced build-at-flush periodic batch (#2).
 	close(releaseFirst)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -928,7 +1405,7 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		mu.Lock()
 		n := len(calls)
 		mu.Unlock()
-		if n >= 3 {
+		if n >= 3 && !pub.hasPending() {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -942,36 +1419,41 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 	if errCount.Load() != 0 {
 		t.Fatalf("unexpected publisher error count = %d", errCount.Load())
 	}
-	if len(gotCalls) < 3 {
-		t.Fatalf("recorded publishBatch calls = %d, want >= 3", len(gotCalls))
+	if len(gotCalls) != 3 {
+		t.Fatalf("recorded publishBatch calls = %d, want exactly 3 (initial + preempting urgent + 1 coalesced periodic)", len(gotCalls))
 	}
 
 	// Call 1 (immediately after stalled call 0) MUST be the preempting urgent flush for sysid=1!
 	if len(gotCalls[1].snaps) != 1 || gotCalls[1].snaps[0].SysID != 1 || !gotCalls[1].snaps[0].Armed ||
 		gotCalls[1].snaps[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
-		t.Fatalf("call[1] = %+v, want urgent sysid=1 %s snapshot ahead of periodic queue", gotCalls[1].snaps, uxsvocab.AuthorityDirectCRSFOverride)
+		t.Fatalf("call[1] = %+v, want urgent sysid=1 %s snapshot ahead of periodic flush", gotCalls[1].snaps, uxsvocab.AuthorityDirectCRSFOverride)
 	}
 
-	// Subsequent periodic drains MUST NOT regress sysid=1 back to Armed=false/MCUFailsafe (rev 5/6 < urgent rev 7),
-	// while sysid=2 MUST advance to LoopDtUs=500!
-	latestBySysID := map[uint8]uxsvocab.VehicleSnapshot{}
-	for idx, c := range gotCalls {
-		for _, s := range c.snaps {
-			if idx > 1 && s.SysID == 1 && !s.Armed {
-				t.Fatalf("stale periodic batch overwrote newer urgent edge state at call[%d]: %+v", idx, s)
-			}
-			latestBySysID[s.SysID] = s
-		}
-	}
-	if latestBySysID[1].Authority != uxsvocab.AuthorityDirectCRSFOverride || !latestBySysID[1].Armed {
-		t.Fatalf("final sysid=1 state = %+v, want Armed %s", latestBySysID[1], uxsvocab.AuthorityDirectCRSFOverride)
-	}
-	if latestBySysID[2].LoopDtUs != 500 {
-		t.Fatalf("final sysid=2 LoopDtUs = %d, want 500 from newest retained periodic batch", latestBySysID[2].LoopDtUs)
+	// Call 2 (coalesced build-at-flush periodic batch) MUST skip already-confirmed sysid=1 (rev 7 <= 7)
+	// and publish ONLY sysid=2's newest live state (LoopDtUs = 500)!
+	if len(gotCalls[2].snaps) != 1 || gotCalls[2].snaps[0].SysID != 2 || gotCalls[2].snaps[0].LoopDtUs != 500 {
+		t.Fatalf("call[2] = %+v, want single build-at-flush sysid=2 snapshot with LoopDtUs=500", gotCalls[2].snaps)
 	}
 
-	// Verify publishBatch and buildUrgent errors invoke onError without panicking.
+	// Subsequent NotifyPeriodic ticks while sessions are silent / unchanged MUST NOT re-upsert!
+	tracker.EvaluateSilence(t0.Add(20 * time.Second))
+	pub.NotifyPeriodic()
+	pub.NotifyPeriodic()
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && pub.hasPending() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(25 * time.Millisecond)
+	mu.Lock()
+	afterSilentCalls := len(calls)
+	mu.Unlock()
+	if afterSilentCalls != 3 {
+		t.Fatalf("publishBatch calls after silent NotifyPeriodic = %d, want 3 (zero redundant re-upserts)", afterSilentCalls)
+	}
+
+	// Verify buildUrgent, buildPeriodic, and publishBatch errors invoke onError without panicking.
 	var failCount atomic.Int32
+	var buildPeriodicAttempt atomic.Int32
 	failPub := NewPublisher(
 		DefaultEntitySubject,
 		func(_ context.Context, _ string, _ [][]byte) error {
@@ -980,10 +1462,16 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		func(_ []uint8) ([]SnapshotBatchItem, error) {
 			return nil, errors.New("build urgent failure")
 		},
+		func(confirmed map[uint8]uint64) ([]SnapshotBatchItem, error) {
+			if buildPeriodicAttempt.Add(1) == 1 {
+				return nil, errors.New("build periodic failure")
+			}
+			return tracker.BuildPeriodicBatch(confirmed)
+		},
 		func() { failCount.Add(1) },
 	)
 	failPub.NotifyUrgent(1)
-	failPub.EnqueuePeriodic(b0)
+	failPub.NotifyPeriodic()
 	failCtx, failCancel := context.WithCancel(context.Background())
 	failDone := make(chan struct{})
 	go func() {
@@ -994,25 +1482,27 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 	for time.Now().Before(deadline) && failCount.Load() < 2 {
 		time.Sleep(5 * time.Millisecond)
 	}
+	// Trigger a second periodic flush that builds items and hits the publishBatch error path.
+	failPub.NotifyPeriodic()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && failCount.Load() < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
 	failCancel()
 	<-failDone
-	if got := failCount.Load(); got != 2 {
-		t.Fatalf("onError count = %d, want 2 (1 urgent build error + 1 periodic publish error)", got)
+	if got := failCount.Load(); got != 3 {
+		t.Fatalf("onError count = %d, want 3 (urgent build + periodic build + periodic publish)", got)
 	}
 
 	// Verify partial urgent batch failure (`PublishBatchToStream` acknowledging item 0 and failing on item 1):
-	// 1. Acknowledged sysid=1 (rev=2) MUST NOT regress to [new, old] when a queued stale periodic batch (rev=1) drains.
-	// 2. Equal revisions (rev=2) MUST remain eligible for recovery so unacknowledged sysid=2 (rev=2) recovers on retry.
+	// 1. Acknowledged sysid=1 (rev=2) MUST NOT regress to [new, old] because stale rev=1 snapshots are never queued.
+	// 2. Unconfirmed revisions remain > lastConfirmedRev so the next NotifyPeriodic recovers sysid=2 (rev=2).
 	partialTracker, err := NewTracker("boxbotix", "bbops")
 	if err != nil {
 		t.Fatalf("NewTracker partial: %v", err)
 	}
 	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 1, Message: hb1}, peer, t0)
 	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 2, ComponentID: 1, Sequence: 1, Message: hb2}, peer, t0)
-	staleRev1Batch, err := partialTracker.BuildPeriodicBatch()
-	if err != nil {
-		t.Fatalf("BuildPeriodicBatch staleRev1: %v", err)
-	}
 
 	edgeHB2 := makeVehicleHB(mavcodec.DomainRover, true, mavcodec.AuthorityDirectCRSFOverride, mavcodec.ModeHoldPosition, mavcodec.LinkTierMeshHighRate, uxsvocab.HealthFlags{TeleopDeadmanClamped: true})
 	partialTracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: 1, Sequence: 2, Message: edgeHB}, peer, t0.Add(time.Second))
@@ -1045,11 +1535,10 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 			return nil
 		},
 		partialTracker.BuildUrgentBatch,
+		partialTracker.BuildPeriodicBatch,
 		func() { partialErrors.Add(1) },
 	)
 
-	// Queue stale rev=1 periodic batch BEFORE urgent rev=2 notifications, then start worker.
-	partialPub.EnqueuePeriodic(staleRev1Batch)
 	partialPub.NotifyUrgent(1)
 	partialPub.NotifyUrgent(2)
 
@@ -1065,22 +1554,16 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for simulated partial urgent batch failure")
 	}
-	// Give worker time to drain staleRev1Batch from periodicCh after the failed urgent batch.
-	time.Sleep(25 * time.Millisecond)
 
-	// Now enqueue an equal-revision (rev=2) periodic batch to verify recovery of unacknowledged sysid=2.
-	recoveryRev2Batch, err := partialTracker.BuildPeriodicBatch()
-	if err != nil {
-		t.Fatalf("BuildPeriodicBatch recoveryRev2: %v", err)
-	}
-	partialPub.EnqueuePeriodic(recoveryRev2Batch)
+	// Trigger NotifyPeriodic to verify unconfirmed rev=2 recovers sysid=2 without regressing sysid=1.
+	partialPub.NotifyPeriodic()
 
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		partialMu.Lock()
 		recovered := len(deliveredArmedBySysID[2]) >= 1
 		partialMu.Unlock()
-		if recovered {
+		if recovered && !partialPub.hasPending() {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -1100,7 +1583,7 @@ func TestPublisherBackpressureAndUrgentPriority(t *testing.T) {
 		t.Fatalf("sysid=1 publications after partial ack = %v, want only Armed=true (no [new old] regression)", sys1History)
 	}
 	if !slices.Equal(sys2History, []bool{true}) {
-		t.Fatalf("unacknowledged sysid=2 recovery publications = %v, want [true] from equal-rev retry", sys2History)
+		t.Fatalf("unacknowledged sysid=2 recovery publications = %v, want [true] from build-at-flush retry", sys2History)
 	}
 }
 
@@ -1286,23 +1769,26 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 	decoder := message.NewDecoder(reg)
 
 	type refVehicle struct {
-		admitted     bool
-		domain       string
-		armed        bool
-		authority    string
-		mode         string
-		tier         string
-		flags        uxsvocab.HealthFlags
-		hasSysStatus bool
-		failsafes    int
-		hasAttitude  bool
-		hasLocalPos  bool
-		hasGlobalPos bool
-		hasHeading   bool
-		hdgDeg       float64
-		latLonAlt    [3]float64
-		nedXYZ       [3]float64
-		rev          uint64
+		admitted      bool
+		domain        string
+		armed         bool
+		authority     string
+		mode          string
+		tier          string
+		flags         uxsvocab.HealthFlags
+		hasSysStatus  bool
+		failsafes     int
+		hasAttitude   bool
+		hasLocalPos   bool
+		hasGlobalPos  bool
+		hasHeading    bool
+		hdgDeg        float64
+		latLonAlt     [3]float64
+		nedXYZ        [3]float64
+		lastPacketAt  time.Time
+		skgObservedAt time.Time
+		linkLost      bool
+		rev           uint64
 	}
 
 	domains := []mavcodec.VehicleDomain{mavcodec.DomainQuadcopter, mavcodec.DomainRover, mavcodec.DomainSurfaceBoat}
@@ -1327,24 +1813,29 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	// Boundary reach & assertion activation counters across generated histories.
 	var (
-		sawAdmission         int
-		sawSysStatusBaseline int
-		sawQuatOverride      int
-		sawHdgFallback       int
-		sawHdgInvalidation   int
-		sawHeartbeatEdge     int
-		sawFailsafeEdge      int
-		sawStatusText        int
-		sawSanitizedReject   int
-		sawDroppedPeriodic   int
-		sawTrackerRestart    int
+		sawAdmission             int
+		sawSysStatusBaseline     int
+		sawQuatOverride          int
+		sawHdgFallback           int
+		sawHdgInvalidation       int
+		sawHeartbeatEdge         int
+		sawFailsafeEdge          int
+		sawStatusText            int
+		sawSanitizedReject       int
+		sawCoalescedPeriodic     int
+		sawTrackerRestart        int
+		sawLinkLost              int
+		sawSupervisoryHold       int
+		sawLinkRestored          int
+		sawConcurrentRestoreEdge int
+		sawSilentNoReupsert      int
 	)
 
-	for seed := uint64(1); seed <= 40; seed++ {
+	for seed := uint64(1); seed <= 50; seed++ {
 		rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-		tracker, err := NewTracker("boxbotix", "bbops")
+		tracker, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
 		if err != nil {
-			t.Fatalf("NewTracker: %v", err)
+			t.Fatalf("NewTrackerWithTimeouts: %v", err)
 		}
 		ref := map[uint8]*refVehicle{
 			1: {},
@@ -1353,6 +1844,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		}
 
 		var publishedMu sync.Mutex
+		var publishCalls atomic.Int64
 		materialized := map[uint8]uxsvocab.VehicleSnapshot{}
 		mergedTriples := map[uint8][]message.Triple{}
 		lastObservedAt := map[uint8]time.Time{}
@@ -1362,6 +1854,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 			return NewPublisher(
 				DefaultEntitySubject,
 				func(_ context.Context, _ string, msgs [][]byte) error {
+					publishCalls.Add(1)
 					publishedMu.Lock()
 					for _, raw := range msgs {
 						bm, uErr := decoder.Decode(raw)
@@ -1393,6 +1886,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				func(sysids []uint8) ([]SnapshotBatchItem, error) {
 					return tracker.BuildUrgentBatch(sysids)
 				},
+				func(confirmed map[uint8]uint64) ([]SnapshotBatchItem, error) {
+					return tracker.BuildPeriodicBatch(confirmed)
+				},
 				func() { t.Errorf("seed %d: unexpected publisher error", seed) },
 			)
 		}
@@ -1408,17 +1904,14 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				if !ok {
 					t.Fatalf("seed %d: admitted sysid=%d missing from tracker", seed, sysid)
 				}
-				wantObserved[sysid] = snap.ObservedAt
+				if !snap.ObservedAt.Equal(rv.skgObservedAt) {
+					t.Fatalf("seed %d sysid=%d: Snapshot ObservedAt = %v, want reference %v", seed, sysid, snap.ObservedAt, rv.skgObservedAt)
+				}
+				wantObserved[sysid] = rv.skgObservedAt
 			}
 
 			converged := func() bool {
-				if len(pub.periodicCh) != 0 {
-					return false
-				}
-				pub.urgentMu.Lock()
-				pendingUrgent := len(pub.urgentSysIDs)
-				pub.urgentMu.Unlock()
-				if pendingUrgent != 0 {
+				if pub.hasPending() {
 					return false
 				}
 				publishedMu.Lock()
@@ -1460,19 +1953,14 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		}
 
 		now := time.Date(2026, 11, 24, 3, 0, 0, 0, time.UTC)
-		for step := range 60 {
-			if seed%2 == 0 && step == 30 {
-				epochBatch, bErr := tracker.BuildPeriodicBatch()
-				if bErr != nil {
-					t.Fatalf("seed %d: pre-restart BuildPeriodicBatch: %v", seed, bErr)
-				}
-				pub.EnqueuePeriodic(epochBatch)
-				sawDroppedPeriodic += int(pub.DroppedPeriodic())
+		for step := range 75 {
+			if seed%2 == 0 && step == 35 {
+				pub.NotifyPeriodic()
 				drainPub()
 
-				tracker, err = NewTracker("boxbotix", "bbops")
+				tracker, err = NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
 				if err != nil {
-					t.Fatalf("seed %d: restart NewTracker: %v", seed, err)
+					t.Fatalf("seed %d: restart NewTrackerWithTimeouts: %v", seed, err)
 				}
 				pub = newPub()
 				publishedMu.Lock()
@@ -1492,7 +1980,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 			peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(40000+int(sysid)*10+rng.IntN(5)))
 			rv := ref[sysid]
 
-			switch rng.IntN(7) {
+			switch rng.IntN(8) {
 			case 0: // #0 HEARTBEAT
 				dom := domains[int(sysid-1)%len(domains)]
 				armed := rng.IntN(2) == 1
@@ -1514,21 +2002,40 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				if !rv.admitted {
 					rv.admitted = true
 					sawAdmission++
-					if out.Event != nil || out.UrgentSKGSync {
+					if len(out.Events) != 0 || out.UrgentSKGSync {
 						t.Fatalf("seed %d step %d: first HB emitted edge event: %+v", seed, step, out)
 					}
 				} else {
+					wasLost := rv.linkLost
 					changed := rv.domain != domS || rv.armed != armed || rv.authority != authS ||
 						rv.mode != modeS || rv.tier != tierS || rv.flags != flags
-					if changed != (out.Event != nil && out.UrgentSKGSync) {
-						t.Fatalf("seed %d step %d: HB edge mismatch changed=%v out=%+v", seed, step, changed, out)
+					var wantKinds []string
+					if wasLost {
+						wantKinds = append(wantKinds, EventKindLinkRestored)
+						sawLinkRestored++
 					}
 					if changed {
+						wantKinds = append(wantKinds, EventKindHeartbeatEdge)
 						sawHeartbeatEdge++
+					}
+					if wasLost && changed {
+						sawConcurrentRestoreEdge++
+					}
+					gotKinds := make([]string, len(out.Events))
+					for i := range out.Events {
+						gotKinds[i] = out.Events[i].Kind
+					}
+					if !slices.Equal(gotKinds, wantKinds) || out.UrgentSKGSync != (len(wantKinds) > 0) {
+						t.Fatalf("seed %d step %d: HB kinds=%v urgent=%v, want kinds=%v", seed, step, gotKinds, out.UrgentSKGSync, wantKinds)
+					}
+					if out.UrgentSKGSync {
 						pub.NotifyUrgent(sysid)
 					}
 				}
 				rv.domain, rv.armed, rv.authority, rv.mode, rv.tier, rv.flags = domS, armed, authS, modeS, tierS, flags
+				rv.lastPacketAt = now
+				rv.skgObservedAt = now
+				rv.linkLost = false
 				rv.rev++
 
 			case 1: // #1 SYS_STATUS
@@ -1557,19 +2064,38 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
+				wasLost := rv.linkLost
 				wantEdge := rv.hasSysStatus && int(nextFS) > rv.failsafes
-				if wantEdge != (out.Event != nil && out.UrgentSKGSync) {
-					t.Fatalf("seed %d step %d: SYS_STATUS edge mismatch want=%v out=%+v", seed, step, wantEdge, out)
+				var wantKinds []string
+				if wasLost {
+					wantKinds = append(wantKinds, EventKindLinkRestored)
+					sawLinkRestored++
+				}
+				if wantEdge {
+					wantKinds = append(wantKinds, EventKindFailsafeIncrement)
+					sawFailsafeEdge++
+				}
+				if wasLost && wantEdge {
+					sawConcurrentRestoreEdge++
+				}
+				gotKinds := make([]string, len(out.Events))
+				for i := range out.Events {
+					gotKinds[i] = out.Events[i].Kind
+				}
+				if !slices.Equal(gotKinds, wantKinds) || out.UrgentSKGSync != (len(wantKinds) > 0) {
+					t.Fatalf("seed %d step %d: SYS_STATUS kinds=%v urgent=%v, want kinds=%v", seed, step, gotKinds, out.UrgentSKGSync, wantKinds)
 				}
 				if !rv.hasSysStatus && nextFS > 0 {
 					sawSysStatusBaseline++
 				}
-				if wantEdge {
-					sawFailsafeEdge++
+				if out.UrgentSKGSync {
 					pub.NotifyUrgent(sysid)
 				}
 				rv.hasSysStatus = true
 				rv.failsafes = int(nextFS)
+				rv.lastPacketAt = now
+				rv.skgObservedAt = now
+				rv.linkLost = false
 				rv.rev++
 
 			case 2: // #31 ATTITUDE_QUATERNION (valid or injected NaN/zero-norm)
@@ -1581,6 +2107,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					out := tracker.IngestFrame(mavcodec.Frame{SystemID: sysid, ComponentID: 1, Sequence: uint8(step), Message: badQ}, peer, now)
 					if !out.CountedError || out.Accepted {
 						t.Fatalf("seed %d: invalid #31 not rejected: %+v", seed, out)
+					}
+					if rv.admitted && tracker.IsLinkLost(sysid) != rv.linkLost {
+						t.Fatalf("seed %d: invalid #31 mutated linkLost state", seed)
 					}
 					sawSanitizedReject++
 					continue
@@ -1597,12 +2126,25 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
+				wasLost := rv.linkLost
+				if wasLost {
+					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
+						t.Fatalf("seed %d: #31 link_restored mismatch: %+v", seed, out)
+					}
+					sawLinkRestored++
+					pub.NotifyUrgent(sysid)
+				} else if len(out.Events) != 0 || out.UrgentSKGSync {
+					t.Fatalf("seed %d: unexpected #31 edge: %+v", seed, out)
+				}
 				if rv.hasGlobalPos {
 					sawQuatOverride++
 				}
 				rv.hasAttitude = true
 				rv.hasHeading = true
 				rv.hdgDeg = wantYaw
+				rv.lastPacketAt = now
+				rv.skgObservedAt = now
+				rv.linkLost = false
 				rv.rev++
 				if out.Telemetry == nil || !out.Telemetry.HasHeading || angularDiffDeg(out.Telemetry.HdgDeg, wantYaw) > 1e-2 {
 					t.Fatalf("seed %d: #31 telemetry heading = %+v, want %v", seed, out.Telemetry, wantYaw)
@@ -1616,6 +2158,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}, peer, now)
 					if !out.CountedError || out.Accepted {
 						t.Fatalf("seed %d: out-of-bounds #33 not rejected", seed)
+					}
+					if rv.admitted && tracker.IsLinkLost(sysid) != rv.linkLost {
+						t.Fatalf("seed %d: invalid #33 mutated linkLost state", seed)
 					}
 					sawSanitizedReject++
 					continue
@@ -1636,6 +2181,16 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
+				wasLost := rv.linkLost
+				if wasLost {
+					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
+						t.Fatalf("seed %d: #33 link_restored mismatch: %+v", seed, out)
+					}
+					sawLinkRestored++
+					pub.NotifyUrgent(sysid)
+				} else if len(out.Events) != 0 || out.UrgentSKGSync {
+					t.Fatalf("seed %d: unexpected #33 edge: %+v", seed, out)
+				}
 				rv.hasGlobalPos = true
 				rv.latLonAlt = [3]float64{float64(latE7) / 1e7, float64(lonE7) / 1e7, 25.0}
 				if !rv.hasAttitude {
@@ -1651,6 +2206,9 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 						rv.hasHeading = false
 					}
 				}
+				rv.lastPacketAt = now
+				rv.skgObservedAt = now
+				rv.linkLost = false
 				rv.rev++
 				if out.Telemetry == nil || !out.Telemetry.HasGlobalPos || out.Telemetry.HasHeading != rv.hasHeading || angularDiffDeg(out.Telemetry.HdgDeg, rv.hdgDeg) > 1e-2 {
 					t.Fatalf("seed %d: #33 telemetry = %+v, want hasHeading=%v hdg=%v", seed, out.Telemetry, rv.hasHeading, rv.hdgDeg)
@@ -1665,14 +2223,27 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				if !rv.admitted {
 					continue
 				}
+				wasLost := rv.linkLost
+				if wasLost {
+					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
+						t.Fatalf("seed %d: #32 link_restored mismatch: %+v", seed, out)
+					}
+					sawLinkRestored++
+					pub.NotifyUrgent(sysid)
+				} else if len(out.Events) != 0 || out.UrgentSKGSync {
+					t.Fatalf("seed %d: unexpected #32 edge: %+v", seed, out)
+				}
 				rv.hasLocalPos = true
 				rv.nedXYZ = [3]float64{float64(x), 5, -10}
+				rv.lastPacketAt = now
+				rv.skgObservedAt = now
+				rv.linkLost = false
 				rv.rev++
 				if out.Telemetry == nil || !out.Telemetry.HasLocalPos || out.Telemetry.NEDXYZ != rv.nedXYZ {
 					t.Fatalf("seed %d: #32 telemetry = %+v, want %v", seed, out.Telemetry, rv.nedXYZ)
 				}
 
-			case 5: // #253 STATUSTEXT
+			case 5: // #253 STATUSTEXT (event-only in steady state; restores + UrgentSKGSync if silent)
 				out := tracker.IngestFrame(mavcodec.Frame{
 					SystemID: sysid, ComponentID: 1, Sequence: uint8(step),
 					Message: mavcodec.StatusText{Severity: 6, Text: "OK\x00"},
@@ -1681,31 +2252,110 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					continue
 				}
 				sawStatusText++
-				rv.rev++
-				if !out.UrgentSKGSync || out.Event == nil || out.Event.StatusText.Text != "OK" {
-					t.Fatalf("seed %d: #253 outcome = %+v", seed, out)
-				}
-				pub.NotifyUrgent(sysid)
-
-			case 6: // Enqueue periodic burst (sometimes > PeriodicQueueCap before draining)
-				burst := 1 + rng.IntN(4)
-				for range burst {
-					batch, bErr := tracker.BuildPeriodicBatch()
-					if bErr != nil {
-						t.Fatalf("seed %d: BuildPeriodicBatch: %v", seed, bErr)
+				wasLost := rv.linkLost
+				rv.lastPacketAt = now
+				rv.linkLost = false
+				if wasLost {
+					rv.skgObservedAt = now
+					rv.rev++
+					if !out.UrgentSKGSync || len(out.Events) != 2 ||
+						out.Events[0].Kind != EventKindLinkRestored ||
+						out.Events[1].Kind != EventKindStatusText || out.Events[1].StatusText.Text != "OK" {
+						t.Fatalf("seed %d: resuming #253 outcome = %+v", seed, out)
 					}
-					pub.EnqueuePeriodic(batch)
+					sawLinkRestored++
+					sawConcurrentRestoreEdge++
+					pub.NotifyUrgent(sysid)
+				} else {
+					if out.UrgentSKGSync || len(out.Events) != 1 ||
+						out.Events[0].Kind != EventKindStatusText || out.Events[0].StatusText.Text != "OK" {
+						t.Fatalf("seed %d: steady-state #253 outcome = %+v, want event-only without UrgentSKGSync", seed, out)
+					}
+				}
+
+			case 6: // Coalesced periodic notification burst
+				burst := 1 + rng.IntN(4)
+				if burst > 1 {
+					sawCoalescedPeriodic++
+				}
+				for range burst {
+					pub.NotifyPeriodic()
+				}
+
+			case 7: // Virtual-clock silence evaluation across LinkTier thresholds + silent non-re-upsert check
+				advance := time.Duration(2+rng.IntN(11)) * time.Second
+				now = now.Add(advance)
+
+				var wantLost []uint8
+				anyAdmitted := false
+				for s := uint8(1); s <= 3; s++ {
+					srv := ref[s]
+					if !srv.admitted {
+						continue
+					}
+					anyAdmitted = true
+					if srv.linkLost {
+						continue
+					}
+					thresh := 3 * time.Second
+					if srv.tier == uxsvocab.LinkTierMeshSupervisory {
+						thresh = 10 * time.Second
+					}
+					elapsed := now.Sub(srv.lastPacketAt)
+					if elapsed >= thresh {
+						srv.linkLost = true
+						wantLost = append(wantLost, s)
+					} else if srv.tier == uxsvocab.LinkTierMeshSupervisory && elapsed >= 3*time.Second {
+						sawSupervisoryHold++
+					}
+				}
+
+				gotLostEvs := tracker.EvaluateSilence(now)
+				gotLostSysIDs := make([]uint8, len(gotLostEvs))
+				for i, ev := range gotLostEvs {
+					if ev.Kind != EventKindLinkLost || ev.Timestamp != now.UnixMilli() {
+						t.Fatalf("seed %d step %d: EvaluateSilence event = %+v", seed, step, ev)
+					}
+					gotLostSysIDs[i] = ev.SysID
+				}
+				if !slices.Equal(gotLostSysIDs, wantLost) {
+					t.Fatalf("seed %d step %d: EvaluateSilence sysids = %v, want %v", seed, step, gotLostSysIDs, wantLost)
+				}
+				sawLinkLost += len(gotLostEvs)
+
+				// Immediate re-evaluation at the same timestamp MUST NOT duplicate link_lost!
+				if dup := tracker.EvaluateSilence(now); len(dup) != 0 {
+					t.Fatalf("seed %d step %d: duplicate link_lost emitted: %+v", seed, step, dup)
+				}
+				for s := uint8(1); s <= 3; s++ {
+					if !ref[s].admitted {
+						continue
+					}
+					if tracker.IsLinkLost(s) != ref[s].linkLost {
+						t.Fatalf("seed %d step %d sysid=%d: IsLinkLost=%v, want %v", seed, step, s, tracker.IsLinkLost(s), ref[s].linkLost)
+					}
+					if snap, _ := tracker.Snapshot(s); !snap.ObservedAt.Equal(ref[s].skgObservedAt) {
+						t.Fatalf("seed %d step %d sysid=%d: EvaluateSilence mutated ObservedAt (%v != %v)", seed, step, s, snap.ObservedAt, ref[s].skgObservedAt)
+					}
+				}
+
+				// Verify silent / unchanged sessions do not re-upsert on repeated NotifyPeriodic ticks.
+				if anyAdmitted && rng.IntN(2) == 0 {
+					pub.NotifyPeriodic()
+					drainPub()
+					beforeSilentCalls := publishCalls.Load()
+					pub.NotifyPeriodic()
+					drainPub()
+					if afterSilentCalls := publishCalls.Load(); afterSilentCalls != beforeSilentCalls {
+						t.Fatalf("seed %d step %d: silent NotifyPeriodic re-upserted (%d -> %d)", seed, step, beforeSilentCalls, afterSilentCalls)
+					}
+					sawSilentNoReupsert++
 				}
 			}
 		}
 
-		// Final periodic enqueue + drain Publisher worker to convergence.
-		finalBatch, err := tracker.BuildPeriodicBatch()
-		if err != nil {
-			t.Fatalf("seed %d: final BuildPeriodicBatch: %v", seed, err)
-		}
-		pub.EnqueuePeriodic(finalBatch)
-		sawDroppedPeriodic += int(pub.DroppedPeriodic())
+		// Final periodic notify + drain Publisher worker to convergence.
+		pub.NotifyPeriodic()
 		drainPub()
 
 		// Verify materialized SKG snapshots and retained ReplaceBySource triples match the reference model.
@@ -1726,7 +2376,8 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				snap.Failsafes != rv.failsafes || snap.HasSysStatus != rv.hasSysStatus || snap.HasAttitude != rv.hasAttitude ||
 				snap.HasLocalPos != rv.hasLocalPos || snap.HasGlobalPos != rv.hasGlobalPos ||
 				snap.HasHeading != rv.hasHeading || angularDiffDeg(snap.HeadingDeg, rv.hdgDeg) > 1e-2 ||
-				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt {
+				snap.NED != rv.nedXYZ || [3]float64{snap.Latitude, snap.Longitude, snap.Altitude} != rv.latLonAlt ||
+				!snap.ObservedAt.Equal(rv.skgObservedAt) {
 				t.Fatalf("seed %d sysid=%d materialized mismatch:\ngot =%+v\nwant=%+v", seed, sysid, snap, *rv)
 			}
 			assertMergedDomain := func(pred string, wantMeasured bool) message.Triple {
@@ -1764,9 +2415,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 || sawHdgInvalidation == 0 ||
 		sawHeartbeatEdge == 0 || sawFailsafeEdge == 0 || sawStatusText == 0 ||
-		sawSanitizedReject == 0 || sawDroppedPeriodic == 0 || sawTrackerRestart == 0 {
-		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d drop=%d restart=%d",
-			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation, sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawDroppedPeriodic, sawTrackerRestart)
+		sawSanitizedReject == 0 || sawCoalescedPeriodic == 0 || sawTrackerRestart == 0 ||
+		sawLinkLost == 0 || sawSupervisoryHold == 0 || sawLinkRestored == 0 ||
+		sawConcurrentRestoreEdge == 0 || sawSilentNoReupsert == 0 {
+		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d coalesced=%d restart=%d lost=%d supHold=%d restored=%d concurrent=%d silentSkip=%d",
+			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation,
+			sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawCoalescedPeriodic,
+			sawTrackerRestart, sawLinkLost, sawSupervisoryHold, sawLinkRestored, sawConcurrentRestoreEdge, sawSilentNoReupsert)
 	}
 }
 
@@ -1845,6 +2500,7 @@ func FuzzTrackerIngestDatagram(f *testing.F) {
 		if !ok {
 			t.Fatal("admitted sysid=1 disappeared")
 		}
+		//Note: steady-state #253 STATUSTEXT is accepted without mutating Snapshot(1), whereas rejected datagrams MUST NOT mutate Snapshot(1).
 		if !outPost.Accepted && after != before {
 			t.Fatalf("rejected datagram mutated sysid=1 snapshot:\nbefore=%+v\nafter =%+v", before, after)
 		}
@@ -1853,6 +2509,13 @@ func FuzzTrackerIngestDatagram(f *testing.F) {
 		}
 		if triples := after.Triples(); len(triples) != 22 {
 			t.Fatalf("Triples() count = %d, want 22", len(triples))
+		}
+
+		// Silence evaluation after arbitrary input must preserve the 22-predicate invariant and frozen ObservedAt.
+		_ = tracker.EvaluateSilence(t0.Add(20 * time.Second))
+		silentSnap, _ := tracker.Snapshot(1)
+		if silentSnap != after {
+			t.Fatalf("EvaluateSilence mutated VehicleSnapshot:\nbefore=%+v\nafter =%+v", after, silentSnap)
 		}
 	})
 }
