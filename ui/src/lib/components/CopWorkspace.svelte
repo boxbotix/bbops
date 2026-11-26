@@ -302,18 +302,18 @@
     onSyncHash?.(viewportStore.toUrlHash());
   }
 
-  function handleCanvasSyncHash(hash: string): void {
-    if (viewportStore.selectedEntityId) {
-      updatePanelOverrides(
-        revealCopInspectorOnSelect(
-          resolvedWidth,
-          resolvedHeight,
-          resolvedOverrides,
-          viewportStore.selectedEntityId,
-        ),
-      );
+  function handleCanvasPickEntity(entityId: string | null): void {
+    if (!entityId) {
+      return;
     }
-    onSyncHash?.(hash);
+    updatePanelOverrides(
+      revealCopInspectorOnSelect(
+        resolvedWidth,
+        resolvedHeight,
+        resolvedOverrides,
+        entityId,
+      ),
+    );
   }
 
   function handleTogglePanel(panel: CopPanelName): void {
@@ -324,7 +324,28 @@
 
   function focusTacticalCanvas(): void {
     const canvasEl = stageEl?.querySelector<HTMLElement>(".safety-hud-canvas");
-    canvasEl?.focus({ preventScroll: true });
+    if (!canvasEl) {
+      return;
+    }
+    canvasEl.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    if (typeof window !== "undefined" && typeof document !== "undefined") {
+      const topbarEl = document.querySelector<HTMLElement>(
+        '[data-testid="invariant-safety-topbar"]',
+      );
+      const topbarSticky =
+        topbarEl !== null &&
+        window.getComputedStyle(topbarEl).position === "sticky";
+      const clearanceTop = topbarSticky
+        ? Math.max(0, topbarEl.getBoundingClientRect().bottom + 4)
+        : 0;
+      const rect = canvasEl.getBoundingClientRect();
+      if (rect.top < clearanceTop && window.scrollY > 0) {
+        window.scrollBy(0, rect.top - clearanceTop);
+      } else if (rect.top >= window.innerHeight) {
+        window.scrollBy(0, rect.bottom - window.innerHeight + 8);
+      }
+    }
+    canvasEl.focus({ preventScroll: true });
   }
 
   function handlePanelEscape(panel: CopPanelName, ev: KeyboardEvent): void {
@@ -615,7 +636,8 @@
       {skgStore}
       {viewportStore}
       {now}
-      onSyncHash={handleCanvasSyncHash}
+      {onSyncHash}
+      onPickEntity={handleCanvasPickEntity}
     />
   </div>
 

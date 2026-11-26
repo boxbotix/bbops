@@ -2645,6 +2645,27 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       flushSync();
     };
 
+    const origLocalStorageDesc = Object.getOwnPropertyDescriptor(
+      window,
+      "localStorage",
+    );
+    const isolatedStorage = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => isolatedStorage.get(key) ?? null,
+        setItem: (key: string, val: string) => {
+          isolatedStorage.set(key, String(val));
+        },
+        removeItem: (key: string) => {
+          isolatedStorage.delete(key);
+        },
+        clear: () => {
+          isolatedStorage.clear();
+        },
+      },
+    });
+
     const ws1Rig = new MockWebSocketRig();
     const ws2Rig = new MockWebSocketRig();
     const hostEl = document.createElement("div");
@@ -2864,6 +2885,44 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       flushSync();
       expect(window.location.hash).not.toContain("tether=");
 
+      // Toggling tactical layers, domain filters, declutter, or camera controls on TacticalCanvas syncs URL hash WITHOUT reopening manually collapsed Inspector!
+      const trailsLayerBtn = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(
+          '[aria-label="Tactical layers"] button.chip',
+        ),
+      ).find((btn) => btn.textContent?.trim() === "trails");
+      expect(trailsLayerBtn).toBeDefined();
+      trailsLayerBtn!.click();
+      flushSync();
+      expect(window.location.hash).not.toContain("trails");
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+      expect(inspectorToggle().getAttribute("aria-expanded")).toBe("false");
+      trailsLayerBtn!.click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+
+      const roverDomainBtn = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(
+          '[aria-label="UXS domain filter"] button.chip',
+        ),
+      ).find((btn) => btn.textContent?.trim() === "rover");
+      expect(roverDomainBtn).toBeDefined();
+      roverDomainBtn!.click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+      roverDomainBtn!.click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+
+      const minDeclutterBtn = Array.from(
+        hostEl.querySelectorAll<HTMLButtonElement>(
+          '[data-testid="declutter-group"] button.chip',
+        ),
+      ).find((btn) => btn.textContent?.trim() !== "Full");
+      minDeclutterBtn?.click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+
       // Re-selecting already-selected UXS #1 via digit hotkey "1" auto-opens collapsed Inspector!
       window.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -2872,6 +2931,18 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
           cancelable: true,
         }),
       );
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
+
+      // Collapse Inspector again and verify a repeat click on already-selected UXS #1 in FleetFilmstrip also reopens Inspector!
+      inspectorToggle().click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+      (
+        hostEl.querySelector(
+          `[data-testid="filmstrip-item"][data-entity-id="boxbotix.local.robotics.uxs.vehicle.1"]`,
+        ) as HTMLButtonElement
+      ).click();
       flushSync();
       expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
 
@@ -2906,11 +2977,18 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
           ?.getAttribute("aria-selected"),
       ).toBe("true");
 
+      const hudCanvas = hostEl.querySelector(
+        ".safety-hud-canvas",
+      ) as HTMLElement;
+      const scrollIntoViewSpy = vi.fn();
+      hudCanvas.scrollIntoView = scrollIntoViewSpy;
       focusMapBtn().click();
       flushSync();
-      expect(
-        document.activeElement?.classList.contains("safety-hud-canvas"),
-      ).toBe(true);
+      expect(scrollIntoViewSpy).toHaveBeenCalledWith({
+        block: "nearest",
+        inline: "nearest",
+      });
+      expect(document.activeElement).toBe(hudCanvas);
 
       (
         hostEl.querySelector(
@@ -2928,7 +3006,7 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
         hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
       ).toContain("1 staged");
 
-      // Resize to 200% zoom equivalent (512x384), return to Fleet, verify stacked tier + preserved manual Roster open + preserved Exceptions tab + zero <kbd> when shortcuts off!
+      // Resize to 200% zoom equivalent (512x384), return to Fleet, verify stacked tier + preserved manual Roster open + preserved Exceptions tab + Focus Map offscreen scroll clearance!
       setWindowSize(512, 384);
       (
         hostEl.querySelector(
@@ -2944,7 +3022,64 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
           ?.getAttribute("aria-selected"),
       ).toBe("true");
 
-      // Disabling single-character shortcuts leaves zero <kbd> tags (panel toggles and Focus Map never inject stray <kbd>).
+      // Simulate scrolled 200% zoom state where canvas is offscreen above a sticky topbar -> Focus Map scrolls canvas into view with header clearance!
+      const stackedCanvas = hostEl.querySelector(
+        ".safety-hud-canvas",
+      ) as HTMLElement;
+      const stackedScrollIntoView = vi.fn();
+      stackedCanvas.scrollIntoView = stackedScrollIntoView;
+      const topbarNode = hostEl.querySelector(
+        '[data-testid="invariant-safety-topbar"]',
+      ) as HTMLElement;
+      topbarNode.style.position = "sticky";
+      vi.spyOn(topbarNode, "getBoundingClientRect").mockReturnValue({
+        x: 0,
+        y: 0,
+        top: 0,
+        bottom: 84,
+        left: 0,
+        right: 512,
+        width: 512,
+        height: 84,
+        toJSON: () => ({}),
+      });
+      vi.spyOn(stackedCanvas, "getBoundingClientRect").mockReturnValue({
+        x: 0,
+        y: -241,
+        top: -241,
+        bottom: -3,
+        left: 0,
+        right: 512,
+        width: 512,
+        height: 238,
+        toJSON: () => ({}),
+      });
+      Object.defineProperty(window, "scrollY", {
+        configurable: true,
+        writable: true,
+        value: 320,
+      });
+      const scrollBySpy = vi
+        .spyOn(window, "scrollBy")
+        .mockImplementation(() => {});
+      focusMapBtn().focus();
+      focusMapBtn().click();
+      flushSync();
+      expect(stackedScrollIntoView).toHaveBeenCalledWith({
+        block: "nearest",
+        inline: "nearest",
+      });
+      expect(scrollBySpy).toHaveBeenCalledWith(0, -241 - (84 + 4));
+      expect(document.activeElement).toBe(stackedCanvas);
+      scrollBySpy.mockRestore();
+      topbarNode.style.position = "";
+      Object.defineProperty(window, "scrollY", {
+        configurable: true,
+        writable: true,
+        value: 0,
+      });
+
+      // Disabling single-character shortcuts leaves zero <kbd> tags and persists to isolated storage.
       (
         hostEl.querySelector(
           '[data-testid="character-shortcuts-toggle"]',
@@ -2952,6 +3087,9 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       ).click();
       flushSync();
       expect(hostEl.querySelectorAll("kbd")).toHaveLength(0);
+      expect(isolatedStorage.get(CHARACTER_SHORTCUTS_STORAGE_KEY)).toBe(
+        "false",
+      );
 
       // Diagnostics draft survived panel toggles and 1024x768 -> 512x384 resize!
       (
@@ -2969,7 +3107,14 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       (globalThis as unknown as { WebSocket: unknown }).WebSocket =
         origWebSocket;
       setWindowSize(prevInnerWidth, prevInnerHeight);
-      window.localStorage.removeItem(CHARACTER_SHORTCUTS_STORAGE_KEY);
+      if (origLocalStorageDesc) {
+        Object.defineProperty(window, "localStorage", origLocalStorageDesc);
+      } else {
+        Reflect.deleteProperty(
+          window as unknown as Record<string, unknown>,
+          "localStorage",
+        );
+      }
       window.history.replaceState(null, "", "/");
     }
   });
