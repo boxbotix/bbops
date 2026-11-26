@@ -11,18 +11,22 @@
   import { MultiDirectedGraph } from "graphology";
   import { onMount } from "svelte";
   import {
-    type CortexSearchHit,
     type GraphSearchClient,
     createGraphSearchClient,
   } from "$lib/cortex/search-client";
   import {
+    type AnalysisSessionStore,
+    createAnalysisSessionStore,
+  } from "$lib/cortex/session.svelte";
+  import {
     CORTEX_QUERY_TIERS,
-    type CortexQueryTier,
     buildCausalSubgraphModel,
     buildGroundedTripleCitations,
     buildRankedCortexHits,
+    formatAnalysisEntityRef,
+    summarizeAnalysisProvenance,
   } from "$lib/cortex/view-model";
-  import type { GraphQLClient, PathSearchResult } from "$lib/graphql";
+  import type { GraphQLClient } from "$lib/graphql";
   import {
     SKG_EDGE_PALETTE,
     drawSkgNodeHover,
@@ -53,6 +57,7 @@
     viewportStore: ViewportStore;
     graphqlClient: GraphQLClient;
     searchClient?: GraphSearchClient;
+    analysisSession?: AnalysisSessionStore;
     probeWebGL?: () => boolean;
     loadSigma?: () => Promise<CortexSigmaConstructor>;
     onSyncHash?: (hash: string) => void;
@@ -85,22 +90,26 @@
     viewportStore,
     graphqlClient,
     searchClient = createGraphSearchClient(),
+    analysisSession,
     probeWebGL = probeWebGLSupport,
     loadSigma = defaultLoadSigma,
     onSyncHash,
   }: Props = $props();
 
-  let queryText = $state("");
-  let activeTier = $state<CortexQueryTier>("hybrid");
-  let running = $state(false);
-  let errorBanner = $state<string | null>(null);
-  let neuralStatusBanner = $state<string | null>(null);
-  let answerSummary = $state<string | null>(null);
-  let indexedRevision = $state<number | null>(null);
-  let damagedEntities = $state<number>(0);
+  let ownedFallbackSession: AnalysisSessionStore | null = null;
+  function getFallbackSession(): AnalysisSessionStore {
+    if (!ownedFallbackSession) {
+      ownedFallbackSession = createAnalysisSessionStore({
+        skgStore,
+        viewportStore,
+        graphqlClient,
+        searchClient,
+      });
+    }
+    return ownedFallbackSession;
+  }
 
-  let rawHits = $state.raw<readonly CortexSearchHit[]>([]);
-  let pathResults = $state.raw<readonly PathSearchResult[]>([]);
+  const session = $derived.by(() => analysisSession ?? getFallbackSession());
 
   let sigmaContainerEl: HTMLDivElement | undefined = $state();
   let mounted = $state(false);
@@ -116,27 +125,30 @@
 
   let sigmaInstance: CortexSigmaRenderer | null = null;
   let isUnmounted = false;
-  let activeSearchController: AbortController | null = null;
-  let activeExpandController: AbortController | null = null;
-  let searchReqSeq = 0;
-  let expandReqSeq = 0;
-  let selectionEpoch = 0;
+
+  const lookupEntity = (id: string) => skgStore.getEntity(id);
 
   const rankedHits = $derived(
-    buildRankedCortexHits(rawHits, (id) => skgStore.getEntity(id)),
+    buildRankedCortexHits(session.rawHits, lookupEntity),
   );
 
   const causalSubgraph = $derived(
     buildCausalSubgraphModel(
       skgStore.entities.values(),
       rankedHits.map((h) => h.entityId),
-      pathResults,
-      viewportStore.selectedEntityId,
+      session.pathResults,
+      session.inspectedEntityId,
     ),
   );
 
+  const inspectedEntity = $derived(
+    session.inspectedEntityId
+      ? skgStore.getEntity(session.inspectedEntityId)
+      : null,
+  );
+
   const selectedHitRevision = $derived.by(() => {
-    const selId = viewportStore.selectedEntityId;
+    const selId = session.inspectedEntityId;
     if (!selId) {
       return null;
     }
@@ -145,339 +157,45 @@
   });
 
   const citations = $derived(
-    buildGroundedTripleCitations(
-      viewportStore.selectedEntity,
-      selectedHitRevision,
+    buildGroundedTripleCitations(inspectedEntity, selectedHitRevision),
+  );
+
+  const provenanceSummary = $derived(
+    summarizeAnalysisProvenance(
+      session.provenance,
+      session.queryText,
+      session.activeTier,
+      viewportStore.selectedEntityId,
+      lookupEntity,
     ),
   );
 
-  function isAbortError(err: unknown, signal: AbortSignal): boolean {
-    if (signal.aborted) {
-      return true;
-    }
-    return (
-      typeof err === "object" &&
-      err !== null &&
-      "name" in err &&
-      (err as { name?: string }).name === "AbortError"
-    );
-  }
+  const inspectedEntityLabel = $derived(
+    session.inspectedEntityId
+      ? formatAnalysisEntityRef(session.inspectedEntityId, lookupEntity)
+      : "none",
+  );
 
-  async function expand2Hop(
-    entityId: string,
-    workspaceAtStart = viewportStore.workspace,
-  ): Promise<void> {
-    if (!entityId || isUnmounted) {
-      return;
-    }
-    activeExpandController?.abort();
-    const controller = new AbortController();
-    activeExpandController = controller;
-    const reqSeq = ++expandReqSeq;
-    const epochAtStart = selectionEpoch;
+  const currentSelectionLabel = $derived(
+    viewportStore.selectedEntityId
+      ? formatAnalysisEntityRef(viewportStore.selectedEntityId, lookupEntity)
+      : "none",
+  );
 
-    try {
-      const res = await graphqlClient.pathSearch(
-        {
-          startEntity: entityId,
-          direction: "both",
-          maxDepth: 2,
-          maxNodes: 40,
-        },
-        { signal: controller.signal },
-      );
-      if (
-        isUnmounted ||
-        controller.signal.aborted ||
-        reqSeq !== expandReqSeq ||
-        selectionEpoch !== epochAtStart ||
-        viewportStore.workspace !== workspaceAtStart
-      ) {
-        return;
-      }
-      if (
-        viewportStore.selectedEntityId !== null &&
-        viewportStore.selectedEntityId !== entityId
-      ) {
-        return;
-      }
-      pathResults = [res.data];
-    } catch {
-      // Keep existing subgraph if optional GraphQL expansion fails or is aborted.
-    } finally {
-      if (activeExpandController === controller) {
-        activeExpandController = null;
-      }
-    }
-  }
+  const inspectionDiverged = $derived(
+    session.inspectedEntityId !== viewportStore.selectedEntityId &&
+      (session.inspectedEntityId !== null ||
+        viewportStore.selectedEntityId !== null),
+  );
 
-  async function executeSearch(ev?: Event): Promise<void> {
-    ev?.preventDefault();
-    const trimmed = queryText.trim();
-    if (!trimmed || running || isUnmounted) {
-      return;
-    }
+  $effect(() => {
+    const activeSession = session;
+    return activeSession.attachView((hash) => onSyncHash?.(hash));
+  });
 
-    activeSearchController?.abort();
-    activeExpandController?.abort();
-    const controller = new AbortController();
-    activeSearchController = controller;
-    const reqSeq = ++searchReqSeq;
-    const tierAtStart = activeTier;
-    const workspaceAtStart = viewportStore.workspace;
-    const selectionAtStart = viewportStore.selectedEntityId;
-    const epochAtStart = selectionEpoch;
-
-    running = true;
-    rawHits = [];
-    pathResults = [];
-    errorBanner = null;
-    neuralStatusBanner = null;
-    answerSummary = null;
-    indexedRevision = null;
-    damagedEntities = 0;
-
-    try {
-      const collected: CortexSearchHit[] = [];
-      let nextIndexedRevision: number | null = null;
-      let nextDamagedEntities = 0;
-      let nextAnswerSummary: string | null = null;
-      let nextNeuralBanner: string | null = null;
-      let nextErrorBanner: string | null = null;
-
-      if (tierAtStart === "lexical" || tierAtStart === "hybrid") {
-        const lex = selectionAtStart
-          ? await searchClient.localSearch(
-              {
-                entityId: selectionAtStart,
-                query: trimmed,
-                limit: 15,
-              },
-              controller.signal,
-            )
-          : await searchClient.globalSearch(
-              {
-                query: trimmed,
-                limit: 15,
-              },
-              controller.signal,
-            );
-        if (lex.ok) {
-          collected.push(...lex.hits);
-          if (lex.indexedRevision > 0) {
-            nextIndexedRevision = Math.max(
-              nextIndexedRevision ?? 0,
-              lex.indexedRevision,
-            );
-          }
-          nextDamagedEntities = Math.max(
-            nextDamagedEntities,
-            lex.damagedEntities,
-          );
-          nextAnswerSummary = lex.answer;
-        } else if (lex.refusal) {
-          nextErrorBanner = `${lex.refusal.code}: ${lex.refusal.message}`;
-        }
-      }
-
-      if (tierAtStart === "semantic") {
-        const predRes = await graphqlClient.entitiesByPredicate(
-          {
-            predicate: trimmed,
-          },
-          { signal: controller.signal },
-        );
-        for (const id of predRes.data.entities) {
-          collected.push({
-            entityId: id,
-            label: null,
-            score: 1,
-            verb: "entitiesByPredicate",
-            wordRank: null,
-            vectorRank: null,
-            indexedRevision: null,
-          });
-        }
-        nextDamagedEntities = predRes.damagedEntities;
-      }
-
-      if (tierAtStart === "neural" || tierAtStart === "hybrid") {
-        const sem = await searchClient.semantic(
-          {
-            query: trimmed,
-            limit: 10,
-          },
-          controller.signal,
-        );
-        if (sem.ok) {
-          collected.push(...sem.hits);
-          if (sem.indexedRevision > 0) {
-            nextIndexedRevision = Math.max(
-              nextIndexedRevision ?? 0,
-              sem.indexedRevision,
-            );
-          }
-          nextDamagedEntities = Math.max(
-            nextDamagedEntities,
-            sem.damagedEntities,
-          );
-        } else if (sem.refusal?.notEnabled) {
-          nextNeuralBanner = `Neural embeddings not enabled on host (${sem.refusal.code})`;
-        } else if (sem.refusal && tierAtStart === "neural") {
-          nextErrorBanner = `${sem.refusal.code}: ${sem.refusal.message}`;
-        }
-      }
-
-      if (
-        isUnmounted ||
-        controller.signal.aborted ||
-        reqSeq !== searchReqSeq ||
-        viewportStore.workspace !== workspaceAtStart
-      ) {
-        return;
-      }
-
-      rawHits = collected;
-      indexedRevision = nextIndexedRevision;
-      damagedEntities = nextDamagedEntities;
-      answerSummary = nextAnswerSummary;
-      neuralStatusBanner = nextNeuralBanner;
-      errorBanner = nextErrorBanner;
-
-      if (
-        (collected.length > 0 || nextErrorBanner === null) &&
-        selectionEpoch === epochAtStart &&
-        viewportStore.selectedEntityId === selectionAtStart &&
-        viewportStore.workspace === workspaceAtStart
-      ) {
-        const topRanked = buildRankedCortexHits(collected, (id) =>
-          skgStore.getEntity(id),
-        )[0];
-        const topId = topRanked?.entityId ?? viewportStore.selectedEntityId;
-        if (topId) {
-          if (topId !== viewportStore.selectedEntityId) {
-            viewportStore.selectEntity(topId);
-            onSyncHash?.(viewportStore.toUrlHash());
-          }
-          await expand2Hop(topId, workspaceAtStart);
-        }
-      }
-    } catch (err) {
-      if (
-        !isUnmounted &&
-        !isAbortError(err, controller.signal) &&
-        reqSeq === searchReqSeq &&
-        viewportStore.workspace === workspaceAtStart
-      ) {
-        rawHits = [];
-        pathResults = [];
-        indexedRevision = null;
-        damagedEntities = 0;
-        answerSummary = null;
-        errorBanner =
-          err instanceof Error ? err.message : "Analysis query failed";
-      }
-    } finally {
-      if (activeSearchController === controller) {
-        activeSearchController = null;
-      }
-      if (!isUnmounted && reqSeq === searchReqSeq) {
-        running = false;
-      }
-    }
-  }
-
-  async function runFindSimilar(): Promise<void> {
-    const entityId = viewportStore.selectedEntityId;
-    if (!entityId || running || isUnmounted) {
-      return;
-    }
-
-    activeSearchController?.abort();
-    activeExpandController?.abort();
-    const controller = new AbortController();
-    activeSearchController = controller;
-    const reqSeq = ++searchReqSeq;
-    const workspaceAtStart = viewportStore.workspace;
-    const epochAtStart = selectionEpoch;
-
-    running = true;
-    rawHits = [];
-    pathResults = [];
-    errorBanner = null;
-    neuralStatusBanner = null;
-    answerSummary = null;
-    indexedRevision = null;
-    damagedEntities = 0;
-
-    try {
-      const sim = await searchClient.similar(
-        { entityId, limit: 10 },
-        controller.signal,
-      );
-      if (
-        isUnmounted ||
-        controller.signal.aborted ||
-        reqSeq !== searchReqSeq ||
-        viewportStore.workspace !== workspaceAtStart
-      ) {
-        return;
-      }
-      if (sim.ok) {
-        rawHits = sim.hits;
-        indexedRevision = sim.indexedRevision > 0 ? sim.indexedRevision : null;
-        damagedEntities = sim.damagedEntities;
-      } else {
-        rawHits = [];
-        if (sim.refusal?.notEnabled) {
-          neuralStatusBanner = `Similarity embeddings not enabled on host (${sim.refusal.code})`;
-        } else if (sim.refusal) {
-          errorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
-        }
-      }
-      if (
-        selectionEpoch === epochAtStart &&
-        viewportStore.selectedEntityId === entityId &&
-        viewportStore.workspace === workspaceAtStart
-      ) {
-        await expand2Hop(entityId, workspaceAtStart);
-      }
-    } catch (err) {
-      if (
-        !isUnmounted &&
-        !isAbortError(err, controller.signal) &&
-        reqSeq === searchReqSeq &&
-        viewportStore.workspace === workspaceAtStart
-      ) {
-        rawHits = [];
-        pathResults = [];
-        indexedRevision = null;
-        damagedEntities = 0;
-        answerSummary = null;
-        errorBanner =
-          err instanceof Error ? err.message : "Similarity lookup failed";
-      }
-    } finally {
-      if (activeSearchController === controller) {
-        activeSearchController = null;
-      }
-      if (!isUnmounted && reqSeq === searchReqSeq) {
-        running = false;
-      }
-    }
-  }
-
-  function selectHit(entityId: string): void {
-    if (isUnmounted) {
-      return;
-    }
-    selectionEpoch += 1;
-    pathResults = [];
-    const workspaceAtClick = viewportStore.workspace;
-    viewportStore.selectEntity(entityId);
-    onSyncHash?.(viewportStore.toUrlHash());
-    void expand2Hop(entityId, workspaceAtClick);
-  }
+  $effect(() => {
+    session.observeMountedSelection(viewportStore.selectedEntityId);
+  });
 
   $effect(() => {
     const model = causalSubgraph;
@@ -491,7 +209,7 @@
   });
 
   $effect(() => {
-    void viewportStore.selectedEntityId;
+    void session.inspectedEntityId;
     void hoveredNodeId;
     sigmaInstance?.refresh();
   });
@@ -521,7 +239,7 @@
           defaultDrawNodeHover: drawSkgNodeHover,
           nodeReducer: (node: string, data: Record<string, unknown>) => {
             const res = { ...data };
-            const focusId = hoveredNodeId ?? viewportStore.selectedEntityId;
+            const focusId = hoveredNodeId ?? session.inspectedEntityId;
             if (focusId) {
               if (node === focusId) {
                 res.highlighted = true;
@@ -539,7 +257,7 @@
           },
         });
         renderer.on("clickNode", ({ node }) => {
-          selectHit(node);
+          session.selectHit(node);
         });
         renderer.on("enterNode", ({ node }) => {
           hoveredNodeId = node;
@@ -586,10 +304,10 @@
       isUnmounted = true;
       mounted = false;
       sigmaReady = false;
-      activeSearchController?.abort();
-      activeExpandController?.abort();
-      activeSearchController = null;
-      activeExpandController = null;
+      if (!analysisSession && ownedFallbackSession) {
+        ownedFallbackSession.dispose();
+        ownedFallbackSession = null;
+      }
       layoutController.stop();
       sigmaInstance?.kill();
       sigmaInstance = null;
@@ -608,18 +326,18 @@
   <form
     class="cortex-query-bar"
     data-testid="cortex-query-bar"
-    onsubmit={executeSearch}
+    onsubmit={(ev) => session.executeSearch(ev)}
   >
     <div class="tier-pills" role="group" aria-label="Analysis SKG query tier">
       {#each CORTEX_QUERY_TIERS as tier (tier)}
         <button
           type="button"
           class="tier-btn"
-          class:active={activeTier === tier}
-          aria-pressed={activeTier === tier}
+          class:active={session.activeTier === tier}
+          aria-pressed={session.activeTier === tier}
           data-testid="cortex-tier-{tier}"
           onclick={() => {
-            activeTier = tier;
+            session.setActiveTier(tier);
           }}
         >
           {tier.toUpperCase()}
@@ -631,54 +349,122 @@
       type="search"
       class="query-input"
       data-testid="cortex-query-input"
-      placeholder={activeTier === "semantic"
+      placeholder={session.activeTier === "semantic"
         ? "Predicate pattern (e.g. uxs.authority.state or cop.contact.source)…"
         : "Search SKG entities, callsigns, descriptions, or causal links…"}
-      bind:value={queryText}
+      bind:value={session.queryText}
     />
 
     <button
       type="submit"
       class="run-btn"
       data-testid="cortex-query-submit"
-      disabled={running || queryText.trim().length === 0}
+      disabled={session.queryText.trim().length === 0}
     >
-      {running ? "Querying…" : "Search SKG"}
+      {session.running ? "Querying…" : "Search SKG"}
     </button>
+
+    {#if session.running}
+      <button
+        type="button"
+        class="cancel-btn"
+        data-testid="cortex-query-cancel"
+        onclick={() => session.cancelSearch()}
+      >
+        Cancel
+      </button>
+    {/if}
 
     <button
       type="button"
       class="similar-btn"
       data-testid="cortex-similar-btn"
-      disabled={running || !viewportStore.selectedEntityId}
-      onclick={runFindSimilar}
+      disabled={!viewportStore.selectedEntityId && !session.inspectedEntityId}
+      onclick={() => session.runFindSimilar()}
     >
       2-Hop &amp; Similar
     </button>
 
-    {#if indexedRevision !== null && indexedRevision > 0}
+    {#if session.status !== "idle"}
+      <span
+        class="status-pill"
+        data-testid="cortex-session-status"
+        data-status={session.status}
+      >
+        {session.status}
+      </span>
+    {/if}
+
+    {#if session.indexedRevision !== null && session.indexedRevision > 0}
       <span class="rev-pill" data-testid="cortex-indexed-rev">
-        idx rev #{indexedRevision}
-        {#if damagedEntities > 0}
-          · damaged:{damagedEntities}
+        idx rev #{session.indexedRevision}
+        {#if session.damagedEntities > 0}
+          · damaged:{session.damagedEntities}
         {/if}
       </span>
-    {:else if damagedEntities > 0}
+    {:else if session.damagedEntities > 0}
       <span class="rev-pill" data-testid="cortex-damaged-pill">
-        damaged:{damagedEntities}
+        damaged:{session.damagedEntities}
       </span>
     {/if}
   </form>
 
-  {#if neuralStatusBanner}
-    <div class="neural-banner" data-testid="cortex-neural-status" role="status">
-      {neuralStatusBanner}
+  {#if provenanceSummary}
+    <div
+      class="provenance-banner"
+      class:diverged={provenanceSummary.earlierSelectionMismatch ||
+        provenanceSummary.draftQueryDiverged}
+      data-testid="cortex-result-provenance"
+      data-earlier-selection={provenanceSummary.earlierSelectionMismatch
+        ? "true"
+        : "false"}
+      role="status"
+    >
+      <span>{provenanceSummary.headline}</span>
     </div>
   {/if}
 
-  {#if errorBanner}
+  {#if inspectionDiverged}
+    <div
+      class="divergence-banner"
+      data-testid="cortex-inspection-divergence"
+      role="status"
+    >
+      <span>
+        Pinned inspection: {inspectedEntityLabel} · Current selection: {currentSelectionLabel}
+      </span>
+      <button
+        type="button"
+        class="sync-btn"
+        data-testid="cortex-sync-selection-btn"
+        onclick={() => session.syncInspectionToSelection()}
+      >
+        {viewportStore.selectedEntityId
+          ? `Inspect ${currentSelectionLabel}`
+          : "Clear Pinned Inspection"}
+      </button>
+    </div>
+  {/if}
+
+  {#if session.status === "cancelled" && session.cancelledSummary}
+    <div
+      class="cancelled-banner"
+      data-testid="cortex-cancelled-banner"
+      role="status"
+    >
+      {session.cancelledSummary}
+    </div>
+  {/if}
+
+  {#if session.neuralStatusBanner}
+    <div class="neural-banner" data-testid="cortex-neural-status" role="status">
+      {session.neuralStatusBanner}
+    </div>
+  {/if}
+
+  {#if session.errorBanner}
     <div class="error-banner" data-testid="cortex-error-banner" role="alert">
-      {errorBanner}
+      {session.errorBanner}
     </div>
   {/if}
 
@@ -703,10 +489,10 @@
               <button
                 type="button"
                 class="hit-btn"
-                class:selected={viewportStore.selectedEntityId === hit.entityId}
+                class:selected={session.inspectedEntityId === hit.entityId}
                 data-testid="cortex-hit-item"
                 data-entity-id={hit.entityId}
-                onclick={() => selectHit(hit.entityId)}
+                onclick={() => session.selectHit(hit.entityId)}
               >
                 <span class="hit-top">
                   <strong>{hit.displayLabel}</strong>
@@ -752,7 +538,7 @@
         class:hidden={!webglAvailable}
         data-testid="cortex-sigma-host"
         data-sigma-ready={sigmaReady ? "true" : "false"}
-        data-highlighted-node={viewportStore.selectedEntityId ?? ""}
+        data-highlighted-node={session.inspectedEntityId ?? ""}
         data-hovered-node={hoveredNodeId ?? ""}
         role="application"
         aria-label="Causal SKG interactive WebGL canvas"
@@ -774,7 +560,7 @@
                     type="button"
                     class="fallback-node-btn"
                     data-node-color={node.color}
-                    onclick={() => selectHit(node.id)}
+                    onclick={() => session.selectHit(node.id)}
                   >
                     <span class="node-swatch" style:background={node.color}
                     ></span>
@@ -798,13 +584,19 @@
         <strong>GROUNDED PROVENANCE ({citations.length})</strong>
       </div>
 
-      {#if answerSummary}
+      {#if session.answerSummary}
         <div class="answer-box" data-testid="cortex-answer-summary">
-          {answerSummary}
+          {session.answerSummary}
         </div>
       {/if}
 
-      {#if citations.length === 0}
+      {#if session.inspectedEntityId !== null && inspectedEntity === null}
+        <p class="unavailable-note" data-testid="cortex-entity-unavailable">
+          Entity {inspectedEntityLabel} ({session.inspectedEntityId}) is
+          unavailable in live Fleet data — grounded SKG triple citations cannot
+          be resolved.
+        </p>
+      {:else if citations.length === 0}
         <p class="muted">
           Select an entity hit or subgraph node to inspect kvRevision-grounded
           SKG triple assertions.
@@ -890,7 +682,9 @@
   }
 
   .run-btn,
-  .similar-btn {
+  .cancel-btn,
+  .similar-btn,
+  .sync-btn {
     padding: 5px 10px;
     border-radius: 4px;
     font: inherit;
@@ -902,6 +696,13 @@
     background: rgba(59, 130, 246, 0.2);
     color: var(--ui-text-primary, #e2e8f0);
     font-weight: 700;
+  }
+
+  .cancel-btn,
+  .sync-btn {
+    border: 1px solid var(--ui-border-strong, #334155);
+    background: var(--ui-surface-elevated, #172033);
+    color: var(--ui-text-primary, #e2e8f0);
   }
 
   .similar-btn {
@@ -916,12 +717,45 @@
     cursor: not-allowed;
   }
 
+  .status-pill,
   .rev-pill {
     padding: 2px 7px;
     border-radius: 999px;
+    font-size: 10px;
+  }
+
+  .status-pill {
+    border: 1px solid var(--ui-border-strong, #334155);
+    background: var(--ui-surface-elevated, #172033);
+    color: var(--ui-text-secondary, #94a3b8);
+    text-transform: uppercase;
+  }
+
+  .rev-pill {
     border: 1px solid #818cf8;
     color: #c7d2fe;
-    font-size: 10px;
+  }
+
+  .provenance-banner,
+  .divergence-banner,
+  .cancelled-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 5px;
+    border: 1px solid var(--ui-border-strong, #334155);
+    background: var(--ui-surface-secondary, #101726);
+    color: var(--ui-text-secondary, #94a3b8);
+  }
+
+  .provenance-banner.diverged,
+  .divergence-banner {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(56, 189, 248, 0.08);
+    color: var(--ui-text-primary, #e2e8f0);
   }
 
   .neural-banner {
@@ -938,6 +772,15 @@
     border: 1px solid #64748b;
     background: rgba(51, 65, 85, 0.35);
     color: var(--ui-text-primary, #e2e8f0);
+  }
+
+  .unavailable-note {
+    margin: 0;
+    padding: 8px;
+    border-radius: 4px;
+    border: 1px solid rgba(129, 140, 248, 0.4);
+    background: var(--ui-surface-elevated, #172033);
+    color: var(--ui-text-secondary, #94a3b8);
   }
 
   .cortex-grid {

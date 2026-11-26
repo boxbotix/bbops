@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 boxbotix
 
-import { type UxsDomainKind, isFiniteNumber } from "../uxs";
+import { SvelteMap } from "svelte/reactivity";
+import {
+  type UxsDomainKind,
+  isFiniteNumber,
+  isUxsDomainKind,
+  parseVehicleEntityId,
+} from "../uxs";
 
 // shortcut: tuning rack stages parameter diffs locally read-only in M2.4, wire ADR-111 non-retrying PARAM_SET commit in M3.1 (#11)
 export type TuningControlWidget = "dial" | "slider";
@@ -24,6 +30,60 @@ export interface TuningDiffEntry {
   readonly baseline: number;
   readonly staged: number;
   readonly delta: number;
+}
+
+export interface VehicleTuningDraftRecord {
+  readonly entityId: string;
+  readonly sysid: number;
+  readonly domain: UxsDomainKind;
+  readonly baseline: Readonly<Record<string, number>>;
+  readonly staged: Readonly<Record<string, number>>;
+}
+
+export interface VehicleTuningView {
+  readonly entityId: string;
+  readonly sysid: number;
+  readonly domain: UxsDomainKind;
+  readonly baseline: Readonly<Record<string, number>>;
+  readonly staged: Readonly<Record<string, number>>;
+  readonly diffs: readonly TuningDiffEntry[];
+}
+
+export interface DormantVehicleDraftView {
+  readonly entityId: string;
+  readonly sysid: number;
+  readonly domain: UxsDomainKind;
+  readonly diffs: readonly TuningDiffEntry[];
+}
+
+export interface CommandableVehicleRef {
+  readonly id: string;
+  readonly sysid: number;
+  readonly domain: UxsDomainKind;
+  readonly poisoned?: boolean;
+}
+
+export interface DiagnosticsDraftStore {
+  readonly records: SvelteMap<string, VehicleTuningDraftRecord>;
+  readVehicle(
+    vehicle: CommandableVehicleRef | null | undefined,
+  ): VehicleTuningView | null;
+  getDormantDraft(
+    entityId: string | null | undefined,
+    knownDomain?: UxsDomainKind | null,
+  ): DormantVehicleDraftView | null;
+  stageParam(
+    vehicle: CommandableVehicleRef | null | undefined,
+    key: string,
+    rawValue: number,
+    baselineOverride?: Readonly<Record<string, number>>,
+  ): VehicleTuningView | null;
+  revertVehicle(entityId: string | null | undefined): boolean;
+  reconcileVehicleDomain(
+    entityId: string | null | undefined,
+    domain: UxsDomainKind,
+  ): void;
+  clearAll(): void;
 }
 
 export const BENCH_TUNING_SPECS: readonly TuningParamSpec[] = [
@@ -203,4 +263,229 @@ export function computeDialProgress(
     return 0;
   }
   return Math.max(0, Math.min(1, (value - spec.min) / span));
+}
+
+function normalizeTuningMap(
+  specs: readonly TuningParamSpec[],
+  source: Readonly<Record<string, number>>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const spec of specs) {
+    const raw = source[spec.key];
+    out[spec.key] = clampTuningValue(
+      spec,
+      isFiniteNumber(raw) ? raw : spec.min,
+    );
+  }
+  return out;
+}
+
+function validateCommandableVehicleRef(
+  vehicle: CommandableVehicleRef | null | undefined,
+): { entityId: string; sysid: number; domain: UxsDomainKind } | null {
+  if (
+    !vehicle ||
+    vehicle.poisoned === true ||
+    !isUxsDomainKind(vehicle.domain) ||
+    typeof vehicle.id !== "string"
+  ) {
+    return null;
+  }
+  const parsed = parseVehicleEntityId(vehicle.id);
+  if (!parsed || parsed.sysid !== vehicle.sysid) {
+    return null;
+  }
+  return {
+    entityId: vehicle.id,
+    sysid: parsed.sysid,
+    domain: vehicle.domain,
+  };
+}
+
+/**
+ * Session-scoped Diagnostics parameter draft store keyed strictly by canonical
+ * 6-part UXS vehicle entity ID (`<org>.<platform>.robotics.uxs.vehicle.<sysid>`).
+ * Retains dormant drafts across transient `poisoned`/`delete` transitions while
+ * refusing invalid, non-vehicle, poisoned, or domain-mismatched reads/writes (#40).
+ */
+export function createDiagnosticsDraftStore(
+  specs: readonly TuningParamSpec[] = BENCH_TUNING_SPECS,
+): DiagnosticsDraftStore {
+  const records = new SvelteMap<string, VehicleTuningDraftRecord>();
+
+  return {
+    records,
+
+    readVehicle(vehicle) {
+      const valid = validateCommandableVehicleRef(vehicle);
+      if (!valid) {
+        return null;
+      }
+      const existing = records.get(valid.entityId);
+      if (existing && existing.domain === valid.domain) {
+        return {
+          entityId: existing.entityId,
+          sysid: existing.sysid,
+          domain: existing.domain,
+          baseline: existing.baseline,
+          staged: existing.staged,
+          diffs: computeTuningDiff(specs, existing.baseline, existing.staged),
+        };
+      }
+      const baseline = normalizeTuningMap(
+        specs,
+        defaultTuningBaseline(valid.domain),
+      );
+      return {
+        entityId: valid.entityId,
+        sysid: valid.sysid,
+        domain: valid.domain,
+        baseline,
+        staged: { ...baseline },
+        diffs: [],
+      };
+    },
+
+    getDormantDraft(entityId, knownDomain) {
+      if (typeof entityId !== "string") {
+        return null;
+      }
+      const parsed = parseVehicleEntityId(entityId);
+      if (!parsed) {
+        return null;
+      }
+      const existing = records.get(entityId);
+      if (!existing || existing.sysid !== parsed.sysid) {
+        return null;
+      }
+      if (
+        knownDomain !== undefined &&
+        knownDomain !== null &&
+        existing.domain !== knownDomain
+      ) {
+        return null;
+      }
+      const diffs = computeTuningDiff(
+        specs,
+        existing.baseline,
+        existing.staged,
+      );
+      if (diffs.length === 0) {
+        return null;
+      }
+      return {
+        entityId: existing.entityId,
+        sysid: existing.sysid,
+        domain: existing.domain,
+        diffs,
+      };
+    },
+
+    stageParam(vehicle, key, rawValue, baselineOverride) {
+      const valid = validateCommandableVehicleRef(vehicle);
+      if (!valid) {
+        return null;
+      }
+      const existing = records.get(valid.entityId);
+      const baseline =
+        existing && existing.domain === valid.domain
+          ? existing.baseline
+          : normalizeTuningMap(
+              specs,
+              baselineOverride ?? defaultTuningBaseline(valid.domain),
+            );
+      const priorStaged =
+        existing && existing.domain === valid.domain
+          ? existing.staged
+          : baseline;
+      const nextStaged = stageTuningValue(specs, priorStaged, key, rawValue);
+      const nextRecord: VehicleTuningDraftRecord = {
+        entityId: valid.entityId,
+        sysid: valid.sysid,
+        domain: valid.domain,
+        baseline,
+        staged: nextStaged,
+      };
+      records.set(valid.entityId, nextRecord);
+      return {
+        ...nextRecord,
+        diffs: computeTuningDiff(specs, baseline, nextStaged),
+      };
+    },
+
+    revertVehicle(entityId) {
+      if (typeof entityId !== "string" || !parseVehicleEntityId(entityId)) {
+        return false;
+      }
+      const existing = records.get(entityId);
+      if (!existing) {
+        return false;
+      }
+      records.set(entityId, {
+        ...existing,
+        staged: revertTuningDraft(existing.baseline),
+      });
+      return true;
+    },
+
+    reconcileVehicleDomain(entityId, domain) {
+      if (
+        typeof entityId !== "string" ||
+        !parseVehicleEntityId(entityId) ||
+        !isUxsDomainKind(domain)
+      ) {
+        return;
+      }
+      const existing = records.get(entityId);
+      if (existing && existing.domain !== domain) {
+        records.delete(entityId);
+      }
+    },
+
+    clearAll() {
+      records.clear();
+    },
+  };
+}
+
+export interface WithheldTuningExplanationInput {
+  readonly selectedEntityId: string | null;
+  readonly selectedEntityKind:
+    "uxs-vehicle" | "external-contact" | "generic" | null;
+  readonly selectedEntityLabel: string | null;
+  readonly selectedEntityPoisoned: boolean;
+  readonly selectedVehicleSysId: number | null;
+  readonly skgSynced: boolean;
+  readonly skgLastSyncedRevision: number | null;
+}
+
+export function describeWithheldTuningState(
+  input: WithheldTuningExplanationInput,
+): string {
+  if (input.selectedEntityKind === "external-contact") {
+    return "External COP contacts expose no parameter tuning rack.";
+  }
+  const poisonedSysId =
+    input.selectedVehicleSysId ??
+    (input.selectedEntityPoisoned && input.selectedEntityId
+      ? (parseVehicleEntityId(input.selectedEntityId)?.sysid ?? null)
+      : null);
+  if (input.selectedEntityPoisoned && poisonedSysId !== null) {
+    return `UXS #${poisonedSysId} is POISONED — parameter staging is withheld.`;
+  }
+  if (input.selectedEntityKind === "generic" && input.selectedEntityId) {
+    const label = input.selectedEntityLabel ?? input.selectedEntityId;
+    return `Selected entity (${label}) is not a commandable UXS vehicle — parameter staging is unavailable.`;
+  }
+  if (input.selectedEntityId !== null && input.selectedEntityKind === null) {
+    if (!input.skgSynced && input.skgLastSyncedRevision === null) {
+      return `Awaiting Fleet data sync for ${input.selectedEntityId} — parameter staging is withheld until vehicle state is verified.`;
+    }
+    const parsedVehicle = parseVehicleEntityId(input.selectedEntityId);
+    if (parsedVehicle) {
+      return `UXS #${parsedVehicle.sysid} (${input.selectedEntityId}) is unavailable in live Fleet data — parameter staging is withheld.`;
+    }
+    return `Selected entity (${input.selectedEntityId}) is unavailable in live Fleet data — parameter staging applies only to active commandable UXS vehicles.`;
+  }
+  return "Select a commandable UXS vehicle to stage control and deadman parameters.";
 }

@@ -8,6 +8,11 @@
     TelemetryTraceBook,
     lookupMeasuredSysStatus,
   } from "$lib/bench/ring-buffer";
+  import {
+    type DiagnosticsDraftStore,
+    type TuningDiffEntry,
+    createDiagnosticsDraftStore,
+  } from "$lib/bench/tuning-rack";
   import { formatShellBanner } from "$lib/bootstrap";
   import AuthorityBanner from "$lib/components/AuthorityBanner.svelte";
   import BenchWorkspace from "$lib/components/BenchWorkspace.svelte";
@@ -19,6 +24,10 @@
     type GraphSearchClient,
     createGraphSearchClient,
   } from "$lib/cortex/search-client";
+  import {
+    type AnalysisSessionStore,
+    createAnalysisSessionStore,
+  } from "$lib/cortex/session.svelte";
   import { type GraphQLClient, createGraphQLClient } from "$lib/graphql";
   import {
     FLEET_FRESHNESS_TICK_MS,
@@ -42,9 +51,15 @@
     graphqlClient?: GraphQLClient;
     searchClient?: GraphSearchClient;
     traceBook?: TelemetryTraceBook;
+    diagnosticsDraftStore?: DiagnosticsDraftStore;
+    analysisSession?: AnalysisSessionStore;
     filmstripItems?: readonly FilmstripItemView[];
     now?: () => number;
     onSyncHash?: (hash: string) => void;
+    onApplyTuning?: (
+      sysid: number,
+      diffs: readonly TuningDiffEntry[],
+    ) => void | Promise<void>;
   }
 
   let {
@@ -54,10 +69,30 @@
     graphqlClient = createGraphQLClient(),
     searchClient = createGraphSearchClient(),
     traceBook = new TelemetryTraceBook(),
+    diagnosticsDraftStore = createDiagnosticsDraftStore(),
+    analysisSession,
     filmstripItems,
     now = () => Date.now(),
     onSyncHash,
+    onApplyTuning,
   }: Props = $props();
+
+  let ownedAnalysisSession: AnalysisSessionStore | null = null;
+  function getShellAnalysisSession(): AnalysisSessionStore {
+    if (!ownedAnalysisSession) {
+      ownedAnalysisSession = createAnalysisSessionStore({
+        skgStore,
+        viewportStore,
+        graphqlClient,
+        searchClient,
+      });
+    }
+    return ownedAnalysisSession;
+  }
+
+  const resolvedAnalysisSession = $derived.by(
+    () => analysisSession ?? getShellAnalysisSession(),
+  );
 
   let freshnessTick = $state(0);
   const clockNowMs = $derived.by(() => {
@@ -69,7 +104,24 @@
     const intervalId = setInterval(() => {
       freshnessTick += 1;
     }, FLEET_FRESHNESS_TICK_MS);
-    return () => clearInterval(intervalId);
+    return () => {
+      clearInterval(intervalId);
+      if (!analysisSession && ownedAnalysisSession) {
+        ownedAnalysisSession.dispose();
+        ownedAnalysisSession = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    for (const vehicle of skgStore.vehicles) {
+      if (!vehicle.poisoned) {
+        diagnosticsDraftStore.reconcileVehicleDomain(
+          vehicle.id,
+          vehicle.domain,
+        );
+      }
+    }
   });
 
   const banner = $derived(formatShellBanner("v0.1.0-dev"));
@@ -370,7 +422,9 @@
         {skgStore}
         {viewportStore}
         {traceBook}
+        draftStore={diagnosticsDraftStore}
         {onSyncHash}
+        {onApplyTuning}
       />
     {:else}
       <CortexWorkspace
@@ -378,6 +432,7 @@
         {viewportStore}
         {graphqlClient}
         {searchClient}
+        analysisSession={resolvedAnalysisSession}
         {onSyncHash}
       />
     {/if}

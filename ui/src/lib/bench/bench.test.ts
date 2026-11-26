@@ -17,9 +17,11 @@ import {
   TelemetryTraceBook,
   VehicleRingBuffer,
 } from "./ring-buffer";
+import type { UxsDomainKind } from "../uxs";
 import {
   BENCH_TUNING_SPECS,
   computeTuningDiff,
+  createDiagnosticsDraftStore,
   defaultTuningBaseline,
   revertTuningDraft,
   stageTuningValue,
@@ -865,6 +867,626 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
 
       unmount(app);
     } finally {
+      hostEl.remove();
+    }
+  });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("matches an independent per-entity reference model across remounts, vehicle switches, single-vehicle reverts, dormant poison/delete retention, domain resets, and non-commandable selections with zero navigation actuation (#40)", () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore();
+    const traceBook = new TelemetryTraceBook();
+    const draftStore = createDiagnosticsDraftStore();
+
+    const domains: readonly UxsDomainKind[] = [
+      "quadcopter",
+      "rover",
+      "surface-boat",
+    ];
+    const vehicleIds = [
+      "boxbotix.local.robotics.uxs.vehicle.1",
+      "boxbotix.local.robotics.uxs.vehicle.2",
+      "boxbotix.local.robotics.uxs.vehicle.3",
+    ] as const;
+    const contactId = "boxbotix.local.tak.cop.vessel.harbor7";
+    const genericId = "boxbotix.local.ops.corridor.sector.north1";
+    const missingVehicleId = "boxbotix.local.robotics.uxs.vehicle.99";
+
+    let rev = 1;
+    const pushPut = (key: string, payload: unknown): void => {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key,
+          revision: rev++,
+          payload,
+        }),
+      );
+    };
+    const pushPoison = (key: string): void => {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key,
+          revision: rev++,
+          error: "corrupt kv frame",
+        }),
+      );
+    };
+    const pushDelete = (key: string): void => {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "delete",
+          bucket: "ENTITY_STATES",
+          key,
+          revision: rev++,
+        }),
+      );
+    };
+
+    // Canonical sysid boundary & non-vehicle entity rejection at store seam.
+    expect(
+      draftStore.stageParam(
+        {
+          id: "boxbotix.local.robotics.uxs.vehicle.0",
+          sysid: 0,
+          domain: "quadcopter",
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(
+      draftStore.stageParam(
+        {
+          id: "boxbotix.local.robotics.uxs.vehicle.255",
+          sysid: 255,
+          domain: "quadcopter",
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(
+      draftStore.stageParam(
+        {
+          id: "boxbotix.local.robotics.uxs.vehicle.01",
+          sysid: 1,
+          domain: "quadcopter",
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(
+      draftStore.stageParam(
+        {
+          id: contactId,
+          sysid: 1,
+          domain: "quadcopter",
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(
+      draftStore.stageParam(
+        {
+          id: vehicleIds[0],
+          sysid: 2, // sysid mismatch vs canonical ID
+          domain: "quadcopter",
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(
+      draftStore.stageParam(
+        {
+          id: vehicleIds[0],
+          sysid: 1,
+          domain: "quadcopter",
+          poisoned: true,
+        },
+        "uxs.control.heading_kp",
+        4.0,
+      ),
+    ).toBeNull();
+    expect(draftStore.records.size).toBe(0);
+
+    // Direct store-seam domain mismatch check (before reconcileVehicleDomain runs):
+    draftStore.stageParam(
+      { id: vehicleIds[0], sysid: 1, domain: "quadcopter" },
+      "uxs.control.heading_kp",
+      3.5,
+    );
+    const mismatchRead = draftStore.readVehicle({
+      id: vehicleIds[0],
+      sysid: 1,
+      domain: "rover",
+    });
+    expect(mismatchRead?.domain).toBe("rover");
+    expect(mismatchRead?.diffs).toEqual([]);
+    expect(mismatchRead?.staged["uxs.control.heading_kp"]).toBe(
+      defaultTuningBaseline("rover")["uxs.control.heading_kp"],
+    );
+    expect(draftStore.getDormantDraft(vehicleIds[0], "rover")).toBeNull();
+    const mismatchStage = draftStore.stageParam(
+      { id: vehicleIds[0], sysid: 1, domain: "rover" },
+      "uxs.limits.max_groundspeed_mps",
+      8.0,
+    );
+    expect(mismatchStage?.domain).toBe("rover");
+    expect(mismatchStage?.baseline["uxs.control.heading_kp"]).toBe(
+      defaultTuningBaseline("rover")["uxs.control.heading_kp"],
+    );
+    draftStore.clearAll();
+
+    // Seed initial fleet + external contact + generic entity.
+    const liveVehicleState = new Map<
+      string,
+      {
+        sysid: number;
+        domain: UxsDomainKind;
+        status: "healthy" | "poisoned" | "deleted";
+      }
+    >();
+    for (let i = 0; i < vehicleIds.length; i += 1) {
+      const sysid = i + 1;
+      const domain = domains[i]!;
+      const id = vehicleIds[i]!;
+      liveVehicleState.set(id, { sysid, domain, status: "healthy" });
+      pushPut(
+        id,
+        buildVehicleStoredPayload(sysid, { "uxs.domain.kind": domain }),
+      );
+    }
+    pushPut(contactId, {
+      id: contactId,
+      triples: [
+        {
+          subject: contactId,
+          predicate: "dc.terms.title",
+          object: "Harbor 7",
+          source: "ais",
+          timestamp: "2026-11-26T12:00:00Z",
+          confidence: 1,
+        },
+      ],
+    });
+    pushPut(genericId, {
+      id: genericId,
+      triples: [
+        {
+          subject: genericId,
+          predicate: "dc.terms.title",
+          object: "North Corridor",
+          source: "ops",
+          timestamp: "2026-11-26T12:00:00Z",
+          confidence: 1,
+        },
+      ],
+    });
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: rev - 1,
+      }),
+    );
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(vehicleIds[0]);
+
+    const onApply = vi.fn();
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+
+    let mountedApp: ReturnType<typeof mount> | null = mount(BenchWorkspace, {
+      target: hostEl,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        traceBook,
+        draftStore,
+        onApplyTuning: onApply,
+      },
+    });
+    flushSync();
+
+    interface RefDraft {
+      domain: UxsDomainKind;
+      baseline: Record<string, number>;
+      staged: Record<string, number>;
+    }
+    const refModel = new Map<string, RefDraft>();
+
+    let sawRemountWithActiveDraft = false;
+    let sawMultiVehicleIsolation = false;
+    let sawSingleVehicleRevert = false;
+    let sawPoisonDormantAndRecovery = false;
+    let sawDeleteDormantRevert = false;
+    let sawDomainMismatchReset = false;
+    let sawGenericAndMissingExplanation = false;
+
+    const mountIfNeeded = (): void => {
+      if (!mountedApp) {
+        mountedApp = mount(BenchWorkspace, {
+          target: hostEl,
+          props: {
+            telemetryStore,
+            skgStore,
+            viewportStore,
+            traceBook,
+            draftStore,
+            onApplyTuning: onApply,
+          },
+        });
+        flushSync();
+      }
+    };
+
+    try {
+      const rng = createSeededRng(0x40d1a650);
+
+      for (let step = 0; step < 260; step += 1) {
+        const roll = rng();
+
+        if (roll < 0.14) {
+          // Simulate workspace switch away from and back to BenchWorkspace.
+          if (mountedApp) {
+            const hadAnyDiff = Array.from(refModel.values()).some(
+              (r) =>
+                computeTuningDiff(BENCH_TUNING_SPECS, r.baseline, r.staged)
+                  .length > 0,
+            );
+            unmount(mountedApp);
+            mountedApp = null;
+            if (hadAnyDiff) {
+              sawRemountWithActiveDraft = true;
+            }
+          } else {
+            mountIfNeeded();
+          }
+        } else if (roll < 0.34) {
+          // Select among UXS vehicles, external contact, generic node, missing vehicle ID, or null.
+          const choices = [
+            ...vehicleIds,
+            contactId,
+            genericId,
+            missingVehicleId,
+            null,
+          ] as const;
+          const pick = choices[Math.floor(rng() * choices.length)] ?? null;
+          viewportStore.selectEntity(pick);
+          flushSync();
+          if (mountedApp && (pick === genericId || pick === missingVehicleId)) {
+            sawGenericAndMissingExplanation = true;
+          }
+        } else if (roll < 0.62) {
+          // Stage a parameter via DOM slider when mounted & commandable, or store seam.
+          mountIfNeeded();
+          const selId = viewportStore.selectedEntityId;
+          const vState = selId ? liveVehicleState.get(selId) : undefined;
+          if (vState && vState.status === "healthy" && selId) {
+            const spec =
+              BENCH_TUNING_SPECS[
+                Math.floor(rng() * BENCH_TUNING_SPECS.length)
+              ]!;
+            const rawCandidates = [
+              spec.min - 10,
+              spec.max + 10,
+              spec.min + rng() * (spec.max - spec.min),
+              spec.key === "uxs.control.heading_kp" ? 3.3 : spec.max,
+            ];
+            const rawVal =
+              rawCandidates[Math.floor(rng() * rawCandidates.length)]!;
+            const input = hostEl.querySelector(
+              `[data-param-key="${spec.key}"] input[type="range"]`,
+            ) as HTMLInputElement | null;
+            expect(input).not.toBeNull();
+            input!.value = String(rawVal);
+            input!.dispatchEvent(new Event("input", { bubbles: true }));
+            flushSync();
+
+            const existingRef = refModel.get(selId);
+            const baseline =
+              existingRef && existingRef.domain === vState.domain
+                ? existingRef.baseline
+                : defaultTuningBaseline(vState.domain);
+            const priorStaged =
+              existingRef && existingRef.domain === vState.domain
+                ? existingRef.staged
+                : baseline;
+            refModel.set(selId, {
+              domain: vState.domain,
+              baseline,
+              staged: stageTuningValue(
+                BENCH_TUNING_SPECS,
+                priorStaged,
+                spec.key,
+                rawVal,
+              ),
+            });
+
+            const distinctDraftVehicles = Array.from(refModel.entries()).filter(
+              ([, entry]) =>
+                computeTuningDiff(
+                  BENCH_TUNING_SPECS,
+                  entry.baseline,
+                  entry.staged,
+                ).length > 0,
+            );
+            if (distinctDraftVehicles.length >= 2) {
+              sawMultiVehicleIsolation = true;
+            }
+          }
+        } else if (roll < 0.74) {
+          // Revert active or dormant draft on currently selected vehicle.
+          mountIfNeeded();
+          const selId = viewportStore.selectedEntityId;
+          const vState = selId ? liveVehicleState.get(selId) : undefined;
+          const refEntry = selId ? refModel.get(selId) : undefined;
+          if (selId && vState && refEntry) {
+            const activeDiffs = computeTuningDiff(
+              BENCH_TUNING_SPECS,
+              refEntry.baseline,
+              refEntry.staged,
+            );
+            if (activeDiffs.length > 0) {
+              if (vState.status === "healthy") {
+                const revertBtn = hostEl.querySelector(
+                  '[data-testid="bench-tuning-revert"]',
+                ) as HTMLButtonElement;
+                revertBtn.click();
+                flushSync();
+                refModel.set(selId, {
+                  ...refEntry,
+                  staged: revertTuningDraft(refEntry.baseline),
+                });
+                const otherStillDirty = Array.from(refModel.entries()).some(
+                  ([otherId, entry]) =>
+                    otherId !== selId &&
+                    computeTuningDiff(
+                      BENCH_TUNING_SPECS,
+                      entry.baseline,
+                      entry.staged,
+                    ).length > 0,
+                );
+                if (otherStillDirty) {
+                  sawSingleVehicleRevert = true;
+                }
+              } else {
+                const dormantRevertBtn = hostEl.querySelector(
+                  '[data-testid="bench-dormant-revert"]',
+                ) as HTMLButtonElement | null;
+                expect(dormantRevertBtn).not.toBeNull();
+                dormantRevertBtn!.click();
+                flushSync();
+                refModel.set(selId, {
+                  ...refEntry,
+                  staged: revertTuningDraft(refEntry.baseline),
+                });
+                if (vState.status === "deleted") {
+                  sawDeleteDormantRevert = true;
+                }
+              }
+            }
+          }
+        } else if (roll < 0.88) {
+          // Poison / delete / recover a vehicle with same domain (OQ1 Option A).
+          const targetId = vehicleIds[Math.floor(rng() * vehicleIds.length)]!;
+          const vState = liveVehicleState.get(targetId)!;
+          if (vState.status === "healthy") {
+            if (rng() < 0.55) {
+              vState.status = "poisoned";
+              pushPoison(targetId);
+            } else {
+              vState.status = "deleted";
+              pushDelete(targetId);
+            }
+            flushSync();
+          } else {
+            const wasPoisonedWithDraft =
+              vState.status === "poisoned" &&
+              Boolean(
+                refModel.get(targetId) &&
+                computeTuningDiff(
+                  BENCH_TUNING_SPECS,
+                  refModel.get(targetId)!.baseline,
+                  refModel.get(targetId)!.staged,
+                ).length > 0,
+              );
+            vState.status = "healthy";
+            pushPut(
+              targetId,
+              buildVehicleStoredPayload(vState.sysid, {
+                "uxs.domain.kind": vState.domain,
+              }),
+            );
+            flushSync();
+            if (wasPoisonedWithDraft) {
+              sawPoisonDormantAndRecovery = true;
+            }
+          }
+        } else {
+          // Healthy domain change on a vehicle resets any stale domain draft.
+          const targetId = vehicleIds[Math.floor(rng() * vehicleIds.length)]!;
+          const vState = liveVehicleState.get(targetId)!;
+          const nextDomain =
+            domains[(domains.indexOf(vState.domain) + 1) % domains.length]!;
+          const hadDirtyPriorDomain = Boolean(
+            refModel.get(targetId) &&
+            refModel.get(targetId)!.domain !== nextDomain &&
+            computeTuningDiff(
+              BENCH_TUNING_SPECS,
+              refModel.get(targetId)!.baseline,
+              refModel.get(targetId)!.staged,
+            ).length > 0,
+          );
+          vState.domain = nextDomain;
+          vState.status = "healthy";
+          pushPut(
+            targetId,
+            buildVehicleStoredPayload(vState.sysid, {
+              "uxs.domain.kind": nextDomain,
+            }),
+          );
+          mountIfNeeded();
+          flushSync();
+          refModel.delete(targetId);
+          if (hadDirtyPriorDomain) {
+            sawDomainMismatchReset = true;
+          }
+        }
+
+        // Assert store + DOM match reference model at every step.
+        for (const id of vehicleIds) {
+          const vState = liveVehicleState.get(id)!;
+          const refEntry = refModel.get(id);
+          if (vState.status === "healthy") {
+            const expectedBaseline =
+              refEntry && refEntry.domain === vState.domain
+                ? refEntry.baseline
+                : defaultTuningBaseline(vState.domain);
+            const expectedStaged =
+              refEntry && refEntry.domain === vState.domain
+                ? refEntry.staged
+                : expectedBaseline;
+            const expectedDiffs = computeTuningDiff(
+              BENCH_TUNING_SPECS,
+              expectedBaseline,
+              expectedStaged,
+            );
+            const view = draftStore.readVehicle(
+              skgStore.getCommandableVehicle(id),
+            );
+            expect(view).not.toBeNull();
+            expect(view!.baseline).toEqual(expectedBaseline);
+            expect(view!.staged).toEqual(expectedStaged);
+            expect(view!.diffs).toEqual(expectedDiffs);
+          } else {
+            expect(skgStore.getCommandableVehicle(id)).toBeNull();
+          }
+        }
+
+        if (mountedApp) {
+          const selId = viewportStore.selectedEntityId;
+          const vState = selId ? liveVehicleState.get(selId) : undefined;
+          if (selId && vState && vState.status === "healthy") {
+            const refEntry = refModel.get(selId);
+            const expectedBaseline =
+              refEntry?.baseline ?? defaultTuningBaseline(vState.domain);
+            const expectedStaged = refEntry?.staged ?? expectedBaseline;
+            const expectedDiffs = computeTuningDiff(
+              BENCH_TUNING_SPECS,
+              expectedBaseline,
+              expectedStaged,
+            );
+            expect(
+              hostEl.querySelector('[data-testid="bench-staged-count"]')
+                ?.textContent,
+            ).toContain(`${expectedDiffs.length} staged`);
+            const kpSpec = BENCH_TUNING_SPECS[0]!;
+            const kpCard = hostEl.querySelector(
+              `[data-param-key="${kpSpec.key}"]`,
+            );
+            expect(kpCard?.textContent).toContain(
+              expectedStaged[kpSpec.key]!.toFixed(kpSpec.decimals),
+            );
+            if (
+              Math.abs(
+                expectedStaged[kpSpec.key]! - expectedBaseline[kpSpec.key]!,
+              ) > 1e-9
+            ) {
+              expect(kpCard?.textContent).toContain(
+                `(base ${expectedBaseline[kpSpec.key]!.toFixed(kpSpec.decimals)})`,
+              );
+            }
+          } else {
+            // Non-commandable / unavailable selection: zero range inputs and zero Apply button.
+            expect(hostEl.querySelectorAll('input[type="range"]')).toHaveLength(
+              0,
+            );
+            expect(
+              hostEl.querySelector('[data-testid="bench-tuning-apply"]'),
+            ).toBeNull();
+            const withheldText =
+              hostEl.querySelector('[data-testid="bench-tuning-withheld"]')
+                ?.textContent ?? "";
+            expect(withheldText.length).toBeGreaterThan(10);
+            if (selId === contactId) {
+              expect(withheldText).toContain("External COP contacts");
+            } else if (selId === genericId) {
+              expect(withheldText).toContain("North Corridor");
+              expect(withheldText).toContain("not a commandable UXS vehicle");
+            } else if (selId === missingVehicleId) {
+              expect(withheldText).toContain("UXS #99");
+              expect(withheldText).toContain("unavailable in live Fleet data");
+            }
+          }
+        }
+
+        expect(onApply).not.toHaveBeenCalled();
+      }
+
+      // Deterministic check of dormant delete -> revert path if RNG did not hit that exact branch.
+      mountIfNeeded();
+      if (!sawDeleteDormantRevert) {
+        const targetId = vehicleIds[1];
+        const vState = liveVehicleState.get(targetId)!;
+        vState.status = "healthy";
+        pushPut(
+          targetId,
+          buildVehicleStoredPayload(vState.sysid, {
+            "uxs.domain.kind": vState.domain,
+          }),
+        );
+        viewportStore.selectEntity(targetId);
+        flushSync();
+        const input = hostEl.querySelector(
+          '[data-param-key="uxs.control.heading_kp"] input[type="range"]',
+        ) as HTMLInputElement;
+        input.value = "3.75";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        flushSync();
+        pushDelete(targetId);
+        vState.status = "deleted";
+        flushSync();
+        expect(
+          hostEl.querySelector('[data-testid="bench-tuning-withheld"]')
+            ?.textContent,
+        ).toContain("unavailable in live Fleet data");
+        expect(
+          hostEl.querySelector('[data-testid="bench-dormant-draft"]'),
+        ).not.toBeNull();
+        (
+          hostEl.querySelector(
+            '[data-testid="bench-dormant-revert"]',
+          ) as HTMLButtonElement
+        ).click();
+        flushSync();
+        expect(
+          hostEl.querySelector('[data-testid="bench-dormant-draft"]'),
+        ).toBeNull();
+        sawDeleteDormantRevert = true;
+      }
+
+      expect(sawRemountWithActiveDraft).toBe(true);
+      expect(sawMultiVehicleIsolation).toBe(true);
+      expect(sawSingleVehicleRevert).toBe(true);
+      expect(sawPoisonDormantAndRecovery).toBe(true);
+      expect(sawDeleteDormantRevert).toBe(true);
+      expect(sawDomainMismatchReset).toBe(true);
+      expect(sawGenericAndMissingExplanation).toBe(true);
+      expect(onApply).toHaveBeenCalledTimes(0);
+    } finally {
+      if (mountedApp) {
+        unmount(mountedApp);
+      }
       hostEl.remove();
     }
   });

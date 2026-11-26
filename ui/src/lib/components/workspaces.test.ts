@@ -542,7 +542,8 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
 
   // spec: cop-ui / Task-modal 4-workspace shell, invariant safety topbar, and Fleet Filmstrip
   // spec: cop-ui / Conventional keyboard traversal, WAI-ARIA tablist navigation, focus management, and character-key shortcut gating
-  it("cancels deferred Cortex searches across workspace switches without mutating COP selection/hash, preserves Tab/Shift+Tab traversal on focused canvases, and toggles Lights-Out via L", async () => {
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("completes deferred Cortex searches in AnalysisSessionStore across workspace switches without mutating COP selection/hash, aborts on shell teardown, preserves Tab/Shift+Tab traversal on focused canvases, and toggles Lights-Out via L", async () => {
     const skgStore = createSkgStore();
     const telemetryStore = createTelemetryStore();
     const quad1 = buildVehicleStoredPayload(1, {
@@ -580,16 +581,19 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       }),
     );
 
-    let resolveDeferredSearch!: (res: Response) => void;
-    let searchAbortSignal: AbortSignal | undefined;
-    const deferredSearchPromise = new Promise<Response>((res) => {
-      resolveDeferredSearch = res;
-    });
+    const searchQueue: Array<{
+      signal: AbortSignal | undefined;
+      resolve: (res: Response) => void;
+    }> = [];
 
     const mockSearch = createGraphSearchClient({
       fetchImpl: (async (_input, init) => {
-        searchAbortSignal = init?.signal ?? undefined;
-        return deferredSearchPromise;
+        return new Promise<Response>((resolve) => {
+          searchQueue.push({
+            signal: init?.signal ?? undefined,
+            resolve,
+          });
+        });
       }) as typeof fetch,
     });
     const mockGraphql: GraphQLClient = {
@@ -751,53 +755,100 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       );
       flushSync();
 
-      // Switch back to COP before deferred search settles.
+      // Switch back to COP before deferred search settles: OQ2 Option A keeps search running in AnalysisSessionStore.
       copTabBtn.click();
       flushSync();
       expect(viewportStore.workspace).toBe("cop");
-      expect(searchAbortSignal?.aborted).toBe(true);
+      expect(searchQueue).toHaveLength(1);
+      expect(searchQueue[0]?.signal?.aborted).toBe(false);
+
+      // Returning early while still pending surfaces defined "running" status + Cancel button.
+      const cortexTabBtn = hostEl.querySelector(
+        '[data-testid="workspace-tab-cortex"]',
+      ) as HTMLButtonElement;
+      cortexTabBtn.click();
+      flushSync();
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-session-status"]')
+          ?.getAttribute("data-status"),
+      ).toBe("running");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      // Switch back to COP again and let the search settle in the background without mutating COP selection or hash.
+      copTabBtn.click();
+      flushSync();
       const hashCountAtCopSwitch = syncedHashes.length;
       const hashAtCopSwitch = syncedHashes.at(-1);
 
-      // Deferred search resolves with rover2.id after Cortex was torn down.
-      resolveDeferredSearch(
+      searchQueue[0]!.resolve(
         new Response(
           JSON.stringify({
             ok: true,
-            verb: "globalSearch",
+            verb: "localSearch",
             result: {
               indexed_revision: 42,
               damaged_entities: 0,
               producer: "graph-query",
               data: {
-                text: {
-                  matches: [
-                    {
-                      id: rover2.id,
-                      label: "Vanguard 2",
-                      score: 5.0,
-                      entity: {},
-                    },
-                  ],
-                },
+                matches: [
+                  {
+                    id: rover2.id,
+                    label: "Vanguard 2",
+                    score: 5.0,
+                    entity: {},
+                  },
+                ],
               },
             },
           }),
           { status: 200 },
         ),
       );
-      await Promise.resolve();
-      await Promise.resolve();
+      await vi.waitFor(() => {
+        expect(mockGraphql.pathSearch).toHaveBeenCalledWith(
+          expect.objectContaining({ startEntity: rover2.id }),
+          expect.anything(),
+        );
+      });
       flushSync();
 
       expect(viewportStore.workspace).toBe("cop");
       expect(viewportStore.selectedEntityId).toBe(quad1.id);
       expect(syncedHashes).toHaveLength(hashCountAtCopSwitch);
       expect(syncedHashes.at(-1)).toBe(hashAtCopSwitch);
-      expect(mockGraphql.pathSearch).not.toHaveBeenCalled();
+
+      // Returning to Analysis shows completed hit + captured UXS #1 provenance; launching a new search and unmounting WorkspaceShell aborts it.
+      cortexTabBtn.click();
+      flushSync();
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-session-status"]')
+          ?.getAttribute("data-status"),
+      ).toBe("completed");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent,
+      ).toContain("UXS #1");
+
+      const remountedForm = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+      remountedForm.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      flushSync();
+      expect(searchQueue).toHaveLength(2);
+      expect(searchQueue[1]?.signal?.aborted).toBe(false);
     } finally {
       window.removeEventListener("keydown", onKeyDown);
       unmount(app);
+      expect(searchQueue[1]?.signal?.aborted).toBe(true);
       hostEl.remove();
     }
   });
@@ -2218,6 +2269,352 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       hostEl.remove();
       telemetryStore.disconnect();
       skgStore.disconnect();
+    }
+  });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("preserves per-vehicle Diagnostics drafts (Heading P Gain 3.20 -> 3.30, baseline, single-vehicle Revert Draft) and Analysis investigation context across Fleet, Vehicle, Diagnostics, and Analysis switches without navigation actuation (#40)", async () => {
+    const skgStore = createSkgStore();
+    const telemetryStore = createTelemetryStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon 1",
+    });
+    const rover2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard 2",
+    });
+    const escortId = "boxbotix.local.tak.cop.vessel.escort4";
+
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: quad1.id,
+        revision: 1,
+        payload: quad1,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover2.id,
+        revision: 2,
+        payload: rover2,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: escortId,
+        revision: 3,
+        payload: {
+          id: escortId,
+          triples: [
+            {
+              subject: escortId,
+              predicate: "dc.terms.title",
+              object: "Escort Vessel 4",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 3,
+      }),
+    );
+
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "localSearch",
+            result: {
+              indexed_revision: 71,
+              damaged_entities: 0,
+              producer: "graph-query",
+              data: {
+                matches: [
+                  {
+                    id: quad1.id,
+                    label: "Falcon 1",
+                    score: 4.1,
+                    entity: {},
+                  },
+                ],
+                answer: "Falcon 1 active in sector",
+              },
+            },
+          }),
+          { status: 200 },
+        )) as typeof fetch,
+    });
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockResolvedValue({
+        data: {
+          entities: [
+            { id: quad1.id, depth: 0 },
+            { id: escortId, depth: 1 },
+          ],
+          paths: [
+            [
+              {
+                from: quad1.id,
+                predicate: "cop.proximity.near",
+                to: escortId,
+              },
+            ],
+          ],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      }),
+    };
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(quad1.id);
+    const onApplyTuning = vi.fn();
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(WorkspaceShell, {
+      target: hostEl,
+      props: {
+        telemetryStore,
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+        onApplyTuning,
+      },
+    });
+    flushSync();
+
+    try {
+      const tab = (mode: "cop" | "pilot" | "bench" | "cortex") =>
+        hostEl.querySelector(
+          `[data-testid="workspace-tab-${mode}"]`,
+        ) as HTMLButtonElement;
+
+      // 1. Open Diagnostics on UXS #1, stage Heading P Gain 3.20 -> 3.30 (1 staged), and stage Max Groundspeed 6.0 -> 9.5 on UXS #2.
+      tab("bench").click();
+      flushSync();
+      expect(hostEl.querySelectorAll("[data-workspace-stage]")).toHaveLength(1);
+
+      const uxs1KpSlider = hostEl.querySelector(
+        '[data-param-key="uxs.control.heading_kp"] input[type="range"]',
+      ) as HTMLInputElement;
+      expect(uxs1KpSlider.value).toBe("3.2");
+      uxs1KpSlider.value = "3.3";
+      uxs1KpSlider.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).toContain("3.30");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).toContain("(base 3.20)");
+
+      // Switch to UXS #2 via FleetFilmstrip and stage Max Groundspeed 6.0 -> 9.5.
+      const filmstripItems = hostEl.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="filmstrip-item"]',
+      );
+      filmstripItems[1]!.click();
+      flushSync();
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("0 staged");
+
+      const uxs2GsSlider = hostEl.querySelector(
+        '[data-param-key="uxs.limits.max_groundspeed_mps"] input[type="range"]',
+      ) as HTMLInputElement;
+      uxs2GsSlider.value = "9.5";
+      uxs2GsSlider.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+
+      // 2. Switch to Analysis, select UXS #1, run Lexical search "Falcon", then round-trip through Fleet -> Vehicle -> Analysis -> Diagnostics.
+      filmstripItems[0]!.click();
+      flushSync();
+      tab("cortex").click();
+      flushSync();
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-lexical"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      const cortexInput = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      cortexInput.value = "Falcon";
+      cortexInput.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-query-bar"]',
+        ) as HTMLFormElement
+      ).dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        flushSync();
+        expect(
+          hostEl
+            .querySelector('[data-testid="cortex-session-status"]')
+            ?.getAttribute("data-status"),
+        ).toBe("completed");
+      });
+
+      // Switch to Fleet, change selected vehicle to UXS #2, visit Vehicle, then return to Analysis.
+      tab("cop").click();
+      flushSync();
+      filmstripItems[1]!.click();
+      flushSync();
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+
+      tab("pilot").click();
+      flushSync();
+      tab("cortex").click();
+      flushSync();
+
+      // Analysis query text, lexical tier, hit, 2-hop Escort Vessel 4, pinned UXS #1 citations, and earlier-selection provenance all survive!
+      expect(
+        (
+          hostEl.querySelector(
+            '[data-testid="cortex-query-input"]',
+          ) as HTMLInputElement
+        ).value,
+      ).toBe("Falcon");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-tier-lexical"]')
+          ?.getAttribute("aria-pressed"),
+      ).toBe("true");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent,
+      ).toContain("Escort Vessel 4");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-result-provenance"]')
+          ?.getAttribute("data-earlier-selection"),
+      ).toBe("true");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-citation-list"]')
+          ?.textContent,
+      ).toContain("Falcon 1");
+
+      // While Analysis IS mounted, direct operator selection (e.g., filmstrip / [1]-[9]) updates inspectedEntityId immediately!
+      filmstripItems[0]!.click();
+      flushSync();
+      filmstripItems[1]!.click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-citation-list"]')
+          ?.textContent,
+      ).toContain("Vanguard 2");
+
+      // 3. Return to Diagnostics: both UXS #2 (9.5 m/s, 1 staged) and UXS #1 (3.30 1/s, base 3.20, 1 staged) survived!
+      tab("bench").click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+      expect(
+        hostEl.querySelector(
+          '[data-param-key="uxs.limits.max_groundspeed_mps"]',
+        )?.textContent,
+      ).toContain("9.5");
+      expect(
+        hostEl.querySelector(
+          '[data-param-key="uxs.limits.max_groundspeed_mps"]',
+        )?.textContent,
+      ).toContain("(base 6.0)");
+
+      filmstripItems[0]!.click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).toContain("3.30");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).toContain("(base 3.20)");
+
+      // Revert UXS #1 ONLY, switch through Fleet and back to Diagnostics, and verify UXS #1 stays 0 staged while UXS #2 stays 1 staged!
+      (
+        hostEl.querySelector(
+          '[data-testid="bench-tuning-revert"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("0 staged");
+
+      tab("cop").click();
+      flushSync();
+      tab("bench").click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("0 staged");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).toContain("3.20");
+      expect(
+        hostEl.querySelector('[data-param-key="uxs.control.heading_kp"]')
+          ?.textContent,
+      ).not.toContain("(base 3.20)");
+
+      filmstripItems[1]!.click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+      expect(
+        hostEl.querySelector(
+          '[data-param-key="uxs.limits.max_groundspeed_mps"]',
+        )?.textContent,
+      ).toContain("9.5");
+
+      expect(onApplyTuning).not.toHaveBeenCalled();
+    } finally {
+      unmount(app);
+      hostEl.remove();
     }
   });
 });

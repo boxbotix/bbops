@@ -9,6 +9,7 @@ import {
   shortEntityLabel,
 } from "../skg/graphology-adapter";
 import type { CopEntityState } from "../stores/skg.svelte";
+import { parseVehicleEntityId } from "../uxs";
 import type { CortexHitSource, CortexSearchHit } from "./search-client";
 
 export const CORTEX_QUERY_TIERS = [
@@ -18,6 +19,27 @@ export const CORTEX_QUERY_TIERS = [
   "neural",
 ] as const;
 export type CortexQueryTier = (typeof CORTEX_QUERY_TIERS)[number];
+
+export type AnalysisQueryStatus =
+  "idle" | "running" | "completed" | "cancelled" | "error";
+
+export type AnalysisSubmissionMode = "query" | "similar";
+
+export interface AnalysisResultProvenance {
+  readonly reqSeq: number;
+  readonly mode: AnalysisSubmissionMode;
+  readonly submittedQuery: string;
+  readonly submittedTier: CortexQueryTier;
+  readonly scopeEntityId: string | null;
+  readonly settledSelectionId: string | null;
+}
+
+export interface AnalysisProvenanceSummary {
+  readonly headline: string;
+  readonly scopeLabel: string;
+  readonly earlierSelectionMismatch: boolean;
+  readonly draftQueryDiverged: boolean;
+}
 
 /** Reserved vehicle safety hex colors strictly prohibited on SKG topology (#7). */
 export const RESERVED_SAFETY_HEX_COLORS = new Set([
@@ -52,6 +74,74 @@ export function isCortexQueryTier(value: unknown): value is CortexQueryTier {
     typeof value === "string" &&
     (CORTEX_QUERY_TIERS as readonly string[]).includes(value)
   );
+}
+
+export function formatAnalysisEntityRef(
+  entityId: string | null | undefined,
+  entityLookup: (id: string) => CopEntityState | null,
+): string {
+  if (!entityId) {
+    return "Fleet-wide (unscoped)";
+  }
+  const parsed = parseVehicleEntityId(entityId);
+  const entity = entityLookup(entityId);
+  if (parsed) {
+    return entity?.title && entity.title !== entityId
+      ? `UXS #${parsed.sysid} (${entity.title})`
+      : `UXS #${parsed.sysid}`;
+  }
+  return entity
+    ? shortEntityLabel(entity.id, entity.title)
+    : shortEntityLabel(entityId);
+}
+
+export function summarizeAnalysisProvenance(
+  provenance: AnalysisResultProvenance | null,
+  liveQueryText: string,
+  liveTier: CortexQueryTier,
+  currentSelectedEntityId: string | null,
+  entityLookup: (id: string) => CopEntityState | null,
+): AnalysisProvenanceSummary | null {
+  if (!provenance) {
+    return null;
+  }
+  const scopeLabel = formatAnalysisEntityRef(
+    provenance.scopeEntityId,
+    entityLookup,
+  );
+  const referenceSelectionId =
+    provenance.scopeEntityId ?? provenance.settledSelectionId;
+  const earlierSelectionMismatch =
+    provenance.scopeEntityId !== null
+      ? currentSelectedEntityId !== provenance.scopeEntityId
+      : currentSelectedEntityId !== referenceSelectionId;
+  const draftQueryDiverged =
+    provenance.mode === "query" &&
+    (liveQueryText.trim() !== provenance.submittedQuery ||
+      liveTier !== provenance.submittedTier);
+
+  const base =
+    provenance.mode === "query"
+      ? `Results for "${provenance.submittedQuery}" (${provenance.submittedTier.toUpperCase()}) · captured scope: ${scopeLabel}`
+      : `2-Hop & Similar results · captured scope: ${scopeLabel}`;
+
+  const notes: string[] = [base];
+  if (earlierSelectionMismatch) {
+    const currentLabel = currentSelectedEntityId
+      ? formatAnalysisEntityRef(currentSelectedEntityId, entityLookup)
+      : "none";
+    notes.push(`earlier selection (current: ${currentLabel})`);
+  }
+  if (draftQueryDiverged) {
+    notes.push("query edited since run");
+  }
+
+  return {
+    headline: notes.join(" · "),
+    scopeLabel,
+    earlierSelectionMismatch,
+    draftQueryDiverged,
+  };
 }
 
 /**
