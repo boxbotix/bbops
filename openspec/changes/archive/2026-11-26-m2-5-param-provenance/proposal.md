@@ -1,5 +1,5 @@
 # Proposal: m2-5-param-provenance
-Approved-by:
+Approved-by: coby (2026-11-26) sha256:9b26c6f6bc70
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track

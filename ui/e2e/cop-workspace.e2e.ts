@@ -1616,4 +1616,184 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
   });
+
+  // spec: cop-ui / Diagnostics sample baseline provenance, exact numeric staging, and non-actuating offline readiness
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  test("displays first-view sample-default provenance and plain-language local staging, enforces exact numeric bounds/step validation without hotkey capture, summarizes target-vehicle diffs, and emits zero outbound command traffic (#43)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+
+    const outboundHttpMutations: Array<{ method: string; url: string }> = [];
+    const outboundWsPayloads: string[] = [];
+
+    page.on("request", (req) => {
+      const method = req.method().toUpperCase();
+      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+        outboundHttpMutations.push({ method, url: req.url() });
+      }
+    });
+    page.on("websocket", (ws) => {
+      ws.on("framesent", (frame) => {
+        const text =
+          typeof frame.payload === "string"
+            ? frame.payload
+            : frame.payload.toString("utf8");
+        outboundWsPayloads.push(text);
+      });
+    });
+
+    await page.goto(info.baseURL);
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "synced",
+      { timeout: 15_000 },
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toContainText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    const selectFilmstripEntity = async (entityId: string) => {
+      await page
+        .locator(`[data-testid="filmstrip-item"][data-entity-id="${entityId}"]`)
+        .click();
+    };
+
+    // 1. Open Diagnostics on UXS #1 (quadcopter) BEFORE editing (0 staged) and verify first-view sample provenance, plain-language local-draft copy, baseline/bounds, and nearby unavailable-apply text.
+    await selectFilmstripEntity(info.vehicles.quadcopter);
+    await page.getByTestId("workspace-tab-bench").click();
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "bench",
+    );
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+
+    const sourceBadge = page.getByTestId("bench-baseline-source-badge");
+    await expect(sourceBadge).toHaveAttribute(
+      "data-baseline-source",
+      "domain-default",
+    );
+    await expect(sourceBadge).toHaveText("SAMPLE DOMAIN DEFAULTS");
+    await expect(page.getByTestId("bench-provenance-headline")).toContainText(
+      "Values shown for UXS #1 are sample quadcopter domain defaults, not parameters read from the vehicle.",
+    );
+    await expect(page.getByTestId("bench-local-draft-notice")).toContainText(
+      "Edits create a local draft in this browser only and cannot change the vehicle in this version.",
+    );
+    await expect(page.getByTestId("bench-tuning-rack")).not.toContainText(
+      "ADR-111",
+    );
+    await expect(page.getByTestId("bench-tuning-rack")).not.toContainText(
+      "M3.1",
+    );
+    await expect(
+      page
+        .locator('[data-param-key="uxs.control.heading_kp"]')
+        .getByTestId("bench-param-meta"),
+    ).toContainText("Baseline 3.20 1/s · Bounds 0.10–8.00 1/s · step 0.05");
+    await expect(page.getByTestId("bench-change-summary-empty")).toContainText(
+      "No local parameter changes staged for UXS #1.",
+    );
+    await expect(page.getByTestId("bench-tuning-apply")).toBeDisabled();
+    await expect(
+      page.getByTestId("bench-apply-unavailable-note"),
+    ).toContainText(
+      "Applying parameters to the vehicle is unavailable in this version. No values have been sent, applied, or confirmed on the vehicle.",
+    );
+
+    // 2. Exact numeric entry alongside sliders (with Shortcuts: On): typing digits ("1", "2", "3") never triggers FleetFilmstrip vehicle hotkeys!
+    const kpCard = page.locator('[data-param-key="uxs.control.heading_kp"]');
+    const kpNumInput = kpCard.locator('input[type="number"]');
+    const kpRangeInput = kpCard.locator('input[type="range"]');
+
+    await kpNumInput.click();
+    await kpNumInput.fill("3.45");
+    await expect(kpRangeInput).toHaveValue("3.45");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(page.getByTestId("invariant-safety-topbar")).toContainText(
+      "UXS #1 · quadcopter",
+    );
+
+    // Out-of-bounds ("9.25") and off-step ("3.42") numeric entries show inline validation error without mutating staged 3.45.
+    await kpNumInput.fill("9.25");
+    await expect(kpNumInput).toHaveAttribute("aria-invalid", "true");
+    await expect(kpCard.getByTestId("bench-param-error")).toContainText(
+      "Maximum is 8.00 1/s",
+    );
+    await expect(kpRangeInput).toHaveValue("3.45");
+
+    await kpNumInput.fill("3.42");
+    await expect(kpNumInput).toHaveAttribute("aria-invalid", "true");
+    await expect(kpCard.getByTestId("bench-param-error")).toContainText(
+      "Must align to step 0.05 1/s",
+    );
+    await expect(kpRangeInput).toHaveValue("3.45");
+
+    // Escape clears invalid numeric text back to staged 3.45 without workspace or tether side effects.
+    await kpNumInput.press("Escape");
+    await expect(kpNumInput).not.toHaveAttribute("aria-invalid", "true");
+    await expect(kpNumInput).toHaveValue("3.45");
+    await expect(kpCard.getByTestId("bench-param-error")).toHaveCount(0);
+
+    // Also stage Teleop Deadman Timeout via exact numeric entry (250 -> 325 ms) and verify compact target-vehicle change summary.
+    const deadmanRow = page.locator(
+      '[data-param-key="uxs.mux.teleop_deadman_ms"]',
+    );
+    await deadmanRow.locator('input[type="number"]').fill("325");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("2 staged");
+
+    const summary = page.getByTestId("bench-change-summary");
+    await expect(summary).toContainText("TARGET UXS #1 (quadcopter)");
+    await expect(summary).toContainText("vs. sample quadcopter defaults");
+    await expect(summary).toContainText("3.20 → 3.45 1/s (+0.25 1/s)");
+    await expect(summary).toContainText("250 → 325 ms (+75 ms)");
+    await expect(page.getByTestId("bench-tuning-apply")).toBeDisabled();
+
+    // 3. Switch to UXS #2 (rover), stage exact value 7.5 m/s, switch to external contact (withheld), and return to UXS #1 -> provenance and isolated drafts preserved!
+    await selectFilmstripEntity(info.vehicles.rover);
+    await expect(sourceBadge).toHaveText("SAMPLE DOMAIN DEFAULTS");
+    await expect(page.getByTestId("bench-provenance-headline")).toContainText(
+      "sample rover domain defaults",
+    );
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+
+    await page
+      .locator(
+        '[data-param-key="uxs.limits.max_groundspeed_mps"] input[type="number"]',
+      )
+      .fill("7.5");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(summary).toContainText("TARGET UXS #2 (rover)");
+    await expect(summary).toContainText("6.0 → 7.5 m/s (+1.5 m/s)");
+
+    await selectFilmstripEntity(info.externalContactId);
+    await expect(page.getByTestId("bench-tuning-withheld")).toContainText(
+      "External COP contacts expose no parameter tuning rack.",
+    );
+    await expect(
+      page.getByTestId("bench-tuning-rack").locator("input"),
+    ).toHaveCount(0);
+
+    await selectFilmstripEntity(info.vehicles.quadcopter);
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("2 staged");
+    await expect(summary).toContainText("TARGET UXS #1 (quadcopter)");
+
+    // 4. Revert UXS #1 -> clears UXS #1 to 0 staged while UXS #2 stays at 1 staged.
+    await page.getByTestId("bench-tuning-revert").click();
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+    await expect(page.getByTestId("bench-change-summary-empty")).toBeVisible();
+
+    await selectFilmstripEntity(info.vehicles.rover);
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+
+    // 5. Assert zero outbound HTTP mutations and zero outbound WebSocket actuation/param frames!
+    expect(outboundHttpMutations).toEqual([]);
+    for (const payload of outboundWsPayloads) {
+      expect(payload).not.toMatch(
+        /param|actuat|command|apply|uxs\.control|uxs\.limits|uxs\.mux/i,
+      );
+    }
+    expect(copStack.pageErrors).toEqual([]);
+    expect(copStack.consoleErrors).toEqual([]);
+  });
 });

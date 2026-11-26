@@ -28,7 +28,7 @@ The `ui/e2e/` harness and COP workspace SHALL verify `ui/build` assets on a live
 - **WHEN** headless Chromium traverses controls with `Tab`/`Shift+Tab` from page entry and pointer-focused canvases, uses `ArrowLeft`/`ArrowRight` in the `Fleet` inspector `tablist`, types in search/range/numeric inputs, toggles character shortcuts off, and switches workspaces
 - **THEN** `Tab`/`Shift+Tab` never toggle `Lights-Out`, `Fleet` inspector tabs expose one `Tab` stop and `tabpanel` links, editable controls and disabled character shortcuts suppress single-key hotkeys while preserving pointer controls and `Escape`, workspace switches leave focus on a mounted element, and `:focus-visible` outlines remain unobstructed
 
-#### Scenario: Browser workspace round trips preserve per-vehicle Diagnostics provenance, exact numeric drafts, and Analysis query/result context
+#### Scenario: Browser workspace round trips preserve per-vehicle Diagnostics drafts and Analysis query/result context
 - **WHEN** headless Chromium opens `Diagnostics` on `UXS #1` (checking first-view sample-default provenance and unavailable-apply copy), enters exact numeric and slider values (including invalid/bounds checks) on `UXS #1` and `UXS #2`, runs a non-default `Analysis` query, switches through `Fleet` (including an external contact) and `Vehicle`, returns, and reverts `UXS #1`
 - **THEN** `Diagnostics` preserves sample-default provenance, bounds/validation feedback, target-vehicle diff summary, and isolated drafts (`UXS #1` reverted to `0 staged`; `UXS #2` intact) while withholding external contacts, `Analysis` restores query, tier, hits/subgraph, inspection context, and provenance, and zero console/`pageerror` faults or outbound command frames occur
 
@@ -47,7 +47,7 @@ The `ui/e2e/` harness and COP workspace SHALL verify `ui/build` assets on a live
 ### Requirement: Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
 The `+page.svelte` shell, `WorkspaceShell.svelte`, `tuning-rack.ts`, `BenchWorkspace.svelte`, `ui/src/lib/cortex/`, and `CortexWorkspace.svelte` modules SHALL preserve per-vehicle Diagnostics parameter drafts (`{ entityId, domain, baselineSource, baseline, staged }`, `1..=254` canonical 6-part IDs) and Analysis query, tier, results, provenance, and inspection context across workspace switches with stale-result refusal, unavailable-entity explanations, and zero navigation actuation.
 
-#### Scenario: Diagnostics staged parameter values, baselines, provenance, and per-vehicle reverts survive workspace and vehicle switches without actuation
+#### Scenario: Diagnostics staged parameter values, baselines, and per-vehicle reverts survive workspace and vehicle switches without actuation
 - **WHEN** an operator in `Diagnostics` adjusts `Heading P Gain` (`3.20 -> 3.30`, `1 staged`) on `UXS #1` and a distinct parameter on `UXS #2`, switches through `Fleet` and `Vehicle`, returns to `Diagnostics` across `UXS #1` and `UXS #2`, clicks `Revert Draft` on `UXS #1`, and switches workspaces again
 - **THEN** each vehicle's staged value, baseline, `baselineSource`, and staged count survive in strict isolation, reverting `UXS #1` clears only `UXS #1` (`0 staged`) while preserving `UXS #2`'s draft across subsequent switches, and zero parameter-write or actuation calls fire during workspace or entity navigation
 
