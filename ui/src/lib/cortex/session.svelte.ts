@@ -331,11 +331,11 @@ export function createAnalysisSessionStore(
     const epochAtStart = selectionEpoch;
 
     hasInvestigationContext = true;
+    inFlightPriorInspectedId = inspectedEntityId;
+    inFlightEpochAtStart = epochAtStart;
     if (inspectedEntityId === null && selectionAtStart !== null) {
       inspectedEntityId = selectionAtStart;
     }
-    inFlightPriorInspectedId = inspectedEntityId;
-    inFlightEpochAtStart = epochAtStart;
 
     status = "running";
     inFlight = {
@@ -453,18 +453,29 @@ export function createAnalysisSessionStore(
         return;
       }
 
+      const isTerminalQueryError =
+        nextErrorBanner !== null && collected.length === 0;
       rawHits = collected;
       indexedRevision = nextIndexedRevision;
       damagedEntities = nextDamagedEntities;
       answerSummary = nextAnswerSummary;
       neuralStatusBanner = nextNeuralBanner;
       errorBanner = nextErrorBanner;
+      provenance = isTerminalQueryError
+        ? null
+        : {
+            reqSeq,
+            mode: "query",
+            submittedQuery: trimmed,
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId: selectionAtStart,
+            settledSelectionId: selectionAtStart,
+          };
 
       let expandTargetId: string | null = null;
-      if (
-        (collected.length > 0 || nextErrorBanner === null) &&
-        selectionEpoch === epochAtStart
-      ) {
+      if (!isTerminalQueryError && selectionEpoch === epochAtStart) {
         const topRanked = buildRankedCortexHits(collected, (id) =>
           skgStore.getEntity(id),
         )[0];
@@ -503,21 +514,20 @@ export function createAnalysisSessionStore(
         settledSelectionId = sanitizeEntityId(viewportStore.selectedEntityId);
       }
 
-      provenance = {
-        reqSeq,
-        mode: "query",
-        submittedQuery: trimmed,
-        submittedTier: tierAtStart,
-        retrievalScope,
-        scopeEntityId: retrievalScope.entityId,
-        submittedSelectionId: selectionAtStart,
-        settledSelectionId,
-      };
+      provenance = isTerminalQueryError
+        ? null
+        : {
+            reqSeq,
+            mode: "query",
+            submittedQuery: trimmed,
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId: selectionAtStart,
+            settledSelectionId,
+          };
       inFlight = null;
-      status =
-        nextErrorBanner !== null && collected.length === 0
-          ? "error"
-          : "completed";
+      status = isTerminalQueryError ? "error" : "completed";
     } catch (err) {
       if (
         !isDisposed &&
@@ -573,7 +583,7 @@ export function createAnalysisSessionStore(
     );
 
     hasInvestigationContext = true;
-    inFlightPriorInspectedId = entityId;
+    inFlightPriorInspectedId = inspectedEntityId;
     inFlightEpochAtStart = epochAtStart;
     inspectedEntityId = entityId;
     status = "running";
@@ -607,6 +617,11 @@ export function createAnalysisSessionStore(
       }
       let nextErrorBanner: string | null = null;
       const simHits = sim.ok ? sim.hits : [];
+      const isTerminalSimilarError =
+        !sim.ok &&
+        sim.refusal !== null &&
+        !sim.refusal.notEnabled &&
+        simHits.length === 0;
       rawHits = simHits;
       if (sim.ok) {
         indexedRevision = sim.indexedRevision > 0 ? sim.indexedRevision : null;
@@ -617,8 +632,21 @@ export function createAnalysisSessionStore(
         nextErrorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
         errorBanner = nextErrorBanner;
       }
+      provenance = isTerminalSimilarError
+        ? null
+        : {
+            reqSeq,
+            mode: "similar",
+            submittedQuery: "",
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId,
+            settledSelectionId: entityId,
+          };
 
       if (
+        !isTerminalSimilarError &&
         selectionEpoch === epochAtStart &&
         (!viewMounted ||
           sanitizeEntityId(viewportStore.selectedEntityId) === null ||
@@ -631,21 +659,20 @@ export function createAnalysisSessionStore(
         return;
       }
 
-      provenance = {
-        reqSeq,
-        mode: "similar",
-        submittedQuery: "",
-        submittedTier: tierAtStart,
-        retrievalScope,
-        scopeEntityId: retrievalScope.entityId,
-        submittedSelectionId,
-        settledSelectionId: entityId,
-      };
+      provenance = isTerminalSimilarError
+        ? null
+        : {
+            reqSeq,
+            mode: "similar",
+            submittedQuery: "",
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId,
+            settledSelectionId: entityId,
+          };
       inFlight = null;
-      status =
-        nextErrorBanner !== null && simHits.length === 0
-          ? "error"
-          : "completed";
+      status = isTerminalSimilarError ? "error" : "completed";
     } catch (err) {
       if (
         !isDisposed &&

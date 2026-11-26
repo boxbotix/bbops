@@ -1981,7 +1981,7 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
 
     const hostEl = document.createElement("div");
     document.body.appendChild(hostEl);
-    const app = mount(CortexWorkspace, {
+    let app = mount(CortexWorkspace, {
       target: hostEl,
       props: {
         skgStore,
@@ -1993,15 +1993,30 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
     });
     flushSync();
 
+    const remountAnalysis = () => {
+      app = mount(CortexWorkspace, {
+        target: hostEl,
+        props: {
+          skgStore,
+          viewportStore,
+          graphqlClient: mockGraphql,
+          searchClient: mockSearch,
+          analysisSession,
+        },
+      });
+      flushSync();
+    };
+
     try {
-      const input = hostEl.querySelector(
+      let input = hostEl.querySelector(
         '[data-testid="cortex-query-input"]',
       ) as HTMLInputElement;
-      const form = hostEl.querySelector(
+      let form = hostEl.querySelector(
         '[data-testid="cortex-query-bar"]',
       ) as HTMLFormElement;
 
-      // 1A. Search SKG (SEMANTIC): hits arrive immediately, pathSearch is held open -> stays "running" with Cancel enabled!
+      // 1A. Search SKG (SEMANTIC): hits arrive immediately while pathSearch is held open ->
+      //     renders hit list + submission provenance banner immediately while keeping Cancel active!
       (
         hostEl.querySelector(
           '[data-testid="cortex-tier-semantic"]',
@@ -2023,6 +2038,54 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       expect(analysisSession.status).toBe("running");
       expect(analysisSession.running).toBe(true);
       expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        'Results for "uxs.domain.kind" (SEMANTIC) · retrieval scope: Fleet-wide · vehicle selected at submission: UXS #1 (Falcon 1)',
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      // Switch away to Fleet, select UXS #2, return to Analysis, and edit draft to "other" BEFORE pathSearch resolves!
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+      input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      input.value = "other";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+
+      // Provisional hits AND provenance banner (with earlier-selection + query-edited notices) render together while Cancel stays active!
+      expect(analysisSession.status).toBe("running");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      const pendingProvBanner = hostEl.querySelector(
+        '[data-testid="cortex-result-provenance"]',
+      );
+      expect(pendingProvBanner).not.toBeNull();
+      expect(pendingProvBanner?.getAttribute("data-earlier-selection")).toBe(
+        "true",
+      );
+      const pendingProvText = pendingProvBanner?.textContent ?? "";
+      expect(pendingProvText).toContain(
+        'Results for "uxs.domain.kind" (SEMANTIC)',
+      );
+      expect(pendingProvText).toContain("retrieval scope: Fleet-wide");
+      expect(pendingProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+      expect(pendingProvText).toContain(
+        "earlier selection (current: UXS #2 (Vanguard 2))",
+      );
+      expect(pendingProvText).toContain("query edited since run");
+      expect(
         hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
       ).not.toBeNull();
 
@@ -2030,6 +2093,10 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       expect(analysisSession.cancelSearch()).toBe(true);
       flushSync();
       expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.provenance).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]'),
+      ).toBeNull();
       expect(heldExpands[0]?.signal?.aborted).toBe(true);
       expect(
         hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
@@ -2065,7 +2132,24 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
           ?.textContent ?? "",
       ).not.toContain("Discarded Late Vessel");
 
-      // 1B. 2-Hop & Similar: similar hits arrive immediately, pathSearch is held open -> stays "running" with Cancel enabled!
+      // 1B. Divergent-pin round trip on 2-Hop & Similar:
+      //     Pin UXS #1 in Analysis, select UXS #2 while away, return, start Similar (targets #2),
+      //     verify provisional provenance + hit list + Cancel while pathSearch is held open,
+      //     then Cancel during path lookup -> pin restores to UXS #1 while global selection stays UXS #2!
+      holdPathSearch = false;
+      analysisSession.selectHit(quad1.id);
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+        expect(analysisSession.pathResults).toHaveLength(1);
+      });
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+
+      holdPathSearch = true;
       (
         hostEl.querySelector(
           '[data-testid="cortex-similar-btn"]',
@@ -2075,8 +2159,18 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
         flushSync();
         expect(heldExpands).toHaveLength(2);
       });
+      expect(heldExpands[1]?.startEntity).toBe(rover2.id);
       expect(analysisSession.rawHits).toHaveLength(1);
       expect(analysisSession.status).toBe("running");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "2-Hop & Similar results · retrieval scope: UXS #2 (Vanguard 2) · vehicle selected at submission: UXS #2 (Vanguard 2)",
+      );
       expect(
         hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
       ).not.toBeNull();
@@ -2088,18 +2182,21 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       ).click();
       flushSync();
       expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.provenance).toBeNull();
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
       expect(heldExpands[1]?.signal?.aborted).toBe(true);
 
       heldExpands[1]!.resolve({
         data: {
           entities: [
-            { id: quad1.id, depth: 0 },
+            { id: rover2.id, depth: 0 },
             { id: lateContactId, depth: 1 },
           ],
           paths: [
             [
               {
-                from: quad1.id,
+                from: rover2.id,
                 predicate: "cop.proximity.near",
                 to: lateContactId,
               },
@@ -2114,6 +2211,14 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
 
       expect(analysisSession.status).toBe("cancelled");
       expect(analysisSession.pathResults).toHaveLength(0);
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-inspection-divergence"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "Pinned inspection: UXS #1 (Falcon 1) · Current selection: UXS #2 (Vanguard 2)",
+      );
       expect(
         hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
           ?.textContent ?? "",
@@ -2123,6 +2228,15 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       //     labels retrieval scope Fleet-wide (never UXS #1!) and preserves UXS #1 as vehicle selected at submission.
       holdPathSearch = false;
       viewportStore.selectEntity(quad1.id);
+      flushSync();
+      input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      form = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+      input.value = "uxs.domain.kind";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
       flushSync();
       form.dispatchEvent(
         new Event("submit", { bubbles: true, cancelable: true }),
