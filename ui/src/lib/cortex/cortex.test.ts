@@ -9,6 +9,7 @@ import { createSkgStore } from "../stores/skg.svelte";
 import { buildVehicleStoredPayload } from "../stores/test-helpers";
 import { createViewportStore } from "../stores/viewport.svelte";
 import { createGraphSearchClient } from "./search-client";
+import { createAnalysisSessionStore } from "./session.svelte";
 import {
   buildCausalSubgraphModel,
   buildGroundedTripleCitations,
@@ -1087,5 +1088,670 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
 
     unmount(app);
     hostEl.remove();
+  });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("enforces monotonic reqSeq stale-result refusal across out-of-order search/2-hop completions (even when transport ignores AbortSignal) and explicit Cancel (#40)", async () => {
+    const skgStore = createSkgStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon 1",
+    });
+    const rover2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard 2",
+    });
+    const neighbor1Id = "boxbotix.local.tak.cop.vessel.alpha1";
+    const neighbor2Id = "boxbotix.local.tak.cop.vessel.bravo2";
+
+    for (const [rev, id, payload] of [
+      [1, quad1.id, quad1],
+      [2, rover2.id, rover2],
+      [
+        3,
+        neighbor1Id,
+        {
+          id: neighbor1Id,
+          triples: [
+            {
+              subject: neighbor1Id,
+              predicate: "dc.terms.title",
+              object: "Alpha Escort",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+      [
+        4,
+        neighbor2Id,
+        {
+          id: neighbor2Id,
+          triples: [
+            {
+              subject: neighbor2Id,
+              predicate: "dc.terms.title",
+              object: "Bravo Escort",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+    ] as const) {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: id,
+          revision: rev,
+          payload,
+        }),
+      );
+    }
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 4,
+      }),
+    );
+
+    interface PendingSearch {
+      query: string;
+      entityId: string | undefined;
+      signal: AbortSignal | undefined;
+      resolve: (res: Response) => void;
+    }
+    const pendingSearches: PendingSearch[] = [];
+
+    interface PendingExpand {
+      startEntity: string;
+      signal: AbortSignal | undefined;
+      resolve: (value: {
+        data: {
+          entities: Array<{ id: string; depth: number }>;
+          paths: Array<Array<{ from: string; predicate: string; to: string }>>;
+          truncated: boolean;
+        };
+        damagedEntities: number;
+      }) => void;
+    }
+    const pendingExpands: PendingExpand[] = [];
+
+    // Transport deliberately ignores AbortSignal so only monotonic reqSeq prevents stale corruption!
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async (_input, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          args?: { query?: string; entity_id?: string };
+        };
+        return new Promise<Response>((resolve) => {
+          pendingSearches.push({
+            query: body.args?.query ?? "",
+            entityId: body.args?.entity_id,
+            signal: init?.signal ?? undefined,
+            resolve,
+          });
+        });
+      }) as typeof fetch,
+    });
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockImplementation(
+        (vars, opts) =>
+          new Promise((resolve) => {
+            pendingExpands.push({
+              startEntity: vars.startEntity,
+              signal: opts?.signal,
+              resolve,
+            });
+          }),
+      ),
+    };
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(quad1.id);
+
+    const analysisSession = createAnalysisSessionStore({
+      skgStore,
+      viewportStore,
+      graphqlClient: mockGraphql,
+      searchClient: mockSearch,
+    });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    const app = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+        analysisSession,
+      },
+    });
+    flushSync();
+
+    try {
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-lexical"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+
+      // 1. Launch Search #1 ("Falcon" scoped to UXS #1), then supersede with Search #2 ("Vanguard" scoped to UXS #2)
+      //    and resolve Search #2 FIRST, Search #1 SECOND.
+      const input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      const form = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+
+      input.value = "Falcon";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      flushSync();
+
+      expect(analysisSession.status).toBe("running");
+      expect(pendingSearches).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      viewportStore.selectEntity(rover2.id);
+      flushSync();
+      input.value = "Vanguard";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      flushSync();
+
+      expect(pendingSearches).toHaveLength(2);
+      expect(pendingSearches[0]?.signal?.aborted).toBe(true);
+      expect(pendingSearches[1]?.signal?.aborted).toBe(false);
+
+      // Resolve newer Search #2 first.
+      pendingSearches[1]!.resolve(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "localSearch",
+            result: {
+              indexed_revision: 52,
+              damaged_entities: 0,
+              producer: "graph-query",
+              data: {
+                matches: [
+                  {
+                    id: rover2.id,
+                    label: "Vanguard 2",
+                    score: 4.5,
+                    entity: {},
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+      expect(pendingExpands).toHaveLength(1);
+      expect(pendingExpands[0]?.startEntity).toBe(rover2.id);
+
+      // Now resolve stale Search #1 AFTER Search #2 (even ignoring AbortSignal): MUST be refused!
+      pendingSearches[0]!.resolve(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "localSearch",
+            result: {
+              indexed_revision: 19,
+              damaged_entities: 2,
+              producer: "graph-query",
+              data: {
+                matches: [
+                  {
+                    id: quad1.id,
+                    label: "Falcon 1",
+                    score: 9.9,
+                    entity: {},
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      flushSync();
+
+      expect(analysisSession.status).toBe("completed");
+      expect(analysisSession.indexedRevision).toBe(52);
+      expect(analysisSession.damagedEntities).toBe(0);
+      expect(analysisSession.rawHits.map((h) => h.entityId)).toEqual([
+        rover2.id,
+      ]);
+      expect(analysisSession.provenance?.submittedQuery).toBe("Vanguard");
+      expect(analysisSession.provenance?.scopeEntityId).toBe(rover2.id);
+
+      // Resolve rover2's 2-hop expansion and verify Bravo Escort appears.
+      pendingExpands[0]!.resolve({
+        data: {
+          entities: [
+            { id: rover2.id, depth: 0 },
+            { id: neighbor2Id, depth: 1 },
+          ],
+          paths: [
+            [
+              {
+                from: rover2.id,
+                predicate: "cop.proximity.near",
+                to: neighbor2Id,
+              },
+            ],
+          ],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      });
+      await vi.waitFor(() => {
+        flushSync();
+        expect(
+          hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+            ?.textContent,
+        ).toContain("Bravo Escort");
+      });
+
+      // 2. Launch Search #3 ("SlowQuery") and click explicit Cancel before completion;
+      //    then resolve Search #3 anyway and verify cancelled state refuses late payload.
+      input.value = "SlowQuery";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      flushSync();
+
+      expect(analysisSession.status).toBe("running");
+      expect(pendingSearches).toHaveLength(3);
+
+      const cancelBtn = hostEl.querySelector(
+        '[data-testid="cortex-query-cancel"]',
+      ) as HTMLButtonElement;
+      expect(cancelBtn).not.toBeNull();
+      cancelBtn.click();
+      flushSync();
+
+      expect(analysisSession.status).toBe("cancelled");
+      expect(pendingSearches[2]?.signal?.aborted).toBe(true);
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-session-status"]')
+          ?.getAttribute("data-status"),
+      ).toBe("cancelled");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-cancelled-banner"]')
+          ?.textContent,
+      ).toContain('Cancelled LEXICAL query "SlowQuery"');
+      expect(analysisSession.queryText).toBe("SlowQuery");
+      expect(analysisSession.activeTier).toBe("lexical");
+
+      // Late resolution of cancelled Search #3 is refused!
+      pendingSearches[2]!.resolve(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            verb: "localSearch",
+            result: {
+              indexed_revision: 88,
+              damaged_entities: 0,
+              producer: "graph-query",
+              data: {
+                matches: [
+                  {
+                    id: quad1.id,
+                    label: "Ghost Late Hit",
+                    score: 7.0,
+                    entity: {},
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      flushSync();
+
+      expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.rawHits).toHaveLength(0);
+      expect(analysisSession.indexedRevision).toBeNull();
+    } finally {
+      unmount(app);
+      analysisSession.dispose();
+      hostEl.remove();
+    }
+  });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("preserves Analysis query, tier, results, pinned inspection, earlier-selection provenance, one-click selection sync, and removed-entity explanations across remounts (#40)", async () => {
+    const skgStore = createSkgStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon 1",
+    });
+    const rover2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard 2",
+    });
+    const contactId = "boxbotix.local.tak.cop.vessel.harbor7";
+
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: quad1.id,
+        revision: 1,
+        payload: quad1,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: rover2.id,
+        revision: 2,
+        payload: rover2,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: contactId,
+        revision: 3,
+        payload: {
+          id: contactId,
+          triples: [
+            {
+              subject: contactId,
+              predicate: "dc.terms.title",
+              object: "Harbor Escort",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 3,
+      }),
+    );
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn(),
+      pathSearch: vi.fn().mockImplementation(async (vars) => ({
+        data: {
+          entities: [
+            { id: vars.startEntity, depth: 0 },
+            ...(vars.startEntity === quad1.id
+              ? [{ id: contactId, depth: 1 }]
+              : []),
+          ],
+          paths:
+            vars.startEntity === quad1.id
+              ? [
+                  [
+                    {
+                      from: quad1.id,
+                      predicate: "cop.proximity.near",
+                      to: contactId,
+                    },
+                  ],
+                ]
+              : [],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      })),
+    };
+
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async (_input, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          verb: string;
+        };
+        if (body.verb === "localSearch") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              verb: "localSearch",
+              result: {
+                indexed_revision: 64,
+                damaged_entities: 0,
+                producer: "graph-query",
+                data: {
+                  matches: [
+                    {
+                      id: quad1.id,
+                      label: "Falcon 1",
+                      score: 3.4,
+                      entity: {},
+                    },
+                  ],
+                  answer: "Matched Falcon 1 corridor context",
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            verb: body.verb,
+            error: {
+              class: "invalid",
+              code: "not_enabled",
+              message: "disabled",
+            },
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(quad1.id);
+
+    const analysisSession = createAnalysisSessionStore({
+      skgStore,
+      viewportStore,
+      graphqlClient: mockGraphql,
+      searchClient: mockSearch,
+    });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    let app: ReturnType<typeof mount> | null = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+        analysisSession,
+      },
+    });
+    flushSync();
+
+    try {
+      // 1. Select Lexical tier, submit "Falcon" scoped to UXS #1, and verify hits + 2-hop subgraph + citations.
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-lexical"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+
+      const input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      input.value = "Falcon";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-query-bar"]',
+        ) as HTMLFormElement
+      ).dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+        expect(analysisSession.pathResults).toHaveLength(1);
+      });
+
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-result-provenance"]')
+          ?.getAttribute("data-earlier-selection"),
+      ).toBe("false");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-inspection-divergence"]'),
+      ).toBeNull();
+
+      // 2. Unmount CortexWorkspace (simulate switching to Fleet), select UXS #2 externally, and remount CortexWorkspace.
+      unmount(app);
+      app = null;
+
+      viewportStore.selectEntity(rover2.id);
+      flushSync();
+
+      app = mount(CortexWorkspace, {
+        target: hostEl,
+        props: {
+          skgStore,
+          viewportStore,
+          graphqlClient: mockGraphql,
+          searchClient: mockSearch,
+          analysisSession,
+        },
+      });
+      flushSync();
+
+      // Query text, tier, ranked hits, 2-hop Harbor Escort subgraph, and pinned UXS #1 citations ALL survive!
+      expect(
+        (
+          hostEl.querySelector(
+            '[data-testid="cortex-query-input"]',
+          ) as HTMLInputElement
+        ).value,
+      ).toBe("Falcon");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-tier-lexical"]')
+          ?.getAttribute("aria-pressed"),
+      ).toBe("true");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent,
+      ).toContain("Harbor Escort");
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-citation-list"]')
+          ?.textContent,
+      ).toContain("Falcon 1");
+
+      // Provenance banner & divergence strip distinguish UXS #1 results from current UXS #2 selection (OQ3 Option A).
+      const provBanner = hostEl.querySelector(
+        '[data-testid="cortex-result-provenance"]',
+      );
+      expect(provBanner?.getAttribute("data-earlier-selection")).toBe("true");
+      expect(provBanner?.textContent).toContain("UXS #1");
+      expect(provBanner?.textContent).toContain("earlier selection");
+      expect(provBanner?.textContent).toContain("UXS #2");
+
+      const divBanner = hostEl.querySelector(
+        '[data-testid="cortex-inspection-divergence"]',
+      );
+      expect(divBanner?.textContent).toContain("Pinned inspection: UXS #1");
+      expect(divBanner?.textContent).toContain("Current selection: UXS #2");
+
+      // 3. Delete pinned UXS #1 from skgStore -> explicit unavailable notice renders instead of silent blank or wrong entity!
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "delete",
+          bucket: "ENTITY_STATES",
+          key: quad1.id,
+          revision: 4,
+        }),
+      );
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-entity-unavailable"]')
+          ?.textContent,
+      ).toContain(quad1.id);
+
+      // 4. One-click sync button adopts current global selection (UXS #2) and resolves UXS #2 citations.
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-sync-selection-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.inspectedEntityId).toBe(rover2.id);
+      });
+      expect(
+        hostEl.querySelector('[data-testid="cortex-inspection-divergence"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-entity-unavailable"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-citation-list"]')
+          ?.textContent,
+      ).toContain("Vanguard 2");
+    } finally {
+      if (app) {
+        unmount(app);
+      }
+      analysisSession.dispose();
+      hostEl.remove();
+    }
   });
 });

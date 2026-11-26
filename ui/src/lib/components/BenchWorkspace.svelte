@@ -11,12 +11,11 @@
   } from "$lib/bench/ring-buffer";
   import {
     BENCH_TUNING_SPECS,
+    type DiagnosticsDraftStore,
     type TuningDiffEntry,
     computeDialProgress,
-    computeTuningDiff,
-    defaultTuningBaseline,
-    revertTuningDraft,
-    stageTuningValue,
+    createDiagnosticsDraftStore,
+    describeWithheldTuningState,
   } from "$lib/bench/tuning-rack";
   import {
     buildExternalContactSummary,
@@ -37,6 +36,7 @@
     skgStore: SkgStore;
     viewportStore: ViewportStore;
     traceBook?: TelemetryTraceBook;
+    draftStore?: DiagnosticsDraftStore;
     onSyncHash?: (hash: string) => void;
     onApplyTuning?: (
       sysid: number,
@@ -49,12 +49,12 @@
     skgStore,
     viewportStore,
     traceBook = new TelemetryTraceBook(),
+    draftStore = createDiagnosticsDraftStore(),
     onSyncHash,
     onApplyTuning,
   }: Props = $props();
 
   let scopeCanvasEl: HTMLCanvasElement | undefined = $state();
-  let draftsByEntityId = $state<Record<string, Record<string, number>>>({});
 
   const selectedEntity = $derived(viewportStore.selectedEntity);
   const selectedVehicle = $derived(
@@ -71,29 +71,43 @@
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
 
+  $effect(() => {
+    for (const vehicle of skgStore.vehicles) {
+      if (!vehicle.poisoned) {
+        draftStore.reconcileVehicleDomain(vehicle.id, vehicle.domain);
+      }
+    }
+  });
+
   const healthChips = $derived(
     selectedVehicle && !selectedVehicle.poisoned
       ? buildHealthStrip(selectedVehicle.healthFlags, selectedVehicle.sysStatus)
       : [],
   );
 
-  const baseline = $derived(
-    commandableVehicle
-      ? defaultTuningBaseline(commandableVehicle.domain)
+  const activeTuningView = $derived(draftStore.readVehicle(commandableVehicle));
+  const baseline = $derived(activeTuningView?.baseline ?? null);
+  const activeDraft = $derived(activeTuningView?.staged ?? null);
+  const stagedDiffs = $derived(activeTuningView?.diffs ?? []);
+  const dormantDraft = $derived(
+    commandableVehicle === null
+      ? draftStore.getDormantDraft(
+          viewportStore.selectedEntityId,
+          selectedVehicle?.domain ?? null,
+        )
       : null,
   );
-
-  const activeDraft = $derived.by(() => {
-    if (!commandableVehicle || !baseline) {
-      return null;
-    }
-    return draftsByEntityId[commandableVehicle.id] ?? baseline;
-  });
-
-  const stagedDiffs = $derived(
-    baseline && activeDraft
-      ? computeTuningDiff(BENCH_TUNING_SPECS, baseline, activeDraft)
-      : [],
+  const withheldExplanation = $derived(
+    describeWithheldTuningState({
+      selectedEntityId: viewportStore.selectedEntityId,
+      selectedEntityKind: selectedEntity?.kind ?? null,
+      selectedEntityLabel: selectedEntity?.title ?? null,
+      selectedEntityPoisoned: Boolean(selectedEntity?.poisoned),
+      selectedVehicleSysId:
+        selectedVehicle?.sysid ?? poisonedOwnshipId?.sysid ?? null,
+      skgSynced: skgStore.synced,
+      skgLastSyncedRevision: skgStore.lastSyncedRevision,
+    }),
   );
 
   const dialSpecs = BENCH_TUNING_SPECS.filter((s) => s.widget === "dial");
@@ -104,25 +118,17 @@
   );
 
   function handleParamInput(key: string, rawValue: number): void {
-    if (!commandableVehicle || !baseline) {
+    if (!commandableVehicle) {
       return;
     }
-    const current = draftsByEntityId[commandableVehicle.id] ?? baseline;
-    const next = stageTuningValue(BENCH_TUNING_SPECS, current, key, rawValue);
-    draftsByEntityId = {
-      ...draftsByEntityId,
-      [commandableVehicle.id]: next,
-    };
+    draftStore.stageParam(commandableVehicle, key, rawValue);
   }
 
   function handleRevert(): void {
-    if (!commandableVehicle || !baseline) {
+    if (!commandableVehicle) {
       return;
     }
-    draftsByEntityId = {
-      ...draftsByEntityId,
-      [commandableVehicle.id]: revertTuningDraft(baseline),
-    };
+    draftStore.revertVehicle(commandableVehicle.id);
   }
 
   function handleApply(): void {
@@ -445,6 +451,16 @@
         · expires: {contactSummary.expiresAt} · uncertainty: {contactSummary.uncertaintyLabel}
         — 0xB1 MCU diagnostics apply only to ownship UXS vehicles.
       </span>
+    {:else if selectedEntity && selectedEntity.kind === "generic"}
+      <span class="bar-muted" data-testid="bench-nonvehicle-notice">
+        Selected entity ({selectedEntity.title ?? selectedEntity.id}) is not an
+        ownship UXS vehicle — 0xB1 MCU diagnostics are unavailable.
+      </span>
+    {:else if viewportStore.selectedEntityId}
+      <span class="bar-muted" data-testid="bench-unavailable-notice">
+        Entity {viewportStore.selectedEntityId} is unavailable in live Fleet data
+        — 0xB1 MCU diagnostics are withheld.
+      </span>
     {:else}
       <span class="bar-muted">
         Select an ownship UXS vehicle to inspect 0xB1 MCU loop timing and trunk
@@ -498,6 +514,7 @@
         <div class="dial-row">
           {#each dialSpecs as spec (spec.key)}
             {@const val = activeDraft[spec.key] ?? spec.min}
+            {@const baseVal = baseline[spec.key] ?? spec.min}
             {@const progress = computeDialProgress(spec, val)}
             <label class="dial-card" data-param-key={spec.key}>
               <svg viewBox="0 0 64 46" class="dial-svg" aria-hidden="true">
@@ -522,6 +539,11 @@
               <strong class="param-readout">
                 {val.toFixed(spec.decimals)}
                 {spec.unit}
+                {#if Math.abs(val - baseVal) > 1e-9}
+                  <em class="delta-tag">
+                    (base {baseVal.toFixed(spec.decimals)})
+                  </em>
+                {/if}
               </strong>
               <input
                 type="range"
@@ -604,17 +626,25 @@
         {/if}
       {:else}
         <p class="withheld-note" data-testid="bench-tuning-withheld">
-          {#if selectedContact}
-            External COP contacts expose no parameter tuning rack.
-          {:else if selectedVehicle?.poisoned}
-            UXS #{selectedVehicle.sysid} is POISONED — parameter staging is withheld.
-          {:else if poisonedOwnshipId}
-            UXS #{poisonedOwnshipId.sysid} is POISONED — parameter staging is withheld.
-          {:else}
-            Select a commandable UXS vehicle to stage control and deadman
-            parameters.
-          {/if}
+          {withheldExplanation}
         </p>
+        {#if dormantDraft}
+          <div class="dormant-draft-box" data-testid="bench-dormant-draft">
+            <span>
+              Dormant local draft retained for UXS #{dormantDraft.sysid} ({dormantDraft
+                .diffs.length} staged, {dormantDraft.domain}) while entity is
+              non-commandable.
+            </span>
+            <button
+              type="button"
+              class="secondary-btn"
+              data-testid="bench-dormant-revert"
+              onclick={() => draftStore.revertVehicle(dormantDraft.entityId)}
+            >
+              Revert Draft
+            </button>
+          </div>
+        {/if}
       {/if}
     </section>
   </div>
@@ -883,6 +913,19 @@
     border-radius: 5px;
     background: var(--ui-surface-elevated, #172033);
     color: var(--ui-text-secondary, #94a3b8);
+  }
+
+  .dormant-draft-box {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 5px;
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    background: rgba(56, 189, 248, 0.08);
+    color: var(--ui-text-primary, #e2e8f0);
   }
 
   .console-list {

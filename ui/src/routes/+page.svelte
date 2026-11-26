@@ -5,8 +5,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { TelemetryTraceBook } from "$lib/bench/ring-buffer";
+  import { createDiagnosticsDraftStore } from "$lib/bench/tuning-rack";
   import WorkspaceShell from "$lib/components/WorkspaceShell.svelte";
   import { createGraphSearchClient } from "$lib/cortex/search-client";
+  import { createAnalysisSessionStore } from "$lib/cortex/session.svelte";
   import { createGraphQLClient } from "$lib/graphql";
   import { selectFilmstripItems } from "$lib/hud/view-model";
   import { createSkgStore } from "$lib/stores/skg.svelte";
@@ -37,6 +39,13 @@
   const graphqlClient = createGraphQLClient();
   const searchClient = createGraphSearchClient();
   const traceBook = new TelemetryTraceBook();
+  const diagnosticsDraftStore = createDiagnosticsDraftStore();
+  const analysisSession = createAnalysisSessionStore({
+    skgStore,
+    viewportStore,
+    graphqlClient,
+    searchClient,
+  });
 
   const filmstripEntityIds = $derived(
     selectFilmstripItems(skgStore).map((item) => item.entityId),
@@ -88,6 +97,8 @@
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("hashchange", onHashChange);
+      analysisSession.dispose();
+      diagnosticsDraftStore.clearAll();
       telemetryStore.disconnect();
       skgStore.disconnect();
     };
@@ -101,5 +112,7 @@
   {graphqlClient}
   {searchClient}
   {traceBook}
+  {diagnosticsDraftStore}
+  {analysisSession}
   onSyncHash={syncWindowHash}
 />

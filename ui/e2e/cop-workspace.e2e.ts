@@ -1414,4 +1414,203 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
     expect(copStack.pageErrors).toEqual([]);
   });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  test("preserves per-vehicle Diagnostics drafts (Heading P Gain 3.20 -> 3.30, baseline, single-vehicle Revert Draft) and Analysis query/tier/results/provenance across Fleet and Vehicle round trips (#40)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+
+    await page.goto(info.baseURL);
+    await expect(page.getByTestId("stream-pill-fleet")).toContainText(
+      "synced",
+      { timeout: 15_000 },
+    );
+    await expect(page.getByTestId("fleet-nominal-badge")).toContainText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    const setRangeValue = async (paramKey: string, nextValue: string) => {
+      const rangeInput = page.locator(
+        `[data-param-key="${paramKey}"] input[type="range"]`,
+      );
+      await expect(rangeInput).toBeVisible();
+      await rangeInput.evaluate((el, val) => {
+        const input = el as HTMLInputElement;
+        input.value = val;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }, nextValue);
+    };
+
+    const selectFilmstripVehicle = async (entityId: string) => {
+      await page
+        .locator(`[data-testid="filmstrip-item"][data-entity-id="${entityId}"]`)
+        .click();
+    };
+
+    // 1. Select UXS #1 (quadcopter), open Diagnostics, and stage Heading P Gain 3.20 -> 3.30 (1 staged).
+    await selectFilmstripVehicle(info.vehicles.quadcopter);
+    await page.getByTestId("workspace-tab-bench").click();
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "bench",
+    );
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("3.20 1/s");
+
+    await setRangeValue("uxs.control.heading_kp", "3.3");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("3.30 1/s");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("(base 3.20)");
+
+    // 2. Select UXS #2 (rover) in Diagnostics and stage Max Groundspeed 6.0 -> 9.5 (1 staged) without affecting UXS #1.
+    await selectFilmstripVehicle(info.vehicles.rover);
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("2.10 1/s");
+
+    await setRangeValue("uxs.limits.max_groundspeed_mps", "9.5");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.limits.max_groundspeed_mps"]'),
+    ).toContainText("9.5 m/s");
+    await expect(
+      page.locator('[data-param-key="uxs.limits.max_groundspeed_mps"]'),
+    ).toContainText("(base 6.0)");
+
+    // 3. Select UXS #1, open Analysis, switch tier to SEMANTIC, and submit predicate query "uxs.domain.kind".
+    await selectFilmstripVehicle(info.vehicles.quadcopter);
+    await page.getByTestId("workspace-tab-cortex").click();
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "cortex",
+    );
+
+    await page.getByTestId("cortex-tier-semantic").click();
+    await expect(page.getByTestId("cortex-tier-semantic")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    const queryInput = page.getByTestId("cortex-query-input");
+    await queryInput.fill("uxs.domain.kind");
+    await page.getByTestId("cortex-query-submit").click();
+
+    await expect(page.getByTestId("cortex-session-status")).toHaveAttribute(
+      "data-status",
+      "completed",
+      { timeout: 10_000 },
+    );
+    await expect(page.getByTestId("cortex-hit-item")).toHaveCount(3);
+    await expect(page.getByTestId("cortex-causal-subgraph")).toContainText(
+      "5 nodes · 2 edges",
+      { timeout: 10_000 },
+    );
+    await expect(page.getByTestId("cortex-sigma-host")).toHaveAttribute(
+      "data-highlighted-node",
+      info.vehicles.quadcopter,
+    );
+    await expect(page.getByTestId("cortex-provenance-column")).toContainText(
+      "quadcopter",
+    );
+
+    // 4. Switch through Fleet -> select UXS #2 -> Vehicle -> Diagnostics and verify both vehicle drafts survived in strict isolation.
+    await page.getByTestId("workspace-tab-cop").click();
+    await selectFilmstripVehicle(info.vehicles.rover);
+    await page.getByTestId("workspace-tab-pilot").click();
+    await page.getByTestId("workspace-tab-bench").click();
+
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.limits.max_groundspeed_mps"]'),
+    ).toContainText("9.5 m/s");
+    await expect(
+      page.locator('[data-param-key="uxs.limits.max_groundspeed_mps"]'),
+    ).toContainText("(base 6.0)");
+
+    await selectFilmstripVehicle(info.vehicles.quadcopter);
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("3.30 1/s");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("(base 3.20)");
+
+    // 5. Revert UXS #1 ONLY, round-trip through Fleet (selecting UXS #2), and verify UXS #1 stays 0 staged while UXS #2 stays 1 staged.
+    await page.getByTestId("bench-tuning-revert").click();
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("3.20 1/s");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).not.toContainText("(base 3.20)");
+
+    await page.getByTestId("workspace-tab-cop").click();
+    await selectFilmstripVehicle(info.vehicles.rover);
+    await page.getByTestId("workspace-tab-bench").click();
+
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.limits.max_groundspeed_mps"]'),
+    ).toContainText("9.5 m/s");
+
+    await selectFilmstripVehicle(info.vehicles.quadcopter);
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("0 staged");
+
+    // 6. Select UXS #2 in Fleet and return to Analysis: query text, SEMANTIC tier, hits, 2-hop subgraph, pinned UXS #1 citations, and earlier-selection provenance all survive!
+    await page.getByTestId("workspace-tab-cop").click();
+    await selectFilmstripVehicle(info.vehicles.rover);
+    await page.getByTestId("workspace-tab-cortex").click();
+
+    await expect(page.getByTestId("cortex-query-input")).toHaveValue(
+      "uxs.domain.kind",
+    );
+    await expect(page.getByTestId("cortex-tier-semantic")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(page.getByTestId("cortex-hit-item")).toHaveCount(3);
+    await expect(page.getByTestId("cortex-causal-subgraph")).toContainText(
+      "5 nodes · 2 edges",
+    );
+    await expect(page.getByTestId("cortex-sigma-host")).toHaveAttribute(
+      "data-highlighted-node",
+      info.vehicles.quadcopter,
+    );
+    await expect(page.getByTestId("cortex-provenance-column")).toContainText(
+      "quadcopter",
+    );
+
+    const provBanner = page.getByTestId("cortex-result-provenance");
+    await expect(provBanner).toHaveAttribute("data-earlier-selection", "true");
+    await expect(provBanner).toContainText("UXS #1");
+    await expect(provBanner).toContainText("earlier selection");
+    await expect(provBanner).toContainText("UXS #2");
+
+    await expect(
+      page.getByTestId("cortex-inspection-divergence"),
+    ).toBeVisible();
+    await page.getByTestId("cortex-sync-selection-btn").click();
+    await expect(page.getByTestId("cortex-sigma-host")).toHaveAttribute(
+      "data-highlighted-node",
+      info.vehicles.rover,
+    );
+    await expect(page.getByTestId("cortex-provenance-column")).toContainText(
+      "rover",
+    );
+
+    expect(copStack.pageErrors).toEqual([]);
+    expect(copStack.consoleErrors).toEqual([]);
+  });
 });
