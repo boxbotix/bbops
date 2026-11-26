@@ -1,5 +1,5 @@
 # Proposal: m2-5-compact-layout
-Approved-by:
+Approved-by: coby (2026-11-26) sha256:a049e40d5a05
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track

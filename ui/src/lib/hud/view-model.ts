@@ -2153,3 +2153,120 @@ export function stepTablistIndex(
       return null;
   }
 }
+
+export const COP_DESKTOP_MIN_WIDTH_PX = 900;
+export const COP_DESKTOP_MIN_HEIGHT_PX = 700;
+export const COP_WIDE_MIN_WIDTH_PX = 1200;
+
+export type CopViewportTier = "wide" | "compact" | "stacked";
+export type CopPanelName = "roster" | "inspector";
+
+export interface CopPanelOverrides {
+  readonly roster: boolean | null;
+  readonly inspector: boolean | null;
+}
+
+export const INITIAL_COP_PANEL_OVERRIDES: CopPanelOverrides = {
+  roster: null,
+  inspector: null,
+};
+
+export interface CopPanelLayout {
+  readonly tier: CopViewportTier;
+  readonly boundedShell: boolean;
+  readonly rosterOpen: boolean;
+  readonly inspectorOpen: boolean;
+}
+
+export function classifyCopViewportTier(
+  widthPx: number,
+  heightPx: number,
+): CopViewportTier {
+  if (!isFiniteNumber(widthPx) || !isFiniteNumber(heightPx)) {
+    return "wide";
+  }
+  if (
+    widthPx < COP_DESKTOP_MIN_WIDTH_PX ||
+    heightPx < COP_DESKTOP_MIN_HEIGHT_PX
+  ) {
+    return "stacked";
+  }
+  if (widthPx < COP_WIDE_MIN_WIDTH_PX) {
+    return "compact";
+  }
+  return "wide";
+}
+
+export function resolveCopPanelLayout(
+  widthPx: number,
+  heightPx: number,
+  overrides: CopPanelOverrides = INITIAL_COP_PANEL_OVERRIDES,
+): CopPanelLayout {
+  const tier = classifyCopViewportTier(widthPx, heightPx);
+  const defaultRosterOpen = tier === "wide";
+  const defaultInspectorOpen = true;
+  return {
+    tier,
+    boundedShell: tier !== "stacked",
+    rosterOpen: overrides.roster ?? defaultRosterOpen,
+    inspectorOpen: overrides.inspector ?? defaultInspectorOpen,
+  };
+}
+
+export function toggleCopPanel(
+  widthPx: number,
+  heightPx: number,
+  overrides: CopPanelOverrides,
+  panel: CopPanelName,
+): CopPanelOverrides {
+  const layout = resolveCopPanelLayout(widthPx, heightPx, overrides);
+  const nextOpen =
+    panel === "roster" ? !layout.rosterOpen : !layout.inspectorOpen;
+  return panel === "roster"
+    ? { ...overrides, roster: nextOpen }
+    : { ...overrides, inspector: nextOpen };
+}
+
+export function revealCopInspectorOnSelect(
+  widthPx: number,
+  heightPx: number,
+  overrides: CopPanelOverrides,
+  selectedEntityId: string | null,
+): CopPanelOverrides {
+  if (!selectedEntityId) {
+    return overrides;
+  }
+  const layout = resolveCopPanelLayout(widthPx, heightPx, overrides);
+  if (layout.inspectorOpen) {
+    return overrides;
+  }
+  return { ...overrides, inspector: true };
+}
+
+export function closeCopPanelOnEscape(
+  widthPx: number,
+  heightPx: number,
+  overrides: CopPanelOverrides,
+  focusedPanelBody: CopPanelName | null,
+): {
+  readonly overrides: CopPanelOverrides;
+  readonly closedPanel: CopPanelName | null;
+} {
+  if (focusedPanelBody === null) {
+    return { overrides, closedPanel: null };
+  }
+  const layout = resolveCopPanelLayout(widthPx, heightPx, overrides);
+  if (focusedPanelBody === "roster" && layout.rosterOpen) {
+    return {
+      overrides: { ...overrides, roster: false },
+      closedPanel: "roster",
+    };
+  }
+  if (focusedPanelBody === "inspector" && layout.inspectorOpen) {
+    return {
+      overrides: { ...overrides, inspector: false },
+      closedPanel: "inspector",
+    };
+  }
+  return { overrides, closedPanel: null };
+}

@@ -129,11 +129,17 @@
   >
     <div class="banner-primary">
       <span class="contact-tag">EXTERNAL CONTACT</span>
-      <strong class="contact-title">{presentation.title}</strong>
-      <span class="contact-pill">type: {presentation.contactType}</span>
+      <strong class="contact-title" title={presentation.title}
+        >{presentation.title}</strong
+      >
+      <span class="contact-pill" title={`type: ${presentation.contactType}`}
+        >type: {presentation.contactType}</span
+      >
       <span class="contact-pill">feed: {presentation.feedStatus}</span>
       {#if compact}
-        <span class="contact-pill">source: {presentation.source}</span>
+        <span class="contact-pill" title={`source: ${presentation.source}`}
+          >source: {presentation.source}</span
+        >
         <span class="contact-pill">observed: {presentation.observedAt}</span>
         <span class="contact-pill">received: {presentation.receivedAt}</span>
         <span class="contact-pill">expires: {presentation.expiresAt}</span>
@@ -172,6 +178,8 @@
     flex-direction: column;
     gap: 6px;
     padding: 8px 12px;
+    min-width: 0;
+    max-width: 100%;
     background: var(--ui-surface-secondary, #101726);
     border: 1px solid var(--ui-border-subtle, #1e293b);
     border-radius: 6px;
@@ -190,12 +198,18 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .entity-tag {
     font-weight: 700;
     color: var(--ui-text-primary, #e2e8f0);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .safety-badge {
@@ -203,6 +217,10 @@
     border-radius: 4px;
     font-weight: 700;
     border: 1px solid var(--ui-border-strong, #334155);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .severity-error {
@@ -236,6 +254,10 @@
     color: var(--skg-node-contact, #22d3ee);
     border: 1px solid rgba(34, 211, 238, 0.35);
     font-size: 11px;
+    max-width: min(260px, 100%);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .health-chip {
@@ -252,6 +274,7 @@
   }
 
   .contact-tag {
+    flex-shrink: 0;
     padding: 2px 7px;
     border-radius: 4px;
     background: rgba(34, 211, 238, 0.14);
@@ -262,11 +285,16 @@
 
   .contact-title {
     color: var(--ui-text-primary, #e2e8f0);
+    max-width: min(260px, 100%);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .contact-meta {
     color: var(--ui-text-secondary, #94a3b8);
     font-size: 11px;
+    overflow-wrap: anywhere;
   }
 
   .standby-banner {
