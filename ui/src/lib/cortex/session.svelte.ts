@@ -617,11 +617,6 @@ export function createAnalysisSessionStore(
       }
       let nextErrorBanner: string | null = null;
       const simHits = sim.ok ? sim.hits : [];
-      const isTerminalSimilarError =
-        !sim.ok &&
-        sim.refusal !== null &&
-        !sim.refusal.notEnabled &&
-        simHits.length === 0;
       rawHits = simHits;
       if (sim.ok) {
         indexedRevision = sim.indexedRevision > 0 ? sim.indexedRevision : null;
@@ -632,21 +627,21 @@ export function createAnalysisSessionStore(
         nextErrorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
         errorBanner = nextErrorBanner;
       }
-      provenance = isTerminalSimilarError
-        ? null
-        : {
-            reqSeq,
-            mode: "similar",
-            submittedQuery: "",
-            submittedTier: tierAtStart,
-            retrievalScope,
-            scopeEntityId: retrievalScope.entityId,
-            submittedSelectionId,
-            settledSelectionId: entityId,
-          };
+      const similarProvenance: AnalysisResultProvenance = {
+        reqSeq,
+        mode: "similar",
+        submittedQuery: "",
+        submittedTier: tierAtStart,
+        retrievalScope,
+        scopeEntityId: retrievalScope.entityId,
+        submittedSelectionId,
+        settledSelectionId: entityId,
+      };
+      if (simHits.length > 0 || nextErrorBanner === null) {
+        provenance = similarProvenance;
+      }
 
       if (
-        !isTerminalSimilarError &&
         selectionEpoch === epochAtStart &&
         (!viewMounted ||
           sanitizeEntityId(viewportStore.selectedEntityId) === null ||
@@ -659,20 +654,17 @@ export function createAnalysisSessionStore(
         return;
       }
 
-      provenance = isTerminalSimilarError
-        ? null
-        : {
-            reqSeq,
-            mode: "similar",
-            submittedQuery: "",
-            submittedTier: tierAtStart,
-            retrievalScope,
-            scopeEntityId: retrievalScope.entityId,
-            submittedSelectionId,
-            settledSelectionId: entityId,
-          };
+      const hasSimilarOrGraphResult =
+        simHits.length > 0 || pathResults.length > 0;
+      provenance =
+        hasSimilarOrGraphResult || nextErrorBanner === null
+          ? similarProvenance
+          : null;
       inFlight = null;
-      status = isTerminalSimilarError ? "error" : "completed";
+      status =
+        nextErrorBanner !== null && !hasSimilarOrGraphResult
+          ? "error"
+          : "completed";
     } catch (err) {
       if (
         !isDisposed &&

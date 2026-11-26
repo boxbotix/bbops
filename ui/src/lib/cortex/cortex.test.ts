@@ -1889,6 +1889,7 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       }),
     };
 
+    let similarMode: "ok" | "embedding_unavailable" = "ok";
     const mockSearch = createGraphSearchClient({
       fetchImpl: (async (_input, init) => {
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<
@@ -1897,6 +1898,20 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
         >;
         searchCalls.push(body);
         if (body.verb === "similar") {
+          if (similarMode === "embedding_unavailable") {
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                verb: "similar",
+                error: {
+                  class: "invalid",
+                  code: "embedding_unavailable",
+                  message: "entity has no usable embedding",
+                },
+              }),
+              { status: 422 },
+            );
+          }
           return new Response(
             JSON.stringify({
               ok: true,
@@ -2378,6 +2393,61 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       );
       expect(neuralProvText).toContain(
         "earlier selection (current: UXS #2 (Vanguard 2))",
+      );
+
+      // 2E. 2-Hop & Similar partial success on structured similarity refusal (`embedding_unavailable`):
+      //     still runs GraphQL 2-hop `pathSearch` and surfaces BOTH the similarity error banner AND the 2-hop graph edge!
+      similarMode = "embedding_unavailable";
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      const pathCallsBefore = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-similar-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+      const pathCallsAfter = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfter - pathCallsBefore).toBe(1);
+      expect(analysisSession.errorBanner).toBe(
+        "embedding_unavailable: entity has no usable embedding",
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent ?? "",
+      ).toContain("embedding_unavailable: entity has no usable embedding");
+      expect(analysisSession.pathResults).toHaveLength(1);
+      expect(analysisSession.pathResults[0]?.paths).toEqual([
+        [
+          {
+            from: quad1.id,
+            predicate: "cop.proximity.near",
+            to: validContactId,
+          },
+        ],
+      ]);
+      expect(
+        (
+          hostEl.querySelector('[data-testid="cortex-causal-subgraph"]')
+            ?.textContent ?? ""
+        ).replace(/\s+/g, " "),
+      ).toContain("2 nodes · 1 edges");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).toContain("Verified Escort");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "2-Hop & Similar results · retrieval scope: UXS #1 (Falcon 1)",
       );
     } finally {
       unmount(app);
