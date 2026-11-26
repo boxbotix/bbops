@@ -315,7 +315,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    min-height: 480px;
+    min-height: 300px;
+    min-width: 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
 
@@ -387,7 +388,8 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    min-height: 460px;
+    min-height: 280px;
+    min-width: 0;
   }
 
   .pilot-pip-hud {
@@ -441,9 +443,10 @@
   .pilot-split-view {
     flex: 1;
     display: grid;
-    grid-template-columns: minmax(320px, 1fr) minmax(0, 1fr);
+    grid-template-columns: minmax(300px, 1fr) minmax(0, 1fr);
     gap: 8px;
-    min-height: 460px;
+    min-height: 280px;
+    min-width: 0;
   }
 
   .pilot-pfd-column,
@@ -452,15 +455,16 @@
     flex-direction: column;
     gap: 8px;
     min-width: 0;
-    min-height: 460px;
+    min-height: 260px;
   }
 
   .pilot-contact-isolation {
     flex: 1;
     display: grid;
-    grid-template-columns: 320px minmax(0, 1fr);
+    grid-template-columns: 300px minmax(0, 1fr);
     gap: 8px;
-    min-height: 460px;
+    min-height: 280px;
+    min-width: 0;
   }
 
   .contact-card {
@@ -468,6 +472,8 @@
     flex-direction: column;
     gap: 10px;
     padding: 12px;
+    min-width: 0;
+    overflow-wrap: anywhere;
     border-radius: 6px;
     background: var(--ui-surface-secondary, #101726);
     border: 1px solid rgba(34, 211, 238, 0.35);
@@ -478,6 +484,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
   }
 
   .contact-badge {
@@ -502,9 +509,10 @@
     flex-direction: column;
     gap: 5px;
     color: var(--ui-text-secondary, #94a3b8);
+    overflow-wrap: anywhere;
   }
 
-  @media (max-width: 960px) {
+  @media (max-width: 960px), (max-height: 699px) {
     .pilot-split-view,
     .pilot-contact-isolation {
       grid-template-columns: 1fr;

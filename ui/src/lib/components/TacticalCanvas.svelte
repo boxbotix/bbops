@@ -1000,7 +1000,7 @@
     position: relative;
     width: 100%;
     height: 100%;
-    min-height: 360px;
+    min-height: 240px;
     overflow: hidden;
     background: var(--ui-surface-primary, #090d16);
     border: 1px solid var(--ui-border-subtle, #1e293b);

@@ -22,8 +22,14 @@ import {
   resolveVehicleSafetyTone,
 } from "../viewport/ned-grid";
 import {
+  COP_DESKTOP_MIN_HEIGHT_PX,
+  COP_DESKTOP_MIN_WIDTH_PX,
   COP_SOLO_SECTIONS,
+  COP_WIDE_MIN_WIDTH_PX,
+  type CopPanelName,
+  type CopPanelOverrides,
   HUD_READOUT_THROTTLE_MS,
+  INITIAL_COP_PANEL_OVERRIDES,
   SKG_VEHICLE_FRESH_MS,
   USV_HUD_CRAB_DEADBAND_MPS,
   VEHICLE_FRESH_DEFAULT_MS,
@@ -33,6 +39,8 @@ import {
   buildFilmstripItems,
   buildHealthStrip,
   buildVehicleBannerView,
+  classifyCopViewportTier,
+  closeCopPanelOnEscape,
   computeFlightMetrics,
   evaluatePoisonedVehicleFreshness,
   evaluateVehicleFreshness,
@@ -43,14 +51,17 @@ import {
   formatObservationAge,
   formatVehicleHudReadouts,
   quaternionToEulerDeg,
+  resolveCopPanelLayout,
   resolveLiveVehiclePose,
   resolveVehicleFreshnessThresholdMs,
+  revealCopInspectorOnSelect,
   selectBannerPresentation,
   selectFilmstripItems,
   shouldRefreshHudReadout,
   stepTablistIndex,
   summarizeFleetHealth,
   summarizeStreamReadiness,
+  toggleCopPanel,
 } from "./view-model";
 
 function eulerRadToQuaternionWxyz(
@@ -5202,5 +5213,183 @@ describe("HUD attitude extraction, P1-P4 badges, and external-contact isolation"
     expect(stepTablistIndex(0, "ArrowRight", 0)).toBeNull();
     expect(stepTablistIndex(0, "Tab", count)).toBeNull();
     expect(stepTablistIndex(0, "Enter", count)).toBeNull();
+  });
+
+  // spec: cop-ui / Compact desktop viewport layout, persistent safety header, and non-modal Fleet panel controls
+  it("classifies 1024x768, 1440x900, and 200% zoom viewport tiers at exact thresholds and checks resize/toggle/select/Escape histories against a reference model (#42)", () => {
+    expect(COP_DESKTOP_MIN_WIDTH_PX).toBe(900);
+    expect(COP_DESKTOP_MIN_HEIGHT_PX).toBe(700);
+    expect(COP_WIDE_MIN_WIDTH_PX).toBe(1200);
+
+    // Exact boundary checks around 900x700 and 1200x700 plus 200% zoom equivalents (512x384, 720x450)
+    expect(classifyCopViewportTier(1440, 900)).toBe("wide");
+    expect(classifyCopViewportTier(1200, 700)).toBe("wide");
+    expect(classifyCopViewportTier(1199, 700)).toBe("compact");
+    expect(classifyCopViewportTier(1024, 768)).toBe("compact");
+    expect(classifyCopViewportTier(900, 700)).toBe("compact");
+    expect(classifyCopViewportTier(899, 700)).toBe("stacked");
+    expect(classifyCopViewportTier(1200, 699)).toBe("stacked");
+    expect(classifyCopViewportTier(512, 384)).toBe("stacked");
+    expect(classifyCopViewportTier(720, 450)).toBe("stacked");
+    expect(classifyCopViewportTier(Number.NaN, 900)).toBe("wide");
+    expect(classifyCopViewportTier(1440, Number.POSITIVE_INFINITY)).toBe(
+      "wide",
+    );
+
+    // Default panel states: 1440x900 opens both; 1024x768 and 200% zoom collapse Roster so Roster+FleetFilmstrip do not double-consume space
+    expect(resolveCopPanelLayout(1440, 900)).toEqual({
+      tier: "wide",
+      boundedShell: true,
+      rosterOpen: true,
+      inspectorOpen: true,
+    });
+    expect(resolveCopPanelLayout(1024, 768)).toEqual({
+      tier: "compact",
+      boundedShell: true,
+      rosterOpen: false,
+      inspectorOpen: true,
+    });
+    expect(resolveCopPanelLayout(512, 384)).toEqual({
+      tier: "stacked",
+      boundedShell: false,
+      rosterOpen: false,
+      inspectorOpen: true,
+    });
+
+    // Resize round-trip without manual overrides restores each tier's default roster visibility
+    expect(
+      resolveCopPanelLayout(1440, 900, INITIAL_COP_PANEL_OVERRIDES).rosterOpen,
+    ).toBe(true);
+    expect(
+      resolveCopPanelLayout(1024, 768, INITIAL_COP_PANEL_OVERRIDES).rosterOpen,
+    ).toBe(false);
+    expect(
+      resolveCopPanelLayout(1440, 900, INITIAL_COP_PANEL_OVERRIDES).rosterOpen,
+    ).toBe(true);
+
+    // Seeded PRNG (mulberry32) order-dependent history test against an independent reference model
+    let seed = 0x42c0de;
+    const nextRand = (): number => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    const viewports: ReadonlyArray<readonly [number, number]> = [
+      [1440, 900],
+      [1200, 700],
+      [1199, 700],
+      [1024, 768],
+      [900, 700],
+      [899, 768],
+      [1440, 699],
+      [720, 450],
+      [512, 384],
+    ];
+
+    let overrides: CopPanelOverrides = INITIAL_COP_PANEL_OVERRIDES;
+    let refRoster: boolean | null = null;
+    let refInspector: boolean | null = null;
+    let [w, h] = viewports[0]!;
+
+    const seenTiers = new Set<string>();
+    let autoReveals = 0;
+    let escapeCloses = 0;
+    let escapeNoops = 0;
+    let rosterToggles = 0;
+    let inspectorToggles = 0;
+
+    const refTier = (
+      width: number,
+      height: number,
+    ): "wide" | "compact" | "stacked" => {
+      if (width < 900 || height < 700) return "stacked";
+      return width < 1200 ? "compact" : "wide";
+    };
+    const refOpen = (
+      width: number,
+      height: number,
+      rOv: boolean | null,
+      iOv: boolean | null,
+    ): { roster: boolean; inspector: boolean } => {
+      const t = refTier(width, height);
+      return {
+        roster: rOv !== null ? rOv : t === "wide",
+        inspector: iOv !== null ? iOv : true,
+      };
+    };
+
+    for (let step = 0; step < 300; step += 1) {
+      const actionRoll = nextRand();
+      if (actionRoll < 0.28) {
+        const picked = viewports[Math.floor(nextRand() * viewports.length)]!;
+        w = picked[0];
+        h = picked[1];
+      } else if (actionRoll < 0.52) {
+        const panel: CopPanelName = nextRand() < 0.5 ? "roster" : "inspector";
+        const cur = refOpen(w, h, refRoster, refInspector);
+        if (panel === "roster") {
+          refRoster = !cur.roster;
+          rosterToggles += 1;
+        } else {
+          refInspector = !cur.inspector;
+          inspectorToggles += 1;
+        }
+        overrides = toggleCopPanel(w, h, overrides, panel);
+      } else if (actionRoll < 0.72) {
+        const selId =
+          nextRand() < 0.25 ? null : "boxbotix.local.robotics.uxs.vehicle.1";
+        const cur = refOpen(w, h, refRoster, refInspector);
+        if (selId && !cur.inspector) {
+          refInspector = true;
+          autoReveals += 1;
+        }
+        overrides = revealCopInspectorOnSelect(w, h, overrides, selId);
+      } else if (actionRoll < 0.92) {
+        const focusRoll = nextRand();
+        const focused: CopPanelName | null =
+          focusRoll < 0.35 ? "roster" : focusRoll < 0.7 ? "inspector" : null;
+        const cur = refOpen(w, h, refRoster, refInspector);
+        let expectedClosed: CopPanelName | null = null;
+        if (focused === "roster" && cur.roster) {
+          refRoster = false;
+          expectedClosed = "roster";
+          escapeCloses += 1;
+        } else if (focused === "inspector" && cur.inspector) {
+          refInspector = false;
+          expectedClosed = "inspector";
+          escapeCloses += 1;
+        } else {
+          escapeNoops += 1;
+        }
+        const res = closeCopPanelOnEscape(w, h, overrides, focused);
+        expect(res.closedPanel).toBe(expectedClosed);
+        overrides = res.overrides;
+      } else {
+        overrides = INITIAL_COP_PANEL_OVERRIDES;
+        refRoster = null;
+        refInspector = null;
+      }
+
+      const actual = resolveCopPanelLayout(w, h, overrides);
+      const expectedTier = refTier(w, h);
+      const expectedOpen = refOpen(w, h, refRoster, refInspector);
+      seenTiers.add(actual.tier);
+      expect(actual).toEqual({
+        tier: expectedTier,
+        boundedShell: expectedTier !== "stacked",
+        rosterOpen: expectedOpen.roster,
+        inspectorOpen: expectedOpen.inspector,
+      });
+    }
+
+    // Prove boundary reach and assertion activation across all tiers and transition branches
+    expect([...seenTiers].sort()).toEqual(["compact", "stacked", "wide"]);
+    expect(rosterToggles).toBeGreaterThan(10);
+    expect(inspectorToggles).toBeGreaterThan(10);
+    expect(autoReveals).toBeGreaterThan(5);
+    expect(escapeCloses).toBeGreaterThan(10);
+    expect(escapeNoops).toBeGreaterThan(10);
   });
 });

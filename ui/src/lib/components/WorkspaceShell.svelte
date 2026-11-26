@@ -29,9 +29,13 @@
   } from "$lib/cortex/session.svelte";
   import { type GraphQLClient, createGraphQLClient } from "$lib/graphql";
   import {
+    type CopPanelOverrides,
+    type CopSoloSection,
     FLEET_FRESHNESS_TICK_MS,
     type FilmstripItemView,
     type FleetFreshnessContext,
+    INITIAL_COP_PANEL_OVERRIDES,
+    revealCopInspectorOnSelect,
     selectFilmstripItems,
     summarizeFleetHealth,
     summarizeStreamReadiness,
@@ -42,6 +46,7 @@
     ViewportStore,
     WorkspaceMode,
   } from "$lib/stores/viewport.svelte";
+  import { isEditableHotkeyTarget } from "$lib/viewport/hotkeys";
 
   interface Props {
     telemetryStore: TelemetryStore;
@@ -94,11 +99,94 @@
     return now();
   });
 
+  let viewportWidth = $state(
+    typeof window !== "undefined" ? window.innerWidth : 1440,
+  );
+  let viewportHeight = $state(
+    typeof window !== "undefined" ? window.innerHeight : 900,
+  );
+  let copPanelOverrides = $state<CopPanelOverrides>(
+    INITIAL_COP_PANEL_OVERRIDES,
+  );
+  let copSoloSection = $state<CopSoloSection>("summary");
+  let unstickCompactTopbar = $state(false);
+
+  let shellEl: HTMLElement | undefined = $state();
+  let topbarEl: HTMLElement | undefined = $state();
+  let stageHostEl: HTMLDivElement | undefined = $state();
+  let lightsOutBtnEl: HTMLButtonElement | undefined = $state();
+
+  function syncTopbarOffset(): void {
+    if (typeof window !== "undefined") {
+      viewportWidth = window.innerWidth;
+      viewportHeight = window.innerHeight;
+    }
+    if (!topbarEl) {
+      return;
+    }
+    const rect = topbarEl.getBoundingClientRect();
+    const measuredH = rect.height || topbarEl.offsetHeight || 56;
+    const shouldUnstick =
+      viewportHeight > 0 &&
+      (viewportHeight < 420 || measuredH > viewportHeight * 0.45);
+    unstickCompactTopbar = shouldUnstick;
+    const offsetPx = shouldUnstick
+      ? 16
+      : Math.max(56, Math.ceil(measuredH) + 12);
+    const cssVal = `${offsetPx}px`;
+    shellEl?.style.setProperty("--shell-topbar-offset", cssVal);
+    if (typeof document !== "undefined") {
+      document.documentElement.style.setProperty(
+        "--shell-topbar-offset",
+        cssVal,
+      );
+    }
+  }
+
   onMount(() => {
+    syncTopbarOffset();
+    const handleResize = (): void => {
+      syncTopbarOffset();
+    };
+    const handleDigitReveal = (ev: KeyboardEvent): void => {
+      if (
+        ev.defaultPrevented ||
+        ev.repeat ||
+        ev.ctrlKey ||
+        ev.metaKey ||
+        ev.altKey ||
+        ev.shiftKey ||
+        !viewportStore.characterShortcutsEnabled ||
+        !/^[1-9]$/.test(ev.key) ||
+        isEditableHotkeyTarget(ev.target as HTMLElement | null)
+      ) {
+        return;
+      }
+      const item = resolvedFilmstripItems[Number(ev.key) - 1];
+      if (item) {
+        revealInspectorForEntity(item.entityId);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("keydown", handleDigitReveal);
+    const topbarObserver =
+      typeof ResizeObserver !== "undefined" && topbarEl
+        ? new ResizeObserver(() => syncTopbarOffset())
+        : null;
+    if (topbarObserver && topbarEl) {
+      topbarObserver.observe(topbarEl);
+    }
+
     const intervalId = setInterval(() => {
       freshnessTick += 1;
     }, FLEET_FRESHNESS_TICK_MS);
     return () => {
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("keydown", handleDigitReveal);
+      topbarObserver?.disconnect();
+      if (typeof document !== "undefined") {
+        document.documentElement.style.removeProperty("--shell-topbar-offset");
+      }
       clearInterval(intervalId);
       if (!analysisSession && ownedAnalysisSession) {
         ownedAnalysisSession.dispose();
@@ -117,6 +205,35 @@
       }
     }
   });
+
+  let lastSelectedIdForPanels: string | null | undefined = undefined;
+  $effect(() => {
+    const selectedId = viewportStore.selectedEntityId;
+    if (lastSelectedIdForPanels === undefined) {
+      lastSelectedIdForPanels = selectedId;
+      return;
+    }
+    if (selectedId !== lastSelectedIdForPanels) {
+      lastSelectedIdForPanels = selectedId;
+      if (selectedId) {
+        copPanelOverrides = revealCopInspectorOnSelect(
+          viewportWidth,
+          viewportHeight,
+          copPanelOverrides,
+          selectedId,
+        );
+      }
+    }
+  });
+
+  function revealInspectorForEntity(entityId: string): void {
+    copPanelOverrides = revealCopInspectorOnSelect(
+      viewportWidth,
+      viewportHeight,
+      copPanelOverrides,
+      entityId,
+    );
+  }
 
   const banner = $derived(formatShellBanner("v0.1.0-dev"));
   const freshnessContext = $derived<FleetFreshnessContext>({
@@ -150,9 +267,6 @@
     );
   });
 
-  let shellEl: HTMLElement | undefined = $state();
-  let stageHostEl: HTMLDivElement | undefined = $state();
-  let lightsOutBtnEl: HTMLButtonElement | undefined = $state();
   let lastWorkspace: WorkspaceMode | null = null;
   let lastLightsOut: boolean | null = null;
   let directNavSelection = false;
@@ -246,6 +360,7 @@
       return;
     }
     viewportStore.selectEntity(fleetHealth.firstFaultEntityId);
+    revealInspectorForEntity(fleetHealth.firstFaultEntityId);
     onSyncHash?.(viewportStore.toUrlHash());
   }
 </script>
@@ -257,7 +372,9 @@
   data-workspace={viewportStore.workspace}
 >
   <header
+    bind:this={topbarEl}
     class="invariant-topbar"
+    class:unstick={unstickCompactTopbar}
     data-testid="invariant-safety-topbar"
     aria-label="Invariant safety and workspace header"
   >
@@ -400,6 +517,16 @@
         {freshnessContext}
         {now}
         {onSyncHash}
+        {viewportWidth}
+        {viewportHeight}
+        panelOverrides={copPanelOverrides}
+        onUpdatePanelOverrides={(next) => {
+          copPanelOverrides = next;
+        }}
+        soloSection={copSoloSection}
+        onSelectSoloSection={(next) => {
+          copSoloSection = next;
+        }}
       />
     {:else if viewportStore.workspace === "pilot"}
       <PilotWorkspace
@@ -436,6 +563,7 @@
       items={resolvedFilmstripItems}
       {viewportStore}
       {onSyncHash}
+      onSelectEntity={revealInspectorForEntity}
     />
   {/if}
 </main>
@@ -444,30 +572,54 @@
   .workspace-shell {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding: 10px;
+    gap: 6px;
+    padding: 8px;
+    width: 100%;
+    max-width: 100%;
     min-height: 100vh;
+    min-height: 100dvh;
+    overflow-x: clip;
     background: var(--ui-surface-primary, #090d16);
     color: var(--ui-text-primary, #e2e8f0);
   }
 
   .invariant-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    flex-shrink: 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
-    padding: 6px 10px;
+    gap: 6px;
+    padding: 5px 8px;
+    max-width: 100%;
     background: var(--ui-surface-secondary, #101726);
     border: 1px solid var(--ui-border-subtle, #1e293b);
     border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(2, 6, 23, 0.45);
+  }
+
+  .invariant-topbar.unstick {
+    position: static;
+    box-shadow: none;
+  }
+
+  @media (max-height: 419px) {
+    .invariant-topbar {
+      position: static;
+      box-shadow: none;
+    }
   }
 
   .topbar-brand-cluster {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .workspace-title {
@@ -475,12 +627,18 @@
     font-size: 13px;
     font-weight: 700;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .stream-pills {
     display: inline-flex;
     flex-wrap: wrap;
     gap: 6px;
+    min-width: 0;
+    max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
   }
@@ -490,6 +648,10 @@
   .fleet-status-pill {
     padding: 2px 8px;
     border-radius: 999px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     background: var(--ui-surface-elevated, #172033);
     border: 1px solid var(--ui-border-strong, #334155);
     color: var(--ui-text-secondary, #94a3b8);
@@ -523,6 +685,10 @@
   .fleet-fault-btn {
     padding: 3px 9px;
     border-radius: 999px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
     font-weight: 700;
@@ -542,10 +708,11 @@
   }
 
   .topbar-authority-slot {
-    flex: 1 1 280px;
+    flex: 1 1 240px;
     display: flex;
     justify-content: center;
     min-width: 0;
+    max-width: 100%;
   }
 
   .workspace-switcher {
@@ -553,6 +720,8 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+    max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px;
   }
@@ -564,6 +733,8 @@
     gap: 5px;
     padding: 4px 8px;
     border-radius: 5px;
+    max-width: 100%;
+    white-space: nowrap;
     border: 1px solid var(--ui-border-strong, #334155);
     background: var(--ui-surface-elevated, #172033);
     color: var(--ui-text-secondary, #94a3b8);
@@ -590,9 +761,40 @@
   }
 
   .workspace-stage-host {
-    flex: 1;
+    flex: 1 0 auto;
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  @media (min-width: 900px) and (min-height: 700px) {
+    .workspace-shell {
+      gap: 8px;
+      padding: 10px;
+      height: 100vh;
+      height: 100dvh;
+      max-height: 100dvh;
+      overflow-y: hidden;
+    }
+
+    .invariant-topbar {
+      position: relative;
+      top: auto;
+      gap: 8px;
+      padding: 6px 10px;
+      box-shadow: none;
+    }
+
+    .topbar-brand-cluster {
+      gap: 8px;
+    }
+
+    .workspace-stage-host {
+      flex: 1 1 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
   }
 </style>

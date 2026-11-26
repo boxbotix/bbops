@@ -10,12 +10,14 @@
     items: readonly FilmstripItemView[];
     viewportStore: ViewportStore;
     onSyncHash?: (hash: string) => void;
+    onSelectEntity?: (entityId: string) => void;
   }
 
-  let { items, viewportStore, onSyncHash }: Props = $props();
+  let { items, viewportStore, onSyncHash, onSelectEntity }: Props = $props();
 
   function handleSelect(entityId: string): void {
     viewportStore.selectEntity(entityId);
+    onSelectEntity?.(entityId);
     onSyncHash?.(viewportStore.toUrlHash());
   }
 </script>
@@ -49,6 +51,7 @@
           viewportStore.characterShortcutsEnabled
             ? item.shortcutKey
             : undefined}
+          title={`${item.primaryLabel} · ${item.secondaryLabel}`}
           onclick={() => handleSelect(item.entityId)}
         >
           {#if item.shortcutKey && viewportStore.characterShortcutsEnabled}
@@ -80,10 +83,12 @@
 
 <style>
   .fleet-filmstrip {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 6px 10px;
+    max-width: 100%;
     background: var(--ui-surface-secondary, #101726);
     border: 1px solid var(--ui-border-subtle, #1e293b);
     border-radius: 6px;
@@ -101,6 +106,7 @@
   }
 
   .filmstrip-empty {
+    min-width: 0;
     color: var(--ui-text-muted, #64748b);
   }
 
@@ -116,6 +122,8 @@
     align-items: center;
     gap: 6px;
     padding: 4px 8px;
+    max-width: 240px;
+    min-width: 0;
     border-radius: 5px;
     border: 1px solid var(--ui-border-strong, #334155);
     background: var(--ui-surface-elevated, #172033);
@@ -136,6 +144,7 @@
   }
 
   .shortcut-key {
+    flex-shrink: 0;
     padding: 1px 4px;
     border-radius: 3px;
     border: 1px solid var(--ui-border-strong, #334155);
@@ -174,16 +183,24 @@
   .card-copy {
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
     line-height: 1.2;
   }
 
   .card-primary {
     font-size: 11px;
     color: var(--ui-text-primary, #e2e8f0);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .card-secondary {
     font-size: 10px;
     color: var(--ui-text-secondary, #94a3b8);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

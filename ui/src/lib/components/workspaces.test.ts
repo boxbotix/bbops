@@ -2625,4 +2625,352 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
       hostEl.remove();
     }
   });
+
+  // spec: cop-ui / Compact desktop viewport layout, persistent safety header, and non-modal Fleet panel controls
+  it("resolves 1024x768, 1440x900, and 200% zoom Fleet panel layouts, returns focus on close/Escape/resize before camera untether, focuses TacticalCanvas, and preserves #40 state across long-name and growing-roster fixtures (#42)", () => {
+    const prevInnerWidth = window.innerWidth;
+    const prevInnerHeight = window.innerHeight;
+    const setWindowSize = (w: number, h: number): void => {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: w,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        writable: true,
+        value: h,
+      });
+      window.dispatchEvent(new Event("resize"));
+      flushSync();
+    };
+
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    setWindowSize(1024, 768);
+    window.history.replaceState(null, "", "/");
+
+    let app: Record<string, unknown> | null = null;
+    const origWebSocket = globalThis.WebSocket;
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = function (
+      url: string,
+    ) {
+      if (url.includes("telemetry") || url.includes("8081")) {
+        return ws1Rig.createSocket(url);
+      }
+      return ws2Rig.createSocket(url);
+    };
+
+    try {
+      app = mount(Page, { target: hostEl });
+      flushSync();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      // Empty-fleet synced state at 1024x768: Roster collapsed by default, Inspector open, zero aria-modal.
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      flushSync();
+
+      const copStage = (): HTMLElement | null =>
+        hostEl.querySelector('[data-testid="cop-workspace"]');
+      const rosterToggle = (): HTMLButtonElement =>
+        hostEl.querySelector(
+          '[data-testid="cop-roster-toggle"]',
+        ) as HTMLButtonElement;
+      const inspectorToggle = (): HTMLButtonElement =>
+        hostEl.querySelector(
+          '[data-testid="cop-inspector-toggle"]',
+        ) as HTMLButtonElement;
+      const focusMapBtn = (): HTMLButtonElement =>
+        hostEl.querySelector(
+          '[data-testid="cop-focus-map-btn"]',
+        ) as HTMLButtonElement;
+
+      expect(copStage()?.getAttribute("data-layout-tier")).toBe("compact");
+      expect(copStage()?.getAttribute("data-roster-open")).toBe("false");
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
+      expect(rosterToggle().getAttribute("aria-expanded")).toBe("false");
+      expect(rosterToggle().getAttribute("aria-controls")).toBe(
+        "cop-roster-body",
+      );
+      expect(
+        hostEl.querySelector("#cop-roster-body")?.hasAttribute("hidden"),
+      ).toBe(true);
+      expect(inspectorToggle().getAttribute("aria-expanded")).toBe("true");
+      expect(inspectorToggle().getAttribute("aria-controls")).toBe(
+        "cop-inspector-body",
+      );
+      expect(
+        hostEl.querySelector("#cop-inspector-body")?.hasAttribute("hidden"),
+      ).toBe(false);
+      expect(hostEl.querySelectorAll("[aria-modal]")).toHaveLength(0);
+      expect(
+        document.documentElement.style.getPropertyValue(
+          "--shell-topbar-offset",
+        ),
+      ).toMatch(/^\d+px$/);
+      expect(
+        hostEl.querySelector('[data-testid="fleet-health-badge"]')?.textContent,
+      ).toContain("No vehicles detected");
+
+      // Populate 14 UXS vehicles (including overlong 140-char title + multiple active faults) and 3 external contacts (17 total).
+      const longTitle =
+        "UXS-ALPHA-LONG-CALLSIGN-" + "MARITIME-SURVEY-SQUADRON-".repeat(5);
+      const nowIso = new Date().toISOString();
+      for (let sysid = 1; sysid <= 14; sysid += 1) {
+        const payload = buildVehicleStoredPayload(sysid, {
+          "uxs.domain.kind":
+            sysid % 3 === 0
+              ? "surface-boat"
+              : sysid % 2 === 0
+                ? "rover"
+                : "quadcopter",
+          "uxs.authority.state":
+            sysid === 2
+              ? "mcu-failsafe"
+              : sysid === 3
+                ? "direct-crsf-override"
+                : "companion-teleop",
+          "uxs.health.armed": sysid % 2 === 1,
+          "uxs.health.failsafes": sysid === 2 ? 3 : 0,
+          "uxs.health.crcerrors": sysid === 3 ? 9 : 0,
+          "dc.terms.title": sysid === 1 ? longTitle : `Vehicle ${sysid}`,
+          "uxs.observation.timestamp": nowIso,
+        });
+        ws2Rig.latest.serverMessage(
+          JSON.stringify({
+            type: "put",
+            bucket: "ENTITY_STATES",
+            key: payload.id,
+            revision: sysid + 1,
+            payload,
+          }),
+        );
+      }
+      const longContactTitle =
+        "CONTACT-OVERLONG-AIS-TRANSPONDER-" + "NORTH-CHANNEL-BUOY-".repeat(5);
+      for (let idx = 1; idx <= 3; idx += 1) {
+        const cid = `boxbotix.local.tak.cop.vessel.long${idx}`;
+        ws2Rig.latest.serverMessage(
+          JSON.stringify({
+            type: "put",
+            bucket: "ENTITY_STATES",
+            key: cid,
+            revision: 30 + idx,
+            payload: {
+              id: cid,
+              triples: [
+                {
+                  subject: cid,
+                  predicate: "dc.terms.title",
+                  object: idx === 1 ? longContactTitle : `Contact ${idx}`,
+                  source: "ais",
+                  timestamp: nowIso,
+                  confidence: 1,
+                },
+              ],
+            },
+          }),
+        );
+      }
+      flushSync();
+
+      expect(rosterToggle().textContent).toContain("Roster (17)");
+
+      // Resize to 1440x900 (no manual override yet): Roster auto-opens alongside Inspector.
+      setWindowSize(1440, 900);
+      expect(copStage()?.getAttribute("data-layout-tier")).toBe("wide");
+      expect(copStage()?.getAttribute("data-roster-open")).toBe("true");
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
+      expect(rosterToggle().getAttribute("aria-expanded")).toBe("true");
+
+      // Focus an item inside #cop-roster-body, then resize down to 1024x768 -> Roster collapses and returns focus to cop-roster-toggle!
+      const firstRosterBtn = hostEl.querySelector(
+        '[data-testid="cop-roster-vehicle"]',
+      ) as HTMLButtonElement;
+      firstRosterBtn.focus();
+      expect(document.activeElement).toBe(firstRosterBtn);
+      setWindowSize(1024, 768);
+      expect(copStage()?.getAttribute("data-roster-open")).toBe("false");
+      expect(document.activeElement).toBe(rosterToggle());
+
+      // Select UXS #1 via filmstrip, tether camera ("t"), move focus into #cop-inspector-body, and press Escape:
+      // 1st Escape closes Inspector + returns focus to cop-inspector-toggle WITHOUT untethering camera!
+      const filmstripItems = hostEl.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="filmstrip-item"]',
+      );
+      filmstripItems[0]!.click();
+      flushSync();
+
+      expect(
+        hostEl
+          .querySelector('[data-testid="cop-summary-title"]')
+          ?.getAttribute("title"),
+      ).toBe(longTitle);
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-authority"]')
+          ?.textContent,
+      ).toContain("P2");
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-propulsion"]')
+          ?.textContent,
+      ).toContain("ARMED");
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-freshness"]')
+          ?.textContent,
+      ).toContain("LIVE");
+
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "t", bubbles: true }),
+      );
+      flushSync();
+      expect(window.location.hash).toContain("tether=");
+
+      const summaryTab = hostEl.querySelector(
+        '[data-testid="cop-solo-tab-summary"]',
+      ) as HTMLButtonElement;
+      summaryTab.focus();
+      expect(document.activeElement).toBe(summaryTab);
+
+      summaryTab.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+      expect(inspectorToggle().getAttribute("aria-expanded")).toBe("false");
+      expect(document.activeElement).toBe(inspectorToggle());
+      expect(window.location.hash).toContain("tether=");
+
+      // 2nd Escape from cop-inspector-toggle (outside hidden panel body) untethers the camera!
+      inspectorToggle().dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(window.location.hash).not.toContain("tether=");
+
+      // Re-selecting already-selected UXS #1 via digit hotkey "1" auto-opens collapsed Inspector!
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "1",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
+
+      // Collapse Inspector via toggle button, then click fleet-fault-badge -> selects faulted UXS #2 and auto-opens Inspector!
+      inspectorToggle().click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("false");
+      (
+        hostEl.querySelector(
+          '[data-testid="fleet-fault-badge"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-inspector-open")).toBe("true");
+      expect(
+        hostEl.querySelector('[data-testid="cop-summary-identity"]')
+          ?.textContent,
+      ).toContain("UXS #2");
+
+      // Switch Inspector tab to Exceptions, open Roster manually, focus map via Focus Map, stage a Diagnostics draft, and round-trip back to Fleet!
+      (
+        hostEl.querySelector(
+          '[data-testid="cop-solo-tab-alerts"]',
+        ) as HTMLButtonElement
+      ).click();
+      rosterToggle().click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-roster-open")).toBe("true");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cop-solo-tab-alerts"]')
+          ?.getAttribute("aria-selected"),
+      ).toBe("true");
+
+      focusMapBtn().click();
+      flushSync();
+      expect(
+        document.activeElement?.classList.contains("safety-hud-canvas"),
+      ).toBe(true);
+
+      (
+        hostEl.querySelector(
+          '[data-testid="workspace-tab-bench"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      const rangeInput = hostEl.querySelector(
+        '[data-param-key="uxs.limits.max_groundspeed_mps"] input[type="range"]',
+      ) as HTMLInputElement;
+      rangeInput.value = "8.5";
+      rangeInput.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+
+      // Resize to 200% zoom equivalent (512x384), return to Fleet, verify stacked tier + preserved manual Roster open + preserved Exceptions tab + zero <kbd> when shortcuts off!
+      setWindowSize(512, 384);
+      (
+        hostEl.querySelector(
+          '[data-testid="workspace-tab-cop"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(copStage()?.getAttribute("data-layout-tier")).toBe("stacked");
+      expect(copStage()?.getAttribute("data-roster-open")).toBe("true");
+      expect(
+        hostEl
+          .querySelector('[data-testid="cop-solo-tab-alerts"]')
+          ?.getAttribute("aria-selected"),
+      ).toBe("true");
+
+      // Disabling single-character shortcuts leaves zero <kbd> tags (panel toggles and Focus Map never inject stray <kbd>).
+      (
+        hostEl.querySelector(
+          '[data-testid="character-shortcuts-toggle"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(hostEl.querySelectorAll("kbd")).toHaveLength(0);
+
+      // Diagnostics draft survived panel toggles and 1024x768 -> 512x384 resize!
+      (
+        hostEl.querySelector(
+          '[data-testid="workspace-tab-bench"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toContain("1 staged");
+    } finally {
+      if (app) unmount(app);
+      hostEl.remove();
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket =
+        origWebSocket;
+      setWindowSize(prevInnerWidth, prevInnerHeight);
+      window.localStorage.removeItem(CHARACTER_SHORTCUTS_STORAGE_KEY);
+      window.history.replaceState(null, "", "/");
+    }
+  });
 });

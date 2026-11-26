@@ -1859,4 +1859,524 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
   });
+
+  // spec: cop-ui / Compact desktop viewport layout, persistent safety header, and non-modal Fleet panel controls
+  // spec: cop-ui / Full-stack headless browser COP end-to-end verification and visual legibility
+  test("keeps Fleet context and safety status usable without page scroll at 1024x768 and 1440x900, preserves focus and #40 state across non-modal panels, and avoids overflow or clipping across empty, multi-fault, growing-roster, long-name, and 200% zoom states (#42)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+
+    const heldEmptyGraphSockets: WebSocketRoute[] = [];
+    let activeGraphSocket: WebSocketRoute | null = null;
+    let allowUpstream = false;
+
+    await page.routeWebSocket(/\/ws\/graph$/, (ws) => {
+      if (!allowUpstream) {
+        heldEmptyGraphSockets.push(ws);
+        return;
+      }
+      activeGraphSocket = ws;
+      const server = ws.connectToServer();
+      server.onMessage((msg) => {
+        ws.send(msg);
+      });
+    });
+
+    const assertInViewport = async (
+      loc: Locator,
+      vpW: number,
+      vpH: number,
+    ): Promise<BoxRect> => {
+      await expect(loc).toBeVisible();
+      const box = await loc.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.width).toBeGreaterThan(0);
+      expect(box!.height).toBeGreaterThan(0);
+      expect(box!.x).toBeGreaterThanOrEqual(-1);
+      expect(box!.y).toBeGreaterThanOrEqual(-1);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(vpW + 1);
+      expect(box!.y + box!.height).toBeLessThanOrEqual(vpH + 1);
+      return box!;
+    };
+
+    const assertZeroHorizontalPageOverflow = async (): Promise<void> => {
+      const metrics = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      }));
+      expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.innerWidth);
+    };
+
+    // Phase A: Empty-data state at 1024x768 (100% zoom) — Roster collapsed by default, zero horizontal overflow, zero page scroll.
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await page.goto(info.baseURL);
+    await expect
+      .poll(() => heldEmptyGraphSockets.length, { timeout: 10_000 })
+      .toBeGreaterThanOrEqual(1);
+    heldEmptyGraphSockets.at(-1)!.send(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 0,
+      }),
+    );
+
+    await expect(page.getByTestId("fleet-health-badge")).toHaveText(
+      "No vehicles detected",
+    );
+    await expect(page.getByTestId("cop-workspace")).toHaveAttribute(
+      "data-layout-tier",
+      "compact",
+    );
+    await expect(page.getByTestId("cop-roster-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    await expect(page.getByTestId("cop-inspector-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    await expect(page.locator("[aria-modal]")).toHaveCount(0);
+    await assertZeroHorizontalPageOverflow();
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+    // Phase B: Connect live loopback fleet and verify scroll-free vehicle inspection + reachable switcher at 1024x768 and 1440x900.
+    allowUpstream = true;
+    for (const sock of heldEmptyGraphSockets) {
+      await sock.close({ code: 1006, reason: "connect live graph" });
+    }
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    // At 1024x768: Roster body is hidden (deduplicating FleetFilmstrip), while TacticalCanvas + Inspector + FleetFilmstrip all fit in [0, 768].
+    await expect(page.locator("#cop-roster-body")).toBeHidden();
+    await page
+      .locator(
+        `[data-testid="filmstrip-item"][data-entity-id="${info.vehicles.quadcopter}"]`,
+      )
+      .click();
+
+    await expect(page.getByTestId("cop-summary-identity")).toContainText(
+      "UXS #1",
+    );
+    await expect(page.getByTestId("cop-summary-authority")).toContainText(
+      /P[1-4]/,
+    );
+    await expect(page.getByTestId("cop-summary-propulsion")).toHaveText(
+      /^(ARMED|DISARMED)$/,
+    );
+    await expect(page.getByTestId("cop-summary-freshness")).toContainText(
+      /^(LIVE|LAST KNOWN)/,
+    );
+
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    await assertZeroHorizontalPageOverflow();
+
+    const topbar1024 = await assertInViewport(
+      page.getByTestId("invariant-safety-topbar"),
+      1024,
+      768,
+    );
+    const canvas1024 = await assertInViewport(
+      page.locator(".safety-hud-canvas"),
+      1024,
+      768,
+    );
+    const inspector1024 = await assertInViewport(
+      page.getByTestId("cop-solo-rail"),
+      1024,
+      768,
+    );
+    await assertInViewport(page.getByTestId("fleet-filmstrip"), 1024, 768);
+    await assertInViewport(page.getByTestId("cop-summary-identity"), 1024, 768);
+    await assertInViewport(
+      page.getByTestId("cop-summary-authority"),
+      1024,
+      768,
+    );
+    await assertInViewport(
+      page.getByTestId("cop-summary-propulsion"),
+      1024,
+      768,
+    );
+    await assertInViewport(
+      page.getByTestId("cop-summary-freshness"),
+      1024,
+      768,
+    );
+    expect(canvas1024.width).toBeGreaterThanOrEqual(450);
+    expect(canvas1024.height).toBeGreaterThanOrEqual(350);
+    expect(boxesOverlap(canvas1024, inspector1024)).toBe(false);
+    expect(topbar1024.y).toBeGreaterThanOrEqual(0);
+
+    // Resize to 1440x900: both Roster and Inspector default open side-by-side with TacticalCanvas and zero page scroll.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await expect(page.getByTestId("cop-workspace")).toHaveAttribute(
+      "data-layout-tier",
+      "wide",
+    );
+    await expect(page.getByTestId("cop-roster-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    await expect(page.locator("#cop-roster-body")).toBeVisible();
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    await assertZeroHorizontalPageOverflow();
+
+    const roster1440 = await assertInViewport(
+      page.getByTestId("cop-roster"),
+      1440,
+      900,
+    );
+    const canvas1440 = await assertInViewport(
+      page.locator(".safety-hud-canvas"),
+      1440,
+      900,
+    );
+    const inspector1440 = await assertInViewport(
+      page.getByTestId("cop-solo-rail"),
+      1440,
+      900,
+    );
+    await assertInViewport(page.getByTestId("cop-summary-identity"), 1440, 900);
+    await assertInViewport(
+      page.getByTestId("cop-summary-authority"),
+      1440,
+      900,
+    );
+    await assertInViewport(
+      page.getByTestId("cop-summary-propulsion"),
+      1440,
+      900,
+    );
+    await assertInViewport(
+      page.getByTestId("cop-summary-freshness"),
+      1440,
+      900,
+    );
+    expect(boxesOverlap(roster1440, canvas1440)).toBe(false);
+    expect(boxesOverlap(canvas1440, inspector1440)).toBe(false);
+
+    // Phase C: Stage #40 Diagnostics draft + Analysis query, then verify keyboard open/close, focus return, scoped Escape vs camera tether, and Focus Map at 1024x768.
+    await page.getByTestId("workspace-tab-bench").click();
+    await page
+      .locator('[data-param-key="uxs.control.heading_kp"] input[type="number"]')
+      .fill("3.35");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+
+    await page.getByTestId("workspace-tab-cortex").click();
+    await page.getByTestId("cortex-tier-semantic").click();
+    await page.getByTestId("cortex-query-input").fill("uxs.domain.kind");
+    await page.getByTestId("cortex-query-submit").click();
+    await expect(page.getByTestId("cortex-session-status")).toHaveAttribute(
+      "data-status",
+      "completed",
+      { timeout: 10_000 },
+    );
+
+    await page.getByTestId("workspace-tab-cop").click();
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await expect(page.getByTestId("cop-roster-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    // Keyboard open Roster via Enter, focus inside Roster body, and close via Escape -> focus returns to cop-roster-toggle!
+    const rosterToggle = page.getByTestId("cop-roster-toggle");
+    await rosterToggle.focus();
+    await page.keyboard.press("Enter");
+    await expect(rosterToggle).toHaveAttribute("aria-expanded", "true");
+    await expect(page.locator("#cop-roster-body")).toBeVisible();
+
+    await page.getByTestId("cop-roster-vehicle").first().focus();
+    await page.keyboard.press("Escape");
+    await expect(rosterToggle).toHaveAttribute("aria-expanded", "false");
+    await expect(rosterToggle).toBeFocused();
+
+    // Tether camera ("t"), focus inside Inspector body, press Escape -> 1st Escape closes Inspector + focuses toggle while preserving camera tether; 2nd Escape untethers!
+    await page.keyboard.press("t");
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toContain("tether=");
+
+    const inspectorToggle = page.getByTestId("cop-inspector-toggle");
+    await page.getByTestId("cop-solo-tab-summary").focus();
+    await page.keyboard.press("Escape");
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+    await expect(inspectorToggle).toBeFocused();
+    expect(await page.evaluate(() => window.location.hash)).toContain(
+      "tether=",
+    );
+
+    await page.keyboard.press("Escape");
+    expect(await page.evaluate(() => window.location.hash)).not.toContain(
+      "tether=",
+    );
+
+    // Selecting a vehicle via digit hotkey "1" auto-opens collapsed Inspector, and Focus Map moves focus directly to TacticalCanvas!
+    await page.keyboard.press("1");
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "true");
+    await page.getByTestId("cop-focus-map-btn").click();
+    await expect(page.locator(".safety-hud-canvas")).toBeFocused();
+
+    // Phase D: Growing roster (15 ownship + 2 external contacts), multiple active faults, and 140-char long names — zero horizontal overflow + persistent topbar + unobstructed focus!
+    const longContactTitle =
+      "CONTACT-LONG-NAME-" + "COASTAL-RADAR-TRACK-ALPHA-".repeat(5);
+    await copStack.upsertExternalContact({
+      id: `${info.org}.${info.platform}.tak.cop.vessel.longtrack`,
+      title: longContactTitle,
+      contact_type: "surface-vessel",
+      source: "ais-coastal-gateway-long-source-identifier",
+      feed_status: "live",
+      latitude: 30.2685,
+      longitude: -97.7418,
+      uncertainty_meters: 25,
+    });
+
+    const longVehicleTitle =
+      "UXS-LONG-CALLSIGN-" + "AUTONOMOUS-MARITIME-PATROL-".repeat(5);
+    const nowIso = new Date().toISOString();
+    expect(activeGraphSocket).not.toBeNull();
+    for (let sysid = 4; sysid <= 15; sysid += 1) {
+      const entityId = `${info.org}.${info.platform}.robotics.uxs.vehicle.${sysid}`;
+      const domain =
+        sysid % 3 === 0
+          ? "surface-boat"
+          : sysid % 2 === 0
+            ? "rover"
+            : "quadcopter";
+      const authority =
+        sysid === 4
+          ? "mcu-failsafe"
+          : sysid === 5
+            ? "direct-crsf-override"
+            : "companion-teleop";
+      const mk = (predicate: string, object: unknown) => ({
+        subject: entityId,
+        predicate,
+        object,
+        source: "mavlink_0xb1",
+        timestamp: nowIso,
+        confidence: 1,
+      });
+      activeGraphSocket!.send(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: entityId,
+          revision: 10_000 + sysid,
+          payload: {
+            id: entityId,
+            updated_at: nowIso,
+            triples: [
+              mk("uxs.domain.kind", domain),
+              mk("uxs.authority.state", authority),
+              mk("uxs.mode.companion", "teleop-velocity"),
+              mk("uxs.link.tier", "mesh-high-rate"),
+              mk("uxs.health.armed", sysid % 2 === 0),
+              mk("uxs.health.flags", {
+                clock_sync_locked: sysid !== 6,
+                teleop_deadman_clamped: sysid === 4 || sysid === 6,
+                crsf_link_healthy: sysid !== 4,
+                companion_trunk_healthy: sysid !== 4,
+              }),
+              mk("uxs.health.failsafes", sysid <= 6 ? 4 : 0),
+              mk("uxs.health.crcerrors", sysid <= 6 ? 12 : 0),
+              mk("uxs.health.loopdtus", sysid <= 6 ? 2400 : 1000),
+              mk("uxs.health.maxloopdtus", sysid <= 6 ? 4800 : 1200),
+              mk("uxs.health.rttus", 650),
+              mk("uxs.attitude.quaternion", [1, 0, 0, 0]),
+              mk("uxs.attitude.rates", [0.01, -0.02, 0.03]),
+              mk("uxs.kinematics.ned", [sysid * 4, -sysid * 2, -18]),
+              mk("uxs.kinematics.vx", 1.5),
+              mk("uxs.kinematics.vy", -0.4),
+              mk("uxs.kinematics.vz", 0.0),
+              mk("uxs.kinematics.headingdeg", (sysid * 22.5) % 360),
+              mk("geo.location.latitude", 30.2672 + sysid * 0.0005),
+              mk("geo.location.longitude", -97.7431 - sysid * 0.0005),
+              mk("geo.location.altitude", 150 + sysid),
+              mk(
+                "dc.terms.title",
+                sysid === 4 ? longVehicleTitle : `Patrol Unit ${sysid}`,
+              ),
+              mk("entity.indexing.profile", "signal"),
+              mk("uxs.observation.timestamp", nowIso),
+            ],
+          },
+        }),
+      );
+    }
+
+    await expect(rosterToggle).toContainText("Roster (17)", {
+      timeout: 10_000,
+    });
+    await expect(page.getByTestId("fleet-fault-badge")).toBeVisible();
+
+    // Open Roster at 1024x768, select long-named faulted UXS #4, scroll #cop-roster-body to bottom, and verify topbar stays visible + focused item is unobstructed!
+    await rosterToggle.click();
+    await expect(page.locator("#cop-roster-body")).toBeVisible();
+    await page
+      .locator(
+        `[data-testid="cop-roster-vehicle"][data-entity-id="${info.org}.${info.platform}.robotics.uxs.vehicle.4"]`,
+      )
+      .click();
+    await expect(page.getByTestId("cop-summary-title")).toHaveAttribute(
+      "title",
+      longVehicleTitle,
+    );
+    await assertZeroHorizontalPageOverflow();
+
+    const rosterScrollCheck = await page.evaluate(() => {
+      const body = document.getElementById("cop-roster-body");
+      if (!body) return null;
+      body.scrollTop = body.scrollHeight;
+      const buttons = body.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="cop-roster-vehicle"], [data-testid="cop-roster-contact"]',
+      );
+      const lastBtn = buttons[buttons.length - 1] ?? null;
+      lastBtn?.focus();
+      const topbarRect = document
+        .querySelector('[data-testid="invariant-safety-topbar"]')!
+        .getBoundingClientRect();
+      const btnRect = lastBtn?.getBoundingClientRect() ?? null;
+      const hit = btnRect
+        ? document.elementFromPoint(
+            btnRect.left + btnRect.width * 0.5,
+            btnRect.top + btnRect.height * 0.5,
+          )
+        : null;
+      return {
+        windowScrollY: window.scrollY,
+        rosterScrollTop: body.scrollTop,
+        topbarTop: topbarRect.top,
+        topbarBottom: topbarRect.bottom,
+        btnTop: btnRect?.top ?? -1,
+        unobstructed: Boolean(
+          lastBtn && hit && (hit === lastBtn || lastBtn.contains(hit)),
+        ),
+      };
+    });
+    expect(rosterScrollCheck).not.toBeNull();
+    expect(rosterScrollCheck!.windowScrollY).toBe(0);
+    expect(rosterScrollCheck!.rosterScrollTop).toBeGreaterThan(0);
+    expect(rosterScrollCheck!.topbarTop).toBeGreaterThanOrEqual(0);
+    expect(rosterScrollCheck!.btnTop).toBeGreaterThanOrEqual(
+      rosterScrollCheck!.topbarBottom - 1,
+    );
+    expect(rosterScrollCheck!.unobstructed).toBe(true);
+
+    // Switch to Exceptions (multiple active faults) and select long-named external contact -> zero horizontal overflow at both 1024x768 and 1440x900!
+    await page.getByTestId("cop-solo-tab-alerts").click();
+    await assertZeroHorizontalPageOverflow();
+    await page.getByTestId("cop-solo-tab-summary").click();
+    await page
+      .locator(
+        `[data-testid="cop-roster-contact"][data-entity-id="${info.org}.${info.platform}.tak.cop.vessel.longtrack"]`,
+      )
+      .click();
+    await expect(page.getByTestId("cop-contact-summary")).toBeVisible();
+    await assertZeroHorizontalPageOverflow();
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await assertZeroHorizontalPageOverflow();
+
+    // Phase E: 200% zoom equivalents (720x450 and 512x384 CSS px) — vertical scroll reaches all controls without clipping or horizontal overflow, and sticky topbar preserves focus clearance!
+    for (const [zoomW, zoomH] of [
+      [720, 450],
+      [512, 384],
+    ] as const) {
+      await page.setViewportSize({ width: zoomW, height: zoomH });
+      await expect(page.getByTestId("cop-workspace")).toHaveAttribute(
+        "data-layout-tier",
+        "stacked",
+      );
+      await assertZeroHorizontalPageOverflow();
+
+      const reachCheck = await page.evaluate(() => {
+        const targets = [
+          '[data-testid="invariant-safety-topbar"]',
+          ".safety-hud-canvas",
+          '[data-testid="cop-solo-rail"]',
+          '[data-testid="fleet-filmstrip"]',
+        ];
+        for (const sel of targets) {
+          const el = document.querySelector<HTMLElement>(sel);
+          if (!el) return { ok: false, missing: sel };
+          el.scrollIntoView({ block: "nearest" });
+          const r = el.getBoundingClientRect();
+          if (r.width < 40 || r.height < 24) {
+            return { ok: false, clipped: sel, w: r.width, h: r.height };
+          }
+        }
+        window.scrollTo(0, document.documentElement.scrollHeight);
+        const focusBtn = document.querySelector<HTMLButtonElement>(
+          '[data-testid="cop-focus-map-btn"]',
+        );
+        focusBtn?.focus({ preventScroll: true });
+        focusBtn?.scrollIntoView({ block: "nearest" });
+        const topbar = document.querySelector<HTMLElement>(
+          '[data-testid="invariant-safety-topbar"]',
+        )!;
+        const topbarRect = topbar.getBoundingClientRect();
+        const focusRect = focusBtn!.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          focusRect.left + focusRect.width * 0.5,
+          focusRect.top + focusRect.height * 0.5,
+        );
+        const topbarSticky =
+          window.getComputedStyle(topbar).position === "sticky";
+        return {
+          ok: true,
+          scrollWidth: document.documentElement.scrollWidth,
+          innerWidth: window.innerWidth,
+          topbarVisibleWhenSticky: !topbarSticky || topbarRect.bottom > 0,
+          focusClearOfTopbar:
+            !topbarSticky || focusRect.top >= topbarRect.bottom - 1,
+          focusUnobstructed: Boolean(
+            focusBtn && hit && (hit === focusBtn || focusBtn.contains(hit)),
+          ),
+        };
+      });
+
+      expect(reachCheck).toEqual({
+        ok: true,
+        scrollWidth: expect.any(Number),
+        innerWidth: zoomW,
+        topbarVisibleWhenSticky: true,
+        focusClearOfTopbar: true,
+        focusUnobstructed: true,
+      });
+      expect(
+        (reachCheck as { scrollWidth: number }).scrollWidth,
+      ).toBeLessThanOrEqual(zoomW);
+    }
+
+    // Verify #40 Diagnostics draft on UXS #1 and Analysis session survived all panel toggles and 1024x768 <-> 1440x900 <-> 200% zoom resizes!
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await page
+      .locator(
+        `[data-testid="filmstrip-item"][data-entity-id="${info.vehicles.quadcopter}"]`,
+      )
+      .click();
+    await page.getByTestId("workspace-tab-bench").click();
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    await expect(
+      page.locator('[data-param-key="uxs.control.heading_kp"]'),
+    ).toContainText("3.35 1/s");
+
+    await page.getByTestId("workspace-tab-cortex").click();
+    await expect(page.getByTestId("cortex-query-input")).toHaveValue(
+      "uxs.domain.kind",
+    );
+    await expect(page.getByTestId("cortex-session-status")).toHaveAttribute(
+      "data-status",
+      "completed",
+    );
+
+    expect(copStack.pageErrors).toEqual([]);
+    expect(copStack.consoleErrors).toEqual([]);
+  });
 });
