@@ -1594,7 +1594,10 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
 
     const provBanner = page.getByTestId("cortex-result-provenance");
     await expect(provBanner).toHaveAttribute("data-earlier-selection", "true");
-    await expect(provBanner).toContainText("UXS #1");
+    await expect(provBanner).toContainText("retrieval scope: Fleet-wide");
+    await expect(provBanner).toContainText(
+      "vehicle selected at submission: UXS #1",
+    );
     await expect(provBanner).toContainText("earlier selection");
     await expect(provBanner).toContainText("UXS #2");
 

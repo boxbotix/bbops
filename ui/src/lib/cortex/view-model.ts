@@ -25,20 +25,52 @@ export type AnalysisQueryStatus =
 
 export type AnalysisSubmissionMode = "query" | "similar";
 
+export type AnalysisRetrievalScope =
+  | { readonly kind: "fleet"; readonly entityId: null }
+  | { readonly kind: "entity"; readonly entityId: string }
+  | { readonly kind: "hybrid-local-and-fleet"; readonly entityId: string };
+
 export interface AnalysisResultProvenance {
   readonly reqSeq: number;
   readonly mode: AnalysisSubmissionMode;
   readonly submittedQuery: string;
   readonly submittedTier: CortexQueryTier;
+  readonly retrievalScope: AnalysisRetrievalScope;
   readonly scopeEntityId: string | null;
+  readonly submittedSelectionId: string | null;
   readonly settledSelectionId: string | null;
 }
 
 export interface AnalysisProvenanceSummary {
   readonly headline: string;
   readonly scopeLabel: string;
+  readonly submittedSelectionLabel: string;
   readonly earlierSelectionMismatch: boolean;
   readonly draftQueryDiverged: boolean;
+}
+
+export function resolveAnalysisRetrievalScope(
+  mode: AnalysisSubmissionMode,
+  tier: CortexQueryTier,
+  entityId: string | null,
+): AnalysisRetrievalScope {
+  if (mode === "similar") {
+    return entityId
+      ? { kind: "entity", entityId }
+      : { kind: "fleet", entityId: null };
+  }
+  if (tier === "lexical") {
+    return entityId
+      ? { kind: "entity", entityId }
+      : { kind: "fleet", entityId: null };
+  }
+  if (tier === "hybrid") {
+    return entityId
+      ? { kind: "hybrid-local-and-fleet", entityId }
+      : { kind: "fleet", entityId: null };
+  }
+  // `semantic` (entitiesByPredicate) and `neural` (semantic vector search) run fleet-wide.
+  return { kind: "fleet", entityId: null };
 }
 
 /** Reserved vehicle safety hex colors strictly prohibited on SKG topology (#7). */
@@ -81,7 +113,7 @@ export function formatAnalysisEntityRef(
   entityLookup: (id: string) => CopEntityState | null,
 ): string {
   if (!entityId) {
-    return "Fleet-wide (unscoped)";
+    return "Fleet-wide";
   }
   const parsed = parseVehicleEntityId(entityId);
   const entity = entityLookup(entityId);
@@ -95,6 +127,22 @@ export function formatAnalysisEntityRef(
     : shortEntityLabel(entityId);
 }
 
+function formatRetrievalScopeLabel(
+  scope: AnalysisRetrievalScope,
+  entityLookup: (id: string) => CopEntityState | null,
+): string {
+  switch (scope.kind) {
+    case "fleet":
+      return "Fleet-wide";
+    case "entity":
+      return formatAnalysisEntityRef(scope.entityId, entityLookup);
+    case "hybrid-local-and-fleet": {
+      const localLabel = formatAnalysisEntityRef(scope.entityId, entityLookup);
+      return `local lexical (${localLabel}) + fleet-wide neural`;
+    }
+  }
+}
+
 export function summarizeAnalysisProvenance(
   provenance: AnalysisResultProvenance | null,
   liveQueryText: string,
@@ -105,15 +153,24 @@ export function summarizeAnalysisProvenance(
   if (!provenance) {
     return null;
   }
-  const scopeLabel = formatAnalysisEntityRef(
-    provenance.scopeEntityId,
+  const scopeLabel = formatRetrievalScopeLabel(
+    provenance.retrievalScope,
     entityLookup,
   );
+  const submittedSelectionLabel = provenance.submittedSelectionId
+    ? formatAnalysisEntityRef(provenance.submittedSelectionId, entityLookup)
+    : "none";
+  const selectionNote = provenance.submittedSelectionId
+    ? parseVehicleEntityId(provenance.submittedSelectionId)
+      ? `vehicle selected at submission: ${submittedSelectionLabel}`
+      : `entity selected at submission: ${submittedSelectionLabel}`
+    : "selected at submission: none";
+
   const referenceSelectionId =
-    provenance.scopeEntityId ?? provenance.settledSelectionId;
+    provenance.submittedSelectionId ?? provenance.settledSelectionId;
   const earlierSelectionMismatch =
-    provenance.scopeEntityId !== null
-      ? currentSelectedEntityId !== provenance.scopeEntityId
+    provenance.submittedSelectionId !== null
+      ? currentSelectedEntityId !== provenance.submittedSelectionId
       : currentSelectedEntityId !== referenceSelectionId;
   const draftQueryDiverged =
     provenance.mode === "query" &&
@@ -122,8 +179,8 @@ export function summarizeAnalysisProvenance(
 
   const base =
     provenance.mode === "query"
-      ? `Results for "${provenance.submittedQuery}" (${provenance.submittedTier.toUpperCase()}) · captured scope: ${scopeLabel}`
-      : `2-Hop & Similar results · captured scope: ${scopeLabel}`;
+      ? `Results for "${provenance.submittedQuery}" (${provenance.submittedTier.toUpperCase()}) · retrieval scope: ${scopeLabel} · ${selectionNote}`
+      : `2-Hop & Similar results · retrieval scope: ${scopeLabel} · ${selectionNote}`;
 
   const notes: string[] = [base];
   if (earlierSelectionMismatch) {
@@ -139,6 +196,7 @@ export function summarizeAnalysisProvenance(
   return {
     headline: notes.join(" · "),
     scopeLabel,
+    submittedSelectionLabel,
     earlierSelectionMismatch,
     draftQueryDiverged,
   };
