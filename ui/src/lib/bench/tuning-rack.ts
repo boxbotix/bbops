@@ -12,6 +12,22 @@ import {
 // shortcut: tuning rack stages parameter diffs locally read-only in M2.4, wire ADR-111 non-retrying PARAM_SET commit in M3.1 (#11)
 export type TuningControlWidget = "dial" | "slider";
 
+export type TuningBaselineSource = "domain-default" | "vehicle-reported";
+
+export type TuningNumericValidationErrorReason =
+  "empty" | "nan" | "below-min" | "above-max" | "off-step";
+
+export type TuningNumericValidationResult =
+  | {
+      readonly ok: true;
+      readonly value: number;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: TuningNumericValidationErrorReason;
+      readonly message: string;
+    };
+
 export interface TuningParamSpec {
   readonly key: string;
   readonly label: string;
@@ -27,15 +43,25 @@ export interface TuningDiffEntry {
   readonly key: string;
   readonly label: string;
   readonly unit: string;
+  readonly decimals: number;
+  readonly min: number;
+  readonly max: number;
+  readonly step: number;
   readonly baseline: number;
   readonly staged: number;
   readonly delta: number;
+}
+
+export interface TuningBaselineSeed {
+  readonly baseline: Readonly<Record<string, number>>;
+  readonly source?: TuningBaselineSource;
 }
 
 export interface VehicleTuningDraftRecord {
   readonly entityId: string;
   readonly sysid: number;
   readonly domain: UxsDomainKind;
+  readonly baselineSource: TuningBaselineSource;
   readonly baseline: Readonly<Record<string, number>>;
   readonly staged: Readonly<Record<string, number>>;
 }
@@ -44,6 +70,7 @@ export interface VehicleTuningView {
   readonly entityId: string;
   readonly sysid: number;
   readonly domain: UxsDomainKind;
+  readonly baselineSource: TuningBaselineSource;
   readonly baseline: Readonly<Record<string, number>>;
   readonly staged: Readonly<Record<string, number>>;
   readonly diffs: readonly TuningDiffEntry[];
@@ -53,6 +80,7 @@ export interface DormantVehicleDraftView {
   readonly entityId: string;
   readonly sysid: number;
   readonly domain: UxsDomainKind;
+  readonly baselineSource: TuningBaselineSource;
   readonly diffs: readonly TuningDiffEntry[];
 }
 
@@ -72,11 +100,15 @@ export interface DiagnosticsDraftStore {
     entityId: string | null | undefined,
     knownDomain?: UxsDomainKind | null,
   ): DormantVehicleDraftView | null;
+  seedVehicleBaseline(
+    vehicle: CommandableVehicleRef | null | undefined,
+    seed: TuningBaselineSeed,
+  ): VehicleTuningView | null;
   stageParam(
     vehicle: CommandableVehicleRef | null | undefined,
     key: string,
     rawValue: number,
-    baselineOverride?: Readonly<Record<string, number>>,
+    baselineOverride?: Readonly<Record<string, number>> | TuningBaselineSeed,
   ): VehicleTuningView | null;
   revertVehicle(entityId: string | null | undefined): boolean;
   reconcileVehicleDomain(
@@ -183,6 +215,139 @@ export function defaultTuningBaseline(
   }
 }
 
+export function formatTuningNumber(
+  spec: Pick<TuningParamSpec, "decimals">,
+  value: number,
+): string {
+  const normalized = Object.is(value, -0) ? 0 : value;
+  return normalized.toFixed(spec.decimals);
+}
+
+export function formatTuningBounds(spec: TuningParamSpec): string {
+  const minText = formatTuningNumber(spec, spec.min);
+  const maxText = formatTuningNumber(spec, spec.max);
+  const stepText = formatTuningNumber(spec, spec.step);
+  return `Bounds ${minText}–${maxText} ${spec.unit} · step ${stepText}`;
+}
+
+export function formatSignedTuningDelta(
+  spec: Pick<TuningParamSpec, "decimals">,
+  delta: number,
+): string {
+  const normalized = Object.is(delta, -0) ? 0 : delta;
+  const prefix = normalized > 0 ? "+" : "";
+  return `${prefix}${normalized.toFixed(spec.decimals)}`;
+}
+
+export interface TuningProvenanceCopy {
+  readonly badge: string;
+  readonly headline: string;
+  readonly localStagingNotice: string;
+  readonly unavailableApplyNotice: string;
+}
+
+export function describeTuningProvenance(
+  sysid: number,
+  domain: UxsDomainKind,
+  baselineSource: TuningBaselineSource,
+): TuningProvenanceCopy {
+  const localStagingNotice =
+    "Edits create a local draft in this browser only and cannot change the vehicle in this version.";
+  const unavailableApplyNotice =
+    "Applying parameters to the vehicle is unavailable in this version. No values have been sent, applied, or confirmed on the vehicle.";
+
+  if (baselineSource === "vehicle-reported") {
+    return {
+      badge: "VEHICLE-REPORTED BASELINE",
+      headline: `Baseline values shown for UXS #${sysid} (${domain}) come from vehicle-reported parameter data.`,
+      localStagingNotice,
+      unavailableApplyNotice,
+    };
+  }
+
+  return {
+    badge: "SAMPLE DOMAIN DEFAULTS",
+    headline: `Values shown for UXS #${sysid} are sample ${domain} domain defaults, not parameters read from the vehicle.`,
+    localStagingNotice,
+    unavailableApplyNotice,
+  };
+}
+
+const STRICT_NUMERIC_LITERAL_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+
+/**
+ * Validates exact numeric text entry against parameter bounds and increment step
+ * (`OQ1` Option A: rejects empty, non-numeric, out-of-bounds, and off-step values
+ * without mutating staged state).
+ */
+export function validateTuningNumericInput(
+  spec: TuningParamSpec,
+  rawText: string,
+): TuningNumericValidationResult {
+  const trimmed = rawText.trim();
+  const minText = formatTuningNumber(spec, spec.min);
+  const maxText = formatTuningNumber(spec, spec.max);
+  const stepText = formatTuningNumber(spec, spec.step);
+
+  if (trimmed.length === 0) {
+    return {
+      ok: false,
+      reason: "empty",
+      message: `Enter a number between ${minText} and ${maxText} ${spec.unit} (step ${stepText}).`,
+    };
+  }
+
+  if (!STRICT_NUMERIC_LITERAL_RE.test(trimmed)) {
+    return {
+      ok: false,
+      reason: "nan",
+      message: `Enter a valid decimal number between ${minText} and ${maxText} ${spec.unit}.`,
+    };
+  }
+
+  const parsed = Number(trimmed);
+  if (!isFiniteNumber(parsed)) {
+    return {
+      ok: false,
+      reason: "nan",
+      message: `Enter a valid decimal number between ${minText} and ${maxText} ${spec.unit}.`,
+    };
+  }
+
+  if (parsed < spec.min - 1e-9) {
+    return {
+      ok: false,
+      reason: "below-min",
+      message: `Minimum is ${minText} ${spec.unit} (allowed ${minText}–${maxText} ${spec.unit}, step ${stepText}).`,
+    };
+  }
+
+  if (parsed > spec.max + 1e-9) {
+    return {
+      ok: false,
+      reason: "above-max",
+      message: `Maximum is ${maxText} ${spec.unit} (allowed ${minText}–${maxText} ${spec.unit}, step ${stepText}).`,
+    };
+  }
+
+  if (spec.step > 0) {
+    const stepsFromMin = (parsed - spec.min) / spec.step;
+    const nearestSteps = Math.round(stepsFromMin);
+    if (Math.abs(stepsFromMin - nearestSteps) > 1e-6) {
+      return {
+        ok: false,
+        reason: "off-step",
+        message: `Must align to step ${stepText} ${spec.unit} from ${minText} (allowed ${minText}–${maxText} ${spec.unit}).`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    value: clampTuningValue(spec, parsed),
+  };
+}
+
 export function clampTuningValue(spec: TuningParamSpec, raw: number): number {
   if (!isFiniteNumber(raw)) {
     return spec.min;
@@ -236,12 +401,17 @@ export function computeTuningDiff(
     }
     const baseClean = clampTuningValue(spec, baseVal);
     const draftClean = clampTuningValue(spec, draftVal);
-    const delta = Number((draftClean - baseClean).toFixed(spec.decimals));
+    const rawDelta = Number((draftClean - baseClean).toFixed(spec.decimals));
+    const delta = Object.is(rawDelta, -0) ? 0 : rawDelta;
     if (Math.abs(delta) > 1e-9) {
       diffs.push({
         key: spec.key,
         label: spec.label,
         unit: spec.unit,
+        decimals: spec.decimals,
+        min: spec.min,
+        max: spec.max,
+        step: spec.step,
         baseline: baseClean,
         staged: draftClean,
         delta,
@@ -280,6 +450,51 @@ function normalizeTuningMap(
   return out;
 }
 
+function isTuningBaselineSource(value: unknown): value is TuningBaselineSource {
+  return value === "domain-default" || value === "vehicle-reported";
+}
+
+function isTuningBaselineSeed(
+  value: Readonly<Record<string, number>> | TuningBaselineSeed | undefined,
+): value is TuningBaselineSeed {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "baseline" in value &&
+    typeof (value as TuningBaselineSeed).baseline === "object" &&
+    (value as TuningBaselineSeed).baseline !== null
+  );
+}
+
+function resolveBaselineInput(
+  specs: readonly TuningParamSpec[],
+  domain: UxsDomainKind,
+  override?: Readonly<Record<string, number>> | TuningBaselineSeed,
+): {
+  readonly baseline: Record<string, number>;
+  readonly baselineSource: TuningBaselineSource;
+} {
+  if (isTuningBaselineSeed(override)) {
+    const source: TuningBaselineSource = isTuningBaselineSource(override.source)
+      ? override.source
+      : "domain-default";
+    return {
+      baseline: normalizeTuningMap(specs, override.baseline),
+      baselineSource: source,
+    };
+  }
+  if (override !== undefined) {
+    return {
+      baseline: normalizeTuningMap(specs, override),
+      baselineSource: "domain-default",
+    };
+  }
+  return {
+    baseline: normalizeTuningMap(specs, defaultTuningBaseline(domain)),
+    baselineSource: "domain-default",
+  };
+}
+
 function validateCommandableVehicleRef(
   vehicle: CommandableVehicleRef | null | undefined,
 ): { entityId: string; sysid: number; domain: UxsDomainKind } | null {
@@ -305,8 +520,9 @@ function validateCommandableVehicleRef(
 /**
  * Session-scoped Diagnostics parameter draft store keyed strictly by canonical
  * 6-part UXS vehicle entity ID (`<org>.<platform>.robotics.uxs.vehicle.<sysid>`).
- * Retains dormant drafts across transient `poisoned`/`delete` transitions while
- * refusing invalid, non-vehicle, poisoned, or domain-mismatched reads/writes (#40).
+ * Tracks baseline provenance (`"domain-default"` vs `"vehicle-reported"`),
+ * retains dormant drafts across transient `poisoned`/`delete` transitions, and
+ * refuses invalid, non-vehicle, poisoned, or domain-mismatched reads/writes (#40, #43).
  */
 export function createDiagnosticsDraftStore(
   specs: readonly TuningParamSpec[] = BENCH_TUNING_SPECS,
@@ -327,21 +543,20 @@ export function createDiagnosticsDraftStore(
           entityId: existing.entityId,
           sysid: existing.sysid,
           domain: existing.domain,
+          baselineSource: existing.baselineSource,
           baseline: existing.baseline,
           staged: existing.staged,
           diffs: computeTuningDiff(specs, existing.baseline, existing.staged),
         };
       }
-      const baseline = normalizeTuningMap(
-        specs,
-        defaultTuningBaseline(valid.domain),
-      );
+      const resolved = resolveBaselineInput(specs, valid.domain);
       return {
         entityId: valid.entityId,
         sysid: valid.sysid,
         domain: valid.domain,
-        baseline,
-        staged: { ...baseline },
+        baselineSource: resolved.baselineSource,
+        baseline: resolved.baseline,
+        staged: { ...resolved.baseline },
         diffs: [],
       };
     },
@@ -377,7 +592,29 @@ export function createDiagnosticsDraftStore(
         entityId: existing.entityId,
         sysid: existing.sysid,
         domain: existing.domain,
+        baselineSource: existing.baselineSource,
         diffs,
+      };
+    },
+
+    seedVehicleBaseline(vehicle, seed) {
+      const valid = validateCommandableVehicleRef(vehicle);
+      if (!valid) {
+        return null;
+      }
+      const resolved = resolveBaselineInput(specs, valid.domain, seed);
+      const nextRecord: VehicleTuningDraftRecord = {
+        entityId: valid.entityId,
+        sysid: valid.sysid,
+        domain: valid.domain,
+        baselineSource: resolved.baselineSource,
+        baseline: resolved.baseline,
+        staged: { ...resolved.baseline },
+      };
+      records.set(valid.entityId, nextRecord);
+      return {
+        ...nextRecord,
+        diffs: [],
       };
     },
 
@@ -387,29 +624,30 @@ export function createDiagnosticsDraftStore(
         return null;
       }
       const existing = records.get(valid.entityId);
-      const baseline =
-        existing && existing.domain === valid.domain
-          ? existing.baseline
-          : normalizeTuningMap(
-              specs,
-              baselineOverride ?? defaultTuningBaseline(valid.domain),
-            );
-      const priorStaged =
-        existing && existing.domain === valid.domain
-          ? existing.staged
-          : baseline;
+      const hasMatchingRecord =
+        existing !== undefined && existing.domain === valid.domain;
+      const resolved = hasMatchingRecord
+        ? {
+            baseline: existing.baseline,
+            baselineSource: existing.baselineSource,
+          }
+        : resolveBaselineInput(specs, valid.domain, baselineOverride);
+      const priorStaged = hasMatchingRecord
+        ? existing.staged
+        : resolved.baseline;
       const nextStaged = stageTuningValue(specs, priorStaged, key, rawValue);
       const nextRecord: VehicleTuningDraftRecord = {
         entityId: valid.entityId,
         sysid: valid.sysid,
         domain: valid.domain,
-        baseline,
+        baselineSource: resolved.baselineSource,
+        baseline: resolved.baseline,
         staged: nextStaged,
       };
       records.set(valid.entityId, nextRecord);
       return {
         ...nextRecord,
-        diffs: computeTuningDiff(specs, baseline, nextStaged),
+        diffs: computeTuningDiff(specs, resolved.baseline, nextStaged),
       };
     },
 
@@ -487,5 +725,5 @@ export function describeWithheldTuningState(
     }
     return `Selected entity (${input.selectedEntityId}) is unavailable in live Fleet data — parameter staging applies only to active commandable UXS vehicles.`;
   }
-  return "Select a commandable UXS vehicle to stage control and deadman parameters.";
+  return "Select a commandable UXS vehicle to stage sample control and deadman parameters locally.";
 }

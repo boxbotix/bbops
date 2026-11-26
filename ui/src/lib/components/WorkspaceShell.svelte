@@ -10,7 +10,6 @@
   } from "$lib/bench/ring-buffer";
   import {
     type DiagnosticsDraftStore,
-    type TuningDiffEntry,
     createDiagnosticsDraftStore,
   } from "$lib/bench/tuning-rack";
   import { formatShellBanner } from "$lib/bootstrap";
@@ -56,10 +55,6 @@
     filmstripItems?: readonly FilmstripItemView[];
     now?: () => number;
     onSyncHash?: (hash: string) => void;
-    onApplyTuning?: (
-      sysid: number,
-      diffs: readonly TuningDiffEntry[],
-    ) => void | Promise<void>;
   }
 
   let {
@@ -74,7 +69,6 @@
     filmstripItems,
     now = () => Date.now(),
     onSyncHash,
-    onApplyTuning,
   }: Props = $props();
 
   let ownedAnalysisSession: AnalysisSessionStore | null = null;
@@ -424,7 +418,6 @@
         {traceBook}
         draftStore={diagnosticsDraftStore}
         {onSyncHash}
-        {onApplyTuning}
       />
     {:else}
       <CortexWorkspace

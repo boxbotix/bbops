@@ -4,6 +4,7 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import {
     type TelemetrySample,
     TelemetryTraceBook,
@@ -12,10 +13,15 @@
   import {
     BENCH_TUNING_SPECS,
     type DiagnosticsDraftStore,
-    type TuningDiffEntry,
+    type TuningParamSpec,
     computeDialProgress,
     createDiagnosticsDraftStore,
+    describeTuningProvenance,
     describeWithheldTuningState,
+    formatSignedTuningDelta,
+    formatTuningBounds,
+    formatTuningNumber,
+    validateTuningNumericInput,
   } from "$lib/bench/tuning-rack";
   import {
     buildExternalContactSummary,
@@ -38,10 +44,6 @@
     traceBook?: TelemetryTraceBook;
     draftStore?: DiagnosticsDraftStore;
     onSyncHash?: (hash: string) => void;
-    onApplyTuning?: (
-      sysid: number,
-      diffs: readonly TuningDiffEntry[],
-    ) => void | Promise<void>;
   }
 
   let {
@@ -51,10 +53,17 @@
     traceBook = new TelemetryTraceBook(),
     draftStore = createDiagnosticsDraftStore(),
     onSyncHash,
-    onApplyTuning,
   }: Props = $props();
 
   let scopeCanvasEl: HTMLCanvasElement | undefined = $state();
+
+  interface NumericDraftEntry {
+    readonly rawText: string;
+    readonly errorMessage: string | null;
+  }
+
+  const numericDraftByKey = new SvelteMap<string, NumericDraftEntry>();
+  let lastTransientKey = "";
 
   const selectedEntity = $derived(viewportStore.selectedEntity);
   const selectedVehicle = $derived(
@@ -79,6 +88,16 @@
     }
   });
 
+  $effect(() => {
+    const nextTransientKey = commandableVehicle
+      ? `${commandableVehicle.id}:${commandableVehicle.domain}`
+      : "";
+    if (nextTransientKey !== lastTransientKey) {
+      lastTransientKey = nextTransientKey;
+      numericDraftByKey.clear();
+    }
+  });
+
   const healthChips = $derived(
     selectedVehicle && !selectedVehicle.poisoned
       ? buildHealthStrip(selectedVehicle.healthFlags, selectedVehicle.sysStatus)
@@ -87,8 +106,20 @@
 
   const activeTuningView = $derived(draftStore.readVehicle(commandableVehicle));
   const baseline = $derived(activeTuningView?.baseline ?? null);
+  const baselineSource = $derived(
+    activeTuningView?.baselineSource ?? "domain-default",
+  );
   const activeDraft = $derived(activeTuningView?.staged ?? null);
   const stagedDiffs = $derived(activeTuningView?.diffs ?? []);
+  const provenanceCopy = $derived(
+    activeTuningView
+      ? describeTuningProvenance(
+          activeTuningView.sysid,
+          activeTuningView.domain,
+          activeTuningView.baselineSource,
+        )
+      : null,
+  );
   const dormantDraft = $derived(
     commandableVehicle === null
       ? draftStore.getDormantDraft(
@@ -117,25 +148,75 @@
     [...telemetryStore.events].reverse().map(formatTransitionEvent),
   );
 
-  function handleParamInput(key: string, rawValue: number): void {
+  function paramInputErrorId(key: string): string {
+    return `tuning-error-${key.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+  }
+
+  function resolveNumericInputText(
+    spec: TuningParamSpec,
+    stagedVal: number,
+  ): string {
+    return (
+      numericDraftByKey.get(spec.key)?.rawText ??
+      formatTuningNumber(spec, stagedVal)
+    );
+  }
+
+  function resolveNumericInputError(key: string): string | null {
+    return numericDraftByKey.get(key)?.errorMessage ?? null;
+  }
+
+  function handleSliderInput(key: string, rawValue: number): void {
     if (!commandableVehicle) {
       return;
     }
+    numericDraftByKey.delete(key);
     draftStore.stageParam(commandableVehicle, key, rawValue);
+  }
+
+  function handleNumericInput(spec: TuningParamSpec, rawText: string): void {
+    if (!commandableVehicle) {
+      return;
+    }
+    const validation = validateTuningNumericInput(spec, rawText);
+    if (validation.ok) {
+      numericDraftByKey.set(spec.key, {
+        rawText,
+        errorMessage: null,
+      });
+      draftStore.stageParam(commandableVehicle, spec.key, validation.value);
+      return;
+    }
+    numericDraftByKey.set(spec.key, {
+      rawText,
+      errorMessage: validation.message,
+    });
+  }
+
+  function handleNumericBlur(spec: TuningParamSpec): void {
+    const entry = numericDraftByKey.get(spec.key);
+    if (entry && entry.errorMessage === null) {
+      numericDraftByKey.delete(spec.key);
+    }
+  }
+
+  function handleNumericKeyDown(
+    spec: TuningParamSpec,
+    ev: KeyboardEvent,
+  ): void {
+    if (ev.key === "Escape" && numericDraftByKey.has(spec.key)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      numericDraftByKey.delete(spec.key);
+    }
   }
 
   function handleRevert(): void {
     if (!commandableVehicle) {
       return;
     }
+    numericDraftByKey.clear();
     draftStore.revertVehicle(commandableVehicle.id);
-  }
-
-  function handleApply(): void {
-    if (!commandableVehicle || !onApplyTuning || stagedDiffs.length === 0) {
-      return;
-    }
-    void onApplyTuning(commandableVehicle.sysid, stagedDiffs);
   }
 
   function drawTraceBand(
@@ -499,24 +580,52 @@
     <section
       class="tuning-panel"
       data-testid="bench-tuning-rack"
-      aria-label="Staged parameter tuning rack"
+      aria-label="Offline parameter staging rack"
     >
       <div class="panel-head">
-        <strong>STAGED TUNING RACK</strong>
+        <strong>LOCAL PARAMETER STAGING</strong>
         {#if commandableVehicle}
-          <span class="diff-pill" data-testid="bench-staged-count">
-            {stagedDiffs.length} staged
-          </span>
+          <div class="panel-head-pills">
+            <span
+              class="provenance-pill source-{baselineSource}"
+              data-testid="bench-baseline-source-badge"
+              data-baseline-source={baselineSource}
+            >
+              {provenanceCopy?.badge}
+            </span>
+            <span class="diff-pill" data-testid="bench-staged-count">
+              {stagedDiffs.length} staged
+            </span>
+          </div>
         {/if}
       </div>
 
-      {#if commandableVehicle && activeDraft && baseline}
+      {#if commandableVehicle && activeDraft && baseline && provenanceCopy}
+        <div
+          class="provenance-banner source-{baselineSource}"
+          data-testid="bench-provenance-banner"
+          data-baseline-source={baselineSource}
+        >
+          <p
+            class="provenance-headline"
+            data-testid="bench-provenance-headline"
+          >
+            {provenanceCopy.headline}
+          </p>
+          <p class="provenance-subline" data-testid="bench-local-draft-notice">
+            {provenanceCopy.localStagingNotice}
+          </p>
+        </div>
+
         <div class="dial-row">
           {#each dialSpecs as spec (spec.key)}
             {@const val = activeDraft[spec.key] ?? spec.min}
             {@const baseVal = baseline[spec.key] ?? spec.min}
+            {@const isModified = Math.abs(val - baseVal) > 1e-9}
             {@const progress = computeDialProgress(spec, val)}
-            <label class="dial-card" data-param-key={spec.key}>
+            {@const inputError = resolveNumericInputError(spec.key)}
+            {@const errorId = paramInputErrorId(spec.key)}
+            <div class="dial-card" data-param-key={spec.key}>
               <svg viewBox="0 0 64 46" class="dial-svg" aria-hidden="true">
                 <path
                   d="M 10 40 A 24 24 0 1 1 54 40"
@@ -537,28 +646,63 @@
               </svg>
               <span class="param-label">{spec.label}</span>
               <strong class="param-readout">
-                {val.toFixed(spec.decimals)}
-                {spec.unit}
-                {#if Math.abs(val - baseVal) > 1e-9}
+                {`${formatTuningNumber(spec, val)} ${spec.unit}`}
+                {#if isModified}
                   <em class="delta-tag">
-                    (base {baseVal.toFixed(spec.decimals)})
+                    {`(base ${formatTuningNumber(spec, baseVal)})`}
                   </em>
                 {/if}
               </strong>
+              <span class="param-meta" data-testid="bench-param-meta">
+                {`Baseline ${formatTuningNumber(spec, baseVal)} ${spec.unit} · ${formatTuningBounds(spec)}`}
+              </span>
+              <div class="numeric-entry-row">
+                <input
+                  type="number"
+                  class="numeric-input"
+                  class:invalid={inputError !== null}
+                  min={spec.min}
+                  max={spec.max}
+                  step={spec.step}
+                  inputmode="decimal"
+                  value={resolveNumericInputText(spec, val)}
+                  aria-label="{spec.label} exact value ({spec.unit})"
+                  aria-invalid={inputError !== null ? "true" : undefined}
+                  aria-describedby={inputError !== null ? errorId : undefined}
+                  oninput={(ev) =>
+                    handleNumericInput(
+                      spec,
+                      (ev.currentTarget as HTMLInputElement).value,
+                    )}
+                  onblur={() => handleNumericBlur(spec)}
+                  onkeydown={(ev) => handleNumericKeyDown(spec, ev)}
+                />
+                <span class="unit-suffix" aria-hidden="true">{spec.unit}</span>
+              </div>
               <input
                 type="range"
                 min={spec.min}
                 max={spec.max}
                 step={spec.step}
                 value={val}
-                aria-label={spec.label}
+                aria-label="{spec.label} slider"
                 oninput={(ev) =>
-                  handleParamInput(
+                  handleSliderInput(
                     spec.key,
                     Number((ev.currentTarget as HTMLInputElement).value),
                   )}
               />
-            </label>
+              {#if inputError}
+                <p
+                  id={errorId}
+                  class="param-validation-error"
+                  data-testid="bench-param-error"
+                  role="alert"
+                >
+                  {inputError}
+                </p>
+              {/if}
+            </div>
           {/each}
         </div>
 
@@ -566,34 +710,123 @@
           {#each sliderSpecs as spec (spec.key)}
             {@const val = activeDraft[spec.key] ?? spec.min}
             {@const baseVal = baseline[spec.key] ?? spec.min}
-            <label class="slider-row" data-param-key={spec.key}>
-              <span class="slider-head">
-                <span>{spec.label}</span>
-                <strong>
-                  {val.toFixed(spec.decimals)}
-                  {spec.unit}
-                  {#if Math.abs(val - baseVal) > 1e-9}
-                    <em class="delta-tag">
-                      (base {baseVal.toFixed(spec.decimals)})
-                    </em>
-                  {/if}
-                </strong>
-              </span>
+            {@const isModified = Math.abs(val - baseVal) > 1e-9}
+            {@const inputError = resolveNumericInputError(spec.key)}
+            {@const errorId = paramInputErrorId(spec.key)}
+            <div class="slider-row" data-param-key={spec.key}>
+              <div class="slider-head">
+                <span class="slider-title-group">
+                  <span class="param-label">{spec.label}</span>
+                  <span class="param-meta" data-testid="bench-param-meta">
+                    {`Baseline ${formatTuningNumber(spec, baseVal)} ${spec.unit} · ${formatTuningBounds(spec)}`}
+                  </span>
+                </span>
+                <div class="slider-value-controls">
+                  <strong class="param-readout">
+                    {`${formatTuningNumber(spec, val)} ${spec.unit}`}
+                    {#if isModified}
+                      <em class="delta-tag">
+                        {`(base ${formatTuningNumber(spec, baseVal)})`}
+                      </em>
+                    {/if}
+                  </strong>
+                  <div class="numeric-entry-row">
+                    <input
+                      type="number"
+                      class="numeric-input"
+                      class:invalid={inputError !== null}
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      inputmode="decimal"
+                      value={resolveNumericInputText(spec, val)}
+                      aria-label="{spec.label} exact value ({spec.unit})"
+                      aria-invalid={inputError !== null ? "true" : undefined}
+                      aria-describedby={inputError !== null
+                        ? errorId
+                        : undefined}
+                      oninput={(ev) =>
+                        handleNumericInput(
+                          spec,
+                          (ev.currentTarget as HTMLInputElement).value,
+                        )}
+                      onblur={() => handleNumericBlur(spec)}
+                      onkeydown={(ev) => handleNumericKeyDown(spec, ev)}
+                    />
+                    <span class="unit-suffix" aria-hidden="true"
+                      >{spec.unit}</span
+                    >
+                  </div>
+                </div>
+              </div>
               <input
                 type="range"
                 min={spec.min}
                 max={spec.max}
                 step={spec.step}
                 value={val}
-                aria-label={spec.label}
+                aria-label="{spec.label} slider"
                 oninput={(ev) =>
-                  handleParamInput(
+                  handleSliderInput(
                     spec.key,
                     Number((ev.currentTarget as HTMLInputElement).value),
                   )}
               />
-            </label>
+              {#if inputError}
+                <p
+                  id={errorId}
+                  class="param-validation-error"
+                  data-testid="bench-param-error"
+                  role="alert"
+                >
+                  {inputError}
+                </p>
+              {/if}
+            </div>
           {/each}
+        </div>
+
+        <div
+          class="change-summary"
+          data-testid="bench-change-summary"
+          data-target-sysid={commandableVehicle.sysid}
+        >
+          <div class="summary-head">
+            <strong>
+              LOCAL DRAFT SUMMARY · TARGET UXS #{commandableVehicle.sysid} ({commandableVehicle.domain})
+            </strong>
+            <span class="muted">
+              {baselineSource === "vehicle-reported"
+                ? "vs. vehicle-reported baseline"
+                : `vs. sample ${commandableVehicle.domain} defaults`}
+            </span>
+          </div>
+          {#if stagedDiffs.length === 0}
+            <p class="summary-empty" data-testid="bench-change-summary-empty">
+              No local parameter changes staged for UXS #{commandableVehicle.sysid}.
+            </p>
+          {:else}
+            <ul
+              class="summary-diff-list"
+              data-testid="bench-change-summary-list"
+            >
+              {#each stagedDiffs as diff (diff.key)}
+                <li class="summary-diff-item" data-diff-key={diff.key}>
+                  <span class="diff-item-label">{diff.label}</span>
+                  <span class="diff-item-values">
+                    {`${formatTuningNumber(diff, diff.baseline)} → `}<strong>
+                      {formatTuningNumber(diff, diff.staged)}
+                    </strong>{` ${diff.unit} `}<em class="delta-tag">
+                      {`(${formatSignedTuningDelta(diff, diff.delta)} ${diff.unit})`}
+                    </em>
+                  </span>
+                  <span class="diff-item-bounds">
+                    {`[${formatTuningNumber(diff, diff.min)}–${formatTuningNumber(diff, diff.max)} ${diff.unit}, step ${formatTuningNumber(diff, diff.step)}]`}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
 
         <div class="tuning-footer">
@@ -601,7 +834,7 @@
             type="button"
             class="secondary-btn"
             data-testid="bench-tuning-revert"
-            disabled={stagedDiffs.length === 0}
+            disabled={stagedDiffs.length === 0 && numericDraftByKey.size === 0}
             onclick={handleRevert}
           >
             Revert Draft
@@ -610,20 +843,19 @@
             type="button"
             class="primary-btn"
             data-testid="bench-tuning-apply"
-            disabled={!onApplyTuning || stagedDiffs.length === 0}
-            onclick={handleApply}
+            disabled
+            aria-describedby="bench-apply-unavailable-note"
           >
-            {onApplyTuning
-              ? `Apply ${stagedDiffs.length} Staged`
-              : "Apply Offline (M3.1)"}
+            Apply to Vehicle (Unavailable)
           </button>
         </div>
-        {#if !onApplyTuning}
-          <p class="seam-note">
-            Changes stage locally without outbound UDP packets until #11 (M3.1)
-            wires ADR-111 non-retrying actuation.
-          </p>
-        {/if}
+        <p
+          id="bench-apply-unavailable-note"
+          class="seam-note"
+          data-testid="bench-apply-unavailable-note"
+        >
+          {provenanceCopy.unavailableApplyNotice}
+        </p>
       {:else}
         <p class="withheld-note" data-testid="bench-tuning-withheld">
           {withheldExplanation}
@@ -632,7 +864,10 @@
           <div class="dormant-draft-box" data-testid="bench-dormant-draft">
             <span>
               Dormant local draft retained for UXS #{dormantDraft.sysid} ({dormantDraft
-                .diffs.length} staged, {dormantDraft.domain}) while entity is
+                .diffs.length} staged vs. {dormantDraft.baselineSource ===
+              "vehicle-reported"
+                ? "vehicle-reported baseline"
+                : `sample ${dormantDraft.domain} defaults`}) while entity is
               non-commandable.
             </span>
             <button
@@ -733,10 +968,15 @@
   }
 
   .bar-muted,
-  .muted,
-  .seam-note {
+  .muted {
     margin: 0;
     color: var(--ui-text-muted, #64748b);
+  }
+
+  .seam-note {
+    margin: 0;
+    color: var(--ui-text-secondary, #94a3b8);
+    line-height: 1.4;
   }
 
   .chip-row {
@@ -772,7 +1012,7 @@
   .bench-main-grid {
     flex: 1;
     display: grid;
-    grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr);
+    grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr);
     gap: 8px;
     min-height: 340px;
   }
@@ -781,15 +1021,23 @@
   .tuning-panel {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
   }
 
   .panel-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
+  }
+
+  .panel-head-pills {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
   }
 
   .scope-canvas {
@@ -800,12 +1048,56 @@
     background: #090d16;
   }
 
+  .provenance-pill,
   .diff-pill {
     padding: 2px 7px;
     border-radius: 999px;
+    font-size: 10px;
+  }
+
+  .provenance-pill {
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    background: rgba(56, 189, 248, 0.12);
+    color: #e0f2fe;
+    font-weight: 700;
+  }
+
+  .provenance-pill.source-vehicle-reported {
+    border-color: rgba(167, 139, 250, 0.5);
+    background: rgba(167, 139, 250, 0.14);
+    color: #ede9fe;
+  }
+
+  .diff-pill {
     border: 1px solid var(--ui-border-interactive, #3b82f6);
     color: var(--ui-text-primary, #e2e8f0);
-    font-size: 10px;
+  }
+
+  .provenance-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    border-radius: 5px;
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    background: rgba(15, 23, 42, 0.85);
+  }
+
+  .provenance-banner.source-vehicle-reported {
+    border-color: rgba(167, 139, 250, 0.4);
+  }
+
+  .provenance-headline {
+    margin: 0;
+    color: var(--ui-text-primary, #e2e8f0);
+    font-weight: 700;
+    line-height: 1.35;
+  }
+
+  .provenance-subline {
+    margin: 0;
+    color: var(--ui-text-secondary, #94a3b8);
+    line-height: 1.35;
   }
 
   .dial-row {
@@ -823,21 +1115,62 @@
     border-radius: 5px;
     background: var(--ui-surface-elevated, #172033);
     text-align: center;
+    min-width: 0;
   }
 
   .dial-svg {
-    width: 56px;
-    height: 40px;
+    width: 52px;
+    height: 36px;
   }
 
   .param-label {
     font-size: 10px;
+    font-weight: 600;
     color: var(--ui-text-secondary, #94a3b8);
   }
 
   .param-readout {
     font-size: 11px;
     color: var(--ui-text-primary, #e2e8f0);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .param-meta {
+    font-size: 9.5px;
+    color: var(--ui-text-muted, #64748b);
+    line-height: 1.3;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .numeric-entry-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+  }
+
+  .numeric-input {
+    width: 72px;
+    min-width: 0;
+    padding: 3px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--ui-border-strong, #334155);
+    background: #0b111e;
+    color: var(--ui-text-primary, #e2e8f0);
+    font: inherit;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .numeric-input.invalid {
+    border-color: var(--status-warning, #f59e0b);
+    background: rgba(245, 158, 11, 0.1);
+  }
+
+  .unit-suffix {
+    font-size: 10px;
+    color: var(--ui-text-secondary, #94a3b8);
+    white-space: nowrap;
   }
 
   .dial-card input[type="range"],
@@ -863,8 +1196,32 @@
 
   .slider-head {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
     gap: 6px;
+  }
+
+  .slider-title-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .slider-value-controls {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .param-validation-error {
+    margin: 2px 0 0;
+    color: var(--status-warning, #fbbf24);
+    font-size: 10px;
+    line-height: 1.3;
+    text-align: left;
   }
 
   .delta-tag {
@@ -873,8 +1230,68 @@
     font-size: 10px;
   }
 
+  .change-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 5px;
+    border: 1px solid var(--ui-border-subtle, #1e293b);
+    background: #0b111e;
+  }
+
+  .summary-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    font-size: 10px;
+  }
+
+  .summary-empty {
+    margin: 0;
+    color: var(--ui-text-muted, #64748b);
+  }
+
+  .summary-diff-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .summary-diff-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: var(--ui-surface-elevated, #172033);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .diff-item-label {
+    color: var(--ui-text-secondary, #94a3b8);
+    font-weight: 600;
+  }
+
+  .diff-item-values {
+    color: var(--ui-text-primary, #e2e8f0);
+  }
+
+  .diff-item-bounds {
+    font-size: 9.5px;
+    color: var(--ui-text-muted, #64748b);
+  }
+
   .tuning-footer {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 8px;
   }

@@ -2388,7 +2388,6 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
 
     const viewportStore = createViewportStore({ skgStore });
     viewportStore.selectEntity(quad1.id);
-    const onApplyTuning = vi.fn();
 
     const hostEl = document.createElement("div");
     document.body.appendChild(hostEl);
@@ -2400,7 +2399,6 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
         viewportStore,
         graphqlClient: mockGraphql,
         searchClient: mockSearch,
-        onApplyTuning,
       },
     });
     flushSync();
@@ -2610,8 +2608,18 @@ describe("WorkspaceShell, CopWorkspace, PilotWorkspace & FleetFilmstrip (M2.4)",
           '[data-param-key="uxs.limits.max_groundspeed_mps"]',
         )?.textContent,
       ).toContain("9.5");
-
-      expect(onApplyTuning).not.toHaveBeenCalled();
+      expect(
+        hostEl
+          .querySelector('[data-testid="bench-baseline-source-badge"]')
+          ?.getAttribute("data-baseline-source"),
+      ).toBe("domain-default");
+      expect(
+        (
+          hostEl.querySelector(
+            '[data-testid="bench-tuning-apply"]',
+          ) as HTMLButtonElement | null
+        )?.disabled,
+      ).toBe(true);
     } finally {
       unmount(app);
       hostEl.remove();
