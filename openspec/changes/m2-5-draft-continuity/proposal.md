@@ -1,5 +1,5 @@
 # Proposal: m2-5-draft-continuity
-Approved-by:
+Approved-by: coby (2026-11-26) sha256:172cc4d056c1
 Architect: gemini (gemini-4-carbon, low)
 
 ## Track

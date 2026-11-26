@@ -1,6 +1,6 @@
 ## 1. Approval
 
-- [ ] 1.1 Hold: OPEN-Q proposal awaits owner approval (`OQ1`–`OQ3` rulings + `Approved-by: <name> (<YYYY-MM-DD>) sha256:<12 hex>` in `proposal.md`) (premise: `.agents/protocol.md:17`, `.agents/contracts/architect.md:3-6`). Check: `ateam state spec-check` exits `0` and `ateam state spec-queue` reports zero active holds.
+- [x] 1.1 Owner approved `sha256:172cc4d056c1` (`2026-11-26`) and ruled **Option A** on `OQ1` (retain dormant per-`entityId` draft across transient `poisoned`/`delete` for matching canonical `entityId` + `domain`, withholding inputs/Apply and surfacing a dormant-draft notice + `Revert Draft`), `OQ2` (keep in-flight searches running in `AnalysisSessionStore` without mutating `Fleet`/`Vehicle` selection/hash while away, showing `running` or `completed` on return + explicit `Cancel`), and `OQ3` (pin `Analysis` `inspectedEntityId` + 2-hop citations across external selection changes with submission provenance + one-click sync to current selection) (premise: `.agents/protocol.md:17`, `.agents/contracts/architect.md:3-6`). Check: `ateam state spec-check` exits `0` and `ateam state spec-queue` reports zero active holds.
 
 ## 2. Implementation
 
