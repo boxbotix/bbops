@@ -273,7 +273,118 @@ export function describeTuningProvenance(
   };
 }
 
-const STRICT_NUMERIC_LITERAL_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+interface ExactDecimal {
+  readonly sign: 1n | -1n;
+  readonly digits: bigint;
+  readonly fracDigits: number;
+}
+
+const STRICT_NUMERIC_LITERAL_RE = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))$/;
+const MAX_NUMERIC_LITERAL_LENGTH = 64;
+
+function parseExactDecimalString(raw: string): ExactDecimal | null {
+  if (raw.length === 0 || raw.length > MAX_NUMERIC_LITERAL_LENGTH) {
+    return null;
+  }
+  const match = STRICT_NUMERIC_LITERAL_RE.exec(raw);
+  if (!match) {
+    return null;
+  }
+  const intPart = match[2] ?? "0";
+  const rawFrac = match[3] ?? match[4] ?? "";
+  const trimmedFrac = rawFrac.replace(/0+$/, "");
+  const digits = BigInt(intPart + trimmedFrac);
+  if (digits === 0n) {
+    return { sign: 1n, digits: 0n, fracDigits: 0 };
+  }
+  return {
+    sign: match[1] === "-" ? -1n : 1n,
+    digits,
+    fracDigits: trimmedFrac.length,
+  };
+}
+
+function numberToExactDecimal(value: number): ExactDecimal | null {
+  if (!isFiniteNumber(value)) {
+    return null;
+  }
+  if (Object.is(value, -0) || value === 0) {
+    return { sign: 1n, digits: 0n, fracDigits: 0 };
+  }
+  const text = String(value);
+  if (!/[eE]/.test(text)) {
+    return parseExactDecimalString(text);
+  }
+  const [mantissa, expText] = text.split(/[eE]/);
+  const base = parseExactDecimalString(mantissa ?? "");
+  const exp = Number(expText);
+  if (!base || !Number.isInteger(exp) || Math.abs(exp) > 64) {
+    return null;
+  }
+  if (exp >= 0) {
+    const shift = exp - base.fracDigits;
+    if (shift >= 0) {
+      return {
+        sign: base.sign,
+        digits: base.digits * 10n ** BigInt(shift),
+        fracDigits: 0,
+      };
+    }
+    return {
+      sign: base.sign,
+      digits: base.digits,
+      fracDigits: -shift,
+    };
+  }
+  return {
+    sign: base.sign,
+    digits: base.digits,
+    fracDigits: base.fracDigits - exp,
+  };
+}
+
+function scaleExactDecimal(dec: ExactDecimal, targetScale: number): bigint {
+  return dec.sign * dec.digits * 10n ** BigInt(targetScale - dec.fracDigits);
+}
+
+function checkExactDecimalAgainstSpec(
+  spec: TuningParamSpec,
+  dec: ExactDecimal,
+): "ok" | "nan" | "below-min" | "above-max" | "off-step" {
+  const minDec = numberToExactDecimal(spec.min);
+  const maxDec = numberToExactDecimal(spec.max);
+  const stepDec = numberToExactDecimal(spec.step);
+  if (!minDec || !maxDec || !stepDec) {
+    return "nan";
+  }
+  const specDecimals =
+    Number.isInteger(spec.decimals) && spec.decimals >= 0 ? spec.decimals : 0;
+  const scale = Math.max(
+    dec.fracDigits,
+    minDec.fracDigits,
+    maxDec.fracDigits,
+    stepDec.fracDigits,
+    specDecimals,
+  );
+  const valScaled = scaleExactDecimal(dec, scale);
+  const minScaled = scaleExactDecimal(minDec, scale);
+  const maxScaled = scaleExactDecimal(maxDec, scale);
+  const stepScaled = scaleExactDecimal(stepDec, scale);
+
+  if (valScaled < minScaled) {
+    return "below-min";
+  }
+  if (valScaled > maxScaled) {
+    return "above-max";
+  }
+  if (dec.fracDigits > specDecimals) {
+    return "off-step";
+  }
+  if (stepScaled > 0n && (valScaled - minScaled) % stepScaled !== 0n) {
+    return "off-step";
+  }
+  return "ok";
+}
 
 /**
  * Validates exact numeric text entry against parameter bounds and increment step
@@ -297,7 +408,8 @@ export function validateTuningNumericInput(
     };
   }
 
-  if (!STRICT_NUMERIC_LITERAL_RE.test(trimmed)) {
+  const inputDec = parseExactDecimalString(trimmed);
+  if (!inputDec) {
     return {
       ok: false,
       reason: "nan",
@@ -314,37 +426,48 @@ export function validateTuningNumericInput(
     };
   }
 
-  if (parsed < spec.min - 1e-9) {
+  const check = checkExactDecimalAgainstSpec(spec, inputDec);
+  if (check === "nan") {
+    return {
+      ok: false,
+      reason: "nan",
+      message: `Enter a valid decimal number between ${minText} and ${maxText} ${spec.unit}.`,
+    };
+  }
+  if (check === "below-min") {
     return {
       ok: false,
       reason: "below-min",
       message: `Minimum is ${minText} ${spec.unit} (allowed ${minText}–${maxText} ${spec.unit}, step ${stepText}).`,
     };
   }
-
-  if (parsed > spec.max + 1e-9) {
+  if (check === "above-max") {
     return {
       ok: false,
       reason: "above-max",
       message: `Maximum is ${maxText} ${spec.unit} (allowed ${minText}–${maxText} ${spec.unit}, step ${stepText}).`,
     };
   }
+  if (check === "off-step") {
+    return {
+      ok: false,
+      reason: "off-step",
+      message: `Must align to step ${stepText} ${spec.unit} from ${minText} (allowed ${minText}–${maxText} ${spec.unit}).`,
+    };
+  }
 
-  if (spec.step > 0) {
-    const stepsFromMin = (parsed - spec.min) / spec.step;
-    const nearestSteps = Math.round(stepsFromMin);
-    if (Math.abs(stepsFromMin - nearestSteps) > 1e-6) {
-      return {
-        ok: false,
-        reason: "off-step",
-        message: `Must align to step ${stepText} ${spec.unit} from ${minText} (allowed ${minText}–${maxText} ${spec.unit}).`,
-      };
-    }
+  const normalized = Object.is(parsed, -0) ? 0 : parsed;
+  if (!Object.is(clampTuningValue(spec, normalized), normalized)) {
+    return {
+      ok: false,
+      reason: "off-step",
+      message: `Must align to step ${stepText} ${spec.unit} from ${minText} (allowed ${minText}–${maxText} ${spec.unit}).`,
+    };
   }
 
   return {
     ok: true,
-    value: clampTuningValue(spec, parsed),
+    value: normalized,
   };
 }
 
@@ -450,6 +573,39 @@ function normalizeTuningMap(
   return out;
 }
 
+function isRepresentableTuningValue(
+  spec: TuningParamSpec,
+  raw: unknown,
+): raw is number {
+  if (!isFiniteNumber(raw)) {
+    return false;
+  }
+  const dec = numberToExactDecimal(raw);
+  if (!dec || checkExactDecimalAgainstSpec(spec, dec) !== "ok") {
+    return false;
+  }
+  const normalized = Object.is(raw, -0) ? 0 : raw;
+  return Object.is(clampTuningValue(spec, normalized), normalized);
+}
+
+function resolveStrictBaselineMap(
+  specs: readonly TuningParamSpec[],
+  source: Readonly<Record<string, number>>,
+): Record<string, number> | null {
+  const out: Record<string, number> = {};
+  for (const spec of specs) {
+    if (!Object.prototype.hasOwnProperty.call(source, spec.key)) {
+      return null;
+    }
+    const raw = source[spec.key];
+    if (!isRepresentableTuningValue(spec, raw)) {
+      return null;
+    }
+    out[spec.key] = Object.is(raw, -0) ? 0 : raw;
+  }
+  return out;
+}
+
 function isTuningBaselineSource(value: unknown): value is TuningBaselineSource {
   return value === "domain-default" || value === "vehicle-reported";
 }
@@ -460,10 +616,25 @@ function isTuningBaselineSeed(
   return (
     typeof value === "object" &&
     value !== null &&
+    !Array.isArray(value) &&
     "baseline" in value &&
     typeof (value as TuningBaselineSeed).baseline === "object" &&
-    (value as TuningBaselineSeed).baseline !== null
+    (value as TuningBaselineSeed).baseline !== null &&
+    !Array.isArray((value as TuningBaselineSeed).baseline)
   );
+}
+
+function resolveDefaultBaselineInput(
+  specs: readonly TuningParamSpec[],
+  domain: UxsDomainKind,
+): {
+  readonly baseline: Record<string, number>;
+  readonly baselineSource: TuningBaselineSource;
+} {
+  return {
+    baseline: normalizeTuningMap(specs, defaultTuningBaseline(domain)),
+    baselineSource: "domain-default",
+  };
 }
 
 function resolveBaselineInput(
@@ -473,26 +644,34 @@ function resolveBaselineInput(
 ): {
   readonly baseline: Record<string, number>;
   readonly baselineSource: TuningBaselineSource;
-} {
+} | null {
   if (isTuningBaselineSeed(override)) {
-    const source: TuningBaselineSource = isTuningBaselineSource(override.source)
-      ? override.source
-      : "domain-default";
+    if (
+      override.source !== undefined &&
+      !isTuningBaselineSource(override.source)
+    ) {
+      return null;
+    }
+    const source: TuningBaselineSource = override.source ?? "domain-default";
+    const strictBaseline = resolveStrictBaselineMap(specs, override.baseline);
+    if (!strictBaseline) {
+      return null;
+    }
     return {
-      baseline: normalizeTuningMap(specs, override.baseline),
+      baseline: strictBaseline,
       baselineSource: source,
     };
   }
   if (override !== undefined) {
+    if (typeof override !== "object" || override === null) {
+      return null;
+    }
     return {
       baseline: normalizeTuningMap(specs, override),
       baselineSource: "domain-default",
     };
   }
-  return {
-    baseline: normalizeTuningMap(specs, defaultTuningBaseline(domain)),
-    baselineSource: "domain-default",
-  };
+  return resolveDefaultBaselineInput(specs, domain);
 }
 
 function validateCommandableVehicleRef(
@@ -549,7 +728,7 @@ export function createDiagnosticsDraftStore(
           diffs: computeTuningDiff(specs, existing.baseline, existing.staged),
         };
       }
-      const resolved = resolveBaselineInput(specs, valid.domain);
+      const resolved = resolveDefaultBaselineInput(specs, valid.domain);
       return {
         entityId: valid.entityId,
         sysid: valid.sysid,
@@ -599,10 +778,13 @@ export function createDiagnosticsDraftStore(
 
     seedVehicleBaseline(vehicle, seed) {
       const valid = validateCommandableVehicleRef(vehicle);
-      if (!valid) {
+      if (!valid || !isTuningBaselineSeed(seed)) {
         return null;
       }
       const resolved = resolveBaselineInput(specs, valid.domain, seed);
+      if (!resolved) {
+        return null;
+      }
       const nextRecord: VehicleTuningDraftRecord = {
         entityId: valid.entityId,
         sysid: valid.sysid,
@@ -632,6 +814,9 @@ export function createDiagnosticsDraftStore(
             baselineSource: existing.baselineSource,
           }
         : resolveBaselineInput(specs, valid.domain, baselineOverride);
+      if (!resolved) {
+        return null;
+      }
       const priorStaged = hasMatchingRecord
         ? existing.staged
         : resolved.baseline;

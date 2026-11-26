@@ -1597,6 +1597,30 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       ok: false,
       reason: "off-step",
     });
+    expect(validateTuningNumericInput(deadmanSpec, "325.00001")).toMatchObject({
+      ok: false,
+      reason: "off-step",
+    });
+    expect(validateTuningNumericInput(deadmanSpec, "325")).toEqual({
+      ok: true,
+      value: 325,
+    });
+    expect(validateTuningNumericInput(deadmanSpec, "99.999999")).toMatchObject({
+      ok: false,
+      reason: "below-min",
+    });
+    expect(
+      validateTuningNumericInput(deadmanSpec, "1000.000001"),
+    ).toMatchObject({
+      ok: false,
+      reason: "above-max",
+    });
+    expect(
+      validateTuningNumericInput(kpSpec, "3.200000000000000001"),
+    ).toMatchObject({
+      ok: false,
+      reason: "off-step",
+    });
     expect(validateTuningNumericInput(deadmanSpec, "275")).toEqual({
       ok: true,
       value: 275,
@@ -1671,21 +1695,78 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       }),
     );
 
-    // Seed UXS #2 with a vehicle-reported baseline distinct from rover sample defaults (kp 2.45 vs 2.10).
-    const seededRoverView = draftStore.seedVehicleBaseline(
-      skgStore.getCommandableVehicle(rover2.id),
-      {
+    const roverRef = skgStore.getCommandableVehicle(rover2.id);
+    const validRoverReportedBaseline = {
+      "uxs.control.heading_kp": 2.45,
+      "uxs.control.heading_kd": 0.24,
+      "uxs.control.rate_ff": 0.3,
+      "uxs.limits.max_groundspeed_mps": 6.0,
+      "uxs.limits.max_yaw_rate_degs": 90,
+      "uxs.mux.teleop_deadman_ms": 300,
+    };
+
+    // Reject empty, partial, off-step, out-of-bounds, and NaN vehicle-reported seeds without inventing minima (100 ms).
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
+        source: "vehicle-reported",
+        baseline: {},
+      }),
+    ).toBeNull();
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
+        source: "vehicle-reported",
+        baseline: { "uxs.control.heading_kp": 2.45 },
+      }),
+    ).toBeNull();
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
         source: "vehicle-reported",
         baseline: {
-          "uxs.control.heading_kp": 2.45,
-          "uxs.control.heading_kd": 0.24,
-          "uxs.control.rate_ff": 0.3,
-          "uxs.limits.max_groundspeed_mps": 6.0,
-          "uxs.limits.max_yaw_rate_degs": 90,
-          "uxs.mux.teleop_deadman_ms": 300,
+          ...validRoverReportedBaseline,
+          "uxs.mux.teleop_deadman_ms": 325.00001,
         },
-      },
+      }),
+    ).toBeNull();
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
+        source: "vehicle-reported",
+        baseline: {
+          ...validRoverReportedBaseline,
+          "uxs.mux.teleop_deadman_ms": 260,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
+        source: "vehicle-reported",
+        baseline: {
+          ...validRoverReportedBaseline,
+          "uxs.mux.teleop_deadman_ms": 1200,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      draftStore.seedVehicleBaseline(roverRef, {
+        source: "vehicle-reported",
+        baseline: {
+          ...validRoverReportedBaseline,
+          "uxs.control.heading_kp": Number.NaN,
+        },
+      }),
+    ).toBeNull();
+    expect(draftStore.records.has(rover2.id)).toBe(false);
+    expect(draftStore.readVehicle(roverRef)?.baselineSource).toBe(
+      "domain-default",
     );
+    expect(
+      draftStore.readVehicle(roverRef)?.baseline["uxs.mux.teleop_deadman_ms"],
+    ).toBe(300);
+
+    // Seed UXS #2 with a complete, representable vehicle-reported baseline distinct from rover sample defaults (kp 2.45 vs 2.10).
+    const seededRoverView = draftStore.seedVehicleBaseline(roverRef, {
+      source: "vehicle-reported",
+      baseline: validRoverReportedBaseline,
+    });
     expect(seededRoverView?.baselineSource).toBe("vehicle-reported");
     expect(seededRoverView?.diffs).toEqual([]);
 
@@ -1816,6 +1897,87 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
         hostEl.querySelector('[data-testid="bench-param-error"]'),
       ).toBeNull();
 
+      // Near-step off-step entry ("325.00001") on Teleop Deadman Timeout (starting at 250 ms, step 25) MUST reject without rounding to 325 ms, whereas exact "325" stages cleanly.
+      const deadmanNumberInput = hostEl.querySelector(
+        '[data-param-key="uxs.mux.teleop_deadman_ms"] input[type="number"]',
+      ) as HTMLInputElement;
+      const deadmanRangeInput = hostEl.querySelector(
+        '[data-param-key="uxs.mux.teleop_deadman_ms"] input[type="range"]',
+      ) as HTMLInputElement;
+      expect(deadmanRangeInput.value).toBe("250");
+
+      deadmanNumberInput.value = "325.00001";
+      deadmanNumberInput.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      expect(deadmanNumberInput.getAttribute("aria-invalid")).toBe("true");
+      expect(
+        hostEl.querySelector(
+          '[data-param-key="uxs.mux.teleop_deadman_ms"] [data-testid="bench-param-error"]',
+        )?.textContent,
+      ).toContain("Must align to step 25 ms");
+      expect(deadmanRangeInput.value).toBe("250");
+      expect(
+        draftStore.readVehicle(skgStore.getCommandableVehicle(quad1.id))
+          ?.staged["uxs.mux.teleop_deadman_ms"],
+      ).toBe(250);
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toBe("1 staged");
+
+      deadmanNumberInput.value = "325";
+      deadmanNumberInput.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      expect(deadmanNumberInput.getAttribute("aria-invalid")).toBeNull();
+      expect(
+        hostEl.querySelector(
+          '[data-param-key="uxs.mux.teleop_deadman_ms"] [data-testid="bench-param-error"]',
+        ),
+      ).toBeNull();
+      expect(deadmanRangeInput.value).toBe("325");
+      expect(
+        draftStore.readVehicle(skgStore.getCommandableVehicle(quad1.id))
+          ?.staged["uxs.mux.teleop_deadman_ms"],
+      ).toBe(325);
+      expect(
+        hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
+      ).toBe("2 staged");
+
+      // Rejected vehicle-reported seeds on UXS #1 MUST leave UXS #1's existing staged draft (3.45 & 325, 2 staged) and domain-default provenance untouched!
+      const quadRef = skgStore.getCommandableVehicle(quad1.id);
+      expect(
+        draftStore.seedVehicleBaseline(quadRef, {
+          source: "vehicle-reported",
+          baseline: {},
+        }),
+      ).toBeNull();
+      expect(
+        draftStore.seedVehicleBaseline(quadRef, {
+          source: "vehicle-reported",
+          baseline: { "uxs.control.heading_kp": 3.2 },
+        }),
+      ).toBeNull();
+      expect(
+        draftStore.seedVehicleBaseline(quadRef, {
+          source: "vehicle-reported",
+          baseline: {
+            ...defaultTuningBaseline("quadcopter"),
+            "uxs.mux.teleop_deadman_ms": 325.00001,
+          },
+        }),
+      ).toBeNull();
+      const quadAfterRejectedSeeds = draftStore.readVehicle(quadRef);
+      expect(quadAfterRejectedSeeds?.baselineSource).toBe("domain-default");
+      expect(
+        quadAfterRejectedSeeds?.baseline["uxs.mux.teleop_deadman_ms"],
+      ).toBe(250);
+      expect(quadAfterRejectedSeeds?.staged["uxs.control.heading_kp"]).toBe(
+        3.45,
+      );
+      expect(quadAfterRejectedSeeds?.staged["uxs.mux.teleop_deadman_ms"]).toBe(
+        325,
+      );
+      expect(quadAfterRejectedSeeds?.diffs).toHaveLength(2);
+
       // 6. Switch to UXS #2 (vehicle-reported fixture): provenance switches cleanly to VEHICLE-REPORTED BASELINE while keeping UXS #1's sample draft isolated.
       viewportStore.selectEntity(rover2.id);
       flushSync();
@@ -1848,7 +2010,7 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
           ?.textContent,
       ).toContain("vs. vehicle-reported baseline");
 
-      // Switch to external contact -> withheld, then back to UXS #1 -> sample-default provenance & 3.45 draft intact.
+      // Switch to external contact -> withheld, then back to UXS #1 -> sample-default provenance & 2 staged diffs intact.
       viewportStore.selectEntity(contactId);
       flushSync();
       expect(
@@ -1864,9 +2026,9 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       ).toBe("domain-default");
       expect(
         hostEl.querySelector('[data-testid="bench-staged-count"]')?.textContent,
-      ).toBe("1 staged");
+      ).toBe("2 staged");
 
-      // Revert UXS #1 even after typing an invalid draft ("abc"): clears both staged diff and transient validation error!
+      // Revert UXS #1 even after typing an invalid draft ("abc"): clears both staged diffs and transient validation error!
       const quadKpInputAfter = hostEl.querySelector(
         '[data-param-key="uxs.control.heading_kp"] input[type="number"]',
       ) as HTMLInputElement;
@@ -1952,6 +2114,18 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       baseline: v2Baseline,
     });
 
+    // Independent oracle: precompute the finite set of permitted numeric grid values per spec by explicit enumeration (no step-division tolerance).
+    const permittedGridByKey = new Map<string, ReadonlySet<number>>();
+    for (const spec of BENCH_TUNING_SPECS) {
+      const count = Math.round((spec.max - spec.min) / spec.step);
+      const grid = new Set<number>();
+      for (let k = 0; k <= count; k += 1) {
+        const point = Number((spec.min + k * spec.step).toFixed(spec.decimals));
+        grid.add(Object.is(point, -0) ? 0 : point);
+      }
+      permittedGridByKey.set(spec.key, grid);
+    }
+
     const viewportStore = createViewportStore({ skgStore });
     viewportStore.selectEntity(v1.id);
 
@@ -1986,41 +2160,53 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
     let sawBelowMinReject = false;
     let sawAboveMaxReject = false;
     let sawOffStepReject = false;
+    let sawNearStepOffStepReject = false;
     let sawNonNumericReject = false;
 
     try {
       const rng = createSeededRng(0x430ff1ce);
       const ids = [v1.id, v2.id] as const;
 
-      for (let step = 0; step < 180; step += 1) {
+      for (let step = 0; step < 220; step += 1) {
         const action = rng();
         const selId = viewportStore.selectedEntityId!;
         const spec =
           BENCH_TUNING_SPECS[Math.floor(rng() * BENCH_TUNING_SPECS.length)]!;
 
-        if (action < 0.18) {
+        if (action < 0.16) {
           const nextId = ids[Math.floor(rng() * ids.length)]!;
           viewportStore.selectEntity(nextId);
           flushSync();
-        } else if (action < 0.72) {
+        } else if (action < 0.74) {
           const numInput = hostEl.querySelector(
             `[data-param-key="${spec.key}"] input[type="number"]`,
           ) as HTMLInputElement;
           const kindRoll = rng();
           let candidateText: string;
-          if (kindRoll < 0.42) {
-            const totalSteps = Math.round((spec.max - spec.min) / spec.step);
+          let isNearStepCandidate = false;
+          const totalSteps = Math.round((spec.max - spec.min) / spec.step);
+          if (kindRoll < 0.36) {
             const k = Math.floor(rng() * (totalSteps + 1));
             const validNum = spec.min + k * spec.step;
             candidateText = validNum.toFixed(spec.decimals);
-          } else if (kindRoll < 0.57) {
+          } else if (kindRoll < 0.5) {
             candidateText = (spec.min - spec.step).toFixed(spec.decimals);
-          } else if (kindRoll < 0.72) {
+          } else if (kindRoll < 0.64) {
             candidateText = (spec.max + spec.step).toFixed(spec.decimals);
-          } else if (kindRoll < 0.87) {
+          } else if (kindRoll < 0.78) {
             candidateText = (spec.min + spec.step * 0.37).toFixed(
               spec.decimals + 2,
             );
+          } else if (kindRoll < 0.9) {
+            // Near-step off-step value within 1e-5 of a valid grid point (e.g. "325.00001") that a step-scaled tolerance would wrongly accept!
+            const k = Math.min(
+              totalSteps - 1,
+              Math.max(1, Math.floor(rng() * totalSteps)),
+            );
+            const baseText = (spec.min + k * spec.step).toFixed(spec.decimals);
+            candidateText =
+              spec.decimals === 0 ? `${baseText}.00001` : `${baseText}001`;
+            isNearStepCandidate = true;
           } else {
             candidateText = rng() < 0.5 ? "" : "bad-num";
           }
@@ -2029,26 +2215,20 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
           numInput.dispatchEvent(new Event("input", { bubbles: true }));
           flushSync();
 
-          // Independent oracle check without calling validateTuningNumericInput:
+          // Independent oracle check via explicit permitted grid membership (zero shared BigInt/modulo math with tuning-rack.ts):
           const trimmed = candidateText.trim();
           const literalValid = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(trimmed);
           const parsed = literalValid ? Number(trimmed) : Number.NaN;
-          const inRange =
-            Number.isFinite(parsed) &&
-            parsed >= spec.min - 1e-9 &&
-            parsed <= spec.max + 1e-9;
-          const stepAligned =
-            inRange &&
-            Math.abs(
-              (parsed - spec.min) / spec.step -
-                Math.round((parsed - spec.min) / spec.step),
-            ) <= 1e-6;
+          const normalized = Object.is(parsed, -0) ? 0 : parsed;
+          const permitted =
+            literalValid &&
+            Number.isFinite(normalized) &&
+            permittedGridByKey.get(spec.key)!.has(normalized);
 
-          if (stepAligned) {
-            const committed = Number(parsed.toFixed(spec.decimals));
+          if (permitted) {
             refStaged.set(selId, {
               ...refStaged.get(selId)!,
-              [spec.key]: Object.is(committed, -0) ? 0 : committed,
+              [spec.key]: normalized,
             });
             expect(numInput.getAttribute("aria-invalid")).toBeNull();
             sawValidExactNumeric = true;
@@ -2056,12 +2236,15 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
             expect(numInput.getAttribute("aria-invalid")).toBe("true");
             if (!literalValid || !Number.isFinite(parsed)) {
               sawNonNumericReject = true;
-            } else if (parsed < spec.min - 1e-9) {
+            } else if (parsed < spec.min) {
               sawBelowMinReject = true;
-            } else if (parsed > spec.max + 1e-9) {
+            } else if (parsed > spec.max) {
               sawAboveMaxReject = true;
             } else {
               sawOffStepReject = true;
+              if (isNearStepCandidate) {
+                sawNearStepOffStepReject = true;
+              }
             }
           }
         } else if (action < 0.88) {
@@ -2106,6 +2289,7 @@ describe("bench/ring-buffer.ts & tuning-rack.ts — 20 Hz trace ring & staged tu
       expect(sawBelowMinReject).toBe(true);
       expect(sawAboveMaxReject).toBe(true);
       expect(sawOffStepReject).toBe(true);
+      expect(sawNearStepOffStepReject).toBe(true);
       expect(sawNonNumericReject).toBe(true);
     } finally {
       unmount(app);
