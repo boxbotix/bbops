@@ -42,6 +42,7 @@
     surfaceSlot?: Snippet;
     now?: () => number;
     onSyncHash?: (hash: string) => void;
+    onPickEntity?: (entityId: string | null) => void;
   }
 
   let {
@@ -52,6 +53,7 @@
     surfaceSlot,
     now = () => Date.now(),
     onSyncHash,
+    onPickEntity,
   }: Props = $props();
 
   const instanceId = $props.id();
@@ -809,6 +811,7 @@
     const rect = overlayCanvasEl.getBoundingClientRect();
     const hitId = findHitEntity(ev.clientX - rect.left, ev.clientY - rect.top);
     viewportStore.selectEntity(hitId);
+    onPickEntity?.(hitId);
     onSyncHash?.(viewportStore.toUrlHash());
   }
 
@@ -821,6 +824,7 @@
     if (hitId) {
       viewportStore.selectEntity(hitId);
       viewportStore.tetherEntity(hitId);
+      onPickEntity?.(hitId);
       onSyncHash?.(viewportStore.toUrlHash());
     }
   }

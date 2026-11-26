@@ -2116,7 +2116,55 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
       "tether=",
     );
 
-    // Selecting a vehicle via digit hotkey "1" auto-opens collapsed Inspector, and Focus Map moves focus directly to TacticalCanvas!
+    // Changing tactical layers, domain filters, declutter, or camera controls preserves manually collapsed Inspector, whereas picking UXS #1 on TacticalCanvas (even when already selected) reopens it!
+    await expect
+      .poll(() => new URL(page.url()).hash)
+      .toContain(`sel=${info.vehicles.quadcopter}`);
+    const trailsBtn = page
+      .getByRole("group", { name: "Tactical layers" })
+      .getByRole("button", { name: "trails" });
+    await trailsBtn.click();
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+    await trailsBtn.click();
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+
+    const roverDomainBtn = page
+      .getByRole("group", { name: "UXS domain filter" })
+      .getByRole("button", { name: "rover" });
+    await roverDomainBtn.click();
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+    await roverDomainBtn.click();
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+
+    const tetherToolbarBtn = page
+      .getByRole("group", { name: "Camera tracking" })
+      .getByRole("button", { name: /^Tether/ });
+    await tetherToolbarBtn.click();
+    await expect(tetherToolbarBtn).toHaveAttribute("aria-pressed", "true");
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
+    expect(new URL(page.url()).hash).toContain(
+      `sel=${info.vehicles.quadcopter}`,
+    );
+
+    await page.evaluate(
+      () => new Promise((resolve) => window.requestAnimationFrame(resolve)),
+    );
+    const compactCanvasSize = await page
+      .locator(".safety-hud-canvas")
+      .evaluate((el) => ({ w: el.clientWidth, h: el.clientHeight }));
+    await page.locator(".safety-hud-canvas").click({
+      position: {
+        x: compactCanvasSize.w * 0.5,
+        y: compactCanvasSize.h * 0.5,
+      },
+    });
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "true");
+    await tetherToolbarBtn.click();
+    await expect(tetherToolbarBtn).toHaveAttribute("aria-pressed", "false");
+
+    // Collapse again, verify digit hotkey "1" also reopens collapsed Inspector, and Focus Map moves focus directly to TacticalCanvas!
+    await inspectorToggle.click();
+    await expect(inspectorToggle).toHaveAttribute("aria-expanded", "false");
     await page.keyboard.press("1");
     await expect(inspectorToggle).toHaveAttribute("aria-expanded", "true");
     await page.getByTestId("cop-focus-map-btn").click();
@@ -2352,6 +2400,74 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
       expect(
         (reachCheck as { scrollWidth: number }).scrollWidth,
       ).toBeLessThanOrEqual(zoomW);
+
+      // Select UXS #1 with SKG details open, scroll until Focus Map is at the top of the viewport (leaving TacticalCanvas offscreen above), press Enter, and verify TacticalCanvas scrolls into view unobscured!
+      await page
+        .locator(
+          `[data-testid="filmstrip-item"][data-entity-id="${info.vehicles.quadcopter}"]`,
+        )
+        .click();
+      await page.getByTestId("cop-solo-tab-skg").click();
+
+      const beforeFocusMap = await page.evaluate(() => {
+        const focusBtn = document.querySelector<HTMLButtonElement>(
+          '[data-testid="cop-focus-map-btn"]',
+        )!;
+        const topbar = document.querySelector<HTMLElement>(
+          '[data-testid="invariant-safety-topbar"]',
+        )!;
+        const canvas =
+          document.querySelector<HTMLElement>(".safety-hud-canvas")!;
+        const topbarSticky =
+          window.getComputedStyle(topbar).position === "sticky";
+        const clearanceTop = topbarSticky
+          ? topbar.getBoundingClientRect().bottom + 4
+          : 4;
+        const btnAbsTop = window.scrollY + focusBtn.getBoundingClientRect().top;
+        window.scrollTo(0, Math.max(0, btnAbsTop - clearanceTop));
+        focusBtn.focus({ preventScroll: true });
+        const canvasRect = canvas.getBoundingClientRect();
+        return {
+          scrolledOffscreenAbove: canvasRect.bottom <= clearanceTop + 2,
+          activeIsFocusBtn: document.activeElement === focusBtn,
+        };
+      });
+      expect(beforeFocusMap).toEqual({
+        scrolledOffscreenAbove: true,
+        activeIsFocusBtn: true,
+      });
+
+      await page.keyboard.press("Enter");
+      await expect(page.locator(".safety-hud-canvas")).toBeFocused();
+
+      const afterFocusMap = await page.evaluate(() => {
+        const topbar = document.querySelector<HTMLElement>(
+          '[data-testid="invariant-safety-topbar"]',
+        )!;
+        const canvas =
+          document.querySelector<HTMLElement>(".safety-hud-canvas")!;
+        const topbarSticky =
+          window.getComputedStyle(topbar).position === "sticky";
+        const clearanceTop = topbarSticky
+          ? topbar.getBoundingClientRect().bottom
+          : 0;
+        const rect = canvas.getBoundingClientRect();
+        const visibleTop = Math.max(rect.top, clearanceTop);
+        const visibleBottom = Math.min(rect.bottom, window.innerHeight);
+        const sampleX = rect.left + rect.width * 0.5;
+        const sampleY = visibleTop + (visibleBottom - visibleTop) * 0.7;
+        const hit = document.elementFromPoint(sampleX, sampleY);
+        return {
+          clearOfTopbar: rect.top >= clearanceTop - 1,
+          withinBottom: rect.bottom <= window.innerHeight + 1,
+          visibleHeight: visibleBottom - visibleTop,
+          unobscuredCanvasHit: hit === canvas,
+        };
+      });
+      expect(afterFocusMap.clearOfTopbar).toBe(true);
+      expect(afterFocusMap.withinBottom).toBe(true);
+      expect(afterFocusMap.visibleHeight).toBeGreaterThanOrEqual(180);
+      expect(afterFocusMap.unobscuredCanvasHit).toBe(true);
     }
 
     // Verify #40 Diagnostics draft on UXS #1 and Analysis session survived all panel toggles and 1024x768 <-> 1440x900 <-> 200% zoom resizes!
