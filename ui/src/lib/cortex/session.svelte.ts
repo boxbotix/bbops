@@ -14,10 +14,12 @@ import {
 import {
   type AnalysisQueryStatus,
   type AnalysisResultProvenance,
+  type AnalysisRetrievalScope,
   type AnalysisSubmissionMode,
   type CortexQueryTier,
   buildRankedCortexHits,
   isCortexQueryTier,
+  resolveAnalysisRetrievalScope,
 } from "./view-model";
 
 function sanitizeEntityId(value: string | null | undefined): string | null {
@@ -29,7 +31,9 @@ export interface AnalysisInFlightRequest {
   readonly mode: AnalysisSubmissionMode;
   readonly submittedQuery: string;
   readonly submittedTier: CortexQueryTier;
+  readonly retrievalScope: AnalysisRetrievalScope;
   readonly scopeEntityId: string | null;
+  readonly submittedSelectionId: string | null;
 }
 
 export interface CreateAnalysisSessionOptions {
@@ -125,11 +129,16 @@ export function createAnalysisSessionStore(
   let searchReqSeq = 0;
   let expandReqSeq = 0;
   let selectionEpoch = 0;
+  let inFlightPriorInspectedId: string | null = initialEntityId;
+  let inFlightEpochAtStart = 0;
 
-  async function expand2Hop(entityId: string): Promise<void> {
+  async function expand2Hop(
+    entityId: string,
+    parentSearchSeq?: number,
+  ): Promise<boolean> {
     const sanitized = sanitizeEntityId(entityId);
     if (!sanitized || isDisposed) {
-      return;
+      return false;
     }
     activeExpandController?.abort();
     const controller = new AbortController();
@@ -151,15 +160,18 @@ export function createAnalysisSessionStore(
         isDisposed ||
         controller.signal.aborted ||
         reqSeq !== expandReqSeq ||
+        (parentSearchSeq !== undefined && parentSearchSeq !== searchReqSeq) ||
         selectionEpoch !== epochAtStart ||
         (inspectedEntityId !== null && inspectedEntityId !== sanitized)
       ) {
-        return;
+        return false;
       }
       pathResults = [res.data];
       expandedEntityId = sanitized;
+      return true;
     } catch {
       // Keep existing subgraph if optional GraphQL expansion fails or is aborted.
+      return false;
     } finally {
       if (activeExpandController === controller) {
         activeExpandController = null;
@@ -269,6 +281,7 @@ export function createAnalysisSessionStore(
       return false;
     }
     const cancelledReq = inFlight;
+    const restoreInspected = selectionEpoch === inFlightEpochAtStart;
     ++searchReqSeq;
     ++expandReqSeq;
     activeSearchController?.abort();
@@ -276,6 +289,18 @@ export function createAnalysisSessionStore(
     activeSearchController = null;
     activeExpandController = null;
     inFlight = null;
+    rawHits = [];
+    pathResults = [];
+    expandedEntityId = null;
+    provenance = null;
+    indexedRevision = null;
+    damagedEntities = 0;
+    answerSummary = null;
+    errorBanner = null;
+    neuralStatusBanner = null;
+    if (restoreInspected) {
+      inspectedEntityId = inFlightPriorInspectedId;
+    }
     status = "cancelled";
     cancelledSummary = cancelledReq
       ? cancelledReq.mode === "query"
@@ -300,9 +325,16 @@ export function createAnalysisSessionStore(
     ++expandReqSeq;
     const tierAtStart = activeTier;
     const selectionAtStart = sanitizeEntityId(viewportStore.selectedEntityId);
+    const retrievalScope = resolveAnalysisRetrievalScope(
+      "query",
+      tierAtStart,
+      selectionAtStart,
+    );
     const epochAtStart = selectionEpoch;
 
     hasInvestigationContext = true;
+    inFlightPriorInspectedId = inspectedEntityId;
+    inFlightEpochAtStart = epochAtStart;
     if (inspectedEntityId === null && selectionAtStart !== null) {
       inspectedEntityId = selectionAtStart;
     }
@@ -313,7 +345,9 @@ export function createAnalysisSessionStore(
       mode: "query",
       submittedQuery: trimmed,
       submittedTier: tierAtStart,
-      scopeEntityId: selectionAtStart,
+      retrievalScope,
+      scopeEntityId: retrievalScope.entityId,
+      submittedSelectionId: selectionAtStart,
     };
     cancelledSummary = null;
     rawHits = [];
@@ -421,80 +455,81 @@ export function createAnalysisSessionStore(
         return;
       }
 
+      const isTerminalQueryError =
+        nextErrorBanner !== null && collected.length === 0;
       rawHits = collected;
       indexedRevision = nextIndexedRevision;
       damagedEntities = nextDamagedEntities;
       answerSummary = nextAnswerSummary;
       neuralStatusBanner = nextNeuralBanner;
       errorBanner = nextErrorBanner;
-      inFlight = null;
-      status =
-        nextErrorBanner !== null && collected.length === 0
-          ? "error"
-          : "completed";
+      provenance = isTerminalQueryError
+        ? null
+        : {
+            reqSeq,
+            mode: "query",
+            submittedQuery: trimmed,
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId: selectionAtStart,
+            settledSelectionId: selectionAtStart,
+          };
 
-      let settledSelectionId = selectionAtStart;
-      if (
-        (collected.length > 0 || nextErrorBanner === null) &&
-        selectionEpoch === epochAtStart
-      ) {
+      let expandTargetId: string | null = null;
+      if (!isTerminalQueryError && selectionEpoch === epochAtStart) {
         const topRanked = buildRankedCortexHits(collected, (id) =>
           skgStore.getEntity(id),
         )[0];
         const topId = sanitizeEntityId(topRanked?.entityId ?? selectionAtStart);
-        if (topId) {
-          if (viewMounted) {
-            if (
-              sanitizeEntityId(viewportStore.selectedEntityId) ===
-              selectionAtStart
-            ) {
-              inspectedEntityId = topId;
-              if (topId !== viewportStore.selectedEntityId) {
-                viewportStore.selectEntity(topId);
-                lastKnownViewportSelection = sanitizeEntityId(
-                  viewportStore.selectedEntityId,
-                );
-                activeSyncHash?.(viewportStore.toUrlHash());
-              }
-              settledSelectionId = sanitizeEntityId(
-                viewportStore.selectedEntityId,
-              );
-              provenance = {
-                reqSeq,
-                mode: "query",
-                submittedQuery: trimmed,
-                submittedTier: tierAtStart,
-                scopeEntityId: selectionAtStart,
-                settledSelectionId,
-              };
-              await expand2Hop(topId);
-              return;
-            }
-          } else {
-            inspectedEntityId = topId;
-            settledSelectionId = selectionAtStart;
-            provenance = {
-              reqSeq,
-              mode: "query",
-              submittedQuery: trimmed,
-              submittedTier: tierAtStart,
-              scopeEntityId: selectionAtStart,
-              settledSelectionId,
-            };
-            await expand2Hop(topId);
-            return;
-          }
+        if (
+          topId &&
+          (!viewMounted ||
+            sanitizeEntityId(viewportStore.selectedEntityId) ===
+              selectionAtStart)
+        ) {
+          expandTargetId = topId;
+          inspectedEntityId = topId;
+          await expand2Hop(topId, reqSeq);
         }
       }
 
-      provenance = {
-        reqSeq,
-        mode: "query",
-        submittedQuery: trimmed,
-        submittedTier: tierAtStart,
-        scopeEntityId: selectionAtStart,
-        settledSelectionId,
-      };
+      if (isDisposed || controller.signal.aborted || reqSeq !== searchReqSeq) {
+        return;
+      }
+
+      let settledSelectionId = selectionAtStart;
+      if (
+        expandTargetId !== null &&
+        selectionEpoch === epochAtStart &&
+        viewMounted &&
+        sanitizeEntityId(viewportStore.selectedEntityId) === selectionAtStart
+      ) {
+        inspectedEntityId = expandTargetId;
+        if (expandTargetId !== viewportStore.selectedEntityId) {
+          viewportStore.selectEntity(expandTargetId);
+          lastKnownViewportSelection = sanitizeEntityId(
+            viewportStore.selectedEntityId,
+          );
+          activeSyncHash?.(viewportStore.toUrlHash());
+        }
+        settledSelectionId = sanitizeEntityId(viewportStore.selectedEntityId);
+      }
+
+      provenance = isTerminalQueryError
+        ? null
+        : {
+            reqSeq,
+            mode: "query",
+            submittedQuery: trimmed,
+            submittedTier: tierAtStart,
+            retrievalScope,
+            scopeEntityId: retrievalScope.entityId,
+            submittedSelectionId: selectionAtStart,
+            settledSelectionId,
+          };
+      inFlight = null;
+      status = isTerminalQueryError ? "error" : "completed";
     } catch (err) {
       if (
         !isDisposed &&
@@ -525,8 +560,11 @@ export function createAnalysisSessionStore(
   }
 
   async function runFindSimilar(): Promise<void> {
+    const submittedSelectionId = sanitizeEntityId(
+      viewportStore.selectedEntityId,
+    );
     const entityId = sanitizeEntityId(
-      viewportStore.selectedEntityId ?? inspectedEntityId,
+      submittedSelectionId ?? inspectedEntityId,
     );
     if (!entityId || isDisposed) {
       return;
@@ -540,8 +578,15 @@ export function createAnalysisSessionStore(
     ++expandReqSeq;
     const tierAtStart = activeTier;
     const epochAtStart = selectionEpoch;
+    const retrievalScope = resolveAnalysisRetrievalScope(
+      "similar",
+      tierAtStart,
+      entityId,
+    );
 
     hasInvestigationContext = true;
+    inFlightPriorInspectedId = inspectedEntityId;
+    inFlightEpochAtStart = epochAtStart;
     inspectedEntityId = entityId;
     status = "running";
     inFlight = {
@@ -549,7 +594,9 @@ export function createAnalysisSessionStore(
       mode: "similar",
       submittedQuery: queryText.trim(),
       submittedTier: tierAtStart,
-      scopeEntityId: entityId,
+      retrievalScope,
+      scopeEntityId: retrievalScope.entityId,
+      submittedSelectionId,
     };
     cancelledSummary = null;
     rawHits = [];
@@ -571,40 +618,55 @@ export function createAnalysisSessionStore(
         return;
       }
       let nextErrorBanner: string | null = null;
+      const simHits = sim.ok ? sim.hits : [];
+      rawHits = simHits;
       if (sim.ok) {
-        rawHits = sim.hits;
         indexedRevision = sim.indexedRevision > 0 ? sim.indexedRevision : null;
         damagedEntities = sim.damagedEntities;
-      } else {
-        rawHits = [];
-        if (sim.refusal?.notEnabled) {
-          neuralStatusBanner = `Similarity embeddings not enabled on host (${sim.refusal.code})`;
-        } else if (sim.refusal) {
-          nextErrorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
-          errorBanner = nextErrorBanner;
-        }
+      } else if (sim.refusal?.notEnabled) {
+        neuralStatusBanner = `Similarity embeddings not enabled on host (${sim.refusal.code})`;
+      } else if (sim.refusal) {
+        nextErrorBanner = `${sim.refusal.code}: ${sim.refusal.message}`;
+        errorBanner = nextErrorBanner;
       }
-      inFlight = null;
-      status =
-        nextErrorBanner !== null && rawHits.length === 0
-          ? "error"
-          : "completed";
-      provenance = {
+      const similarProvenance: AnalysisResultProvenance = {
         reqSeq,
         mode: "similar",
         submittedQuery: "",
         submittedTier: tierAtStart,
-        scopeEntityId: entityId,
+        retrievalScope,
+        scopeEntityId: retrievalScope.entityId,
+        submittedSelectionId,
         settledSelectionId: entityId,
       };
+      if (simHits.length > 0 || nextErrorBanner === null) {
+        provenance = similarProvenance;
+      }
+
+      let publishedOwnPath = false;
       if (
         selectionEpoch === epochAtStart &&
         (!viewMounted ||
           sanitizeEntityId(viewportStore.selectedEntityId) === null ||
           sanitizeEntityId(viewportStore.selectedEntityId) === entityId)
       ) {
-        await expand2Hop(entityId);
+        publishedOwnPath = await expand2Hop(entityId, reqSeq);
       }
+
+      if (isDisposed || controller.signal.aborted || reqSeq !== searchReqSeq) {
+        return;
+      }
+
+      const hasSimilarOrGraphResult = simHits.length > 0 || publishedOwnPath;
+      provenance =
+        hasSimilarOrGraphResult || nextErrorBanner === null
+          ? similarProvenance
+          : null;
+      inFlight = null;
+      status =
+        nextErrorBanner !== null && !hasSimilarOrGraphResult
+          ? "error"
+          : "completed";
     } catch (err) {
       if (
         !isDisposed &&

@@ -4,7 +4,7 @@
 import { flushSync, mount, unmount } from "svelte";
 import { describe, expect, it, vi } from "vitest";
 import CortexWorkspace from "../components/CortexWorkspace.svelte";
-import type { GraphQLClient } from "../graphql";
+import type { GraphQLClient, PathSearchResult } from "../graphql";
 import { createSkgStore } from "../stores/skg.svelte";
 import { buildVehicleStoredPayload } from "../stores/test-helpers";
 import { createViewportStore } from "../stores/viewport.svelte";
@@ -1312,12 +1312,17 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       );
       await vi.waitFor(() => {
         flushSync();
-        expect(analysisSession.status).toBe("completed");
+        expect(pendingExpands).toHaveLength(1);
       });
-      expect(pendingExpands).toHaveLength(1);
+      // While the associated 2-hop expansion is pending, Search #2 stays running and Cancel stays available!
+      expect(analysisSession.status).toBe("running");
+      expect(analysisSession.inFlight).not.toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
       expect(pendingExpands[0]?.startEntity).toBe(rover2.id);
 
-      // Now resolve stale Search #1 AFTER Search #2 (even ignoring AbortSignal): MUST be refused!
+      // Now resolve stale Search #1 AFTER Search #2 hits arrived (even ignoring AbortSignal): MUST be refused!
       pendingSearches[0]!.resolve(
         new Response(
           JSON.stringify({
@@ -1345,16 +1350,14 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       await new Promise((resolve) => setTimeout(resolve, 20));
       flushSync();
 
-      expect(analysisSession.status).toBe("completed");
+      expect(analysisSession.status).toBe("running");
       expect(analysisSession.indexedRevision).toBe(52);
       expect(analysisSession.damagedEntities).toBe(0);
       expect(analysisSession.rawHits.map((h) => h.entityId)).toEqual([
         rover2.id,
       ]);
-      expect(analysisSession.provenance?.submittedQuery).toBe("Vanguard");
-      expect(analysisSession.provenance?.scopeEntityId).toBe(rover2.id);
 
-      // Resolve rover2's 2-hop expansion and verify Bravo Escort appears.
+      // Resolve rover2's 2-hop expansion and verify Search #2 now completes with provenance and Bravo Escort.
       pendingExpands[0]!.resolve({
         data: {
           entities: [
@@ -1376,11 +1379,15 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       });
       await vi.waitFor(() => {
         flushSync();
+        expect(analysisSession.status).toBe("completed");
         expect(
           hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
             ?.textContent,
         ).toContain("Bravo Escort");
       });
+      expect(analysisSession.provenance?.submittedQuery).toBe("Vanguard");
+      expect(analysisSession.provenance?.scopeEntityId).toBe(rover2.id);
+      expect(analysisSession.provenance?.submittedSelectionId).toBe(rover2.id);
 
       // 2. Launch Search #3 ("SlowQuery") and click explicit Cancel before completion;
       //    then resolve Search #3 anyway and verify cancelled state refuses late payload.
@@ -1750,6 +1757,801 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       if (app) {
         unmount(app);
       }
+      analysisSession.dispose();
+      hostEl.remove();
+    }
+  });
+
+  // spec: cop-ui / Session-scoped Diagnostics parameter draft and Analysis investigation continuity across workspace switches
+  it("keeps Cancel active while 2-hop pathSearch is pending after hits arrive (discarding late edges on Search and 2-Hop & Similar) and distinguishes fleet-wide vs vehicle-scoped retrieval provenance (#40)", async () => {
+    const skgStore = createSkgStore();
+    const quad1 = buildVehicleStoredPayload(1, {
+      "uxs.domain.kind": "quadcopter",
+      "dc.terms.title": "Falcon 1",
+    });
+    const rover2 = buildVehicleStoredPayload(2, {
+      "uxs.domain.kind": "rover",
+      "dc.terms.title": "Vanguard 2",
+    });
+    const lateContactId = "boxbotix.local.tak.cop.vessel.late9";
+    const validContactId = "boxbotix.local.tak.cop.vessel.escort3";
+
+    for (const [rev, id, payload] of [
+      [1, quad1.id, quad1],
+      [2, rover2.id, rover2],
+      [
+        3,
+        lateContactId,
+        {
+          id: lateContactId,
+          triples: [
+            {
+              subject: lateContactId,
+              predicate: "dc.terms.title",
+              object: "Discarded Late Vessel",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+      [
+        4,
+        validContactId,
+        {
+          id: validContactId,
+          triples: [
+            {
+              subject: validContactId,
+              predicate: "dc.terms.title",
+              object: "Verified Escort",
+              source: "ais",
+              timestamp: "2026-11-26T12:00:00Z",
+              confidence: 1,
+            },
+          ],
+        },
+      ],
+    ] as const) {
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: id,
+          revision: rev,
+          payload,
+        }),
+      );
+    }
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "synced",
+        bucket: "ENTITY_STATES",
+        revision: 4,
+      }),
+    );
+
+    interface PendingExpand {
+      startEntity: string;
+      signal?: AbortSignal;
+      resolve: (res: {
+        data: PathSearchResult;
+        damagedEntities: number;
+      }) => void;
+    }
+    const heldExpands: PendingExpand[] = [];
+    let holdPathSearch = true;
+    const predicateCalls: Array<Record<string, unknown>> = [];
+    const searchCalls: Array<Record<string, unknown>> = [];
+
+    const mockGraphql: GraphQLClient = {
+      endpoint: "/graph-gateway/graphql",
+      entity: vi.fn(),
+      entitiesByPrefix: vi.fn(),
+      entitiesByPredicate: vi.fn().mockImplementation(async (vars) => {
+        predicateCalls.push(vars as Record<string, unknown>);
+        // Fleet-wide predicate query returns UXS #2 even when UXS #1 was selected!
+        return {
+          data: { entities: [rover2.id] },
+          damagedEntities: 0,
+        };
+      }),
+      pathSearch: vi.fn().mockImplementation((vars, opts) => {
+        if (holdPathSearch) {
+          return new Promise((resolve) => {
+            heldExpands.push({
+              startEntity: vars.startEntity,
+              signal: opts?.signal,
+              resolve,
+            });
+          });
+        }
+        return Promise.resolve({
+          data: {
+            entities: [
+              { id: vars.startEntity, depth: 0 },
+              { id: validContactId, depth: 1 },
+            ],
+            paths: [
+              [
+                {
+                  from: vars.startEntity,
+                  predicate: "cop.proximity.near",
+                  to: validContactId,
+                },
+              ],
+            ],
+            truncated: false,
+          },
+          damagedEntities: 0,
+        });
+      }),
+    };
+
+    let similarMode: "ok" | "embedding_unavailable" | "deferred" = "ok";
+    const heldSimilars: Array<(res: Response) => void> = [];
+    const mockSearch = createGraphSearchClient({
+      fetchImpl: (async (_input, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<
+          string,
+          unknown
+        >;
+        searchCalls.push(body);
+        if (body.verb === "similar") {
+          if (similarMode === "deferred") {
+            return new Promise<Response>((resolve) => {
+              heldSimilars.push(resolve);
+            });
+          }
+          if (similarMode === "embedding_unavailable") {
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                verb: "similar",
+                error: {
+                  class: "invalid",
+                  code: "embedding_unavailable",
+                  message: "entity has no usable embedding",
+                },
+              }),
+              { status: 422 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              verb: "similar",
+              result: {
+                indexed_revision: 41,
+                damaged_entities: 0,
+                producer: "graph-query",
+                data: {
+                  results: [{ entity_id: rover2.id, similarity: 0.91 }],
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (body.verb === "localSearch") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              verb: "localSearch",
+              result: {
+                indexed_revision: 42,
+                damaged_entities: 0,
+                producer: "graph-query",
+                data: {
+                  matches: [
+                    {
+                      id: quad1.id,
+                      label: "Falcon 1",
+                      score: 3.8,
+                      entity: {},
+                    },
+                  ],
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (body.verb === "semantic") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              verb: "semantic",
+              result: {
+                indexed_revision: 43,
+                damaged_entities: 0,
+                producer: "graph-query",
+                data: {
+                  results: [{ entity_id: rover2.id, similarity: 2.2 }],
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            verb: String(body.verb ?? ""),
+            error: {
+              class: "invalid",
+              code: "not_enabled",
+              message: "disabled",
+            },
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+
+    const viewportStore = createViewportStore({ skgStore });
+    viewportStore.selectEntity(quad1.id);
+
+    const analysisSession = createAnalysisSessionStore({
+      skgStore,
+      viewportStore,
+      graphqlClient: mockGraphql,
+      searchClient: mockSearch,
+    });
+
+    const hostEl = document.createElement("div");
+    document.body.appendChild(hostEl);
+    let app = mount(CortexWorkspace, {
+      target: hostEl,
+      props: {
+        skgStore,
+        viewportStore,
+        graphqlClient: mockGraphql,
+        searchClient: mockSearch,
+        analysisSession,
+      },
+    });
+    flushSync();
+
+    const remountAnalysis = () => {
+      app = mount(CortexWorkspace, {
+        target: hostEl,
+        props: {
+          skgStore,
+          viewportStore,
+          graphqlClient: mockGraphql,
+          searchClient: mockSearch,
+          analysisSession,
+        },
+      });
+      flushSync();
+    };
+
+    try {
+      let input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      let form = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+
+      // 1A. Search SKG (SEMANTIC): hits arrive immediately while pathSearch is held open ->
+      //     renders hit list + submission provenance banner immediately while keeping Cancel active!
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-semantic"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      input.value = "uxs.domain.kind";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+
+      await vi.waitFor(() => {
+        flushSync();
+        expect(heldExpands).toHaveLength(1);
+      });
+      expect(analysisSession.rawHits).toHaveLength(1);
+      expect(analysisSession.status).toBe("running");
+      expect(analysisSession.running).toBe(true);
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        'Results for "uxs.domain.kind" (SEMANTIC) · retrieval scope: Fleet-wide · vehicle selected at submission: UXS #1 (Falcon 1)',
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      // Switch away to Fleet, select UXS #2, return to Analysis, and edit draft to "other" BEFORE pathSearch resolves!
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+      input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      input.value = "other";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+
+      // Provisional hits AND provenance banner (with earlier-selection + query-edited notices) render together while Cancel stays active!
+      expect(analysisSession.status).toBe("running");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      const pendingProvBanner = hostEl.querySelector(
+        '[data-testid="cortex-result-provenance"]',
+      );
+      expect(pendingProvBanner).not.toBeNull();
+      expect(pendingProvBanner?.getAttribute("data-earlier-selection")).toBe(
+        "true",
+      );
+      const pendingProvText = pendingProvBanner?.textContent ?? "";
+      expect(pendingProvText).toContain(
+        'Results for "uxs.domain.kind" (SEMANTIC)',
+      );
+      expect(pendingProvText).toContain("retrieval scope: Fleet-wide");
+      expect(pendingProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+      expect(pendingProvText).toContain(
+        "earlier selection (current: UXS #2 (Vanguard 2))",
+      );
+      expect(pendingProvText).toContain("query edited since run");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      // Cancel after hits arrived while 2-hop pathSearch is pending!
+      expect(analysisSession.cancelSearch()).toBe(true);
+      flushSync();
+      expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.provenance).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]'),
+      ).toBeNull();
+      expect(heldExpands[0]?.signal?.aborted).toBe(true);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).toBeNull();
+
+      // Resolve the held Search pathSearch anyway -> session stays cancelled and late edges are discarded!
+      heldExpands[0]!.resolve({
+        data: {
+          entities: [
+            { id: rover2.id, depth: 0 },
+            { id: lateContactId, depth: 1 },
+          ],
+          paths: [
+            [
+              {
+                from: rover2.id,
+                predicate: "cop.proximity.near",
+                to: lateContactId,
+              },
+            ],
+          ],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      flushSync();
+
+      expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.pathResults).toHaveLength(0);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).not.toContain("Discarded Late Vessel");
+
+      // 1B. Divergent-pin round trip on 2-Hop & Similar:
+      //     Pin UXS #1 in Analysis, select UXS #2 while away, return, start Similar (targets #2),
+      //     verify provisional provenance + hit list + Cancel while pathSearch is held open,
+      //     then Cancel during path lookup -> pin restores to UXS #1 while global selection stays UXS #2!
+      holdPathSearch = false;
+      analysisSession.selectHit(quad1.id);
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+        expect(analysisSession.pathResults).toHaveLength(1);
+      });
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+
+      holdPathSearch = true;
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-similar-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(heldExpands).toHaveLength(2);
+      });
+      expect(heldExpands[1]?.startEntity).toBe(rover2.id);
+      expect(analysisSession.rawHits).toHaveLength(1);
+      expect(analysisSession.status).toBe("running");
+      expect(
+        hostEl.querySelectorAll('[data-testid="cortex-hit-item"]'),
+      ).toHaveLength(1);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "2-Hop & Similar results · retrieval scope: UXS #2 (Vanguard 2) · vehicle selected at submission: UXS #2 (Vanguard 2)",
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-query-cancel"]'),
+      ).not.toBeNull();
+
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-query-cancel"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.provenance).toBeNull();
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+      expect(heldExpands[1]?.signal?.aborted).toBe(true);
+
+      heldExpands[1]!.resolve({
+        data: {
+          entities: [
+            { id: rover2.id, depth: 0 },
+            { id: lateContactId, depth: 1 },
+          ],
+          paths: [
+            [
+              {
+                from: rover2.id,
+                predicate: "cop.proximity.near",
+                to: lateContactId,
+              },
+            ],
+          ],
+          truncated: false,
+        },
+        damagedEntities: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      flushSync();
+
+      expect(analysisSession.status).toBe("cancelled");
+      expect(analysisSession.pathResults).toHaveLength(0);
+      expect(analysisSession.inspectedEntityId).toBe(quad1.id);
+      expect(viewportStore.selectedEntityId).toBe(rover2.id);
+      expect(
+        hostEl.querySelector('[data-testid="cortex-inspection-divergence"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "Pinned inspection: UXS #1 (Falcon 1) · Current selection: UXS #2 (Vanguard 2)",
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).not.toContain("Discarded Late Vessel");
+
+      // 2A. Fleet-wide SEMANTIC query submitted while UXS #1 is selected returning UXS #2:
+      //     labels retrieval scope Fleet-wide (never UXS #1!) and preserves UXS #1 as vehicle selected at submission.
+      holdPathSearch = false;
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      input = hostEl.querySelector(
+        '[data-testid="cortex-query-input"]',
+      ) as HTMLInputElement;
+      form = hostEl.querySelector(
+        '[data-testid="cortex-query-bar"]',
+      ) as HTMLFormElement;
+      input.value = "uxs.domain.kind";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+
+      expect(predicateCalls.at(-1)).toEqual({ predicate: "uxs.domain.kind" });
+      expect(analysisSession.provenance?.retrievalScope).toEqual({
+        kind: "fleet",
+        entityId: null,
+      });
+      expect(analysisSession.provenance?.scopeEntityId).toBeNull();
+      expect(analysisSession.provenance?.submittedSelectionId).toBe(quad1.id);
+      expect(analysisSession.provenance?.settledSelectionId).toBe(rover2.id);
+
+      const semanticProvText =
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "";
+      expect(semanticProvText).toContain("retrieval scope: Fleet-wide");
+      expect(semanticProvText).not.toContain("captured scope: UXS #1");
+      expect(semanticProvText).not.toContain("retrieval scope: UXS #1");
+      expect(semanticProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+      expect(semanticProvText).toContain(
+        "earlier selection (current: UXS #2 (Vanguard 2))",
+      );
+
+      // 2B. Vehicle-scoped LEXICAL search with UXS #1 selected sends entityId=quad1.id and labels retrieval scope UXS #1.
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-lexical"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      input.value = "Falcon";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+
+      const lastLocalCall = searchCalls
+        .filter((c) => c.verb === "localSearch")
+        .at(-1);
+      expect(
+        (lastLocalCall?.params as Record<string, unknown> | undefined)
+          ?.entity_id,
+      ).toBe(quad1.id);
+      expect(analysisSession.provenance?.retrievalScope).toEqual({
+        kind: "entity",
+        entityId: quad1.id,
+      });
+      expect(analysisSession.provenance?.scopeEntityId).toBe(quad1.id);
+      const lexicalProvText =
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "";
+      expect(lexicalProvText).toContain("retrieval scope: UXS #1 (Falcon 1)");
+      expect(lexicalProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+      expect(
+        hostEl
+          .querySelector('[data-testid="cortex-result-provenance"]')
+          ?.getAttribute("data-earlier-selection"),
+      ).toBe("false");
+
+      // 2C. HYBRID with UXS #1 selected combines local lexical on UXS #1 + fleet-wide neural.
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-hybrid"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+      expect(analysisSession.provenance?.retrievalScope).toEqual({
+        kind: "hybrid-local-and-fleet",
+        entityId: quad1.id,
+      });
+      const hybridProvText =
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "";
+      expect(hybridProvText).toContain(
+        "retrieval scope: local lexical (UXS #1 (Falcon 1)) + fleet-wide neural",
+      );
+      expect(hybridProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+
+      // 2D. NEURAL with UXS #1 selected returning UXS #2 is also fleet-wide retrieval scope.
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-tier-neural"]',
+        ) as HTMLButtonElement
+      ).click();
+      flushSync();
+      form.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+      const lastSemanticVerbCall = searchCalls
+        .filter((c) => c.verb === "semantic")
+        .at(-1);
+      expect(
+        (lastSemanticVerbCall?.params as Record<string, unknown> | undefined)
+          ?.scope,
+      ).toBeUndefined();
+      expect(analysisSession.provenance?.retrievalScope).toEqual({
+        kind: "fleet",
+        entityId: null,
+      });
+      expect(analysisSession.provenance?.scopeEntityId).toBeNull();
+      const neuralProvText =
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "";
+      expect(neuralProvText).toContain("retrieval scope: Fleet-wide");
+      expect(neuralProvText).toContain(
+        "vehicle selected at submission: UXS #1 (Falcon 1)",
+      );
+      expect(neuralProvText).toContain(
+        "earlier selection (current: UXS #2 (Vanguard 2))",
+      );
+
+      // 2E. 2-Hop & Similar partial success on structured similarity refusal (`embedding_unavailable`):
+      //     still runs GraphQL 2-hop `pathSearch` and surfaces BOTH the similarity error banner AND the 2-hop graph edge!
+      similarMode = "embedding_unavailable";
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      const pathCallsBefore = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-similar-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("completed");
+      });
+      const pathCallsAfter = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfter - pathCallsBefore).toBe(1);
+      expect(analysisSession.errorBanner).toBe(
+        "embedding_unavailable: entity has no usable embedding",
+      );
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent ?? "",
+      ).toContain("embedding_unavailable: entity has no usable embedding");
+      expect(analysisSession.pathResults).toHaveLength(1);
+      expect(analysisSession.pathResults[0]?.paths).toEqual([
+        [
+          {
+            from: quad1.id,
+            predicate: "cop.proximity.near",
+            to: validContactId,
+          },
+        ],
+      ]);
+      expect(
+        (
+          hostEl.querySelector('[data-testid="cortex-causal-subgraph"]')
+            ?.textContent ?? ""
+        ).replace(/\s+/g, " "),
+      ).toContain("2 nodes · 1 edges");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).toContain("Verified Escort");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]')
+          ?.textContent ?? "",
+      ).toContain(
+        "2-Hop & Similar results · retrieval scope: UXS #1 (Falcon 1)",
+      );
+
+      // 2F. Cross-vehicle ordering: hold Similar response for UXS #1 open, switch to Fleet & select UXS #2,
+      //     return to Analysis & click Inspect UXS #2 (publishing #2's graph), then release #1's
+      //     `embedding_unavailable` response -> #2's graph stays visible while #1's refused lookup
+      //     does NOT claim #2's graph (`status === "error"`, `provenance === null`, 0 extra pathSearch calls)!
+      similarMode = "deferred";
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-similar-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(heldSimilars).toHaveLength(1);
+      });
+      expect(analysisSession.status).toBe("running");
+
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+
+      const pathCallsBeforeInspect2 = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-sync-selection-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.inspectedEntityId).toBe(rover2.id);
+        expect(analysisSession.pathResults).toHaveLength(1);
+        expect(analysisSession.pathResults[0]?.paths[0]?.[0]?.from).toBe(
+          rover2.id,
+        );
+      });
+      const pathCallsAfterInspect2 = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfterInspect2 - pathCallsBeforeInspect2).toBe(1);
+
+      heldSimilars[0]!(
+        new Response(
+          JSON.stringify({
+            ok: false,
+            verb: "similar",
+            error: {
+              class: "invalid",
+              code: "embedding_unavailable",
+              message: "entity has no usable embedding",
+            },
+          }),
+          { status: 422 },
+        ),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("error");
+      });
+
+      const pathCallsAfterRefusal = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfterRefusal).toBe(pathCallsAfterInspect2);
+      expect(analysisSession.provenance).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent ?? "",
+      ).toContain("embedding_unavailable: entity has no usable embedding");
+      expect(analysisSession.inspectedEntityId).toBe(rover2.id);
+      expect(analysisSession.pathResults[0]?.paths).toEqual([
+        [
+          {
+            from: rover2.id,
+            predicate: "cop.proximity.near",
+            to: validContactId,
+          },
+        ],
+      ]);
+      expect(
+        (
+          hostEl.querySelector('[data-testid="cortex-causal-subgraph"]')
+            ?.textContent ?? ""
+        ).replace(/\s+/g, " "),
+      ).toContain("2 nodes · 1 edges");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).toContain("Verified Escort");
+    } finally {
+      unmount(app);
       analysisSession.dispose();
       hostEl.remove();
     }
