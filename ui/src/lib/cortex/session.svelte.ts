@@ -135,10 +135,10 @@ export function createAnalysisSessionStore(
   async function expand2Hop(
     entityId: string,
     parentSearchSeq?: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const sanitized = sanitizeEntityId(entityId);
     if (!sanitized || isDisposed) {
-      return;
+      return false;
     }
     activeExpandController?.abort();
     const controller = new AbortController();
@@ -164,12 +164,14 @@ export function createAnalysisSessionStore(
         selectionEpoch !== epochAtStart ||
         (inspectedEntityId !== null && inspectedEntityId !== sanitized)
       ) {
-        return;
+        return false;
       }
       pathResults = [res.data];
       expandedEntityId = sanitized;
+      return true;
     } catch {
       // Keep existing subgraph if optional GraphQL expansion fails or is aborted.
+      return false;
     } finally {
       if (activeExpandController === controller) {
         activeExpandController = null;
@@ -641,21 +643,21 @@ export function createAnalysisSessionStore(
         provenance = similarProvenance;
       }
 
+      let publishedOwnPath = false;
       if (
         selectionEpoch === epochAtStart &&
         (!viewMounted ||
           sanitizeEntityId(viewportStore.selectedEntityId) === null ||
           sanitizeEntityId(viewportStore.selectedEntityId) === entityId)
       ) {
-        await expand2Hop(entityId, reqSeq);
+        publishedOwnPath = await expand2Hop(entityId, reqSeq);
       }
 
       if (isDisposed || controller.signal.aborted || reqSeq !== searchReqSeq) {
         return;
       }
 
-      const hasSimilarOrGraphResult =
-        simHits.length > 0 || pathResults.length > 0;
+      const hasSimilarOrGraphResult = simHits.length > 0 || publishedOwnPath;
       provenance =
         hasSimilarOrGraphResult || nextErrorBanner === null
           ? similarProvenance

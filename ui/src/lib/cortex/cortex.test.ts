@@ -1889,7 +1889,8 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       }),
     };
 
-    let similarMode: "ok" | "embedding_unavailable" = "ok";
+    let similarMode: "ok" | "embedding_unavailable" | "deferred" = "ok";
+    const heldSimilars: Array<(res: Response) => void> = [];
     const mockSearch = createGraphSearchClient({
       fetchImpl: (async (_input, init) => {
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<
@@ -1898,6 +1899,11 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
         >;
         searchCalls.push(body);
         if (body.verb === "similar") {
+          if (similarMode === "deferred") {
+            return new Promise<Response>((resolve) => {
+              heldSimilars.push(resolve);
+            });
+          }
           if (similarMode === "embedding_unavailable") {
             return new Response(
               JSON.stringify({
@@ -2449,6 +2455,101 @@ describe("cortex/search-client.ts, view-model.ts & CortexWorkspace.svelte", () =
       ).toContain(
         "2-Hop & Similar results · retrieval scope: UXS #1 (Falcon 1)",
       );
+
+      // 2F. Cross-vehicle ordering: hold Similar response for UXS #1 open, switch to Fleet & select UXS #2,
+      //     return to Analysis & click Inspect UXS #2 (publishing #2's graph), then release #1's
+      //     `embedding_unavailable` response -> #2's graph stays visible while #1's refused lookup
+      //     does NOT claim #2's graph (`status === "error"`, `provenance === null`, 0 extra pathSearch calls)!
+      similarMode = "deferred";
+      viewportStore.selectEntity(quad1.id);
+      flushSync();
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-similar-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(heldSimilars).toHaveLength(1);
+      });
+      expect(analysisSession.status).toBe("running");
+
+      unmount(app);
+      viewportStore.selectEntity(rover2.id);
+      remountAnalysis();
+
+      const pathCallsBeforeInspect2 = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      (
+        hostEl.querySelector(
+          '[data-testid="cortex-sync-selection-btn"]',
+        ) as HTMLButtonElement
+      ).click();
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.inspectedEntityId).toBe(rover2.id);
+        expect(analysisSession.pathResults).toHaveLength(1);
+        expect(analysisSession.pathResults[0]?.paths[0]?.[0]?.from).toBe(
+          rover2.id,
+        );
+      });
+      const pathCallsAfterInspect2 = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfterInspect2 - pathCallsBeforeInspect2).toBe(1);
+
+      heldSimilars[0]!(
+        new Response(
+          JSON.stringify({
+            ok: false,
+            verb: "similar",
+            error: {
+              class: "invalid",
+              code: "embedding_unavailable",
+              message: "entity has no usable embedding",
+            },
+          }),
+          { status: 422 },
+        ),
+      );
+      await vi.waitFor(() => {
+        flushSync();
+        expect(analysisSession.status).toBe("error");
+      });
+
+      const pathCallsAfterRefusal = (
+        mockGraphql.pathSearch as ReturnType<typeof vi.fn>
+      ).mock.calls.length;
+      expect(pathCallsAfterRefusal).toBe(pathCallsAfterInspect2);
+      expect(analysisSession.provenance).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-result-provenance"]'),
+      ).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="cortex-error-banner"]')
+          ?.textContent ?? "",
+      ).toContain("embedding_unavailable: entity has no usable embedding");
+      expect(analysisSession.inspectedEntityId).toBe(rover2.id);
+      expect(analysisSession.pathResults[0]?.paths).toEqual([
+        [
+          {
+            from: rover2.id,
+            predicate: "cop.proximity.near",
+            to: validContactId,
+          },
+        ],
+      ]);
+      expect(
+        (
+          hostEl.querySelector('[data-testid="cortex-causal-subgraph"]')
+            ?.textContent ?? ""
+        ).replace(/\s+/g, " "),
+      ).toContain("2 nodes · 1 edges");
+      expect(
+        hostEl.querySelector('[data-testid="cortex-subgraph-fallback"]')
+          ?.textContent ?? "",
+      ).toContain("Verified Escort");
     } finally {
       unmount(app);
       analysisSession.dispose();
