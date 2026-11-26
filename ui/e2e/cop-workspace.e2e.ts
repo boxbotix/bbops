@@ -1625,7 +1625,66 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     const { page, info } = copStack;
 
     const outboundHttpMutations: Array<{ method: string; url: string }> = [];
-    const outboundWsPayloads: string[] = [];
+    const outboundWsPayloads: Array<string | Buffer> = [];
+
+    const isPermittedKeepaliveWsPayload = (
+      payload: string | Buffer,
+    ): boolean => {
+      if (typeof payload !== "string") {
+        return false;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        return false;
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        return false;
+      }
+      const record = parsed as Record<string, unknown>;
+      const keys = Object.keys(record);
+      return (
+        keys.length === 2 &&
+        Object.prototype.hasOwnProperty.call(record, "type") &&
+        Object.prototype.hasOwnProperty.call(record, "timestamp") &&
+        record.type === "keepalive" &&
+        typeof record.timestamp === "number" &&
+        Number.isFinite(record.timestamp)
+      );
+    };
+
+    const assertOnlyKeepaliveWsFrames = (
+      payloads: ReadonlyArray<string | Buffer>,
+    ): void => {
+      const unexpected = payloads.filter(
+        (payload) => !isPermittedKeepaliveWsPayload(payload),
+      );
+      expect(unexpected).toEqual([]);
+    };
+
+    // Self-verify that unexpected text and binary WebSocket frames fail the outbound assertion.
+    expect(() =>
+      assertOnlyKeepaliveWsFrames([
+        JSON.stringify({ type: "keepalive", timestamp: 1_700_000_000_000 }),
+      ]),
+    ).not.toThrow();
+    expect(() =>
+      assertOnlyKeepaliveWsFrames(['{"op":"set","value":325}']),
+    ).toThrow();
+    expect(() =>
+      assertOnlyKeepaliveWsFrames([
+        '{"type":"keepalive","timestamp":1,"op":"set"}',
+      ]),
+    ).toThrow();
+    expect(() => assertOnlyKeepaliveWsFrames(["ping"])).toThrow();
+    expect(() =>
+      assertOnlyKeepaliveWsFrames([Buffer.from([0xfd, 0x09, 0x00])]),
+    ).toThrow();
 
     page.on("request", (req) => {
       const method = req.method().toUpperCase();
@@ -1635,11 +1694,7 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     });
     page.on("websocket", (ws) => {
       ws.on("framesent", (frame) => {
-        const text =
-          typeof frame.payload === "string"
-            ? frame.payload
-            : frame.payload.toString("utf8");
-        outboundWsPayloads.push(text);
+        outboundWsPayloads.push(frame.payload);
       });
     });
 
@@ -1735,11 +1790,23 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(kpNumInput).toHaveValue("3.45");
     await expect(kpCard.getByTestId("bench-param-error")).toHaveCount(0);
 
-    // Also stage Teleop Deadman Timeout via exact numeric entry (250 -> 325 ms) and verify compact target-vehicle change summary.
+    // Near-step off-step "325.00001" on Teleop Deadman Timeout (starting at 250 ms, step 25) rejects without rounding, then exact "325" stages 325 ms.
     const deadmanRow = page.locator(
       '[data-param-key="uxs.mux.teleop_deadman_ms"]',
     );
-    await deadmanRow.locator('input[type="number"]').fill("325");
+    const deadmanNumInput = deadmanRow.locator('input[type="number"]');
+    const deadmanRangeInput = deadmanRow.locator('input[type="range"]');
+    await deadmanNumInput.fill("325.00001");
+    await expect(deadmanNumInput).toHaveAttribute("aria-invalid", "true");
+    await expect(deadmanRow.getByTestId("bench-param-error")).toContainText(
+      "Must align to step 25 ms",
+    );
+    await expect(deadmanRangeInput).toHaveValue("250");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+
+    await deadmanNumInput.fill("325");
+    await expect(deadmanNumInput).not.toHaveAttribute("aria-invalid", "true");
+    await expect(deadmanRangeInput).toHaveValue("325");
     await expect(page.getByTestId("bench-staged-count")).toHaveText("2 staged");
 
     const summary = page.getByTestId("bench-change-summary");
@@ -1786,13 +1853,9 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await selectFilmstripEntity(info.vehicles.rover);
     await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
 
-    // 5. Assert zero outbound HTTP mutations and zero outbound WebSocket actuation/param frames!
+    // 5. Assert zero outbound HTTP mutations and strictly keepalive-only outbound WebSocket frames!
     expect(outboundHttpMutations).toEqual([]);
-    for (const payload of outboundWsPayloads) {
-      expect(payload).not.toMatch(
-        /param|actuat|command|apply|uxs\.control|uxs\.limits|uxs\.mux/i,
-      );
-    }
+    assertOnlyKeepaliveWsFrames(outboundWsPayloads);
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
   });
