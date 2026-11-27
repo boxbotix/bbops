@@ -1,20 +1,35 @@
 package mavlink
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/boxbotix/bbops/internal/mavcodec"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/message"
 )
+
+var trackerIncarnationCounter atomic.Uint64
+
+func newTrackerIncarnation() string {
+	seq := trackerIncarnationCounter.Add(1)
+	var raw [6]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "t" + strconv.FormatUint(seq, 10)
+	}
+	return "t" + hex.EncodeToString(raw[:]) + "-" + strconv.FormatUint(seq, 10)
+}
 
 const (
 	minVehicleSysID uint8 = 1
@@ -76,23 +91,24 @@ type StatusTextEvent struct {
 // #1 SYS_STATUS failsafes increment, #253 STATUSTEXT arrives, or per-sysid link
 // freshness crosses silence/restoration boundaries (`link_lost` / `link_restored`).
 type TransitionEvent struct {
-	SysID          uint8                `json:"sysid"`
-	EntityID       string               `json:"entity_id"`
-	Domain         string               `json:"domain"`
-	Seq            uint8                `json:"seq"`
-	MsgID          uint32               `json:"msg_id"`
-	Kind           string               `json:"kind"`
-	Reasons        []string             `json:"reasons"`
-	Armed          bool                 `json:"armed"`
-	Authority      string               `json:"authority"`
-	PrevAuthority  string               `json:"prev_authority,omitempty"`
-	AuthorityEpoch uint64               `json:"authority_epoch,omitempty"`
-	CompanionMode  string               `json:"companion_mode"`
-	LinkTier       string               `json:"link_tier"`
-	Flags          uxsvocab.HealthFlags `json:"flags"`
-	Failsafes      int                  `json:"failsafes"`
-	StatusText     *StatusTextEvent     `json:"status_text,omitempty"`
-	Timestamp      int64                `json:"timestamp"`
+	SysID                uint8                `json:"sysid"`
+	EntityID             string               `json:"entity_id"`
+	Domain               string               `json:"domain"`
+	Seq                  uint8                `json:"seq"`
+	MsgID                uint32               `json:"msg_id"`
+	Kind                 string               `json:"kind"`
+	Reasons              []string             `json:"reasons"`
+	Armed                bool                 `json:"armed"`
+	Authority            string               `json:"authority"`
+	PrevAuthority        string               `json:"prev_authority,omitempty"`
+	AuthorityIncarnation string               `json:"authority_incarnation,omitempty"`
+	AuthorityEpoch       uint64               `json:"authority_epoch,omitempty"`
+	CompanionMode        string               `json:"companion_mode"`
+	LinkTier             string               `json:"link_tier"`
+	Flags                uxsvocab.HealthFlags `json:"flags"`
+	Failsafes            int                  `json:"failsafes"`
+	StatusText           *StatusTextEvent     `json:"status_text,omitempty"`
+	Timestamp            int64                `json:"timestamp"`
 }
 
 // SnapshotBatchItem pairs a serialized BaseMessage(VehicleSnapshot) with its
@@ -113,7 +129,11 @@ type ActuationTarget struct {
 	Domain                  string
 	Armed                   bool
 	Authority               string
+	AuthorityIncarnation    string
 	AuthorityEpoch          uint64
+	LinkEpoch               uint64
+	PacketOrder             uint64
+	LastAckOrder            uint64
 	CompanionMode           string
 	LinkTier                string
 	LinkLost                bool
@@ -143,7 +163,9 @@ type vehicleSession struct {
 	snap           uxsvocab.VehicleSnapshot
 	rev            uint64
 	authorityEpoch uint64
+	linkEpoch      uint64
 	rxPacketOrder  uint64
+	lastAckOrder   uint64
 	seenAckFrames  [256]ackFrameSlot
 	lastPacketAt   time.Time
 	lastSeq        uint8
@@ -167,6 +189,7 @@ func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
 func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, monoSample time.Time) {
 	if s.linkLost {
 		s.authorityEpoch++
+		s.linkEpoch++
 		s.seenAckFrames = [256]ackFrameSlot{}
 	}
 	if msgID != mavcodec.MsgIDCommandAck {
@@ -199,23 +222,24 @@ func monoOrEpoch(ts time.Time) time.Time {
 	return ts
 }
 
-func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, authorityEpoch uint64, seq uint8, msgID uint32, kind, reason string, ts time.Time) TransitionEvent {
+func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, incarnation string, authorityEpoch uint64, seq uint8, msgID uint32, kind, reason string, ts time.Time) TransitionEvent {
 	return TransitionEvent{
-		SysID:          snap.SysID,
-		EntityID:       snap.EntityID(),
-		Domain:         snap.Domain,
-		Seq:            seq,
-		MsgID:          msgID,
-		Kind:           kind,
-		Reasons:        []string{reason},
-		Armed:          snap.Armed,
-		Authority:      snap.Authority,
-		AuthorityEpoch: authorityEpoch,
-		CompanionMode:  snap.CompanionMode,
-		LinkTier:       snap.LinkTier,
-		Flags:          snap.Flags,
-		Failsafes:      snap.Failsafes,
-		Timestamp:      ts.UnixMilli(),
+		SysID:                snap.SysID,
+		EntityID:             snap.EntityID(),
+		Domain:               snap.Domain,
+		Seq:                  seq,
+		MsgID:                msgID,
+		Kind:                 kind,
+		Reasons:              []string{reason},
+		Armed:                snap.Armed,
+		Authority:            snap.Authority,
+		AuthorityIncarnation: incarnation,
+		AuthorityEpoch:       authorityEpoch,
+		CompanionMode:        snap.CompanionMode,
+		LinkTier:             snap.LinkTier,
+		Flags:                snap.Flags,
+		Failsafes:            snap.Failsafes,
+		Timestamp:            ts.UnixMilli(),
 	}
 }
 
@@ -225,12 +249,18 @@ func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, authorityEpoch uint64
 type Tracker struct {
 	org                string
 	platform           string
+	incarnation        string
 	linkTimeout        time.Duration
 	supervisoryTimeout time.Duration
 	allowedPeers       []netip.Prefix
 
 	mu       sync.RWMutex
 	sessions map[uint8]*vehicleSession
+}
+
+// Incarnation returns the unique per-instance tracker incarnation identifier.
+func (t *Tracker) Incarnation() string {
+	return t.incarnation
 }
 
 // NewTracker constructs a per-sysid MAVLink v2 state tracker with default silence timeouts.
@@ -275,6 +305,7 @@ func NewTrackerWithOptions(
 	return &Tracker{
 		org:                org,
 		platform:           platform,
+		incarnation:        newTrackerIncarnation(),
 		linkTimeout:        linkTimeout,
 		supervisoryTimeout: supervisoryTimeout,
 		allowedPeers:       prefixes,
@@ -420,6 +451,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			snap:           *snap,
 			rev:            1,
 			authorityEpoch: 1,
+			linkEpoch:      1,
 		}
 		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 		t.sessions[sysid] = newSess
@@ -463,7 +495,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		SysID:    sysid,
 	}
 	if wasLost {
-		out.Events = append(out.Events, newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	if len(reasons) > 0 {
@@ -472,22 +504,23 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			prevAuth = prev.Authority
 		}
 		out.Events = append(out.Events, TransitionEvent{
-			SysID:          sysid,
-			EntityID:       next.EntityID(),
-			Domain:         next.Domain,
-			Seq:            seq,
-			MsgID:          mavcodec.MsgIDHeartbeat,
-			Kind:           EventKindHeartbeatEdge,
-			Reasons:        reasons,
-			Armed:          next.Armed,
-			Authority:      next.Authority,
-			PrevAuthority:  prevAuth,
-			AuthorityEpoch: sess.authorityEpoch,
-			CompanionMode:  next.CompanionMode,
-			LinkTier:       next.LinkTier,
-			Flags:          next.Flags,
-			Failsafes:      next.Failsafes,
-			Timestamp:      wallUTC.UnixMilli(),
+			SysID:                sysid,
+			EntityID:             next.EntityID(),
+			Domain:               next.Domain,
+			Seq:                  seq,
+			MsgID:                mavcodec.MsgIDHeartbeat,
+			Kind:                 EventKindHeartbeatEdge,
+			Reasons:              reasons,
+			Armed:                next.Armed,
+			Authority:            next.Authority,
+			PrevAuthority:        prevAuth,
+			AuthorityIncarnation: t.incarnation,
+			AuthorityEpoch:       sess.authorityEpoch,
+			CompanionMode:        next.CompanionMode,
+			LinkTier:             next.LinkTier,
+			Flags:                next.Flags,
+			Failsafes:            next.Failsafes,
+			Timestamp:            wallUTC.UnixMilli(),
 		})
 		out.UrgentSKGSync = true
 	}
@@ -561,26 +594,27 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 		SysID:    sysid,
 	}
 	if wasLost {
-		out.Events = append(out.Events, newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", wallUTC))
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	if hadSysStatus && next.Failsafes > prevFailsafes {
 		out.Events = append(out.Events, TransitionEvent{
-			SysID:          sysid,
-			EntityID:       next.EntityID(),
-			Domain:         next.Domain,
-			Seq:            seq,
-			MsgID:          mavcodec.MsgIDSysStatus,
-			Kind:           EventKindFailsafeIncrement,
-			Reasons:        []string{"failsafes_incremented"},
-			Armed:          next.Armed,
-			Authority:      next.Authority,
-			AuthorityEpoch: sess.authorityEpoch,
-			CompanionMode:  next.CompanionMode,
-			LinkTier:       next.LinkTier,
-			Flags:          next.Flags,
-			Failsafes:      next.Failsafes,
-			Timestamp:      wallUTC.UnixMilli(),
+			SysID:                sysid,
+			EntityID:             next.EntityID(),
+			Domain:               next.Domain,
+			Seq:                  seq,
+			MsgID:                mavcodec.MsgIDSysStatus,
+			Kind:                 EventKindFailsafeIncrement,
+			Reasons:              []string{"failsafes_incremented"},
+			Armed:                next.Armed,
+			Authority:            next.Authority,
+			AuthorityIncarnation: t.incarnation,
+			AuthorityEpoch:       sess.authorityEpoch,
+			CompanionMode:        next.CompanionMode,
+			LinkTier:             next.LinkTier,
+			Flags:                next.Flags,
+			Failsafes:            next.Failsafes,
+			Timestamp:            wallUTC.UnixMilli(),
 		})
 		out.UrgentSKGSync = true
 	}
@@ -657,7 +691,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -714,7 +748,7 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -791,7 +825,7 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -819,7 +853,8 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 
 	wasLost := sess.linkLost
 	prevSlot := sess.seenAckFrames[seq]
-	isDupAck := !wasLost && prevSlot.active && prevSlot.ack == msg && sess.rxPacketOrder-prevSlot.packetOrder < 256
+	nextOrder := sess.rxPacketOrder + 1
+	isDupAck := !wasLost && prevSlot.active && prevSlot.ack == msg && nextOrder-prevSlot.packetOrder < 256
 
 	var events []TransitionEvent
 	urgent := false
@@ -835,7 +870,7 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	}
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDCommandAck, normPeer, monoSample)
 	if wasLost {
-		events = append(events, newLinkTransitionEvent(next, sess.authorityEpoch, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
+		events = append(events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
 	}
 	if isDupAck {
 		return IngestOutcome{
@@ -845,11 +880,12 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 			UrgentSKGSync: urgent,
 		}
 	}
-	sess.rxPacketOrder++
+	sess.rxPacketOrder = nextOrder
+	sess.lastAckOrder = nextOrder
 	sess.seenAckFrames[seq] = ackFrameSlot{
 		active:      true,
 		ack:         msg,
-		packetOrder: sess.rxPacketOrder,
+		packetOrder: nextOrder,
 	}
 	ackCopy := msg
 	return IngestOutcome{
@@ -897,25 +933,26 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 	}
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDStatusText, normPeer, monoSample)
 	if wasLost {
-		events = append(events, newLinkTransitionEvent(snap, sess.authorityEpoch, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", wallUTC))
+		events = append(events, newLinkTransitionEvent(snap, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", wallUTC))
 	}
 
 	cleanText := strings.TrimRight(msg.Text, "\x00")
 	events = append(events, TransitionEvent{
-		SysID:          sysid,
-		EntityID:       snap.EntityID(),
-		Domain:         snap.Domain,
-		Seq:            seq,
-		MsgID:          mavcodec.MsgIDStatusText,
-		Kind:           EventKindStatusText,
-		Reasons:        []string{"statustext"},
-		Armed:          snap.Armed,
-		Authority:      snap.Authority,
-		AuthorityEpoch: sess.authorityEpoch,
-		CompanionMode:  snap.CompanionMode,
-		LinkTier:       snap.LinkTier,
-		Flags:          snap.Flags,
-		Failsafes:      snap.Failsafes,
+		SysID:                sysid,
+		EntityID:             snap.EntityID(),
+		Domain:               snap.Domain,
+		Seq:                  seq,
+		MsgID:                mavcodec.MsgIDStatusText,
+		Kind:                 EventKindStatusText,
+		Reasons:              []string{"statustext"},
+		Armed:                snap.Armed,
+		Authority:            snap.Authority,
+		AuthorityIncarnation: t.incarnation,
+		AuthorityEpoch:       sess.authorityEpoch,
+		CompanionMode:        snap.CompanionMode,
+		LinkTier:             snap.LinkTier,
+		Flags:                snap.Flags,
+		Failsafes:            snap.Failsafes,
 		StatusText: &StatusTextEvent{
 			Severity: msg.Severity,
 			Text:     cleanText,
@@ -1060,9 +1097,11 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	}
 	sess.linkLost = true
 	sess.authorityEpoch++
+	sess.linkEpoch++
 	sess.seenAckFrames = [256]ackFrameSlot{}
 	return newLinkTransitionEvent(
 		sess.snap,
+		t.incarnation,
 		sess.authorityEpoch,
 		sess.lastSeq,
 		sess.lastMsgID,
@@ -1112,7 +1151,11 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 		Domain:                  sess.snap.Domain,
 		Armed:                   sess.snap.Armed,
 		Authority:               sess.snap.Authority,
+		AuthorityIncarnation:    t.incarnation,
 		AuthorityEpoch:          sess.authorityEpoch,
+		LinkEpoch:               sess.linkEpoch,
+		PacketOrder:             sess.rxPacketOrder,
+		LastAckOrder:            sess.lastAckOrder,
 		CompanionMode:           sess.snap.CompanionMode,
 		LinkTier:                sess.snap.LinkTier,
 		LinkLost:                sess.linkLost,

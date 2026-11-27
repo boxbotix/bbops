@@ -37,8 +37,12 @@ const (
 	PredicateCommandCmdID = "uxs.command.cmdid"
 	// PredicateCommandAction records the canonical bbops discrete command action slug.
 	PredicateCommandAction = "uxs.command.action"
-	// PredicateCommandAckResult records the #77 COMMAND_ACK MAV_RESULT (`-1` while unacknowledged).
+	// PredicateCommandAckResult records the #77 COMMAND_ACK MAV_RESULT (`-1` while unacknowledged or ambiguous).
 	PredicateCommandAckResult = "uxs.command.ackresult"
+	// PredicateCommandAckAccounted records (`1` vs `0`) whether an unattributed/ambiguous or idle #77 COMMAND_ACK slot was accounted for.
+	PredicateCommandAckAccounted = "uxs.command.ackaccounted"
+	// PredicateCommandAckPoolMask records the cumulative bitmask of #77 COMMAND_ACK MAV_RESULT codes observed on `(sysid, cmd_id)`.
+	PredicateCommandAckPoolMask = "uxs.command.ackpoolmask"
 	// PredicateCommandDetail records operator-facing status or refusal detail text.
 	PredicateCommandDetail = "uxs.command.detail"
 	// PredicateCommandIssuedMs records the UTC Unix-millisecond dispatch timestamp.
@@ -54,8 +58,8 @@ const (
 	PhasePreempted     = "preempted"
 
 	// UnacknowledgedResult is stamped into uxs.command.ackresult once a #76 COMMAND_LONG is
-	// persisted/sent without receiving a #77 COMMAND_ACK so TransitionWith emits an explicit
-	// triple delta when MAV_RESULT_ACCEPTED (0) arrives.
+	// persisted/sent without an unambiguously attributed #77 COMMAND_ACK so TransitionWith emits
+	// an explicit triple delta when an unambiguous MAV_RESULT_ACCEPTED (0) arrives.
 	UnacknowledgedResult = -1
 
 	// UnsentAckResult marks a CommandEntity that was aborted or rejected prior to transmitting
@@ -88,16 +92,18 @@ const (
 // CommandEntity projects a discrete #76 COMMAND_LONG execution into SemEngine ENTITY_STATES
 // via semengine/pkg/lifecycle.Manager revision-fenced CAS transitions (`OQ2 Option A`).
 type CommandEntity struct {
-	ID         string `lifecycle:"id"`
-	PhaseState string `lifecycle:"phase,predicate=uxs.command.phase"`
-	Target     string `lifecycle:"predicate=uxs.command.target"`
-	SysID      int    `lifecycle:"predicate=uxs.command.sysid"`
-	CmdID      int    `lifecycle:"predicate=uxs.command.cmdid"`
-	Action     string `lifecycle:"predicate=uxs.command.action"`
-	AckResult  int    `json:"ack_result" lifecycle:"predicate=uxs.command.ackresult,operator_writable"`
-	Detail     string `lifecycle:"predicate=uxs.command.detail"`
-	IssuedMs   int64  `lifecycle:"predicate=uxs.command.issuedms"`
-	UpdatedMs  int64  `json:"updated_ms" lifecycle:"predicate=uxs.command.updatedms,operator_writable"`
+	ID           string `lifecycle:"id"`
+	PhaseState   string `lifecycle:"phase,predicate=uxs.command.phase"`
+	Target       string `lifecycle:"predicate=uxs.command.target"`
+	SysID        int    `lifecycle:"predicate=uxs.command.sysid"`
+	CmdID        int    `lifecycle:"predicate=uxs.command.cmdid"`
+	Action       string `lifecycle:"predicate=uxs.command.action"`
+	AckResult    int    `lifecycle:"predicate=uxs.command.ackresult"`
+	AckAccounted int    `json:"ack_accounted,omitempty" lifecycle:"predicate=uxs.command.ackaccounted,operator_writable"`
+	AckPoolMask  int    `json:"ack_pool_mask,omitempty" lifecycle:"predicate=uxs.command.ackpoolmask,operator_writable"`
+	Detail       string `lifecycle:"predicate=uxs.command.detail"`
+	IssuedMs     int64  `lifecycle:"predicate=uxs.command.issuedms"`
+	UpdatedMs    int64  `json:"updated_ms" lifecycle:"predicate=uxs.command.updatedms,operator_writable"`
 }
 
 var _ lifecycle.Participant = (*CommandEntity)(nil)
@@ -179,7 +185,17 @@ func ControlPackSpec() vocabulary.PackSpec {
 			},
 			{
 				Name:        PredicateCommandAckResult,
-				Description: "Inbound #77 COMMAND_ACK MAV_RESULT code (-1 while unacknowledged)",
+				Description: "Unambiguously attributed inbound #77 COMMAND_ACK MAV_RESULT code (-1 while unacknowledged or ambiguous)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandAckAccounted,
+				Description: "Owner-neutral slot accounting marker (1 when a #77 COMMAND_ACK slot for the command pool was consumed)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandAckPoolMask,
+				Description: "Owner-neutral bitmask of #77 COMMAND_ACK MAV_RESULT codes observed across the (sysid, cmd_id) pool",
 				DataType:    "int",
 			},
 			{

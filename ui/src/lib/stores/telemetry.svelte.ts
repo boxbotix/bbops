@@ -86,6 +86,7 @@ export interface TransitionEvent {
   armed: boolean;
   authority: ControlAuthority;
   prev_authority?: ControlAuthority;
+  authority_incarnation?: string;
   authority_epoch?: number;
   companion_mode: CompanionMode;
   link_tier: LinkTier;
@@ -366,6 +367,18 @@ function parseTransitionEventPayload(
     prevAuthority = payload.prev_authority;
   }
 
+  let authorityIncarnation: string | undefined;
+  if (
+    payload.authority_incarnation !== undefined &&
+    payload.authority_incarnation !== null &&
+    payload.authority_incarnation !== ""
+  ) {
+    if (typeof payload.authority_incarnation !== "string") {
+      return null;
+    }
+    authorityIncarnation = payload.authority_incarnation;
+  }
+
   let authorityEpoch: number | undefined;
   if (
     payload.authority_epoch !== undefined &&
@@ -406,6 +419,9 @@ function parseTransitionEventPayload(
   };
   if (prevAuthority !== undefined) {
     event.prev_authority = prevAuthority;
+  }
+  if (authorityIncarnation !== undefined) {
+    event.authority_incarnation = authorityIncarnation;
   }
   if (authorityEpoch !== undefined) {
     event.authority_epoch = authorityEpoch;

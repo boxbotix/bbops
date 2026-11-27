@@ -38,6 +38,7 @@ function buildTransitionFrame(
       "heartbeat_edge" | "failsafe_increment" | "link_lost" | "link_restored";
     armed?: boolean;
     authority?: ControlAuthority;
+    authorityIncarnation?: string;
     authorityEpoch?: number;
     companionMode?:
       "disarmed" | "hold-position" | "teleop-velocity" | "autonomous-velocity";
@@ -58,6 +59,9 @@ function buildTransitionFrame(
       reasons: ["authority"],
       armed: opts.armed ?? true,
       authority: opts.authority ?? "companion-teleop",
+      ...(opts.authorityIncarnation !== undefined
+        ? { authority_incarnation: opts.authorityIncarnation }
+        : {}),
       ...(opts.authorityEpoch !== undefined
         ? { authority_epoch: opts.authorityEpoch }
         : {}),
@@ -2259,6 +2263,186 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       expect(serverLeaseActive).toBe(true);
       expect(controller.engaged).toBe(true);
       expect(controller.preemptionLatch).toBeNull();
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("forwards authority_incarnation on Engage Teleop and protects an active post-recovery session when a delayed pre-override request rejects second", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-24T11:45:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      // Initial transition event under incarnation "inc-A" at epoch=9.
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 1,
+          kind: "heartbeat_edge",
+          authority: "companion-teleop",
+          authorityIncarnation: "inc-A",
+          authorityEpoch: 9,
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+
+      const sentTeleops: ControlTeleopRequest[] = [];
+      let resolveDelayedStaleEngage:
+        | ((value: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void)
+        | null = null;
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push(req);
+            if (req.engage && req.authority_incarnation === "inc-A") {
+              return await new Promise((resolve) => {
+                resolveDelayedStaleEngage = resolve;
+              });
+            }
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: !req.stop,
+                expires_ms: nowMs + 250,
+              },
+            };
+          },
+        },
+      });
+
+      // 1) Pre-override Engage under inc-A (epoch=9) is delayed in network transit.
+      const staleEngagePromise = controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(sentTeleops[0]).toMatchObject({
+        sysid: 1,
+        engage: true,
+        authority_incarnation: "inc-A",
+        authority_epoch: 9,
+        observed_ms: nowMs,
+      });
+
+      // 2) Host restarts onto inc-B: P1 override at epoch=2, then P2 recovery at epoch=3.
+      nowMs += 20;
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 2,
+          kind: "heartbeat_edge",
+          authority: "direct-crsf-override",
+          authorityIncarnation: "inc-B",
+          authorityEpoch: 2,
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+      nowMs += 20;
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 3,
+          kind: "heartbeat_edge",
+          authority: "companion-teleop",
+          authorityIncarnation: "inc-B",
+          authorityEpoch: 3,
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+
+      // 3) Operator clicks Engage Teleop AFTER recovery -> carries inc-B + epoch=3 and succeeds FIRST!
+      const freshEngaged = await controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(freshEngaged).toBe(true);
+      const freshSession = sentTeleops[1]?.session;
+      expect(sentTeleops[1]).toMatchObject({
+        sysid: 1,
+        engage: true,
+        authority_incarnation: "inc-B",
+        authority_epoch: 3,
+        observed_ms: nowMs,
+      });
+      expect(controller.engaged).toBe(true);
+
+      // 4) Delayed pre-override inc-A Engage resolves SECOND with 409 preemption_latched:
+      // MUST NOT disengage or latch preemption over the active inc-B session!
+      resolveDelayedStaleEngage!({
+        ok: false,
+        error: {
+          code: "preemption_latched",
+          message:
+            'vehicle sysid 1 teleop authority incarnation mismatch ("inc-A" != "inc-B")',
+          status: 409,
+        },
+      });
+      expect(await staleEngagePromise).toBe(false);
+      expect(controller.engaged).toBe(true);
+      expect(controller.preemptionLatch).toBeNull();
+      expect(controller.lastError).toBeNull();
+
+      // 5) Active inc-B session continues sending 20 Hz renewal nudges normally!
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: freshSession,
+        seq: 2,
+      });
 
       controller.dispose();
       telemetryStore.disconnect();

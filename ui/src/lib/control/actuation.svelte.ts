@@ -103,6 +103,7 @@ export interface ControlTeleopRequest {
   readonly engage?: boolean;
   readonly stop?: boolean;
   readonly observed_ms?: number;
+  readonly authority_incarnation?: string;
   readonly authority_epoch?: number;
 }
 
@@ -159,6 +160,7 @@ export interface LiveActuationSafety {
   readonly fresh: boolean;
   readonly statusLabel: string;
   readonly stateObservedMs: number | null;
+  readonly authorityIncarnation?: string;
   readonly authorityEpoch?: number;
   readonly isSupervisoryOnly: boolean;
   readonly isSitlLocal: boolean;
@@ -541,6 +543,12 @@ export function resolveLiveActuationSafety(
     : Number.isFinite(fallbackObsMs)
       ? fallbackObsMs
       : null;
+  const authorityIncarnation =
+    useEventOverlay &&
+    latestEv.authority_incarnation !== undefined &&
+    latestEv.authority_incarnation.length > 0
+      ? latestEv.authority_incarnation
+      : undefined;
   const authorityEpoch =
     useEventOverlay &&
     latestEv.authority_epoch !== undefined &&
@@ -596,6 +604,7 @@ export function resolveLiveActuationSafety(
     fresh: freshness.fresh,
     statusLabel: freshness.statusLabel,
     stateObservedMs,
+    ...(authorityIncarnation !== undefined ? { authorityIncarnation } : {}),
     ...(authorityEpoch !== undefined ? { authorityEpoch } : {}),
     isSupervisoryOnly,
     isSitlLocal,
@@ -845,7 +854,11 @@ export function createActuationController(
   async function dispatchTeleopNudge(
     sysid: number,
     engageFlag: boolean,
-    engageMeta?: { observedMs: number | null; authorityEpoch?: number },
+    engageMeta?: {
+      observedMs: number | null;
+      authorityIncarnation?: string;
+      authorityEpoch?: number;
+    },
   ): Promise<boolean> {
     if (engagedSysId !== sysid || engagedSession === null) {
       return false;
@@ -872,6 +885,11 @@ export function createActuationController(
       engageMeta?.observedMs !== null &&
       engageMeta?.observedMs !== undefined
         ? { observed_ms: Math.trunc(engageMeta.observedMs) }
+        : {}),
+      ...(engageFlag &&
+      engageMeta?.authorityIncarnation !== undefined &&
+      engageMeta.authorityIncarnation.length > 0
+        ? { authority_incarnation: engageMeta.authorityIncarnation }
         : {}),
       ...(engageFlag && engageMeta?.authorityEpoch !== undefined
         ? { authority_epoch: engageMeta.authorityEpoch }
@@ -1150,6 +1168,7 @@ export function createActuationController(
 
     const ok = await dispatchTeleopNudge(vehicle.sysid, true, {
       observedMs: safety.stateObservedMs,
+      authorityIncarnation: safety.authorityIncarnation,
       authorityEpoch: safety.authorityEpoch,
     });
     if (!ok || engagedSysId !== vehicle.sysid || engagedSession !== session) {
