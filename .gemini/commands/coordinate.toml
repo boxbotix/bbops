@@ -1,0 +1,2 @@
+description = "Run coordinate workflow."
+prompt = "Read .agents/skills/coordinate/SKILL.md fully and follow the canonical workflow."

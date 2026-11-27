@@ -19,6 +19,6 @@ Confirm the previous writer has handed off or stopped before mutating files in a
 
 ## 3. Reconcile and Continue
 
-Report verified worktree/branch/HEAD SHA, active holds/drift, write ownership status, and the next authorized step under the Ponytail decision ladder.
+Report verified worktree/branch/HEAD SHA, active holds/drift, write ownership status, and the next authorized step under the Ponytail decision ladder: continue the unit a handoff names as in hand, else take the issue `ateam state next` names (the pickup line's `next=`), never an order recalled from a handoff.
 
 **T3 Code card.** Only when the `html_render` tool is available to you and `printenv T3CODE_THREAD_ID` prints a non-empty value: after the report above, read [t3-card.html](../handoff/t3-card.html), replace each double-brace placeholder with a fact read this turn (escape `& < > " '` first, write `not checked` for anything you did not read, and put the handoff goal and done-when only in the Agent-written region), then call `html_render` with that HTML, the title `Pickup · <branch>`, and height 560. On any other host, skip this step.
