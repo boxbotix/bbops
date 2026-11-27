@@ -39,6 +39,7 @@ type Component struct {
 	sysidMu [256]sync.Mutex
 
 	actuationHooks atomic.Pointer[actuationCallbacks]
+	wallNowFn      atomic.Pointer[func() time.Time]
 
 	// Test-only synchronization hooks (nil in production).
 	beforeIngestFrame func(frame mavcodec.Frame)
@@ -201,6 +202,29 @@ func (c *Component) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 	return c.tracker.ActuationTarget(sysid)
 }
 
+// ResolveObservation resolves an inbound operator observation against the underlying Tracker.
+func (c *Component) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool) {
+	return c.tracker.ResolveObservation(sysid, obsRev, authorityEpoch, observedMs)
+}
+
+// SetWallClock configures an optional wall-clock source for UTC timestamps while
+// keeping monotonic elapsed-time silence tracking anchored to time.Now().
+func (c *Component) SetWallClock(fn func() time.Time) {
+	if fn == nil {
+		c.wallNowFn.Store(nil)
+		return
+	}
+	c.wallNowFn.Store(&fn)
+}
+
+func (c *Component) currentClocks() (time.Time, time.Time) {
+	mono := time.Now()
+	if ptr := c.wallNowFn.Load(); ptr != nil && *ptr != nil {
+		return (*ptr)(), mono
+	}
+	return mono, mono
+}
+
 // SetActuationCallbacks registers synchronous callbacks invoked on Lane 3 state
 // transitions (`heartbeat_edge`, `link_lost`, etc.) and `#77 COMMAND_ACK` ingest.
 func (c *Component) SetActuationCallbacks(
@@ -354,10 +378,10 @@ func (c *Component) readLoop(ctx context.Context, conn *net.UDPConn) {
 }
 
 func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame, peerAddr netip.AddrPort, n int) {
-	now := time.Now()
+	wallNow, monoNow := c.currentClocks()
 	mu := &c.sysidMu[frame.SystemID]
 	mu.Lock()
-	outcome := c.tracker.IngestFrame(frame, peerAddr, now)
+	outcome := c.tracker.IngestFrameWithClock(frame, peerAddr, wallNow, monoNow)
 	if outcome.CountedError {
 		c.lifecycle.CountError()
 		mu.Unlock()
@@ -388,9 +412,9 @@ func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame
 		}
 		if outcome.CommandAck != nil {
 			if hooks.onAckFrame != nil {
-				hooks.onAckFrame(outcome.SysID, outcome.CommandAckSeq, *outcome.CommandAck, now)
+				hooks.onAckFrame(outcome.SysID, outcome.CommandAckSeq, *outcome.CommandAck, wallNow)
 			} else if hooks.onAck != nil {
-				hooks.onAck(outcome.SysID, *outcome.CommandAck, now)
+				hooks.onAck(outcome.SysID, *outcome.CommandAck, wallNow)
 			}
 		}
 	}
@@ -412,9 +436,10 @@ func (c *Component) tickLoop(ctx context.Context) {
 func (c *Component) evaluateSilenceTick(ctx context.Context) {
 	hooks := c.actuationHooks.Load()
 	for _, sysid := range c.tracker.admittedSysIDs() {
+		wallNow, monoNow := c.currentClocks()
 		mu := &c.sysidMu[sysid]
 		mu.Lock()
-		ev, lost := c.tracker.evaluateSilenceSysID(sysid, time.Now())
+		ev, lost := c.tracker.evaluateSilenceSysIDAt(sysid, wallNow, monoNow)
 		if lost {
 			if c.afterSilenceEval != nil {
 				c.afterSilenceEval(ev)

@@ -49,6 +49,7 @@ type Options struct {
 	Version                string
 	Overrides              PortOverrides
 	Logger                 *slog.Logger
+	Now                    func() time.Time
 	RegisterPayloads       func(*payloadregistry.Registry) error
 	Contracts              []projection.Contract
 	beforeMigrationCreate  func(ctx context.Context, client *natsclient.Client) error
@@ -263,6 +264,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		Sender:   mavBridge,
 		Store:    lcStore,
 		Logger:   logger,
+		Now:      opts.Now,
 	})
 	if err != nil {
 		return cleanup(fmt.Errorf("create control service: %w", err))
@@ -271,6 +273,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 
 	compReg := component.NewRegistry()
 	if err := registerComponentsWithHook(compReg, func(c *mavlink.Component) {
+		if opts.Now != nil {
+			c.SetWallClock(opts.Now)
+		}
 		c.SetActuationFrameCallbacks(ctrlSvc.OnTransitionEvent, ctrlSvc.OnCommandAckFrame)
 		rt.mavlinkIngest.Store(c)
 	}); err != nil {
@@ -461,6 +466,12 @@ type runtimeMAVLinkBridge struct {
 	comp *atomic.Pointer[mavlink.Component]
 }
 
+var (
+	_ control.TargetSource        = runtimeMAVLinkBridge{}
+	_ control.ObservationResolver = runtimeMAVLinkBridge{}
+	_ control.FrameSender         = runtimeMAVLinkBridge{}
+)
+
 func (b runtimeMAVLinkBridge) ActuationTarget(sysid uint8) (mavlink.ActuationTarget, bool) {
 	if b.comp == nil {
 		return mavlink.ActuationTarget{}, false
@@ -470,6 +481,17 @@ func (b runtimeMAVLinkBridge) ActuationTarget(sysid uint8) (mavlink.ActuationTar
 		return mavlink.ActuationTarget{}, false
 	}
 	return c.ActuationTarget(sysid)
+}
+
+func (b runtimeMAVLinkBridge) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool) {
+	if b.comp == nil {
+		return 0, false
+	}
+	c := b.comp.Load()
+	if c == nil {
+		return 0, false
+	}
+	return c.ResolveObservation(sysid, obsRev, authorityEpoch, observedMs)
 }
 
 func (b runtimeMAVLinkBridge) SendFrame(frame mavcodec.Frame, peer netip.AddrPort) error {

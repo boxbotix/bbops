@@ -710,6 +710,8 @@ export function createActuationController(
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const heldKeys = new Set<PadHoldKey>();
   let teleopTimer: ReturnType<typeof setInterval> | null = null;
+  let timerRenewalsInFlight = 0;
+  let timerGen = 0;
   let engageCounter = 0;
   let engagedEntityId: string | null = null;
   let engagedSession: string | null = null;
@@ -746,6 +748,8 @@ export function createActuationController(
   );
 
   function stopTeleopTimer(): void {
+    timerGen += 1;
+    timerRenewalsInFlight = 0;
     if (teleopTimer !== null) {
       clearIntervalFn(teleopTimer);
       teleopTimer = null;
@@ -951,6 +955,7 @@ export function createActuationController(
 
   function startTeleopTimer(sysid: number): void {
     stopTeleopTimer();
+    const gen = timerGen;
     teleopTimer = setIntervalFn(() => {
       if (engagedSysId !== sysid) {
         stopTeleopTimer();
@@ -959,7 +964,15 @@ export function createActuationController(
       if (!verifyEngagedVehicleLive(sysid)) {
         return;
       }
-      void dispatchTeleopNudge(sysid, false);
+      if (timerRenewalsInFlight >= 2) {
+        return;
+      }
+      timerRenewalsInFlight += 1;
+      void dispatchTeleopNudge(sysid, false).finally(() => {
+        if (timerGen === gen && timerRenewalsInFlight > 0) {
+          timerRenewalsInFlight -= 1;
+        }
+      });
     }, teleopIntervalMs);
   }
 

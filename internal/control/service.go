@@ -329,6 +329,7 @@ const (
 type earlyCommandAck struct {
 	seq        uint8
 	hasSeq     bool
+	uncertain  bool
 	ack        mavcodec.CommandAck
 	observedAt time.Time
 }
@@ -340,27 +341,136 @@ type serviceAckSlot struct {
 }
 
 type directSeqTracker struct {
-	hasSeq  bool
-	lastSeq uint8
-	pos     uint64
+	hasSeq           bool
+	lastSeq          uint8
+	pos              uint64
+	hasPendingGap    bool
+	pendingGapSeq    uint8
+	pendingGapDelta  uint8
+	pendingGapHasAck bool
+	pendingGapAck    mavcodec.CommandAck
 }
 
-func (d *directSeqTracker) computePos(seq uint8) (pos uint64, advanceHead bool) {
+func (d *directSeqTracker) evaluate(seq uint8, msg mavcodec.CommandAck, baseOrder uint64, slots *[256]serviceAckSlot) (candOrder uint64, recordSlot, isDup, uncertain bool) {
+	prev := slots[seq]
 	if !d.hasSeq {
-		return 1, true
+		d.hasSeq = true
+		d.lastSeq = seq
+		d.pos = 1
+		d.hasPendingGap = false
+		d.pendingGapHasAck = false
+		return baseOrder + 1, true, false, false
+	}
+	if d.hasPendingGap {
+		gapStep := uint8(seq - d.pendingGapSeq)
+		if gapStep >= 1 && gapStep <= 64 {
+			gapRel := d.pos + uint64(d.pendingGapDelta)
+			if d.pendingGapHasAck {
+				slots[d.pendingGapSeq] = serviceAckSlot{
+					active:      true,
+					ack:         d.pendingGapAck,
+					streamOrder: baseOrder + gapRel,
+				}
+			}
+			nextRel := gapRel + uint64(gapStep)
+			cand := baseOrder + nextRel
+			dup := prev.active && prev.ack == msg &&
+				(cand <= prev.streamOrder || cand-prev.streamOrder < 256)
+			d.hasPendingGap = false
+			d.pendingGapHasAck = false
+			if !dup {
+				d.pos = nextRel
+				d.lastSeq = seq
+			}
+			return cand, !dup, dup, false
+		}
+		if gapStep == 0 {
+			fwdOrder := baseOrder + d.pos + uint64(d.pendingGapDelta)
+			if d.pendingGapHasAck && d.pendingGapAck == msg {
+				return fwdOrder, false, true, false
+			}
+			if prev.active && prev.ack == msg {
+				if fwdOrder <= prev.streamOrder || fwdOrder-prev.streamOrder < 256 {
+					return fwdOrder, false, true, false
+				}
+				d.pendingGapHasAck = true
+				d.pendingGapAck = msg
+				return fwdOrder, false, false, true
+			}
+			d.pendingGapHasAck = true
+			d.pendingGapAck = msg
+			return fwdOrder, false, false, false
+		}
+		d.hasPendingGap = false
+		d.pendingGapHasAck = false
 	}
 	delta := uint8(seq - d.lastSeq)
 	if delta == 0 {
-		return d.pos, false
+		cand := baseOrder + d.pos
+		dup := prev.active && prev.ack == msg &&
+			(cand <= prev.streamOrder || cand-prev.streamOrder < 256)
+		return cand, !dup, dup, false
 	}
 	if delta <= 64 {
-		return d.pos + uint64(delta), true
+		nextRel := d.pos + uint64(delta)
+		cand := baseOrder + nextRel
+		dup := prev.active && prev.ack == msg &&
+			(cand <= prev.streamOrder || cand-prev.streamOrder < 256)
+		if !dup {
+			d.pos = nextRel
+			d.lastSeq = seq
+		}
+		return cand, !dup, dup, false
+	}
+	if delta <= 128 {
+		fwdOrder := baseOrder + d.pos + uint64(delta)
+		if prev.active && prev.ack == msg {
+			if fwdOrder <= prev.streamOrder || fwdOrder-prev.streamOrder < 256 {
+				return fwdOrder, false, true, false
+			}
+			d.hasPendingGap = true
+			d.pendingGapSeq = seq
+			d.pendingGapDelta = delta
+			d.pendingGapHasAck = true
+			d.pendingGapAck = msg
+			return fwdOrder, false, false, true
+		}
+		d.hasPendingGap = true
+		d.pendingGapSeq = seq
+		d.pendingGapDelta = delta
+		d.pendingGapHasAck = true
+		d.pendingGapAck = msg
+		return fwdOrder, false, false, false
 	}
 	back := uint64(uint8(d.lastSeq - seq))
+	rel := uint64(1)
 	if d.pos > back {
-		return d.pos - back, false
+		rel = d.pos - back
 	}
-	return 1, false
+	cand := baseOrder + rel
+	dup := prev.active && prev.ack == msg &&
+		(cand <= prev.streamOrder || cand-prev.streamOrder < 256)
+	return cand, !dup, dup, false
+}
+
+type commandInvokeSpec struct {
+	action     string
+	param1Bits uint32
+	param2Bits uint32
+	param3Bits uint32
+}
+
+type seqResultKey struct {
+	sysid  uint8
+	cmdID  uint16
+	seq    uint8
+	result uint8
+}
+
+type seqResultOrigin struct {
+	seen           bool
+	ambiguousOwner bool
+	spec           commandInvokeSpec
 }
 
 type ackMetaState struct {
@@ -374,6 +484,7 @@ type inFlightCommand struct {
 	sysid           uint8
 	cmdID           uint16
 	action          string
+	invokeSpec      commandInvokeSpec
 	sitlOnly        bool
 	dispatch        cmdDispatchState
 	abortedNote     string
@@ -450,10 +561,12 @@ type Service struct {
 	seenAckFrames           map[uint8]*[256]serviceAckSlot
 	directAckSeq            map[uint8]directSeqTracker
 	lastSeenTrackerAckOrder map[uint8]uint64
+	lastSeenTrackerAckSeq   map[uint8]uint64
 	lastAckIncarnation      map[uint8]string
 	lastAckLinkEpoch        map[uint8]uint64
 	seenAckResultMask       map[cmdKey]uint64
 	seenAckResultMaskBySeq  map[cmdKey]*[256]uint64
+	seenSeqResultOrigin     map[seqResultKey]seqResultOrigin
 	preResetAckResultMask   map[cmdKey]uint64
 	surplusAckTainted       map[cmdKey]bool
 	dispatchedInBoot        map[cmdKey]bool
@@ -564,10 +677,12 @@ func NewService(opts Options) (*Service, error) {
 		seenAckFrames:           make(map[uint8]*[256]serviceAckSlot),
 		directAckSeq:            make(map[uint8]directSeqTracker),
 		lastSeenTrackerAckOrder: make(map[uint8]uint64),
+		lastSeenTrackerAckSeq:   make(map[uint8]uint64),
 		lastAckIncarnation:      make(map[uint8]string),
 		lastAckLinkEpoch:        make(map[uint8]uint64),
 		seenAckResultMask:       make(map[cmdKey]uint64),
 		seenAckResultMaskBySeq:  make(map[cmdKey]*[256]uint64),
+		seenSeqResultOrigin:     make(map[seqResultKey]seqResultOrigin),
 		preResetAckResultMask:   make(map[cmdKey]uint64),
 		surplusAckTainted:       make(map[cmdKey]bool),
 		dispatchedInBoot:        make(map[cmdKey]bool),
@@ -1026,6 +1141,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			sysid:           uint8(ce.SysID),
 			cmdID:           uint16(ce.CmdID),
 			action:          ce.Action,
+			invokeSpec:      commandInvokeSpec{action: ce.Action},
 			sitlOnly:        isSITLOnlyAction(ce.Action),
 			dispatch:        dispatchSent,
 			phase:           PhaseCommitUnknown,
@@ -1450,7 +1566,9 @@ func (s *Service) validateEngageObservationLocked(sysid uint8, session string, r
 		resolvedRev, matched := resolver.ResolveObservation(sysid, req.ObservationRev, req.AuthorityEpoch, req.ObservedMs)
 		if !matched {
 			if st != nil {
-				isPreOverride := st.latched || (st.preemptEpoch > 0 && req.AuthorityEpoch > 0 && req.AuthorityEpoch <= st.preemptEpoch)
+				isPreOverride := st.latched ||
+					(st.preemptEpoch > 0 && req.AuthorityEpoch > 0 && req.AuthorityEpoch <= st.preemptEpoch) ||
+					(st.preemptedAtMs > 0 && req.ObservationRev == 0 && req.ObservedMs > 0 && req.ObservedMs <= st.preemptedAtMs)
 				if !isPreOverride && req.ObservedMs > 0 && st.preemptObsRev > 0 {
 					if anyRev, anyOK := resolver.ResolveObservation(sysid, 0, 0, req.ObservedMs); anyOK && anyRev <= st.preemptObsRev {
 						isPreOverride = true
@@ -2002,6 +2120,12 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		sysid:    req.SysID,
 		cmdID:    spec.msg.Command,
 		action:   actionSlug,
+		invokeSpec: commandInvokeSpec{
+			action:     actionSlug,
+			param1Bits: math.Float32bits(spec.msg.Param1),
+			param2Bits: math.Float32bits(spec.msg.Param2),
+			param3Bits: math.Float32bits(spec.msg.Param3),
+		},
 		sitlOnly: spec.sitlOnly,
 		dispatch: dispatchReserved,
 		phase:    PhasePending,
@@ -2148,7 +2272,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.flushPendingWrites(ctx)
 		s.signalPersistWake()
 		for _, ea := range earlyAcks {
-			s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.ack, ea.observedAt)
+			s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
 		}
 		return CommandResult{}, &ControlError{
 			Status:  http.StatusServiceUnavailable,
@@ -2217,7 +2341,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.signalPersistWake()
 	}
 	for _, ea := range earlyAcks {
-		s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.ack, ea.observedAt)
+		s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
 	}
 	s.signalLeaseWake()
 
@@ -2252,9 +2376,15 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 			delete(s.seenAckResultMaskBySeq, k)
 		}
 	}
+	for k := range s.seenSeqResultOrigin {
+		if k.sysid == sysid {
+			delete(s.seenSeqResultOrigin, k)
+		}
+	}
 	delete(s.seenAckFrames, sysid)
 	delete(s.directAckSeq, sysid)
 	delete(s.lastSeenTrackerAckOrder, sysid)
+	delete(s.lastSeenTrackerAckSeq, sysid)
 }
 
 func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, baselineHbSeq uint64) bool {
@@ -2289,6 +2419,7 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 	obsUTC := observedAt.UTC()
 
 	target, targetOK := s.targets.ActuationTarget(sysid)
+	var ackOrderUncertain bool
 	s.mu.Lock()
 	if targetOK {
 		prevInc := s.lastAckIncarnation[sysid]
@@ -2311,53 +2442,54 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 			s.seenAckFrames[sysid] = slots
 		}
 		fromTracker := targetOK &&
-			target.LastAckOrder > 0 &&
-			target.LastAckOrder != s.lastSeenTrackerAckOrder[sysid]
-		var candidateOrder uint64
-		var advanceDirect bool
-		var nextDirect directSeqTracker
+			target.LastAckSeq > 0 &&
+			target.LastAckSeq != s.lastSeenTrackerAckSeq[sysid]
 		if fromTracker {
-			candidateOrder = target.LastAckOrder
-		} else {
-			nextDirect = s.directAckSeq[sysid]
-			relPos, adv := nextDirect.computePos(seq)
-			advanceDirect = adv
-			if targetOK && target.PacketOrder > 0 {
-				candidateOrder = target.PacketOrder + relPos
-			} else {
-				candidateOrder = relPos
+			candidateOrder := target.LastAckOrder
+			ackOrderUncertain = target.LastAckUncertain
+			prev := slots[seq]
+			if !ackOrderUncertain && prev.active && prev.ack == ack &&
+				(candidateOrder <= prev.streamOrder || candidateOrder-prev.streamOrder < 256) {
+				s.mu.Unlock()
+				return
 			}
-		}
-		prev := slots[seq]
-		if prev.active && prev.ack == ack &&
-			(candidateOrder <= prev.streamOrder || candidateOrder-prev.streamOrder < 256) {
-			s.mu.Unlock()
-			return
-		}
-		if fromTracker {
+			s.lastSeenTrackerAckSeq[sysid] = target.LastAckSeq
 			s.lastSeenTrackerAckOrder[sysid] = target.LastAckOrder
-		} else if advanceDirect {
-			relPos := candidateOrder
-			if targetOK && target.PacketOrder > 0 && relPos > target.PacketOrder {
-				relPos -= target.PacketOrder
+			if !ackOrderUncertain {
+				slots[seq] = serviceAckSlot{
+					active:      true,
+					ack:         ack,
+					streamOrder: candidateOrder,
+				}
 			}
-			nextDirect.hasSeq = true
-			nextDirect.lastSeq = seq
-			nextDirect.pos = relPos
+		} else {
+			var baseOrder uint64
+			if targetOK && target.PacketOrder > 0 {
+				baseOrder = target.PacketOrder
+			}
+			nextDirect := s.directAckSeq[sysid]
+			candOrder, recordSlot, isDup, uncertain := nextDirect.evaluate(seq, ack, baseOrder, slots)
+			if isDup {
+				s.mu.Unlock()
+				return
+			}
+			ackOrderUncertain = uncertain
 			s.directAckSeq[sysid] = nextDirect
-		}
-		slots[seq] = serviceAckSlot{
-			active:      true,
-			ack:         ack,
-			streamOrder: candidateOrder,
+			if recordSlot {
+				slots[seq] = serviceAckSlot{
+					active:      true,
+					ack:         ack,
+					streamOrder: candOrder,
+				}
+			}
 		}
 	}
 	s.mu.Unlock()
 
-	s.processDedupedCommandAck(sysid, seq, hasSeq, ack, obsUTC)
+	s.processDedupedCommandAck(sysid, seq, hasSeq, ackOrderUncertain, ack, obsUTC)
 }
 
-func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.CommandAck, obsUTC time.Time) {
+func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUncertain bool, ack mavcodec.CommandAck, obsUTC time.Time) {
 	updatedMs := obsUTC.UnixMilli()
 	obsNs := obsUTC.UnixNano()
 	key := cmdKey{sysid: sysid, cmdID: ack.Command}
@@ -2368,6 +2500,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 			cmd.earlyAcks = append(cmd.earlyAcks, earlyCommandAck{
 				seq:        seq,
 				hasSeq:     hasSeq,
+				uncertain:  ackOrderUncertain,
 				ack:        ack,
 				observedAt: obsUTC,
 			})
@@ -2399,6 +2532,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 	seenBeforeSeqReset := ack.Result < 64 && (s.preResetAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
 	seqMasks := s.seenAckResultMaskBySeq[key]
 	seenSameSeqResultBefore := hasSeq && seqMasks != nil && ack.Result < 64 && (seqMasks[seq]&(uint64(1)<<ack.Result)) != 0
+	var prevOrigin seqResultOrigin
 	if ack.Result < 64 {
 		s.seenAckResultMask[key] |= uint64(1) << ack.Result
 		if hasSeq {
@@ -2407,6 +2541,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 				s.seenAckResultMaskBySeq[key] = seqMasks
 			}
 			seqMasks[seq] |= uint64(1) << ack.Result
+			seqKey := seqResultKey{sysid: sysid, cmdID: ack.Command, seq: seq, result: ack.Result}
+			prevOrigin = s.seenSeqResultOrigin[seqKey]
+			if len(matches) != 1 || ackOrderUncertain {
+				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, ambiguousOwner: true}
+			} else if !prevOrigin.seen {
+				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, spec: matches[0].invokeSpec}
+			} else if prevOrigin.ambiguousOwner || prevOrigin.spec != matches[0].invokeSpec {
+				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, ambiguousOwner: true}
+			}
 		}
 	}
 	poolMask := poolMaskInt(s.seenAckResultMask[key])
@@ -2442,18 +2585,23 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 	}
 
 	target, targetOK := s.targets.ActuationTarget(sysid)
-	wrapPositiveAmbiguous := false
-	if len(matches) == 1 &&
-		!matches[0].sitlOnly &&
-		ack.Result == mavcodec.MAVResultAccepted &&
-		hasSeq &&
-		seenSameSeqResultBefore {
+	wrapAmbiguous := false
+	if len(matches) == 1 && hasSeq {
 		hasPostDispatchMatchingHB := targetOK &&
 			!target.LinkLost &&
+			!ackOrderUncertain &&
 			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq) &&
-			matchesExpectedVehicleState(matches[0].action, target.Armed, target.CompanionMode, target.Authority)
-		if !hasPostDispatchMatchingHB {
-			wrapPositiveAmbiguous = true
+			matchesExpectedCommandState(matches[0], target)
+		if ackOrderUncertain {
+			wrapAmbiguous = true
+		} else if seenSameSeqResultBefore {
+			if ack.Result == mavcodec.MAVResultAccepted {
+				if !hasPostDispatchMatchingHB {
+					wrapAmbiguous = true
+				}
+			} else if prevOrigin.ambiguousOwner || prevOrigin.spec != matches[0].invokeSpec || hasPostDispatchMatchingHB {
+				wrapAmbiguous = true
+			}
 		}
 	}
 
@@ -2464,7 +2612,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 		s.surplusAckTainted[key] ||
 		seenBeforeSeqReset ||
 		(!hasSeq && seenSameResultBefore) ||
-		wrapPositiveAmbiguous
+		wrapAmbiguous
 
 	if ambiguous {
 		wroteAny := false
@@ -2760,7 +2908,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 						cmd.sysid == ev.SysID &&
 						cmd.phase == PhaseCommitUnknown &&
 						hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
-						matchesExpectedVehicleState(cmd.action, targetForObs.Armed, targetForObs.CompanionMode, targetForObs.Authority) {
+						matchesExpectedCommandState(cmd, targetForObs) {
 						cmd.phase = PhaseConfirmed
 						cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 						delete(s.inFlight, id)
@@ -2968,7 +3116,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		if cmd.phase == PhaseCommitUnknown {
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
 				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
-				matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
+				matchesExpectedCommandState(cmd, target) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
@@ -3050,12 +3198,28 @@ func (s *Service) bootMillis(now time.Time) uint32 {
 	return uint32(ms)
 }
 
+func matchesExpectedCommandState(cmd *inFlightCommand, target mavlink.ActuationTarget) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.action == ActionSITLCRSFOverride {
+		if cmd.invokeSpec.param1Bits != math.Float32bits(2) {
+			return false
+		}
+		if math.Float32frombits(cmd.invokeSpec.param2Bits) > 0 {
+			return target.Authority == uxsvocab.AuthorityDirectCRSFOverride
+		}
+		return target.Authority != uxsvocab.AuthorityDirectCRSFOverride
+	}
+	return matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority)
+}
+
 func matchesExpectedVehicleState(action string, armed bool, companionMode, authority string) bool {
 	switch action {
 	case ActionArm:
 		return armed
 	case ActionDisarm:
-		return !armed || companionMode == uxsvocab.ModeDisarmed
+		return !armed
 	case ActionHoldPosition:
 		return companionMode == uxsvocab.ModeHoldPosition
 	case ActionModeTeleop:

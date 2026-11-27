@@ -137,6 +137,8 @@ type ActuationTarget struct {
 	LinkEpoch               uint64
 	PacketOrder             uint64
 	LastAckOrder            uint64
+	LastAckSeq              uint64
+	LastAckUncertain        bool
 	CompanionMode           string
 	LinkTier                string
 	LinkLost                bool
@@ -168,30 +170,46 @@ type authorityObsRecord struct {
 	obsMs int64
 }
 
+const (
+	maxTrackedObsMs   = 4096
+	ambiguousObsEpoch = ^uint64(0)
+)
+
 type vehicleSession struct {
-	snap           uxsvocab.VehicleSnapshot
-	rev            uint64
-	authorityEpoch uint64
-	obsRev         uint64
-	heartbeatSeq   uint64
-	obsHistory     [256]authorityObsRecord
-	obsIdx         int
-	linkEpoch      uint64
-	hasSeqStream   bool
-	lastStreamSeq  uint8
-	seqStreamPos   uint64
-	lastAckOrder   uint64
-	seenAckFrames  [256]ackFrameSlot
-	lastPacketAt   time.Time
-	lastSeq        uint8
-	lastMsgID      uint32
-	linkLost       bool
-	hasSysStatus   bool
-	hasAttitude    bool
-	hasLocalPos    bool
-	hasGlobalPos   bool
-	hasHeading     bool
-	peerAddr       netip.AddrPort
+	snap             uxsvocab.VehicleSnapshot
+	rev              uint64
+	authorityEpoch   uint64
+	obsRev           uint64
+	heartbeatSeq     uint64
+	obsHistory       [256]authorityObsRecord
+	obsIdx           int
+	obsMsEpoch       map[int64]uint64
+	obsMsOrder       [maxTrackedObsMs]int64
+	obsMsValid       [maxTrackedObsMs]bool
+	obsMsIdx         int
+	linkEpoch        uint64
+	hasSeqStream     bool
+	lastStreamSeq    uint8
+	seqStreamPos     uint64
+	hasPendingGap    bool
+	pendingGapSeq    uint8
+	pendingGapDelta  uint8
+	pendingGapHasAck bool
+	pendingGapAck    mavcodec.CommandAck
+	lastAckOrder     uint64
+	lastAckSeq       uint64
+	lastAckUncertain bool
+	seenAckFrames    [256]ackFrameSlot
+	lastPacketAt     time.Time
+	lastSeq          uint8
+	lastMsgID        uint32
+	linkLost         bool
+	hasSysStatus     bool
+	hasAttitude      bool
+	hasLocalPos      bool
+	hasGlobalPos     bool
+	hasHeading       bool
+	peerAddr         netip.AddrPort
 }
 
 func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
@@ -201,32 +219,141 @@ func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 }
 
-func (s *vehicleSession) computeSeqStreamPos(seq uint8) (pos uint64, advanceHead bool) {
+func (s *vehicleSession) advanceTelemetrySeq(seq uint8) {
 	if !s.hasSeqStream {
-		return 1, true
+		s.hasSeqStream = true
+		s.seqStreamPos = 1
+		s.lastStreamSeq = seq
+		s.hasPendingGap = false
+		s.pendingGapHasAck = false
+		return
+	}
+	if s.hasPendingGap {
+		gapStep := uint8(seq - s.pendingGapSeq)
+		if gapStep >= 1 && gapStep <= 64 {
+			gapOrder := s.seqStreamPos + uint64(s.pendingGapDelta)
+			if s.pendingGapHasAck {
+				s.seenAckFrames[s.pendingGapSeq] = ackFrameSlot{
+					active:      true,
+					ack:         s.pendingGapAck,
+					packetOrder: gapOrder,
+				}
+			}
+			s.seqStreamPos = gapOrder + uint64(gapStep)
+			s.lastStreamSeq = seq
+			s.hasPendingGap = false
+			s.pendingGapHasAck = false
+			return
+		}
+		if gapStep == 0 {
+			return
+		}
+		s.hasPendingGap = false
+		s.pendingGapHasAck = false
 	}
 	delta := uint8(seq - s.lastStreamSeq)
 	if delta == 0 {
-		return s.seqStreamPos, false
+		return
 	}
 	if delta <= 64 {
-		return s.seqStreamPos + uint64(delta), true
+		s.seqStreamPos += uint64(delta)
+		s.lastStreamSeq = seq
+		return
+	}
+	if delta <= 191 {
+		s.hasPendingGap = true
+		s.pendingGapSeq = seq
+		s.pendingGapDelta = delta
+		s.pendingGapHasAck = false
+	}
+}
+
+func (s *vehicleSession) evaluateCommandAckSeq(seq uint8, msg mavcodec.CommandAck) (candPos uint64, advanceHead, clearGap, setGap, recordAckSlot, isDup, uncertain bool) {
+	prevSlot := s.seenAckFrames[seq]
+	if !s.hasSeqStream {
+		return 1, true, true, false, true, false, false
+	}
+	if s.hasPendingGap {
+		gapStep := uint8(seq - s.pendingGapSeq)
+		if gapStep >= 1 && gapStep <= 64 {
+			pos := s.seqStreamPos + uint64(s.pendingGapDelta) + uint64(gapStep)
+			dup := prevSlot.active && prevSlot.ack == msg &&
+				(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
+			return pos, true, true, false, true, dup, false
+		}
+		if gapStep == 0 {
+			fwdPos := s.seqStreamPos + uint64(s.pendingGapDelta)
+			if s.pendingGapHasAck && s.pendingGapAck == msg {
+				return fwdPos, false, false, false, false, true, false
+			}
+			if prevSlot.active && prevSlot.ack == msg {
+				if fwdPos <= prevSlot.packetOrder || fwdPos-prevSlot.packetOrder < 256 {
+					return fwdPos, false, false, false, false, true, false
+				}
+				return fwdPos, false, false, true, false, false, true
+			}
+			return fwdPos, false, false, true, false, false, false
+		}
+	}
+	delta := uint8(seq - s.lastStreamSeq)
+	if delta == 0 {
+		pos := s.seqStreamPos
+		dup := prevSlot.active && prevSlot.ack == msg &&
+			(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
+		return pos, false, false, false, true, dup, false
+	}
+	if delta <= 64 {
+		pos := s.seqStreamPos + uint64(delta)
+		dup := prevSlot.active && prevSlot.ack == msg &&
+			(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
+		return pos, true, true, false, true, dup, false
+	}
+	if delta <= 128 {
+		fwdPos := s.seqStreamPos + uint64(delta)
+		if prevSlot.active && prevSlot.ack == msg {
+			if fwdPos <= prevSlot.packetOrder || fwdPos-prevSlot.packetOrder < 256 {
+				return fwdPos, false, false, false, false, true, false
+			}
+			return fwdPos, false, false, true, false, false, true
+		}
+		return fwdPos, false, false, true, false, false, false
 	}
 	back := uint64(uint8(s.lastStreamSeq - seq))
+	pos := uint64(1)
 	if s.seqStreamPos > back {
-		return s.seqStreamPos - back, false
+		pos = s.seqStreamPos - back
 	}
-	return 1, false
+	dup := prevSlot.active && prevSlot.ack == msg &&
+		(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
+	return pos, false, false, false, true, dup, false
 }
 
 func (s *vehicleSession) recordAuthorityObservation(wallUTC time.Time) {
+	ms := wallUTC.UnixMilli()
 	s.obsRev++
 	s.obsHistory[s.obsIdx] = authorityObsRecord{
 		rev:   s.obsRev,
 		epoch: s.authorityEpoch,
-		obsMs: wallUTC.UnixMilli(),
+		obsMs: ms,
 	}
 	s.obsIdx = (s.obsIdx + 1) % len(s.obsHistory)
+	if s.obsMsEpoch == nil {
+		s.obsMsEpoch = make(map[int64]uint64, 64)
+	}
+	if prevEpoch, seen := s.obsMsEpoch[ms]; !seen {
+		if s.obsMsValid[s.obsMsIdx] {
+			oldMs := s.obsMsOrder[s.obsMsIdx]
+			if s.obsMsEpoch[oldMs] != ambiguousObsEpoch {
+				delete(s.obsMsEpoch, oldMs)
+			}
+		}
+		s.obsMsOrder[s.obsMsIdx] = ms
+		s.obsMsValid[s.obsMsIdx] = true
+		s.obsMsIdx = (s.obsMsIdx + 1) % len(s.obsMsOrder)
+		s.obsMsEpoch[ms] = s.authorityEpoch
+	} else if prevEpoch != s.authorityEpoch {
+		s.obsMsEpoch[ms] = ambiguousObsEpoch
+	}
 }
 
 func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, monoSample time.Time) {
@@ -235,16 +362,15 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 		s.linkEpoch++
 		s.hasSeqStream = false
 		s.seqStreamPos = 0
+		s.hasPendingGap = false
+		s.pendingGapHasAck = false
 		s.lastAckOrder = 0
+		s.lastAckSeq = 0
+		s.lastAckUncertain = false
 		s.seenAckFrames = [256]ackFrameSlot{}
 	}
 	if msgID != mavcodec.MsgIDCommandAck {
-		candPos, advanceHead := s.computeSeqStreamPos(seq)
-		if advanceHead {
-			s.hasSeqStream = true
-			s.seqStreamPos = candPos
-			s.lastStreamSeq = seq
-		}
+		s.advanceTelemetrySeq(seq)
 	}
 	if s.lastPacketAt.IsZero() || !monoSample.Before(s.lastPacketAt) {
 		s.lastPacketAt = monoSample
@@ -405,6 +531,12 @@ func (t *Tracker) IngestDatagram(datagram []byte, peer netip.AddrPort, now time.
 // to UTC for published timestamps.
 func (t *Tracker) IngestFrame(frame mavcodec.Frame, peer netip.AddrPort, now time.Time) IngestOutcome {
 	return t.ingestFrameAt(frame, peer, observedUTC(now), monoOrEpoch(now))
+}
+
+// IngestFrameWithClock processes an already-decoded MAVLink v2 Frame using wallUTC
+// for published UTC timestamps and monoSample for monotonic silence intervals.
+func (t *Tracker) IngestFrameWithClock(frame mavcodec.Frame, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	return t.ingestFrameAt(frame, peer, observedUTC(wallUTC), monoOrEpoch(monoSample))
 }
 
 func (t *Tracker) ingestFrameAt(frame mavcodec.Frame, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
@@ -918,13 +1050,9 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 
 	wasLost := sess.linkLost
 	var candPos uint64
-	var advanceHead bool
-	isDupAck := false
+	var advanceHead, clearGap, setGap, recordAckSlot, isDupAck, ackUncertain bool
 	if !wasLost {
-		candPos, advanceHead = sess.computeSeqStreamPos(seq)
-		prevSlot := sess.seenAckFrames[seq]
-		isDupAck = prevSlot.active && prevSlot.ack == msg &&
-			(candPos <= prevSlot.packetOrder || candPos-prevSlot.packetOrder < 256)
+		candPos, advanceHead, clearGap, setGap, recordAckSlot, isDupAck, ackUncertain = sess.evaluateCommandAckSeq(seq, msg)
 	}
 
 	var events []TransitionEvent
@@ -943,6 +1071,10 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	if wasLost {
 		candPos = 1
 		advanceHead = true
+		clearGap = true
+		setGap = false
+		recordAckSlot = true
+		ackUncertain = false
 		sess.recordAuthorityObservation(wallUTC)
 		events = append(events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
 	}
@@ -954,16 +1086,39 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 			UrgentSKGSync: urgent,
 		}
 	}
+	if clearGap {
+		if sess.hasPendingGap && sess.pendingGapHasAck {
+			sess.seenAckFrames[sess.pendingGapSeq] = ackFrameSlot{
+				active:      true,
+				ack:         sess.pendingGapAck,
+				packetOrder: sess.seqStreamPos + uint64(sess.pendingGapDelta),
+			}
+		}
+		sess.hasPendingGap = false
+		sess.pendingGapHasAck = false
+	} else if setGap {
+		if !sess.hasPendingGap {
+			sess.hasPendingGap = true
+			sess.pendingGapSeq = seq
+			sess.pendingGapDelta = uint8(seq - sess.lastStreamSeq)
+		}
+		sess.pendingGapHasAck = true
+		sess.pendingGapAck = msg
+	}
 	if advanceHead {
 		sess.hasSeqStream = true
 		sess.seqStreamPos = candPos
 		sess.lastStreamSeq = seq
 	}
 	sess.lastAckOrder = candPos
-	sess.seenAckFrames[seq] = ackFrameSlot{
-		active:      true,
-		ack:         msg,
-		packetOrder: candPos,
+	sess.lastAckSeq++
+	sess.lastAckUncertain = ackUncertain
+	if recordAckSlot {
+		sess.seenAckFrames[seq] = ackFrameSlot{
+			active:      true,
+			ack:         msg,
+			packetOrder: candPos,
+		}
 	}
 	ackCopy := msg
 	return IngestOutcome{
@@ -1135,9 +1290,9 @@ func (t *Tracker) admittedSysIDs() []uint8 {
 	return out
 }
 
-func (t *Tracker) evaluateSilenceSysID(sysid uint8, now time.Time) (TransitionEvent, bool) {
-	wallUTC := observedUTC(now)
-	monoSample := monoOrEpoch(now)
+func (t *Tracker) evaluateSilenceSysIDAt(sysid uint8, wallUTC, monoSample time.Time) (TransitionEvent, bool) {
+	wUTC := observedUTC(wallUTC)
+	mSample := monoOrEpoch(monoSample)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1145,7 +1300,7 @@ func (t *Tracker) evaluateSilenceSysID(sysid uint8, now time.Time) (TransitionEv
 	if !ok {
 		return TransitionEvent{}, false
 	}
-	return t.evaluateSessionSilence(sess, wallUTC, monoSample)
+	return t.evaluateSessionSilence(sess, wUTC, mSample)
 }
 
 func (t *Tracker) evaluateSilenceAt(wallUTC, monoSample time.Time) []TransitionEvent {
@@ -1180,7 +1335,11 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	sess.linkEpoch++
 	sess.hasSeqStream = false
 	sess.seqStreamPos = 0
+	sess.hasPendingGap = false
+	sess.pendingGapHasAck = false
 	sess.lastAckOrder = 0
+	sess.lastAckSeq = 0
+	sess.lastAckUncertain = false
 	sess.seenAckFrames = [256]ackFrameSlot{}
 	sess.recordAuthorityObservation(wallUTC)
 	return newLinkTransitionEvent(
@@ -1243,6 +1402,8 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 		LinkEpoch:               sess.linkEpoch,
 		PacketOrder:             sess.seqStreamPos,
 		LastAckOrder:            sess.lastAckOrder,
+		LastAckSeq:              sess.lastAckSeq,
+		LastAckUncertain:        sess.lastAckUncertain,
 		CompanionMode:           sess.snap.CompanionMode,
 		LinkTier:                sess.snap.LinkTier,
 		LinkLost:                sess.linkLost,
@@ -1252,7 +1413,9 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 
 // ResolveObservation resolves an inbound operator observation (optional obsRev,
 // authorityEpoch, and UTC observedMs) to the matching host-monotonic observation
-// revision recorded for sysid.
+// revision recorded for sysid. Timestamp-only lookups (obsRev == 0) whose
+// observedMs was shared across an authority-epoch boundary are rejected as
+// ambiguous so re-engagement requires an explicit current observation revision.
 func (t *Tracker) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -1287,17 +1450,24 @@ func (t *Tracker) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64,
 	if observedMs <= 0 {
 		return 0, false
 	}
+	epochState, seenMs := sess.obsMsEpoch[observedMs]
+	if !seenMs || epochState == ambiguousObsEpoch {
+		return 0, false
+	}
+	if authorityEpoch > 0 && authorityEpoch != epochState {
+		return 0, false
+	}
 	for i := 1; i <= n; i++ {
 		idx := (sess.obsIdx - i + n) % n
 		entry := sess.obsHistory[idx]
 		if entry.rev == 0 {
 			continue
 		}
-		if (authorityEpoch == 0 || entry.epoch == authorityEpoch) && entry.obsMs == observedMs {
+		if entry.epoch == epochState && entry.obsMs == observedMs {
 			return entry.rev, true
 		}
 	}
-	if (authorityEpoch == 0 || sess.authorityEpoch == authorityEpoch) &&
+	if sess.authorityEpoch == epochState &&
 		sess.snap.HeartbeatObservedUnixNs/int64(time.Millisecond) == observedMs {
 		return sess.obsRev, true
 	}

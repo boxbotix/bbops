@@ -2610,4 +2610,132 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
     telemetryStore.disconnect();
     skgStore.disconnect();
   });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("caps overlapping periodic teleop timer renewals at 2 in flight while keeping interactive pad nudges responsive", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-27T20:50:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      const sentTeleops: ControlTeleopRequest[] = [];
+      const pendingRenewals: Array<
+        (res: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void
+      > = [];
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push(req);
+            if (req.engage) {
+              return {
+                ok: true,
+                result: {
+                  sysid: req.sysid,
+                  lease_active: true,
+                  expires_ms: nowMs + 240,
+                },
+              };
+            }
+            return await new Promise((resolve) => {
+              pendingRenewals.push(resolve);
+            });
+          },
+        },
+      });
+
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      expect(sentTeleops).toHaveLength(1);
+
+      // Advance 5 timer ticks (250ms total) while transport responses stall:
+      // periodic timer renewals must cap at 2 in-flight requests (not 5).
+      for (let i = 0; i < 5; i++) {
+        nowMs += 50;
+        telemetryStore.ingestRawFrame(
+          buildTransitionFrame(1, {
+            seq: i + 1,
+            kind: "heartbeat_edge",
+            authority: "companion-teleop",
+            linkTier: "sitl-local",
+            timestamp: nowMs,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(50);
+      }
+      expect(sentTeleops).toHaveLength(3); // 1 engage + 2 capped periodic renewals
+
+      // Interactive pad keydown still dispatches immediately without waiting on timer slots!
+      controller.handlePadKeyDown({ key: "w" });
+      await Promise.resolve();
+      expect(sentTeleops).toHaveLength(4);
+      expect(sentTeleops[3]?.vx).toBeGreaterThan(0);
+
+      // Once 1 periodic renewal resolves, the next timer tick is allowed to send again.
+      pendingRenewals.shift()?.({
+        ok: true,
+        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+      });
+      await Promise.resolve();
+      nowMs += 50;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sentTeleops).toHaveLength(5);
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

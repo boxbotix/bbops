@@ -789,3 +789,221 @@ func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
 		t.Fatalf("boot 4 explicit DENIED after idle ACK consumption = %q, want %q (not commit_unknown)", got, control.PhaseRejected)
 	}
 }
+
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+func TestRuntimeBackwardClockTeleopEngageAndCollidedTimestampFence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 27, 20, 45, 0, 0, time.UTC)
+	clockNs := t0.UnixNano()
+	readClock := func() time.Time {
+		return time.Unix(0, clockNs).UTC()
+	}
+	setClock := func(next time.Time) {
+		clockNs = next.UTC().UnixNano()
+	}
+
+	// Guard wall clock for concurrent runtime HTTP + UDP goroutines.
+	type syncedClock struct {
+		ch chan func()
+	}
+	sc := &syncedClock{ch: make(chan func(), 1)}
+	sc.ch <- func() {}
+	getWall := func() time.Time {
+		tok := <-sc.ch
+		cur := readClock()
+		sc.ch <- tok
+		return cur
+	}
+	putWall := func(next time.Time) {
+		tok := <-sc.ch
+		setClock(next)
+		sc.ch <- tok
+	}
+
+	rt, err := StartEphemeral(ctx, Options{
+		DataDir:   t.TempDir(),
+		Logger:    slog.New(slog.DiscardHandler),
+		Overrides: PortOverrides{MetricsPort: -1},
+		UIDir:     t.TempDir(),
+		Version:   "test-m3.1-wallclock",
+		Now:       getWall,
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = rt.Stop(stopCtx)
+	}()
+	if err := rt.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	bridge := runtimeMAVLinkBridge{comp: &rt.mavlinkIngest}
+	if _, ok := any(bridge).(control.ObservationResolver); !ok {
+		t.Fatal("runtimeMAVLinkBridge must implement control.ObservationResolver")
+	}
+
+	baseURL := rt.Endpoints().HTTPBaseURL
+	udpDst, err := net.ResolveUDPAddr("udp4", rt.Endpoints().MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr: %v", err)
+	}
+	peerConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = peerConn.Close() }()
+
+	sendHB := func(seq uint8, mode mavcodec.CompanionMode, auth mavcodec.ControlAuthority, waitObsRev uint64) {
+		t.Helper()
+		hbMsg, encErr := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+			Armed:        true,
+			SystemStatus: mavcodec.MAVStateActive,
+			Custom: mavcodec.CustomMode{
+				LinkTier:         mavcodec.LinkTierSITLLocal,
+				HealthFlags:      mavcodec.HealthFlags{CRSFLinkHealthy: true, CompanionTrunkHealthy: true},
+				Domain:           mavcodec.DomainQuadcopter,
+				CompanionMode:    mode,
+				ControlAuthority: auth,
+			},
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeVehicleHeartbeat: %v", encErr)
+		}
+		raw, encErr := mavcodec.EncodeFrame(mavcodec.Frame{
+			Sequence:    seq,
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Message:     hbMsg,
+		})
+		if encErr != nil {
+			t.Fatalf("EncodeFrame: %v", encErr)
+		}
+		if _, wErr := peerConn.WriteToUDP(raw, udpDst); wErr != nil {
+			t.Fatalf("WriteToUDP: %v", wErr)
+		}
+		waitDeadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(waitDeadline) {
+			if tgt, ok := rt.MAVLinkIngest().ActuationTarget(1); ok && tgt.ObservationRev >= waitObsRev {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for ObservationRev >= %d", waitObsRev)
+	}
+
+	postTeleopJSON := func(body any) (int, map[string]any) {
+		t.Helper()
+		rawBody, mErr := json.Marshal(body)
+		if mErr != nil {
+			t.Fatalf("json.Marshal: %v", mErr)
+		}
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+control.TeleopFrontDoorPath, bytes.NewReader(rawBody))
+		if rErr != nil {
+			t.Fatalf("NewRequestWithContext: %v", rErr)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, dErr := http.DefaultClient.Do(req)
+		if dErr != nil {
+			t.Fatalf("POST /control/teleop: %v", dErr)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		respBytes, _ := io.ReadAll(resp.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(respBytes, &parsed)
+		return resp.StatusCode, parsed
+	}
+
+	// 1) Admit sysid=1 at t0, engage and stop session s1 over live HTTP /control/teleop.
+	sendHB(1, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, 1)
+	tgt1, _ := rt.MAVLinkIngest().ActuationTarget(1)
+	if code, body := postTeleopJSON(map[string]any{
+		"sysid":                 1,
+		"session":               "host-s1",
+		"seq":                   1,
+		"vx":                    0.4,
+		"engage":                true,
+		"observed_ms":           t0.UnixMilli(),
+		"observation_rev":       tgt1.ObservationRev,
+		"authority_incarnation": tgt1.AuthorityIncarnation,
+		"authority_epoch":       tgt1.AuthorityEpoch,
+	}); code != http.StatusOK {
+		t.Fatalf("initial HTTP Engage status=%d body=%v, want 200", code, body)
+	}
+	if code, body := postTeleopJSON(map[string]any{
+		"sysid":   1,
+		"session": "host-s1",
+		"seq":     2,
+		"stop":    true,
+	}); code != http.StatusOK {
+		t.Fatalf("initial HTTP Stop status=%d body=%v, want 200", code, body)
+	}
+
+	// 2) Step host wall clock BACKWARD by 60 seconds and verify timestamp-only HTTP Engage succeeds
+	// end-to-end through runtimeMAVLinkBridge.ResolveObservation!
+	tBack := t0.Add(-60 * time.Second)
+	putWall(tBack)
+	sendHB(2, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, 2)
+	if code, body := postTeleopJSON(map[string]any{
+		"sysid":       1,
+		"session":     "host-s2-after-backward-step",
+		"seq":         1,
+		"vx":          0.6,
+		"engage":      true,
+		"observed_ms": tBack.UnixMilli(),
+	}); code != http.StatusOK {
+		t.Fatalf("post-backward-clock HTTP Engage (observed_ms only) status=%d body=%v, want 200", code, body)
+	}
+	if code, body := postTeleopJSON(map[string]any{
+		"sysid":   1,
+		"session": "host-s2-after-backward-step",
+		"seq":     2,
+		"stop":    true,
+	}); code != http.StatusOK {
+		t.Fatalf("post-backward-clock HTTP Stop status=%d body=%v, want 200", code, body)
+	}
+
+	// 3) Collided timestamp across authority boundary over live UDP + HTTP:
+	// P2 at tClick -> P1 override at tClick+20ms -> backward clock step landing P2 recovery on tClick!
+	tClick := t0.Add(5 * time.Second)
+	putWall(tClick)
+	sendHB(3, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, 3)
+
+	putWall(tClick.Add(20 * time.Millisecond))
+	sendHB(4, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, 4)
+
+	putWall(tClick)
+	sendHB(5, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, 5)
+	recTgt, _ := rt.MAVLinkIngest().ActuationTarget(1)
+
+	code, body := postTeleopJSON(map[string]any{
+		"sysid":       1,
+		"session":     "host-stale-collided-ts",
+		"seq":         1,
+		"vx":          0.9,
+		"engage":      true,
+		"observed_ms": tClick.UnixMilli(),
+	})
+	errObj, _ := body["error"].(map[string]any)
+	if code != http.StatusConflict || errObj["code"] != "preemption_latched" {
+		t.Fatalf("collided timestamp-only HTTP Engage status=%d body=%v, want 409 preemption_latched", code, body)
+	}
+
+	if code, body := postTeleopJSON(map[string]any{
+		"sysid":                 1,
+		"session":               "host-fresh-explicit-rev",
+		"seq":                   1,
+		"vx":                    0.7,
+		"engage":                true,
+		"observed_ms":           tClick.UnixMilli(),
+		"observation_rev":       recTgt.ObservationRev,
+		"authority_incarnation": recTgt.AuthorityIncarnation,
+		"authority_epoch":       recTgt.AuthorityEpoch,
+	}); code != http.StatusOK {
+		t.Fatalf("explicit observation_rev HTTP Engage status=%d body=%v, want 200", code, body)
+	}
+}
