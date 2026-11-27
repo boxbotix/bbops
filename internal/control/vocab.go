@@ -94,10 +94,10 @@ type CommandEntity struct {
 	SysID      int    `lifecycle:"predicate=uxs.command.sysid"`
 	CmdID      int    `lifecycle:"predicate=uxs.command.cmdid"`
 	Action     string `lifecycle:"predicate=uxs.command.action"`
-	AckResult  int    `lifecycle:"predicate=uxs.command.ackresult"`
+	AckResult  int    `json:"ack_result" lifecycle:"predicate=uxs.command.ackresult,operator_writable"`
 	Detail     string `lifecycle:"predicate=uxs.command.detail"`
 	IssuedMs   int64  `lifecycle:"predicate=uxs.command.issuedms"`
-	UpdatedMs  int64  `lifecycle:"predicate=uxs.command.updatedms"`
+	UpdatedMs  int64  `json:"updated_ms" lifecycle:"predicate=uxs.command.updatedms,operator_writable"`
 }
 
 var _ lifecycle.Participant = (*CommandEntity)(nil)

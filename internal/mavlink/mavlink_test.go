@@ -3062,3 +3062,146 @@ func TestComponentActuationCallbacksAndSendFrame(t *testing.T) {
 		t.Fatal("timed out waiting for onEvent link_lost callback")
 	}
 }
+
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+func TestTrackerDuplicateCommandAckSuppressionAndAuthorityEpoch(t *testing.T) {
+	tracker, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:24551")
+	t0 := time.Date(2026, 11, 27, 16, 0, 0, 0, time.UTC)
+
+	hbAdmit := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	out0 := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    1,
+		Message:     hbAdmit,
+	}, peer, t0)
+	if len(out0.Events) != 0 {
+		t.Fatalf("admission Events = %+v, want none", out0.Events)
+	}
+	if tg, ok := tracker.ActuationTarget(1); !ok || tg.AuthorityEpoch != 1 {
+		t.Fatalf("ActuationTarget after admission = (%+v, %v), want AuthorityEpoch=1", tg, ok)
+	}
+
+	// First #77 COMMAND_ACK at Sequence=42 is emitted with CommandAckSeq=42.
+	ackMsg := mavcodec.CommandAck{
+		Command: mavcodec.MAVCmdComponentArmDisarm,
+		Result:  mavcodec.MAVResultAccepted,
+	}
+	outAck1 := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    42,
+		Message:     ackMsg,
+	}, peer, t0.Add(10*time.Millisecond))
+	if outAck1.CommandAck == nil || outAck1.CommandAckSeq != 42 || *outAck1.CommandAck != ackMsg {
+		t.Fatalf("first COMMAND_ACK outcome = %+v, want CommandAckSeq=42 Accepted", outAck1)
+	}
+
+	// Exact duplicate delivery of Sequence=42 MUST be suppressed (CommandAck == nil, not counted as error).
+	outAckDup := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    42,
+		Message:     ackMsg,
+	}, peer, t0.Add(20*time.Millisecond))
+	if !outAckDup.Accepted || outAckDup.CountedError || outAckDup.CommandAck != nil {
+		t.Fatalf("duplicate COMMAND_ACK outcome = %+v, want Accepted=true CommandAck=nil", outAckDup)
+	}
+
+	// Distinct Sequence=43 with the same payload IS delivered.
+	outAck2 := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    43,
+		Message:     ackMsg,
+	}, peer, t0.Add(30*time.Millisecond))
+	if outAck2.CommandAck == nil || outAck2.CommandAckSeq != 43 {
+		t.Fatalf("distinct Sequence=43 COMMAND_ACK outcome = %+v, want CommandAckSeq=43", outAck2)
+	}
+
+	// After 256 intervening accepted frames (uint8 sequence wraparound), Sequence=42 IS delivered again.
+	for i := 0; i < 256; i++ {
+		tracker.IngestFrame(mavcodec.Frame{
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Sequence:    uint8(44 + i),
+			Message:     hbAdmit,
+		}, peer, t0.Add(time.Duration(40+i)*time.Millisecond))
+	}
+	outAckWrapped := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    42,
+		Message:     ackMsg,
+	}, peer, t0.Add(400*time.Millisecond))
+	if outAckWrapped.CommandAck == nil || outAckWrapped.CommandAckSeq != 42 {
+		t.Fatalf("wrapped Sequence=42 COMMAND_ACK after 256 packets = %+v, want delivered", outAckWrapped)
+	}
+
+	// Authority transition P2 -> P1 increments AuthorityEpoch (1 -> 2), P1 -> P2 increments (2 -> 3),
+	// link_lost increments (3 -> 4), and link_restored increments (4 -> 5) while resetting ACK dedup slots!
+	hbOverride := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityDirectCRSFOverride,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	outOv := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    50,
+		Message:     hbOverride,
+	}, peer, t0.Add(500*time.Millisecond))
+	if len(outOv.Events) != 1 || outOv.Events[0].AuthorityEpoch != 2 {
+		t.Fatalf("override AuthorityEpoch = %+v, want 2", outOv.Events)
+	}
+
+	outRec := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    51,
+		Message:     hbAdmit,
+	}, peer, t0.Add(550*time.Millisecond))
+	if len(outRec.Events) != 1 || outRec.Events[0].AuthorityEpoch != 3 {
+		t.Fatalf("recovery AuthorityEpoch = %+v, want 3", outRec.Events)
+	}
+
+	lostEvs := tracker.EvaluateSilence(t0.Add(5 * time.Second))
+	if len(lostEvs) != 1 || lostEvs[0].AuthorityEpoch != 4 {
+		t.Fatalf("link_lost AuthorityEpoch = %+v, want 4", lostEvs)
+	}
+
+	// Re-admit after link_lost: AuthorityEpoch advances to 5, and Sequence=42 is accepted cleanly on the new link session.
+	outRestored := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    1,
+		Message:     hbAdmit,
+	}, peer, t0.Add(6*time.Second))
+	if len(outRestored.Events) == 0 || outRestored.Events[0].AuthorityEpoch != 5 {
+		t.Fatalf("link_restored AuthorityEpoch = %+v, want 5", outRestored.Events)
+	}
+	outPostRestoreAck := tracker.IngestFrame(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    42,
+		Message:     ackMsg,
+	}, peer, t0.Add(6100*time.Millisecond))
+	if outPostRestoreAck.CommandAck == nil {
+		t.Fatal("expected Sequence=42 COMMAND_ACK to be delivered after link_lost/link_restored reset")
+	}
+}

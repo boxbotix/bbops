@@ -102,6 +102,8 @@ export interface ControlTeleopRequest {
   readonly yaw_rate: number;
   readonly engage?: boolean;
   readonly stop?: boolean;
+  readonly observed_ms?: number;
+  readonly authority_epoch?: number;
 }
 
 export interface ControlTeleopWireResult {
@@ -156,6 +158,8 @@ export interface LiveActuationSafety {
   readonly linkLost: boolean;
   readonly fresh: boolean;
   readonly statusLabel: string;
+  readonly stateObservedMs: number | null;
+  readonly authorityEpoch?: number;
   readonly isSupervisoryOnly: boolean;
   readonly isSitlLocal: boolean;
   readonly isHardwarePreempted: boolean;
@@ -525,9 +529,24 @@ export function resolveLiveActuationSafety(
   const skgStateMs = vehicle.stateObservedAt
     ? Date.parse(vehicle.stateObservedAt)
     : Number.NaN;
+  const fallbackObsIso = vehicle.stateObservedAt || vehicle.observedAt;
+  const fallbackObsMs = fallbackObsIso
+    ? Date.parse(fallbackObsIso)
+    : Number.NaN;
   const useEventOverlay =
     latestEv !== null &&
     (Number.isNaN(skgStateMs) || latestEv.timestamp >= skgStateMs);
+  const stateObservedMs = useEventOverlay
+    ? latestEv.timestamp
+    : Number.isFinite(fallbackObsMs)
+      ? fallbackObsMs
+      : null;
+  const authorityEpoch =
+    useEventOverlay &&
+    latestEv.authority_epoch !== undefined &&
+    latestEv.authority_epoch > 0
+      ? latestEv.authority_epoch
+      : undefined;
 
   const armed = useEventOverlay ? latestEv.armed : vehicle.armed;
   const authority = useEventOverlay ? latestEv.authority : vehicle.authority;
@@ -576,6 +595,8 @@ export function resolveLiveActuationSafety(
     linkLost,
     fresh: freshness.fresh,
     statusLabel: freshness.statusLabel,
+    stateObservedMs,
+    ...(authorityEpoch !== undefined ? { authorityEpoch } : {}),
     isSupervisoryOnly,
     isSitlLocal,
     isHardwarePreempted,
@@ -674,6 +695,7 @@ export function createActuationController(
   let engageCounter = 0;
   let engagedEntityId: string | null = null;
   let engagedSession: string | null = null;
+  let leaseAccepted = false;
   let teleopSeq = 0;
   let lastFreshnessContext: FleetFreshnessContext | undefined;
 
@@ -717,6 +739,7 @@ export function createActuationController(
     engagedSysId = null;
     engagedEntityId = null;
     engagedSession = null;
+    leaseAccepted = false;
     teleopSeq = 0;
     resetStickState();
   }
@@ -822,11 +845,12 @@ export function createActuationController(
   async function dispatchTeleopNudge(
     sysid: number,
     engageFlag: boolean,
+    engageMeta?: { observedMs: number | null; authorityEpoch?: number },
   ): Promise<boolean> {
     if (engagedSysId !== sysid || engagedSession === null) {
       return false;
     }
-    if (!engageFlag && !verifyEngagedVehicleLive(sysid)) {
+    if (!engageFlag && (!leaseAccepted || !verifyEngagedVehicleLive(sysid))) {
       return false;
     }
     const session = engagedSession;
@@ -844,6 +868,14 @@ export function createActuationController(
       vz: currentAxes.vz,
       yaw_rate: currentAxes.yawRate,
       engage: engageFlag || undefined,
+      ...(engageFlag &&
+      engageMeta?.observedMs !== null &&
+      engageMeta?.observedMs !== undefined
+        ? { observed_ms: Math.trunc(engageMeta.observedMs) }
+        : {}),
+      ...(engageFlag && engageMeta?.authorityEpoch !== undefined
+        ? { authority_epoch: engageMeta.authorityEpoch }
+        : {}),
     });
     if (!res.ok) {
       if (
@@ -868,7 +900,20 @@ export function createActuationController(
       }
       return false;
     }
-    return engagedSession === session && engagedSysId === sysid;
+    if (engagedSession !== session || engagedSysId !== sysid) {
+      return false;
+    }
+    if (engageFlag) {
+      if (!verifyEngagedVehicleLive(sysid)) {
+        return false;
+      }
+      leaseAccepted = true;
+      startTeleopTimer(sysid);
+      if (heldKeys.size > 0) {
+        void dispatchTeleopNudge(sysid, false);
+      }
+    }
+    return true;
   }
 
   function startTeleopTimer(sysid: number): void {
@@ -1090,6 +1135,7 @@ export function createActuationController(
       return false;
     }
 
+    stopTeleopTimer();
     lastError = null;
     preemptBySysId.delete(vehicle.sysid);
     engageCounter += 1;
@@ -1098,11 +1144,14 @@ export function createActuationController(
     engagedSysId = vehicle.sysid;
     engagedEntityId = vehicle.id;
     engagedSession = session;
+    leaseAccepted = false;
     teleopSeq = 0;
     resetStickState();
 
-    startTeleopTimer(vehicle.sysid);
-    const ok = await dispatchTeleopNudge(vehicle.sysid, true);
+    const ok = await dispatchTeleopNudge(vehicle.sysid, true, {
+      observedMs: safety.stateObservedMs,
+      authorityEpoch: safety.authorityEpoch,
+    });
     if (!ok || engagedSysId !== vehicle.sysid || engagedSession !== session) {
       if (engagedSysId === vehicle.sysid && engagedSession === session) {
         clearEngagedSessionLocal();
@@ -1141,7 +1190,7 @@ export function createActuationController(
     } else {
       axes = ZERO_TELEOP_AXES;
     }
-    if (engagedSysId !== null) {
+    if (engagedSysId !== null && leaseAccepted) {
       void dispatchTeleopNudge(engagedSysId, false);
     }
   }
@@ -1172,7 +1221,9 @@ export function createActuationController(
     }
     heldKeys.add(classified);
     recomputeKeyboardAxes();
-    void dispatchTeleopNudge(engagedSysId, false);
+    if (leaseAccepted) {
+      void dispatchTeleopNudge(engagedSysId, false);
+    }
     return true;
   }
 
@@ -1188,7 +1239,7 @@ export function createActuationController(
     event.stopPropagation?.();
     heldKeys.delete(classified);
     recomputeKeyboardAxes();
-    if (engagedSysId !== null) {
+    if (engagedSysId !== null && leaseAccepted) {
       void dispatchTeleopNudge(engagedSysId, false);
     }
     return true;

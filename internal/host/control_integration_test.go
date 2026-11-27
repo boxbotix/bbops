@@ -305,7 +305,7 @@ func TestRuntimeControlEndpointsAndLifecycleCAS(t *testing.T) {
 
 // spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
 func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	retainedDataDir := t.TempDir()
@@ -591,7 +591,11 @@ func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartEphemeral boot 3: %v", err)
 	}
+	rt3Stopped := false
 	defer func() {
+		if rt3Stopped {
+			return
+		}
 		stopCtx3, stopCancel3 := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stopCancel3()
 		_ = rt3.Stop(stopCtx3)
@@ -664,5 +668,124 @@ func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
 	}
 	if got := readKVPhase(rt3, cmdBoot3.CommandID); got != control.PhaseCommitUnknown {
 		t.Fatalf("boot 3 failed to preserve terminal heartbeat-reconciled ACK ambiguity: phase=%q, want commit_unknown", got)
+	}
+
+	// Reconcile cmdBoot3 via #0 HEARTBEAT (ModeHoldPosition), then deliver cmdBoot3's sole late #77 ACCEPTED
+	// while idle so LifecycleStore.RecordConsumedAck (UpdateFromOperator) persists AckResult != -1 in JetStream!
+	hbBoot3Loiter, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    7,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message:     hbMsg2,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame hbBoot3Loiter: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(hbBoot3Loiter, udpDst3); err != nil {
+		t.Fatalf("WriteToUDP hbBoot3Loiter: %v", err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt3, cmdBoot3.CommandID) != control.PhaseConfirmed {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readKVPhase(rt3, cmdBoot3.CommandID); got != control.PhaseConfirmed {
+		t.Fatalf("boot 3 failed to reconcile cmdBoot3 via ModeHoldPosition heartbeat: phase=%q", got)
+	}
+
+	idleAckBoot3, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    8,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message: mavcodec.CommandAck{
+			Command: mavcodec.MAVCmdNavLoiterUnlim,
+			Result:  mavcodec.MAVResultAccepted,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame idleAckBoot3: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(idleAckBoot3, udpDst3); err != nil {
+		t.Fatalf("WriteToUDP idleAckBoot3: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	// Boot #4 on the SAME retainedDataDir: both prior Loiter commands have now consumed their ACKs
+	// durably in JetStream ENTITY_STATES, so a new Hold-Position command receiving explicit DENIED
+	// MUST transition to PhaseRejected (NOT commit_unknown)!
+	stopCtx3Explicit, stopCancel3Explicit := context.WithTimeout(ctx, 10*time.Second)
+	stopErr3 := rt3.Stop(stopCtx3Explicit)
+	stopCancel3Explicit()
+	rt3Stopped = true
+	if stopErr3 != nil {
+		t.Fatalf("Stop boot 3: %v", stopErr3)
+	}
+
+	rt4, err := StartEphemeral(ctx, Options{
+		DataDir:   retainedDataDir,
+		Logger:    slog.New(slog.DiscardHandler),
+		Overrides: PortOverrides{MetricsPort: -1},
+		UIDir:     uiDir,
+		Version:   "test-m3.1-boot4",
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral boot 4: %v", err)
+	}
+	defer func() {
+		stopCtx4, stopCancel4 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel4()
+		_ = rt4.Stop(stopCtx4)
+	}()
+	if err := rt4.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady boot 4: %v", err)
+	}
+
+	udpDst4, err := net.ResolveUDPAddr("udp4", rt4.Endpoints().MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr boot 4: %v", err)
+	}
+	hb4, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    9,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message:     hbMsg3,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame hb4: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(hb4, udpDst4); err != nil {
+		t.Fatalf("WriteToUDP hb4: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if target, ok := rt4.MAVLinkIngest().ActuationTarget(1); ok && target.Armed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	cmdBoot4 := postCommand(rt4.Endpoints().HTTPBaseURL, `{"sysid":1,"action":"hold-position"}`)
+	_ = readPeerFrames(2, 100*time.Millisecond)
+
+	deniedAckBoot4, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    10,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message: mavcodec.CommandAck{
+			Command: mavcodec.MAVCmdNavLoiterUnlim,
+			Result:  mavcodec.MAVResultDenied,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame deniedAckBoot4: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(deniedAckBoot4, udpDst4); err != nil {
+		t.Fatalf("WriteToUDP deniedAckBoot4: %v", err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt4, cmdBoot4.CommandID) != control.PhaseRejected {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readKVPhase(rt4, cmdBoot4.CommandID); got != control.PhaseRejected {
+		t.Fatalf("boot 4 explicit DENIED after idle ACK consumption = %q, want %q (not commit_unknown)", got, control.PhaseRejected)
 	}
 }

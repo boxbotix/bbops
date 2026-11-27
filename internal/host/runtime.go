@@ -271,7 +271,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 
 	compReg := component.NewRegistry()
 	if err := registerComponentsWithHook(compReg, func(c *mavlink.Component) {
-		c.SetActuationCallbacks(ctrlSvc.OnTransitionEvent, ctrlSvc.OnCommandAck)
+		c.SetActuationFrameCallbacks(ctrlSvc.OnTransitionEvent, ctrlSvc.OnCommandAckFrame)
 		rt.mavlinkIngest.Store(c)
 	}); err != nil {
 		return cleanup(err)

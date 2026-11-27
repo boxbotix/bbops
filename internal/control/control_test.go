@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,6 +172,19 @@ func (s *fakeCommandStore) Transition(
 		detail:    detail,
 		updatedMs: updatedMs,
 	})
+	return nil
+}
+
+func (s *fakeCommandStore) RecordConsumedAck(_ context.Context, entityID string, ackResult int, updatedMs int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.entities[entityID]
+	if !ok {
+		return errors.New("unknown entity ID")
+	}
+	cur.AckResult = ackResult
+	cur.UpdatedMs = updatedMs
+	s.entities[entityID] = cur
 	return nil
 }
 
@@ -653,6 +667,7 @@ func TestServiceDiscreteCommandsCommitUnknownAndPreemption(t *testing.T) {
 	// Authority returns to companion-teleop, but un-engaged teleop nudges MUST fail until explicit Engage=true!
 	now = now.Add(100 * time.Millisecond)
 	target.Authority = uxsvocab.AuthorityCompanionTeleop
+	target.HeartbeatObservedUnixNs = now.UnixNano()
 	targets.set(target)
 	svc.OnTransitionEvent(mavlink.TransitionEvent{
 		Kind:          mavlink.EventKindHeartbeatEdge,
@@ -667,7 +682,12 @@ func TestServiceDiscreteCommandsCommitUnknownAndPreemption(t *testing.T) {
 	if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{SysID: 3, Vx: 0.8}); !errors.As(err, &ce) || ce.Code != "preemption_latched" {
 		t.Fatalf("un-engaged teleop after preemption got err=%v, want preemption_latched", err)
 	}
-	if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{SysID: 3, Vx: 0.8, Engage: true}); err != nil {
+	if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+		SysID:      3,
+		Vx:         0.8,
+		Engage:     true,
+		ObservedMs: now.UnixMilli(),
+	}); err != nil {
 		t.Fatalf("explicit Engage=true teleop after preemption failed: %v", err)
 	}
 	if svc.IsPreempted(3) || !svc.HasActiveLease(3) {
@@ -686,6 +706,7 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 		sawHeartbeatReconcile     int
 		sawPreemptionLatch        int
 		sawExplicitReengage       int
+		sawDuplicateAckIgnored    int
 	)
 
 	tiers := []string{
@@ -729,6 +750,7 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 			EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
 			Domain:                  uxsvocab.DomainQuadcopter,
 			Authority:               uxsvocab.AuthorityCompanionTeleop,
+			AuthorityEpoch:          1,
 			CompanionMode:           uxsvocab.ModeTeleopVelocity,
 			LinkTier:                uxsvocab.LinkTierSITLLocal,
 			Armed:                   true,
@@ -747,18 +769,27 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 			refUnackedCount   int
 			refCmdDeadline    time.Time
 			refCmdUnknownNs   int64
+			ackSeq            uint8
+			hasPrevAck        bool
+			prevAckSeq        uint8
+			prevAck           mavcodec.CommandAck
 		)
 
 		for step := 0; step < 65; step++ {
 			switch rng.Intn(6) {
 			case 0: // SubmitTeleop
+				if refLeaseActive && !now.Before(refLeaseExpiresAt) {
+					refLeaseActive = false
+				}
 				engage := rng.Intn(2) == 0
 				stop := !engage && rng.Intn(5) == 0
 				_, callErr := svc.SubmitTeleop(context.Background(), TeleopRequest{
-					SysID:  1,
-					Vx:     0.6,
-					Engage: engage,
-					Stop:   stop,
+					SysID:          1,
+					Vx:             0.6,
+					Engage:         engage,
+					Stop:           stop,
+					AuthorityEpoch: curTarget.AuthorityEpoch,
+					ObservedMs:     curTarget.HeartbeatObservedUnixNs / int64(time.Millisecond),
 				})
 				if stop {
 					refLeaseActive = false
@@ -822,17 +853,27 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 					t.Fatalf("seed %d step %d expected command refusal", seed, step)
 				}
 
-			case 2: // Inbound #77 COMMAND_ACK
+			case 2: // Inbound #77 COMMAND_ACK (including duplicate packet replays)
+				if hasPrevAck && rng.Intn(3) == 0 {
+					svc.OnCommandAckFrame(1, prevAckSeq, prevAck, now)
+					sawDuplicateAckIgnored++
+					break
+				}
 				if refCmdID != "" && (refCmdPhase == PhasePending || refCmdPhase == PhaseCommitUnknown) {
 					accept := rng.Intn(2) == 0
 					ackRes := mavcodec.MAVResultDenied
 					if accept {
 						ackRes = mavcodec.MAVResultAccepted
 					}
-					svc.OnCommandAck(1, mavcodec.CommandAck{
+					ackSeq++
+					ack := mavcodec.CommandAck{
 						Command: mavcodec.MAVCmdNavLoiterUnlim,
 						Result:  ackRes,
-					}, now)
+					}
+					svc.OnCommandAckFrame(1, ackSeq, ack, now)
+					hasPrevAck = true
+					prevAckSeq = ackSeq
+					prevAck = ack
 					wasAmbiguous := refCmdAmbiguous || refUnackedCount > 1
 					if refUnackedCount > 0 {
 						refUnackedCount--
@@ -860,19 +901,35 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 					if rng.Intn(2) == 0 {
 						ackRes = mavcodec.MAVResultDenied
 					}
-					svc.OnCommandAck(1, mavcodec.CommandAck{
+					ackSeq++
+					ack := mavcodec.CommandAck{
 						Command: mavcodec.MAVCmdNavLoiterUnlim,
 						Result:  ackRes,
-					}, now)
+					}
+					svc.OnCommandAckFrame(1, ackSeq, ack, now)
+					hasPrevAck = true
+					prevAckSeq = ackSeq
+					prevAck = ack
 					refUnackedCount--
 				}
 
 			case 3: // Inbound vehicle state / link transition
 				now = now.Add(5 * time.Millisecond)
+				if refLeaseActive && !now.Before(refLeaseExpiresAt) {
+					refLeaseActive = false
+				}
+				prevLinkLost := curTarget.LinkLost
+				prevTier := curTarget.LinkTier
+				prevAuth := curTarget.Authority
+				prevArmed := curTarget.Armed
 				curTarget.LinkLost = rng.Intn(6) == 0
 				curTarget.LinkTier = tiers[rng.Intn(len(tiers))]
 				curTarget.Authority = authorities[rng.Intn(len(authorities))]
 				curTarget.Armed = rng.Intn(5) != 0
+				if prevLinkLost != curTarget.LinkLost || prevTier != curTarget.LinkTier ||
+					prevAuth != curTarget.Authority || prevArmed != curTarget.Armed {
+					curTarget.AuthorityEpoch++
+				}
 				if rng.Intn(2) == 0 {
 					curTarget.CompanionMode = uxsvocab.ModeHoldPosition
 				} else {
@@ -880,23 +937,28 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 				}
 				if !curTarget.LinkLost {
 					curTarget.HeartbeatObservedUnixNs = now.UTC().UnixNano()
+				} else {
+					hasPrevAck = false
 				}
 				targets.set(curTarget)
 
 				kind := mavlink.EventKindHeartbeatEdge
 				if curTarget.LinkLost {
 					kind = mavlink.EventKindLinkLost
+				} else if prevLinkLost {
+					kind = mavlink.EventKindLinkRestored
 				}
 				svc.OnTransitionEvent(mavlink.TransitionEvent{
-					Kind:          kind,
-					MsgID:         mavcodec.MsgIDHeartbeat,
-					SysID:         1,
-					EntityID:      curTarget.EntityID,
-					Authority:     curTarget.Authority,
-					CompanionMode: curTarget.CompanionMode,
-					LinkTier:      curTarget.LinkTier,
-					Armed:         curTarget.Armed,
-					Timestamp:     now.UnixMilli(),
+					Kind:           kind,
+					MsgID:          mavcodec.MsgIDHeartbeat,
+					SysID:          1,
+					EntityID:       curTarget.EntityID,
+					Authority:      curTarget.Authority,
+					AuthorityEpoch: curTarget.AuthorityEpoch,
+					CompanionMode:  curTarget.CompanionMode,
+					LinkTier:       curTarget.LinkTier,
+					Armed:          curTarget.Armed,
+					Timestamp:      now.UnixMilli(),
 				})
 
 				isPreempt := curTarget.LinkLost ||
@@ -973,10 +1035,11 @@ func TestPropertyControlHistoryAgainstReferenceModel(t *testing.T) {
 	}
 
 	if sawTeleopAccepted == 0 || sawLeaseExpiryZero == 0 || sawMeshSupervisoryRefusal == 0 ||
-		sawCommitUnknown == 0 || sawHeartbeatReconcile == 0 || sawPreemptionLatch == 0 || sawExplicitReengage == 0 {
-		t.Fatalf("insufficient property boundary reach: teleop=%d expiryZero=%d meshRefusal=%d unknown=%d reconcile=%d latch=%d reengage=%d",
+		sawCommitUnknown == 0 || sawHeartbeatReconcile == 0 || sawPreemptionLatch == 0 ||
+		sawExplicitReengage == 0 || sawDuplicateAckIgnored == 0 {
+		t.Fatalf("insufficient property boundary reach: teleop=%d expiryZero=%d meshRefusal=%d unknown=%d reconcile=%d latch=%d reengage=%d dupAck=%d",
 			sawTeleopAccepted, sawLeaseExpiryZero, sawMeshSupervisoryRefusal,
-			sawCommitUnknown, sawHeartbeatReconcile, sawPreemptionLatch, sawExplicitReengage)
+			sawCommitUnknown, sawHeartbeatReconcile, sawPreemptionLatch, sawExplicitReengage, sawDuplicateAckIgnored)
 	}
 }
 
@@ -1186,19 +1249,22 @@ func TestServicePreemptionAndPeerChangeFenceBeforeTransmit(t *testing.T) {
 
 	// 1d. #84 SET_POSITION_TARGET_LOCAL_NED: pinned peer changes right before #84 write.
 	now = now.Add(2 * time.Second)
-	targets.set(baseTarget)
+	recoveredTarget := baseTarget
+	recoveredTarget.HeartbeatObservedUnixNs = now.UnixNano()
+	targets.set(recoveredTarget)
 	sender.onSend = func(frame mavcodec.Frame, _ netip.AddrPort) error {
 		if _, isHB := frame.Message.(mavcodec.Heartbeat); isHB {
-			tg := baseTarget
+			tg := recoveredTarget
 			tg.PeerAddr = peerB
 			targets.set(tg)
 		}
 		return nil
 	}
 	_, err = svc.SubmitTeleop(context.Background(), TeleopRequest{
-		SysID:  1,
-		Vx:     2.5,
-		Engage: true,
+		SysID:      1,
+		Vx:         2.5,
+		Engage:     true,
+		ObservedMs: now.UnixMilli(),
 	})
 	if !errors.As(err, &ce) || ce.Code != "vehicle_peer_changed" {
 		t.Fatalf("SubmitTeleop peer-changed before #84 write got err=%v, want vehicle_peer_changed", err)
@@ -2533,7 +2599,7 @@ func TestServiceReservedCommandNotAckEligibleBeforeDispatch(t *testing.T) {
 			return
 		}
 		now = now.Add(1400 * time.Millisecond)
-		svc.OnCommandAck(1, mavcodec.CommandAck{
+		svc.OnCommandAckFrame(1, 10, mavcodec.CommandAck{
 			Command: mavcodec.MAVCmdComponentArmDisarm,
 			Result:  mavcodec.MAVResultAccepted,
 		}, now)
@@ -2559,9 +2625,9 @@ func TestServiceReservedCommandNotAckEligibleBeforeDispatch(t *testing.T) {
 		t.Fatalf("Disarm timed out 200ms after UDP dispatch (used pre-Create timestamp): %+v", ent)
 	}
 
-	// Unambiguous #77 ACCEPTED for Disarm now confirms Disarm cleanly because Arm was already ACKed before Disarm dispatched!
+	// Unambiguous #77 ACCEPTED frame (distinct seq=11) for Disarm now confirms Disarm cleanly because Arm was already ACKed before Disarm dispatched!
 	now = now.Add(50 * time.Millisecond)
-	svc.OnCommandAck(1, mavcodec.CommandAck{
+	svc.OnCommandAckFrame(1, 11, mavcodec.CommandAck{
 		Command: mavcodec.MAVCmdComponentArmDisarm,
 		Result:  mavcodec.MAVResultAccepted,
 	}, now)
@@ -3233,6 +3299,7 @@ func TestServiceRevokedTeleopSessionCannotReengageWithoutFreshSession(t *testing
 
 	now = now.Add(20 * time.Millisecond)
 	target.Authority = uxsvocab.AuthorityCompanionTeleop
+	target.HeartbeatObservedUnixNs = now.UnixNano()
 	targets.set(target)
 	svc.OnTransitionEvent(mavlink.TransitionEvent{
 		Kind:      mavlink.EventKindHeartbeatEdge,
@@ -3262,11 +3329,12 @@ func TestServiceRevokedTeleopSessionCannotReengageWithoutFreshSession(t *testing
 
 	// Fresh operator click minting session "s1-e2" clears preemption latch and engages cleanly!
 	if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
-		SysID:   1,
-		Session: "s1-e2",
-		Seq:     1,
-		Vx:      0.8,
-		Engage:  true,
+		SysID:      1,
+		Session:    "s1-e2",
+		Seq:        1,
+		Vx:         0.8,
+		Engage:     true,
+		ObservedMs: now.UnixMilli(),
 	}); err != nil {
 		t.Fatalf("fresh session s1-e2 Engage=true failed: %v", err)
 	}
@@ -3423,5 +3491,516 @@ func TestServiceBlockedVehicleWriterDoesNotStarveOtherVehicleDeadman(t *testing.
 	releaseOnce.Do(func() { close(releaseVeh1Send) })
 	if err := <-veh1RenewDone; err != nil {
 		t.Fatalf("vehicle 1 renewal after release failed: %v", err)
+	}
+}
+
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+func TestServiceDuplicateCommandAckBeforeAndAfterDisarmNeverConfirmsArmedVehicle(t *testing.T) {
+	// Subcase A: Sequenced MAVLink #77 frames (OnCommandAckFrame) — duplicate Arm ACK delivered
+	// BOTH before Disarm (while idle) AND after Disarm (while Disarm is pending) without resending either command.
+	t.Run("sequenced_frames_before_and_after_disarm", func(t *testing.T) {
+		targets := newFakeTargetSource()
+		sender := &fakeFrameSender{}
+		store := newFakeCommandStore()
+		now := time.Date(2026, 11, 27, 16, 10, 0, 0, time.UTC)
+
+		svc, err := NewService(Options{
+			Org:               "boxbotix",
+			Platform:          "bbops",
+			Targets:           targets,
+			Sender:            sender,
+			Store:             store,
+			Now:               func() time.Time { return now },
+			CommandAckTimeout: 1500 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewService: %v", err)
+		}
+
+		peer := netip.MustParseAddrPort("127.0.0.1:19901")
+		target := mavlink.ActuationTarget{
+			SysID:                   1,
+			EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
+			Domain:                  uxsvocab.DomainQuadcopter,
+			Authority:               uxsvocab.AuthorityCompanionTeleop,
+			CompanionMode:           uxsvocab.ModeTeleopVelocity,
+			LinkTier:                uxsvocab.LinkTierSITLLocal,
+			Armed:                   false,
+			PeerAddr:                peer,
+			HeartbeatObservedUnixNs: now.UnixNano(),
+		}
+		targets.set(target)
+
+		armRes, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionArm})
+		if err != nil {
+			t.Fatalf("SubmitCommand Arm: %v", err)
+		}
+		armAck := mavcodec.CommandAck{
+			Command: mavcodec.MAVCmdComponentArmDisarm,
+			Result:  mavcodec.MAVResultAccepted,
+		}
+		now = now.Add(20 * time.Millisecond)
+		svc.OnCommandAckFrame(1, 71, armAck, now)
+		if ent, _ := store.get(armRes.CommandID); ent.PhaseState != PhaseConfirmed {
+			t.Fatalf("Arm after seq=71 ACK = %+v, want confirmed", ent)
+		}
+
+		// Vehicle transitions to Armed=true.
+		now = now.Add(10 * time.Millisecond)
+		target.Armed = true
+		target.HeartbeatObservedUnixNs = now.UnixNano()
+		targets.set(target)
+
+		// Replay duplicate Arm ACK (seq=71) BEFORE Disarm while idle.
+		now = now.Add(10 * time.Millisecond)
+		svc.OnCommandAckFrame(1, 71, armAck, now)
+
+		// Submit Disarm (vehicle still reports Armed=true).
+		disarmRes, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+		if err != nil {
+			t.Fatalf("SubmitCommand Disarm: %v", err)
+		}
+
+		// Replay duplicate Arm ACK (seq=71) AFTER Disarm without any disarmed heartbeat!
+		now = now.Add(15 * time.Millisecond)
+		svc.OnCommandAckFrame(1, 71, armAck, now)
+		if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhasePending {
+			t.Fatalf("Disarm after duplicate seq=71 Arm ACK = %+v, want pending (never confirmed while armed)", ent)
+		}
+
+		// Genuine distinct seq=72 Disarm ACK now confirms Disarm cleanly.
+		now = now.Add(15 * time.Millisecond)
+		svc.OnCommandAckFrame(1, 72, armAck, now)
+		if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhaseConfirmed {
+			t.Fatalf("Disarm after distinct seq=72 ACK = %+v, want confirmed", ent)
+		}
+	})
+
+	// Subcase B: Sequence-less OnCommandAck — duplicate Arm ACCEPTED delivered after or before Disarm
+	// cannot prove packet ownership, so Disarm MUST enter commit_unknown (never confirmed while armed)
+	// until a fresh disarmed #0 HEARTBEAT arrives.
+	for _, dupBeforeDisarm := range []bool{false, true} {
+		name := "unsequenced_duplicate_after_disarm"
+		if dupBeforeDisarm {
+			name = "unsequenced_duplicate_before_disarm"
+		}
+		t.Run(name, func(t *testing.T) {
+			targets := newFakeTargetSource()
+			sender := &fakeFrameSender{}
+			store := newFakeCommandStore()
+			now := time.Date(2026, 11, 27, 16, 15, 0, 0, time.UTC)
+
+			svc, err := NewService(Options{
+				Org:               "boxbotix",
+				Platform:          "bbops",
+				Targets:           targets,
+				Sender:            sender,
+				Store:             store,
+				Now:               func() time.Time { return now },
+				CommandAckTimeout: 1500 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+
+			target := mavlink.ActuationTarget{
+				SysID:                   1,
+				EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
+				Domain:                  uxsvocab.DomainQuadcopter,
+				Authority:               uxsvocab.AuthorityCompanionTeleop,
+				CompanionMode:           uxsvocab.ModeTeleopVelocity,
+				LinkTier:                uxsvocab.LinkTierSITLLocal,
+				Armed:                   true,
+				PeerAddr:                netip.MustParseAddrPort("127.0.0.1:19902"),
+				HeartbeatObservedUnixNs: now.UnixNano(),
+			}
+			targets.set(target)
+
+			armRes, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionArm})
+			if err != nil {
+				t.Fatalf("SubmitCommand Arm: %v", err)
+			}
+			ackAccepted := mavcodec.CommandAck{
+				Command: mavcodec.MAVCmdComponentArmDisarm,
+				Result:  mavcodec.MAVResultAccepted,
+			}
+			now = now.Add(15 * time.Millisecond)
+			svc.OnCommandAck(1, ackAccepted, now)
+			if ent, _ := store.get(armRes.CommandID); ent.PhaseState != PhaseConfirmed {
+				t.Fatalf("Arm after first ACK = %+v, want confirmed", ent)
+			}
+
+			if dupBeforeDisarm {
+				now = now.Add(10 * time.Millisecond)
+				svc.OnCommandAck(1, ackAccepted, now)
+			}
+
+			disarmRes, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+			if err != nil {
+				t.Fatalf("SubmitCommand Disarm: %v", err)
+			}
+
+			now = now.Add(10 * time.Millisecond)
+			svc.OnCommandAck(1, ackAccepted, now)
+			ent, _ := store.get(disarmRes.CommandID)
+			if ent.PhaseState == PhaseConfirmed {
+				t.Fatalf("duplicate unsequenced ACK falsely confirmed Disarm with Armed=true: %+v", ent)
+			}
+			if ent.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("Disarm phase = %q, want commit_unknown", ent.PhaseState)
+			}
+
+			// Armed heartbeat MUST NOT confirm Disarm; only a fresh disarmed #0 HEARTBEAT reconciles it!
+			now = now.Add(20 * time.Millisecond)
+			target.HeartbeatObservedUnixNs = now.UnixNano()
+			targets.set(target)
+			svc.Advance(context.Background(), now)
+			if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("Disarm reconciled while still Armed=true: %+v", ent)
+			}
+
+			now = now.Add(20 * time.Millisecond)
+			target.Armed = false
+			target.HeartbeatObservedUnixNs = now.UnixNano()
+			targets.set(target)
+			svc.OnTransitionEvent(mavlink.TransitionEvent{
+				Kind:      mavlink.EventKindHeartbeatEdge,
+				MsgID:     mavcodec.MsgIDHeartbeat,
+				SysID:     1,
+				EntityID:  target.EntityID,
+				Authority: target.Authority,
+				LinkTier:  target.LinkTier,
+				Armed:     false,
+				Timestamp: now.UnixMilli(),
+			})
+			if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhaseConfirmed {
+				t.Fatalf("Disarm after fresh disarmed heartbeat = %+v, want confirmed", ent)
+			}
+		})
+	}
+}
+
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+func TestServiceIdleAckConsumptionPersistsAcrossRestartBeforeExplicitDenial(t *testing.T) {
+	store := newFakeCommandStore()
+	now := time.Date(2026, 11, 27, 16, 20, 0, 0, time.UTC)
+	peer := netip.MustParseAddrPort("127.0.0.1:19911")
+
+	targets1 := newFakeTargetSource()
+	sender1 := &fakeFrameSender{}
+	svc1, err := NewService(Options{
+		Org:               "boxbotix",
+		Platform:          "bbops",
+		Targets:           targets1,
+		Sender:            sender1,
+		Store:             store,
+		Now:               func() time.Time { return now },
+		CommandAckTimeout: 1000 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService boot 1: %v", err)
+	}
+
+	target := mavlink.ActuationTarget{
+		SysID:                   1,
+		EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
+		Domain:                  uxsvocab.DomainQuadcopter,
+		Authority:               uxsvocab.AuthorityCompanionTeleop,
+		CompanionMode:           uxsvocab.ModeTeleopVelocity,
+		LinkTier:                uxsvocab.LinkTierSITLLocal,
+		Armed:                   false,
+		PeerAddr:                peer,
+		HeartbeatObservedUnixNs: now.UnixNano(),
+	}
+	targets1.set(target)
+
+	// 1) Submit Arm -> timeout to commit_unknown -> reconcile via armed #0 HEARTBEAT (AckResult == -1).
+	armRes, err := svc1.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionArm})
+	if err != nil {
+		t.Fatalf("SubmitCommand Arm: %v", err)
+	}
+	now = now.Add(1100 * time.Millisecond)
+	svc1.Advance(context.Background(), now)
+	if ent, _ := store.get(armRes.CommandID); ent.PhaseState != PhaseCommitUnknown {
+		t.Fatalf("Arm after timeout = %+v, want commit_unknown", ent)
+	}
+
+	now = now.Add(50 * time.Millisecond)
+	target.Armed = true
+	target.HeartbeatObservedUnixNs = now.UnixNano()
+	targets1.set(target)
+	svc1.OnTransitionEvent(mavlink.TransitionEvent{
+		Kind:      mavlink.EventKindHeartbeatEdge,
+		MsgID:     mavcodec.MsgIDHeartbeat,
+		SysID:     1,
+		EntityID:  target.EntityID,
+		Authority: target.Authority,
+		LinkTier:  target.LinkTier,
+		Armed:     true,
+		Timestamp: now.UnixMilli(),
+	})
+	if ent, _ := store.get(armRes.CommandID); ent.PhaseState != PhaseConfirmed || ent.AckResult != UnacknowledgedResult {
+		t.Fatalf("Arm after heartbeat reconcile = %+v, want PhaseConfirmed AckResult=-1", ent)
+	}
+
+	// 2) Deliver Arm's sole late #77 ACCEPTED while idle (no active command in flight).
+	now = now.Add(50 * time.Millisecond)
+	svc1.OnCommandAckFrame(1, 19, mavcodec.CommandAck{
+		Command: mavcodec.MAVCmdComponentArmDisarm,
+		Result:  mavcodec.MAVResultAccepted,
+	}, now)
+	if ent, _ := store.get(armRes.CommandID); ent.AckResult != int(mavcodec.MAVResultAccepted) {
+		t.Fatalf("Arm AckResult after idle ACK consumption = %d, want %d (persisted via RecordConsumedAck)", ent.AckResult, mavcodec.MAVResultAccepted)
+	}
+
+	// 3) Restart immediately on the same store (Boot 2), submit Disarm, and deliver explicit DENIED.
+	targets2 := newFakeTargetSource()
+	targets2.set(target)
+	sender2 := &fakeFrameSender{}
+	svc2, err := NewService(Options{
+		Org:               "boxbotix",
+		Platform:          "bbops",
+		Targets:           targets2,
+		Sender:            sender2,
+		Store:             store,
+		Now:               func() time.Time { return now },
+		CommandAckTimeout: 1000 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService boot 2: %v", err)
+	}
+
+	now = now.Add(50 * time.Millisecond)
+	disarmRes, err := svc2.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+	if err != nil {
+		t.Fatalf("SubmitCommand Disarm on boot 2: %v", err)
+	}
+
+	now = now.Add(20 * time.Millisecond)
+	svc2.OnCommandAckFrame(1, 20, mavcodec.CommandAck{
+		Command: mavcodec.MAVCmdComponentArmDisarm,
+		Result:  mavcodec.MAVResultDenied,
+	}, now)
+
+	disarmEnt, ok := store.get(disarmRes.CommandID)
+	if !ok || disarmEnt.PhaseState != PhaseRejected || disarmEnt.AckResult != int(mavcodec.MAVResultDenied) {
+		t.Fatalf("Disarm after explicit DENIED on boot 2 = %+v, want PhaseRejected AckResult=%d (not commit_unknown)", disarmEnt, mavcodec.MAVResultDenied)
+	}
+}
+
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+func TestServiceOverdueTeleopRenewalLosingWorkerRaceNeverExtendsExpiredLease(t *testing.T) {
+	targets := newFakeTargetSource()
+	sender := &fakeFrameSender{}
+	store := newFakeCommandStore()
+	now := time.Date(2026, 11, 27, 16, 30, 0, 0, time.UTC)
+
+	svc, err := NewService(Options{
+		Org:            "boxbotix",
+		Platform:       "bbops",
+		Targets:        targets,
+		Sender:         sender,
+		Store:          store,
+		Now:            func() time.Time { return now },
+		TeleopLeaseTTL: 220 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	peer := netip.MustParseAddrPort("127.0.0.1:19921")
+	targets.set(mavlink.ActuationTarget{
+		SysID:                   1,
+		EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
+		Domain:                  uxsvocab.DomainQuadcopter,
+		Authority:               uxsvocab.AuthorityCompanionTeleop,
+		AuthorityEpoch:          1,
+		CompanionMode:           uxsvocab.ModeTeleopVelocity,
+		LinkTier:                uxsvocab.LinkTierSITLLocal,
+		Armed:                   true,
+		PeerAddr:                peer,
+		HeartbeatObservedUnixNs: now.UnixNano(),
+	})
+
+	// 1) Initial Engage nudge with Vx=1.0 (TTL = 250ms).
+	if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+		SysID:          1,
+		Session:        "s1-race",
+		Seq:            1,
+		Vx:             1.0,
+		Engage:         true,
+		AuthorityEpoch: 1,
+		ObservedMs:     now.UnixMilli(),
+	}); err != nil {
+		t.Fatalf("initial Engage SubmitTeleop: %v", err)
+	}
+	if !svc.HasActiveLease(1) {
+		t.Fatal("expected active lease at t=0")
+	}
+
+	// 2) Advance clock 251ms (> 250ms TTL) WITHOUT running Advance first so SubmitTeleop
+	// acquires egressMu[1] ahead of the background expiry worker!
+	now = now.Add(251 * time.Millisecond)
+	if svc.HasActiveLease(1) {
+		t.Fatal("HasActiveLease(1) reported true 251ms after 250ms TTL")
+	}
+
+	var ce *ControlError
+	_, err = svc.SubmitTeleop(context.Background(), TeleopRequest{
+		SysID:   1,
+		Session: "s1-race",
+		Seq:     2,
+		Vx:      2.0,
+	})
+	if !errors.As(err, &ce) || (ce.Code != "teleop_session_stopped" && ce.Code != "teleop_not_engaged") {
+		t.Fatalf("overdue renewal got err=%v, want teleop_session_stopped/teleop_not_engaged", err)
+	}
+	if svc.HasActiveLease(1) {
+		t.Fatal("overdue renewal extended an expired lease")
+	}
+
+	extractVx := func() []float32 {
+		var vx []float32
+		for _, rec := range sender.snapshot() {
+			if sp, ok := rec.frame.Message.(mavcodec.SetPositionTargetLocalNED); ok {
+				vx = append(vx, sp.Vx)
+			}
+		}
+		return vx
+	}
+	if got := extractVx(); !slices.Equal(got, []float32{1.0, 0.0}) {
+		t.Fatalf("recorded #84 Vx immediately after overdue renewal (before Advance) = %v, want [1 0]", got)
+	}
+
+	// Subsequent Advance tick must NOT emit a duplicate second zero-velocity frame.
+	svc.Advance(context.Background(), now.Add(10*time.Millisecond))
+	if got := extractVx(); !slices.Equal(got, []float32{1.0, 0.0}) {
+		t.Fatalf("recorded #84 Vx after subsequent Advance = %v, want [1 0]", got)
+	}
+}
+
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+func TestServiceDelayedPreOverrideEngageRejectedAfterRecovery(t *testing.T) {
+	for _, useEpoch := range []bool{true, false} {
+		name := "authority_epoch"
+		if !useEpoch {
+			name = "observed_ms_fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			targets := newFakeTargetSource()
+			sender := &fakeFrameSender{}
+			store := newFakeCommandStore()
+			t0 := time.Date(2026, 11, 27, 16, 40, 0, 0, time.UTC)
+			now := t0
+
+			svc, err := NewService(Options{
+				Org:            "boxbotix",
+				Platform:       "bbops",
+				Targets:        targets,
+				Sender:         sender,
+				Store:          store,
+				Now:            func() time.Time { return now },
+				TeleopLeaseTTL: 220 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+
+			target := mavlink.ActuationTarget{
+				SysID:                   1,
+				EntityID:                "boxbotix.bbops.robotics.uxs.vehicle.1",
+				Domain:                  uxsvocab.DomainQuadcopter,
+				Authority:               uxsvocab.AuthorityCompanionTeleop,
+				AuthorityEpoch:          1,
+				CompanionMode:           uxsvocab.ModeTeleopVelocity,
+				LinkTier:                uxsvocab.LinkTierSITLLocal,
+				Armed:                   true,
+				PeerAddr:                netip.MustParseAddrPort("127.0.0.1:19931"),
+				HeartbeatObservedUnixNs: t0.UnixNano(),
+			}
+			targets.set(target)
+
+			// Operator clicked Engage at t0 BEFORE any lease existed on the server; request is delayed in transit.
+			delayedReq := TeleopRequest{
+				SysID:      1,
+				Session:    "s1-delayed-pre-override",
+				Seq:        1,
+				Vx:         0.9,
+				Engage:     true,
+				ObservedMs: t0.UnixMilli(),
+			}
+			if useEpoch {
+				delayedReq.AuthorityEpoch = 1
+			}
+
+			// At t0+20ms: P1 CRSF override arrives when NO lease exists yet -> latches preemption.
+			now = t0.Add(20 * time.Millisecond)
+			target.Authority = uxsvocab.AuthorityDirectCRSFOverride
+			target.AuthorityEpoch = 2
+			target.HeartbeatObservedUnixNs = now.UnixNano()
+			targets.set(target)
+			svc.OnTransitionEvent(mavlink.TransitionEvent{
+				Kind:           mavlink.EventKindHeartbeatEdge,
+				MsgID:          mavcodec.MsgIDHeartbeat,
+				SysID:          1,
+				EntityID:       target.EntityID,
+				Authority:      uxsvocab.AuthorityDirectCRSFOverride,
+				AuthorityEpoch: 2,
+				LinkTier:       target.LinkTier,
+				Armed:          true,
+				Timestamp:      now.UnixMilli(),
+			})
+
+			// At t0+40ms: P2 companion-teleop recovers.
+			tRecovery := t0.Add(40 * time.Millisecond)
+			now = tRecovery
+			target.Authority = uxsvocab.AuthorityCompanionTeleop
+			target.AuthorityEpoch = 3
+			target.HeartbeatObservedUnixNs = tRecovery.UnixNano()
+			targets.set(target)
+			svc.OnTransitionEvent(mavlink.TransitionEvent{
+				Kind:           mavlink.EventKindHeartbeatEdge,
+				MsgID:          mavcodec.MsgIDHeartbeat,
+				SysID:          1,
+				EntityID:       target.EntityID,
+				Authority:      uxsvocab.AuthorityCompanionTeleop,
+				AuthorityEpoch: 3,
+				LinkTier:       target.LinkTier,
+				Armed:          true,
+				Timestamp:      tRecovery.UnixMilli(),
+			})
+
+			// At t0+60ms: delayed pre-override Engage=true arrives -> MUST be rejected with preemption_latched!
+			now = t0.Add(60 * time.Millisecond)
+			var ce *ControlError
+			if _, err := svc.SubmitTeleop(context.Background(), delayedReq); !errors.As(err, &ce) || ce.Code != "preemption_latched" {
+				t.Fatalf("delayed pre-override Engage=true got err=%v, want preemption_latched", err)
+			}
+			if svc.HasActiveLease(1) || !svc.IsPreempted(1) {
+				t.Fatalf("after delayed pre-override Engage: HasActiveLease=%v IsPreempted=%v, want false/true", svc.HasActiveLease(1), svc.IsPreempted(1))
+			}
+			if got := countMessages[mavcodec.SetPositionTargetLocalNED](sender.snapshot()); got != 0 {
+				t.Fatalf("transmitted %d #84 frames for rejected pre-override Engage, want 0", got)
+			}
+
+			// Subsequent post-recovery operator Engage click (observing tRecovery / epoch=3) succeeds cleanly!
+			freshReq := TeleopRequest{
+				SysID:      1,
+				Session:    "s1-post-recovery",
+				Seq:        1,
+				Vx:         0.5,
+				Engage:     true,
+				ObservedMs: tRecovery.UnixMilli(),
+			}
+			if useEpoch {
+				freshReq.AuthorityEpoch = 3
+			}
+			if _, err := svc.SubmitTeleop(context.Background(), freshReq); err != nil {
+				t.Fatalf("post-recovery Engage=true failed: %v", err)
+			}
+			if !svc.HasActiveLease(1) || svc.IsPreempted(1) {
+				t.Fatal("expected post-recovery Engage=true to activate lease and clear preemption latch")
+			}
+		})
 	}
 }

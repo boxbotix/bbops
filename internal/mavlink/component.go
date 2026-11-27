@@ -50,8 +50,9 @@ type Component struct {
 }
 
 type actuationCallbacks struct {
-	onEvent func(TransitionEvent)
-	onAck   func(sysid uint8, ack mavcodec.CommandAck, observedAt time.Time)
+	onEvent    func(TransitionEvent)
+	onAck      func(sysid uint8, ack mavcodec.CommandAck, observedAt time.Time)
+	onAckFrame func(sysid, seq uint8, ack mavcodec.CommandAck, observedAt time.Time)
 }
 
 var (
@@ -216,6 +217,22 @@ func (c *Component) SetActuationCallbacks(
 	})
 }
 
+// SetActuationFrameCallbacks registers synchronous callbacks invoked on Lane 3 state
+// transitions and `#77 COMMAND_ACK` ingest with the originating MAVLink v2 frame sequence.
+func (c *Component) SetActuationFrameCallbacks(
+	onEvent func(TransitionEvent),
+	onAckFrame func(sysid, seq uint8, ack mavcodec.CommandAck, observedAt time.Time),
+) {
+	if onEvent == nil && onAckFrame == nil {
+		c.actuationHooks.Store(nil)
+		return
+	}
+	c.actuationHooks.Store(&actuationCallbacks{
+		onEvent:    onEvent,
+		onAckFrame: onAckFrame,
+	})
+}
+
 // SendFrame encodes frame as a MAVLink v2 (`0xFD`) packet and transmits it over
 // the bound UDP socket to peer.
 func (c *Component) SendFrame(frame mavcodec.Frame, peer netip.AddrPort) error {
@@ -369,8 +386,12 @@ func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame
 				hooks.onEvent(outcome.Events[i])
 			}
 		}
-		if hooks.onAck != nil && outcome.CommandAck != nil {
-			hooks.onAck(outcome.SysID, *outcome.CommandAck, now)
+		if outcome.CommandAck != nil {
+			if hooks.onAckFrame != nil {
+				hooks.onAckFrame(outcome.SysID, outcome.CommandAckSeq, *outcome.CommandAck, now)
+			} else if hooks.onAck != nil {
+				hooks.onAck(outcome.SysID, *outcome.CommandAck, now)
+			}
 		}
 	}
 }
