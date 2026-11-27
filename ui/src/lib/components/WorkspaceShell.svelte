@@ -19,6 +19,7 @@
   import CortexWorkspace from "$lib/components/CortexWorkspace.svelte";
   import FleetFilmstrip from "$lib/components/FleetFilmstrip.svelte";
   import PilotWorkspace from "$lib/components/PilotWorkspace.svelte";
+  import type { ControlClient } from "$lib/control/actuation.svelte";
   import {
     type GraphSearchClient,
     createGraphSearchClient,
@@ -52,6 +53,7 @@
     telemetryStore: TelemetryStore;
     skgStore: SkgStore;
     viewportStore: ViewportStore;
+    controlClient?: ControlClient;
     graphqlClient?: GraphQLClient;
     searchClient?: GraphSearchClient;
     traceBook?: TelemetryTraceBook;
@@ -66,6 +68,7 @@
     telemetryStore,
     skgStore,
     viewportStore,
+    controlClient,
     graphqlClient = createGraphQLClient(),
     searchClient = createGraphSearchClient(),
     traceBook = new TelemetryTraceBook(),
@@ -533,6 +536,7 @@
         {telemetryStore}
         {skgStore}
         {viewportStore}
+        {controlClient}
         {freshnessContext}
         {now}
         {onSyncHash}

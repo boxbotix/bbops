@@ -290,3 +290,189 @@ func TestStartStackStreamsMultiDomainTelemetryEdgesAndPathSearch(t *testing.T) {
 		t.Fatalf("UpsertExternalContact full provenance: %v", err)
 	}
 }
+
+// spec: uxs-control / Pin-on-admission MAVLink v2 UDP command egress and 1 Hz GCS liveness
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+func TestStackClosedLoopActuationTeleopDeadmanAndSITLFaults(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	uiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(uiDir, "index.html"), []byte("<!doctype html><title>bbops</title>"), 0o600); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+
+	stack, err := e2eharness.StartStack(ctx, e2eharness.Options{
+		UIDir:             uiDir,
+		TelemetryInterval: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("StartStack: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = stack.Stop(stopCtx)
+	})
+
+	info := stack.Info()
+	wsBase := strings.Replace(info.BaseURL, "http://", "ws://", 1)
+
+	telConn, telHTTP, err := websocket.DefaultDialer.DialContext(ctx, wsBase+"/ws/telemetry", http.Header{"Origin": []string{info.BaseURL}})
+	if telHTTP != nil && telHTTP.Body != nil {
+		_ = telHTTP.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial /ws/telemetry: %v", err)
+	}
+	defer func() { _ = telConn.Close() }()
+
+	graphConn, graphHTTP, err := websocket.DefaultDialer.DialContext(ctx, wsBase+"/ws/graph", http.Header{"Origin": []string{info.BaseURL}})
+	if graphHTTP != nil && graphHTTP.Body != nil {
+		_ = graphHTTP.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial /ws/graph: %v", err)
+	}
+	defer func() { _ = graphConn.Close() }()
+
+	postJSON := func(route, body string) (int, []byte) {
+		t.Helper()
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, info.BaseURL+route, strings.NewReader(body))
+		if reqErr != nil {
+			t.Fatalf("NewRequest(%s): %v", route, reqErr)
+		}
+		req.Header.Set("Origin", info.BaseURL)
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("POST %s: %v", route, doErr)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, raw
+	}
+
+	// 1. Engage #84 velocity teleop on Quadcopter (#1) and verify GCS #0 HEARTBEAT + NED motion.
+	for range 4 {
+		status, raw := postJSON("/control/teleop", `{"sysid":1,"frame":"local-ned","vx":4.0,"vy":0,"vz":0,"yaw_rate":0,"engage":true}`)
+		if status != http.StatusOK {
+			t.Fatalf("POST /control/teleop = %d %s", status, string(raw))
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+	if gotHB := stack.GCSHeartbeatCount(1); gotHB < 1 {
+		t.Fatalf("GCSHeartbeatCount(1) = %d, want >= 1", gotHB)
+	}
+
+	movedNorth := false
+	moveDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(moveDeadline) && !movedNorth {
+		_ = telConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, raw, readErr := telConn.ReadMessage()
+		if readErr != nil {
+			t.Fatalf("read /ws/telemetry: %v", readErr)
+		}
+		var env struct {
+			Subject string          `json:"subject"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if json.Unmarshal(raw, &env) == nil && env.Subject == "bbops.telemetry.1" {
+			var tf mavlink.TelemetryFrame
+			if json.Unmarshal(env.Payload, &tf) == nil && tf.HasLocalPos && tf.NEDXYZ[0] > 24.4 {
+				movedNorth = true
+			}
+		}
+	}
+	if !movedNorth {
+		t.Fatal("expected Quadcopter (#1) NED North position to advance under #84 velocity teleop")
+	}
+
+	// 2. Inject MAV_CMD_USER_1 350ms companion blackout on sitl-local Quadcopter (#1) -> mcu-failsafe -> restored companion-teleop.
+	status, raw := postJSON("/control/command", `{"sysid":1,"action":"sitl-companion-blackout","param1":250}`)
+	if status != http.StatusOK {
+		t.Fatalf("POST sitl-companion-blackout = %d %s", status, string(raw))
+	}
+	sawFailsafe := false
+	sawRecovered := false
+	faultDeadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(faultDeadline) && (!sawFailsafe || !sawRecovered) {
+		_ = telConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, wsRaw, readErr := telConn.ReadMessage()
+		if readErr != nil {
+			t.Fatalf("read /ws/telemetry fault: %v", readErr)
+		}
+		var env struct {
+			Subject string          `json:"subject"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if json.Unmarshal(wsRaw, &env) == nil && env.Subject == "bbops.telemetry.events.1" {
+			var ev mavlink.TransitionEvent
+			if json.Unmarshal(env.Payload, &ev) == nil && ev.Kind == mavlink.EventKindHeartbeatEdge {
+				if ev.Authority == "mcu-failsafe" {
+					sawFailsafe = true
+				} else if sawFailsafe && ev.Authority == "companion-teleop" {
+					sawRecovered = true
+				}
+			}
+		}
+	}
+	if !sawFailsafe || !sawRecovered {
+		t.Fatalf("SITL blackout edges: sawFailsafe=%v sawRecovered=%v", sawFailsafe, sawRecovered)
+	}
+
+	// 3. Dropped #77 COMMAND_ACK on disarm: verify commit_unknown followed by heartbeat reconciliation to confirmed on /ws/graph.
+	if err := stack.SetDropCommandAck(1, 1); err != nil {
+		t.Fatalf("SetDropCommandAck: %v", err)
+	}
+	status, cmdRaw := postJSON("/control/command", `{"sysid":1,"action":"disarm"}`)
+	if status != http.StatusOK {
+		t.Fatalf("POST disarm = %d %s", status, string(cmdRaw))
+	}
+	var cmdOut struct {
+		Result struct {
+			CommandID string `json:"command_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(cmdRaw, &cmdOut); err != nil || cmdOut.Result.CommandID == "" {
+		t.Fatalf("decode disarm response: %s err=%v", string(cmdRaw), err)
+	}
+
+	sawUnknown := false
+	sawConfirmed := false
+	graphDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(graphDeadline) && (!sawUnknown || !sawConfirmed) {
+		_ = graphConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, gRaw, readErr := graphConn.ReadMessage()
+		if readErr != nil {
+			t.Fatalf("read /ws/graph: %v", readErr)
+		}
+		var gEnv struct {
+			Type    string `json:"type"`
+			Key     string `json:"key"`
+			Payload struct {
+				Triples []struct {
+					Predicate string `json:"predicate"`
+					Object    any    `json:"object"`
+				} `json:"triples"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(gRaw, &gEnv) != nil || gEnv.Type != "put" || gEnv.Key != cmdOut.Result.CommandID {
+			continue
+		}
+		for _, tr := range gEnv.Payload.Triples {
+			if tr.Predicate == "uxs.command.phase" {
+				if tr.Object == "commit_unknown" {
+					sawUnknown = true
+				}
+				if sawUnknown && tr.Object == "confirmed" {
+					sawConfirmed = true
+				}
+			}
+		}
+	}
+	if !sawUnknown || !sawConfirmed {
+		t.Fatalf("dropped-ACK lifecycle on /ws/graph: sawUnknown=%v sawConfirmed=%v", sawUnknown, sawConfirmed)
+	}
+}

@@ -130,6 +130,7 @@ export interface TelemetryStore {
   onKinematicsAccepted(
     listener: (frame: VehicleKinematics) => void,
   ): () => void;
+  onTransitionEvent?(listener: (event: TransitionEvent) => void): () => void;
   onFeedReset?(listener: () => void): () => void;
   ingestRawFrame(rawText: string): void;
   clearEvents(): void;
@@ -440,6 +441,8 @@ export function createTelemetryStore(
     (frame: VehicleKinematics) => void
   >();
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const transitionEventListeners = new Set<(event: TransitionEvent) => void>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const feedResetListeners = new Set<() => void>();
   const eventRing = new Array<TransitionEvent | undefined>(maxEvents);
   let ringWriteIdx = 0;
@@ -740,6 +743,9 @@ export function createTelemetryStore(
         recordPacketLinkReceipt(sysid, transition.timestamp, receivedAtMs);
       }
       pushTransitionEvent(transition);
+      for (const listener of transitionEventListeners) {
+        listener(transition);
+      }
       return;
     }
 
@@ -849,6 +855,12 @@ export function createTelemetryStore(
       kinematicsAcceptedListeners.add(listener);
       return () => {
         kinematicsAcceptedListeners.delete(listener);
+      };
+    },
+    onTransitionEvent(listener: (event: TransitionEvent) => void) {
+      transitionEventListeners.add(listener);
+      return () => {
+        transitionEventListeners.delete(listener);
       };
     },
     onFeedReset(listener: () => void) {

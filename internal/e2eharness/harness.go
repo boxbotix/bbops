@@ -297,20 +297,32 @@ func EulerZYXDegToQuaternion(rollDeg, pitchDeg, yawDeg float64) [4]float32 {
 }
 
 type vehicleSimState struct {
-	sysid     uint8
-	domain    mavcodec.VehicleDomain
-	armed     bool
-	authority mavcodec.ControlAuthority
-	mode      mavcodec.CompanionMode
-	linkTier  mavcodec.LinkTier
-	flags     uxsvocab.HealthFlags
-	ned       [3]float64
-	vel       [3]float64
-	rollDeg   float64
-	pitchDeg  float64
-	yawDeg    float64
-	seq       uint8
-	conn      *net.UDPConn
+	sysid                  uint8
+	domain                 mavcodec.VehicleDomain
+	armed                  bool
+	authority              mavcodec.ControlAuthority
+	mode                   mavcodec.CompanionMode
+	linkTier               mavcodec.LinkTier
+	flags                  uxsvocab.HealthFlags
+	ned                    [3]float64
+	vel                    [3]float64
+	cmdVel                 [3]float64
+	crossCurrentNED        [2]float64
+	hasInjectedCurrent     bool
+	yawRateDegS            float64
+	teleopControlled       bool
+	teleopActive           bool
+	lastTeleopAt           time.Time
+	blackoutUntil          time.Time
+	suppressHeartbeatUntil time.Time
+	failsafeCount          uint16
+	dropAckCount           int
+	gcsHeartbeatCount      int
+	rollDeg                float64
+	pitchDeg               float64
+	yawDeg                 float64
+	seq                    uint8
+	conn                   *net.UDPConn
 }
 
 // Stack manages a live ephemeral loopback bbops runtime and deterministic 0xB1
@@ -323,6 +335,7 @@ type Stack struct {
 
 	mu       sync.Mutex
 	vehicles map[uint8]*vehicleSimState
+	rxWg     sync.WaitGroup
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 	stopOnce sync.Once
@@ -513,6 +526,10 @@ func StartStack(ctx context.Context, opts Options) (*Stack, error) {
 		vs.conn = conn
 		stack.vehicles[vs.sysid] = vs
 	}
+	for _, vs := range specs {
+		stack.rxWg.Add(1)
+		go stack.readVehicleLoop(vs.sysid, vs.conn)
+	}
 
 	stack.mu.Lock()
 	burstErr := stack.sendAllTelemetryLocked(true)
@@ -624,7 +641,92 @@ func (s *Stack) PulseCRSFOverride(sysid uint8) error {
 	vs.mode = mavcodec.ModeHoldPosition
 	vs.linkTier = mavcodec.LinkTierMeshHighRate
 	vs.flags.TeleopDeadmanClamped = true
+	vs.teleopActive = false
+	vs.cmdVel = [3]float64{}
+	vs.yawRateDegS = 0
+	if vs.teleopControlled {
+		recomputeEffectiveVelLocked(vs)
+	}
 	return s.sendVehicleHeartbeatLocked(vs)
+}
+
+// RestoreCompanionTeleop returns sysid to armed P2 CompanionTeleop (ModeTeleopVelocity)
+// while preserving its active LinkTier and immediately transmits a 0xB1 HEARTBEAT frame.
+func (s *Stack) RestoreCompanionTeleop(sysid uint8) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vs, ok := s.vehicles[sysid]
+	if !ok {
+		return fmt.Errorf("e2eharness: unknown vehicle sysid %d", sysid)
+	}
+	vs.armed = true
+	vs.authority = mavcodec.AuthorityCompanionTeleop
+	vs.mode = mavcodec.ModeTeleopVelocity
+	vs.blackoutUntil = time.Time{}
+	vs.flags.CompanionTrunkHealthy = true
+	vs.flags.TeleopDeadmanClamped = false
+	return s.sendVehicleHeartbeatLocked(vs)
+}
+
+// SetVehicleLinkTier switches sysid's 0xB1 LinkTier (`sitl-local`, `direct-bench`,
+// `mesh-high-rate`, or `mesh-supervisory`) and immediately emits a 0xB1 HEARTBEAT frame.
+func (s *Stack) SetVehicleLinkTier(sysid uint8, tier string) error {
+	var parsed mavcodec.LinkTier
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case uxsvocab.LinkTierSITLLocal:
+		parsed = mavcodec.LinkTierSITLLocal
+	case uxsvocab.LinkTierDirectBench:
+		parsed = mavcodec.LinkTierDirectBench
+	case uxsvocab.LinkTierMeshHighRate:
+		parsed = mavcodec.LinkTierMeshHighRate
+	case uxsvocab.LinkTierMeshSupervisory:
+		parsed = mavcodec.LinkTierMeshSupervisory
+	default:
+		return fmt.Errorf("e2eharness: unsupported link tier %q", tier)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vs, ok := s.vehicles[sysid]
+	if !ok {
+		return fmt.Errorf("e2eharness: unknown vehicle sysid %d", sysid)
+	}
+	vs.linkTier = parsed
+	if parsed == mavcodec.LinkTierMeshSupervisory && vs.teleopActive {
+		vs.teleopActive = false
+		vs.cmdVel = [3]float64{}
+		vs.yawRateDegS = 0
+		recomputeEffectiveVelLocked(vs)
+	}
+	return s.sendVehicleHeartbeatLocked(vs)
+}
+
+// SetDropCommandAck configures sysid to drop the next count outbound #77 COMMAND_ACK
+// replies (while still applying the command and delaying the next #0 HEARTBEAT past
+// 1.5s so ADR-111 commit_unknown and subsequent heartbeat reconciliation are exercised).
+func (s *Stack) SetDropCommandAck(sysid uint8, count int) error {
+	if count < 0 {
+		return errors.New("e2eharness: drop count cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vs, ok := s.vehicles[sysid]
+	if !ok {
+		return fmt.Errorf("e2eharness: unknown vehicle sysid %d", sysid)
+	}
+	vs.dropAckCount = count
+	return nil
+}
+
+// GCSHeartbeatCount returns the number of outbound MAV_TYPE_GCS (#0) heartbeats
+// received on sysid's simulated UDP peer socket from bbops.
+func (s *Stack) GCSHeartbeatCount(sysid uint8) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vs, ok := s.vehicles[sysid]
+	if !ok {
+		return 0
+	}
+	return vs.gcsHeartbeatCount
 }
 
 // EmitStatusText transmits a MAVLink #253 STATUSTEXT datagram from sysid's UDP peer socket.
@@ -662,6 +764,7 @@ func (s *Stack) Stop(ctx context.Context) error {
 			}
 		}
 		s.mu.Unlock()
+		s.rxWg.Wait()
 		if s.rt != nil {
 			stopErr = s.rt.Stop(ctx)
 		}
@@ -676,29 +779,305 @@ func (s *Stack) runLoop(interval time.Duration) {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	dt := interval.Seconds()
 	tick := 0
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
 			tick++
 			includeHB := tick%10 == 0
 			s.mu.Lock()
+			s.stepSimulationLocked(now, dt)
 			_ = s.sendAllTelemetryLocked(includeHB)
 			s.mu.Unlock()
 		}
 	}
 }
 
+func (s *Stack) stepSimulationLocked(now time.Time, dt float64) {
+	for _, sysid := range []uint8{1, 2, 3} {
+		vs := s.vehicles[sysid]
+		if vs == nil {
+			continue
+		}
+		if !vs.blackoutUntil.IsZero() && !now.Before(vs.blackoutUntil) {
+			vs.blackoutUntil = time.Time{}
+			vs.flags.CompanionTrunkHealthy = true
+			if vs.authority == mavcodec.AuthorityMCUFailsafe {
+				vs.authority = mavcodec.AuthorityCompanionTeleop
+				vs.mode = mavcodec.ModeHoldPosition
+			}
+			_ = s.sendVehicleHeartbeatLocked(vs)
+		}
+		if vs.teleopActive && now.Sub(vs.lastTeleopAt) > 300*time.Millisecond {
+			vs.teleopActive = false
+			vs.cmdVel = [3]float64{}
+			vs.yawRateDegS = 0
+			vs.flags.TeleopDeadmanClamped = true
+			recomputeEffectiveVelLocked(vs)
+			_ = s.sendVehicleHeartbeatLocked(vs)
+		}
+		if vs.teleopControlled && dt > 0 {
+			vs.ned[0] += vs.vel[0] * dt
+			vs.ned[1] += vs.vel[1] * dt
+			vs.ned[2] += vs.vel[2] * dt
+			vs.yawDeg = math.Mod(math.Mod(vs.yawDeg+vs.yawRateDegS*dt, 360.0)+360.0, 360.0)
+		}
+	}
+}
+
+func recomputeEffectiveVelLocked(vs *vehicleSimState) {
+	if !vs.armed {
+		vs.vel = [3]float64{}
+		return
+	}
+	v := vs.cmdVel
+	if vs.hasInjectedCurrent {
+		v[0] += vs.crossCurrentNED[0]
+		v[1] += vs.crossCurrentNED[1]
+	}
+	vs.vel = v
+}
+
+func (s *Stack) readVehicleLoop(sysid uint8, conn *net.UDPConn) {
+	defer s.rxWg.Done()
+	buf := make([]byte, 512)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-s.stopCh:
+				return
+			default:
+				return
+			}
+		}
+		frame, decErr := mavcodec.DecodeFrame(buf[:n])
+		if decErr != nil {
+			continue
+		}
+		s.mu.Lock()
+		vs := s.vehicles[sysid]
+		if vs != nil {
+			s.handleOutboundFrameLocked(vs, frame, time.Now())
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *Stack) handleOutboundFrameLocked(vs *vehicleSimState, frame mavcodec.Frame, now time.Time) {
+	switch msg := frame.Message.(type) {
+	case mavcodec.Heartbeat:
+		if frame.SystemID == mavcodec.GCSSystemID && msg.Type == mavcodec.MAVTypeGCS {
+			vs.gcsHeartbeatCount++
+		}
+
+	case mavcodec.SetPositionTargetLocalNED:
+		if msg.TargetSystem != vs.sysid {
+			return
+		}
+		if !vs.armed || vs.authority != mavcodec.AuthorityCompanionTeleop || vs.linkTier == mavcodec.LinkTierMeshSupervisory {
+			return
+		}
+		vx := float64(msg.Vx)
+		vy := float64(msg.Vy)
+		vz := float64(msg.Vz)
+		yawRate := float64(msg.YawRate)
+		if math.IsNaN(vx) || math.IsInf(vx, 0) ||
+			math.IsNaN(vy) || math.IsInf(vy, 0) ||
+			math.IsNaN(vz) || math.IsInf(vz, 0) ||
+			math.IsNaN(yawRate) || math.IsInf(yawRate, 0) {
+			return
+		}
+		vN, vE := vx, vy
+		if msg.CoordinateFrame == mavcodec.MAVFrameBodyNED {
+			yawRad := vs.yawDeg * math.Pi / 180.0
+			cy, sy := math.Cos(yawRad), math.Sin(yawRad)
+			vN = vx*cy - vy*sy
+			vE = vx*sy + vy*cy
+		}
+		vs.teleopControlled = true
+		vs.mode = mavcodec.ModeTeleopVelocity
+		vs.cmdVel = [3]float64{vN, vE, vz}
+		vs.yawRateDegS = yawRate * 180.0 / math.Pi
+		vs.flags.TeleopDeadmanClamped = false
+		vs.lastTeleopAt = now
+		vs.teleopActive = math.Abs(vN) > 1e-4 || math.Abs(vE) > 1e-4 || math.Abs(vz) > 1e-4 || math.Abs(yawRate) > 1e-4
+		recomputeEffectiveVelLocked(vs)
+
+	case mavcodec.CommandLong:
+		if msg.TargetSystem != vs.sysid {
+			return
+		}
+		result := s.applyVehicleCommandLocked(vs, msg, now)
+		if vs.dropAckCount > 0 {
+			vs.dropAckCount--
+			vs.suppressHeartbeatUntil = now.Add(1900 * time.Millisecond)
+			return
+		}
+		_ = s.sendFrameLocked(vs, mavcodec.CommandAck{
+			Command:         msg.Command,
+			Result:          result,
+			TargetSystem:    frame.SystemID,
+			TargetComponent: frame.ComponentID,
+		})
+		if result == mavcodec.MAVResultAccepted {
+			_ = s.sendVehicleHeartbeatLocked(vs)
+		}
+	}
+}
+
+func (s *Stack) applyVehicleCommandLocked(vs *vehicleSimState, msg mavcodec.CommandLong, now time.Time) uint8 {
+	switch msg.Command {
+	case mavcodec.MAVCmdComponentArmDisarm:
+		if vs.authority == mavcodec.AuthorityDirectCRSFOverride {
+			return mavcodec.MAVResultDenied
+		}
+		if msg.Param1 >= 0.5 {
+			if vs.authority == mavcodec.AuthorityMCUFailsafe {
+				return mavcodec.MAVResultTemporarilyRejected
+			}
+			vs.armed = true
+			if vs.mode == mavcodec.ModeDisarmed {
+				vs.mode = mavcodec.ModeTeleopVelocity
+			}
+			vs.authority = mavcodec.AuthorityCompanionTeleop
+			vs.flags.TeleopDeadmanClamped = false
+			return mavcodec.MAVResultAccepted
+		}
+		vs.armed = false
+		vs.mode = mavcodec.ModeDisarmed
+		vs.teleopControlled = true
+		vs.teleopActive = false
+		vs.cmdVel = [3]float64{}
+		vs.yawRateDegS = 0
+		if vs.authority == mavcodec.AuthorityMCUFailsafe {
+			vs.authority = mavcodec.AuthorityCompanionTeleop
+			vs.flags.CompanionTrunkHealthy = true
+		}
+		recomputeEffectiveVelLocked(vs)
+		return mavcodec.MAVResultAccepted
+
+	case mavcodec.MAVCmdNavLoiterUnlim:
+		if vs.authority == mavcodec.AuthorityDirectCRSFOverride || vs.authority == mavcodec.AuthorityMCUFailsafe {
+			return mavcodec.MAVResultTemporarilyRejected
+		}
+		vs.mode = mavcodec.ModeHoldPosition
+		vs.teleopControlled = true
+		vs.teleopActive = false
+		vs.cmdVel = [3]float64{}
+		vs.yawRateDegS = 0
+		recomputeEffectiveVelLocked(vs)
+		return mavcodec.MAVResultAccepted
+
+	case mavcodec.MAVCmdDoSetMode:
+		if vs.authority == mavcodec.AuthorityDirectCRSFOverride || vs.authority == mavcodec.AuthorityMCUFailsafe {
+			return mavcodec.MAVResultTemporarilyRejected
+		}
+		switch mavcodec.CompanionMode(math.Round(float64(msg.Param2))) {
+		case mavcodec.ModeTeleopVelocity:
+			vs.mode = mavcodec.ModeTeleopVelocity
+			vs.authority = mavcodec.AuthorityCompanionTeleop
+			vs.flags.TeleopDeadmanClamped = false
+			return mavcodec.MAVResultAccepted
+		case mavcodec.ModeAutonomousVelocity:
+			vs.mode = mavcodec.ModeAutonomousVelocity
+			vs.authority = mavcodec.AuthorityCompanionAutonomous
+			vs.teleopActive = false
+			return mavcodec.MAVResultAccepted
+		case mavcodec.ModeHoldPosition:
+			vs.mode = mavcodec.ModeHoldPosition
+			vs.teleopControlled = true
+			vs.teleopActive = false
+			vs.cmdVel = [3]float64{}
+			vs.yawRateDegS = 0
+			recomputeEffectiveVelLocked(vs)
+			return mavcodec.MAVResultAccepted
+		default:
+			return mavcodec.MAVResultUnsupported
+		}
+
+	case mavcodec.MAVCmdUser1:
+		if vs.linkTier != mavcodec.LinkTierSITLLocal {
+			return mavcodec.MAVResultDenied
+		}
+		switch int(math.Round(float64(msg.Param1))) {
+		case 1: // Simulated companion trunk blackout (default 350ms -> MCU failsafe).
+			durMs := float64(msg.Param2)
+			if durMs <= 0 {
+				durMs = 350
+			}
+			if durMs > 2000 {
+				durMs = 2000
+			}
+			vs.authority = mavcodec.AuthorityMCUFailsafe
+			vs.mode = mavcodec.ModeHoldPosition
+			vs.flags.CompanionTrunkHealthy = false
+			vs.flags.TeleopDeadmanClamped = true
+			vs.failsafeCount++
+			vs.teleopControlled = true
+			vs.teleopActive = false
+			vs.cmdVel = [3]float64{}
+			vs.yawRateDegS = 0
+			vs.blackoutUntil = now.Add(time.Duration(durMs) * time.Millisecond)
+			recomputeEffectiveVelLocked(vs)
+			return mavcodec.MAVResultAccepted
+
+		case 2: // Simulated P1 CRSF override set / restore / toggle.
+			enableCRSF := msg.Param2 >= 0.5 || (math.Abs(float64(msg.Param2)) < 0.5 && vs.authority != mavcodec.AuthorityDirectCRSFOverride)
+			if enableCRSF {
+				vs.authority = mavcodec.AuthorityDirectCRSFOverride
+				vs.mode = mavcodec.ModeHoldPosition
+				vs.flags.TeleopDeadmanClamped = true
+				vs.teleopActive = false
+				vs.cmdVel = [3]float64{}
+				vs.yawRateDegS = 0
+				if vs.teleopControlled {
+					recomputeEffectiveVelLocked(vs)
+				}
+			} else {
+				vs.authority = mavcodec.AuthorityCompanionTeleop
+				vs.mode = mavcodec.ModeTeleopVelocity
+				vs.flags.TeleopDeadmanClamped = false
+			}
+			return mavcodec.MAVResultAccepted
+
+		case 3: // Simulated cross-current vector (m/s North, m/s East).
+			vs.crossCurrentNED = [2]float64{float64(msg.Param2), float64(msg.Param3)}
+			vs.hasInjectedCurrent = true
+			vs.teleopControlled = true
+			recomputeEffectiveVelLocked(vs)
+			return mavcodec.MAVResultAccepted
+
+		default:
+			return mavcodec.MAVResultUnsupported
+		}
+
+	default:
+		return mavcodec.MAVResultUnsupported
+	}
+}
+
 func (s *Stack) sendAllTelemetryLocked(includeHeartbeat bool) error {
+	now := time.Now()
 	origin := [3]float64{defaultOriginLatDeg, defaultOriginLonDeg, defaultOriginAltM}
 	for _, sysid := range []uint8{1, 2, 3} {
 		vs := s.vehicles[sysid]
 		if vs == nil {
 			continue
 		}
-		if includeHeartbeat {
+		emitHB := includeHeartbeat
+		if !vs.suppressHeartbeatUntil.IsZero() {
+			if now.Before(vs.suppressHeartbeatUntil) {
+				emitHB = false
+			} else {
+				vs.suppressHeartbeatUntil = time.Time{}
+				emitHB = true
+			}
+		}
+		if emitHB {
 			if err := s.sendVehicleHeartbeatLocked(vs); err != nil {
 				return err
 			}
@@ -706,7 +1085,7 @@ func (s *Stack) sendAllTelemetryLocked(includeHeartbeat bool) error {
 		if err := s.sendFrameLocked(vs, mavcodec.SysStatus{
 			Load:         820,
 			ErrorsComm:   0,
-			ErrorsCount1: 0,
+			ErrorsCount1: vs.failsafeCount,
 			ErrorsCount2: 1100,
 			ErrorsCount3: 420,
 		}); err != nil {
@@ -718,7 +1097,7 @@ func (s *Stack) sendAllTelemetryLocked(includeHeartbeat bool) error {
 			Q2:       quat[1],
 			Q3:       quat[2],
 			Q4:       quat[3],
-			Yawspeed: 0.05,
+			Yawspeed: float32(vs.yawRateDegS * math.Pi / 180.0),
 		}); err != nil {
 			return err
 		}

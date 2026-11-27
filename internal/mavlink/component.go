@@ -38,6 +38,8 @@ type Component struct {
 	// publication across readLoop and tickLoop while keeping JetStream acks off both paths.
 	sysidMu [256]sync.Mutex
 
+	actuationHooks atomic.Pointer[actuationCallbacks]
+
 	// Test-only synchronization hooks (nil in production).
 	beforeIngestFrame func(frame mavcodec.Frame)
 	afterSilenceEval  func(ev TransitionEvent)
@@ -45,6 +47,11 @@ type Component struct {
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
+}
+
+type actuationCallbacks struct {
+	onEvent func(TransitionEvent)
+	onAck   func(sysid uint8, ack mavcodec.CommandAck, observedAt time.Time)
 }
 
 var (
@@ -100,7 +107,7 @@ func NewComponent(rawConfig json.RawMessage, deps component.Dependencies) (*Comp
 	if platform == "" {
 		platform = "bbops"
 	}
-	tracker, err := NewTrackerWithTimeouts(org, platform, settings.linkTimeout, settings.supervisoryTimeout)
+	tracker, err := NewTrackerWithOptions(org, platform, settings.linkTimeout, settings.supervisoryTimeout, settings.allowedPeers)
 	if err != nil {
 		return nil, err
 	}
@@ -178,14 +185,53 @@ func (c *Component) UDPConn() *net.UDPConn {
 	return c.conn.Load()
 }
 
-// PeerAddr returns the latest validated peer UDP address recorded for sysid (`D4 Option A`).
+// PeerAddr returns the pinned validated peer UDP address recorded for sysid (`OQ1 Option A`).
 func (c *Component) PeerAddr(sysid uint8) (netip.AddrPort, bool) {
 	return c.tracker.PeerAddr(sysid)
 }
 
-// Peers returns a snapshot map of all admitted sysids and their latest UDP peer endpoints.
+// Peers returns a snapshot map of all admitted sysids and their pinned UDP peer endpoints.
 func (c *Component) Peers() map[uint8]netip.AddrPort {
 	return c.tracker.Peers()
+}
+
+// ActuationTarget returns the pinned UDP endpoint and current safety state for sysid.
+func (c *Component) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
+	return c.tracker.ActuationTarget(sysid)
+}
+
+// SetActuationCallbacks registers synchronous callbacks invoked on Lane 3 state
+// transitions (`heartbeat_edge`, `link_lost`, etc.) and `#77 COMMAND_ACK` ingest.
+func (c *Component) SetActuationCallbacks(
+	onEvent func(TransitionEvent),
+	onAck func(sysid uint8, ack mavcodec.CommandAck, observedAt time.Time),
+) {
+	if onEvent == nil && onAck == nil {
+		c.actuationHooks.Store(nil)
+		return
+	}
+	c.actuationHooks.Store(&actuationCallbacks{
+		onEvent: onEvent,
+		onAck:   onAck,
+	})
+}
+
+// SendFrame encodes frame as a MAVLink v2 (`0xFD`) packet and transmits it over
+// the bound UDP socket to peer.
+func (c *Component) SendFrame(frame mavcodec.Frame, peer netip.AddrPort) error {
+	if !peer.IsValid() {
+		return errors.New("mavlink: invalid peer address")
+	}
+	conn := c.UDPConn()
+	if conn == nil {
+		return errors.New("mavlink: UDP socket is not running")
+	}
+	raw, err := mavcodec.EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
+	_, err = conn.WriteToUDPAddrPort(raw, peer)
+	return err
 }
 
 func (c *Component) start(ctx context.Context) error {
@@ -291,16 +337,17 @@ func (c *Component) readLoop(ctx context.Context, conn *net.UDPConn) {
 }
 
 func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame, peerAddr netip.AddrPort, n int) {
+	now := time.Now()
 	mu := &c.sysidMu[frame.SystemID]
 	mu.Lock()
-	defer mu.Unlock()
-
-	outcome := c.tracker.IngestFrame(frame, peerAddr, time.Now())
+	outcome := c.tracker.IngestFrame(frame, peerAddr, now)
 	if outcome.CountedError {
 		c.lifecycle.CountError()
+		mu.Unlock()
 		return
 	}
 	if !outcome.Accepted {
+		mu.Unlock()
 		return
 	}
 	c.lifecycle.CountInput(n)
@@ -313,6 +360,18 @@ func (c *Component) ingestDecodedFrame(ctx context.Context, frame mavcodec.Frame
 	}
 	if outcome.UrgentSKGSync {
 		c.publisher.NotifyUrgent(outcome.SysID)
+	}
+	mu.Unlock()
+
+	if hooks := c.actuationHooks.Load(); hooks != nil {
+		if hooks.onEvent != nil {
+			for i := range outcome.Events {
+				hooks.onEvent(outcome.Events[i])
+			}
+		}
+		if hooks.onAck != nil && outcome.CommandAck != nil {
+			hooks.onAck(outcome.SysID, *outcome.CommandAck, now)
+		}
 	}
 }
 
@@ -330,16 +389,21 @@ func (c *Component) tickLoop(ctx context.Context) {
 }
 
 func (c *Component) evaluateSilenceTick(ctx context.Context) {
+	hooks := c.actuationHooks.Load()
 	for _, sysid := range c.tracker.admittedSysIDs() {
 		mu := &c.sysidMu[sysid]
 		mu.Lock()
-		if ev, lost := c.tracker.evaluateSilenceSysID(sysid, time.Now()); lost {
+		ev, lost := c.tracker.evaluateSilenceSysID(sysid, time.Now())
+		if lost {
 			if c.afterSilenceEval != nil {
 				c.afterSilenceEval(ev)
 			}
 			c.publishCoreJSON(ctx, c.eventSubject(ev.SysID), ev)
 		}
 		mu.Unlock()
+		if lost && hooks != nil && hooks.onEvent != nil {
+			hooks.onEvent(ev)
+		}
 	}
 	c.publisher.NotifyPeriodic()
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"reflect"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ type Config struct {
 	SKGHz                float64              `json:"skg_hz,omitempty" schema:"type:float,description:Coalesced SKG snapshot publish rate in Hz (1..5),default:1,min:1,max:5"`
 	LinkTimeoutMs        int                  `json:"link_timeout_ms,omitempty" schema:"type:int,description:Per-sysid silence timeout in ms for bench and high-rate links (200..300000),default:3000,min:200,max:300000"`
 	SupervisoryTimeoutMs int                  `json:"supervisory_timeout_ms,omitempty" schema:"type:int,description:Per-sysid silence timeout in ms for mesh-supervisory links (>= link_timeout_ms),default:10000,min:200,max:300000"`
+	AllowedPeers         []string             `json:"allowed_peers,omitempty" schema:"type:array,description:Allowed peer IP or CIDR prefixes for MAVLink UDP admission and actuation"`
 	Ports                component.PortConfig `json:"ports" schema:"type:ports,description:External MAVLink UDP input and NATS/JetStream outputs"`
 }
 
@@ -70,6 +72,7 @@ type resolvedSettings struct {
 	skgInterval        time.Duration
 	linkTimeout        time.Duration
 	supervisoryTimeout time.Duration
+	allowedPeers       []netip.Prefix
 	telemetryPrefix    string
 	entitySubject      string
 	inputPort          component.Port
@@ -81,6 +84,7 @@ func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 		SKGHz                *float64              `json:"skg_hz"`
 		LinkTimeoutMs        *int                  `json:"link_timeout_ms"`
 		SupervisoryTimeoutMs *int                  `json:"supervisory_timeout_ms"`
+		AllowedPeers         []string              `json:"allowed_peers"`
 		Ports                *component.PortConfig `json:"ports"`
 	}
 	trimmed := bytes.TrimSpace(rawConfig)
@@ -211,6 +215,11 @@ func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 		return resolvedSettings{}, fmt.Errorf("mavlink: entity_upsert subject %q must be a concrete NATS subject without wildcards", entitySubject)
 	}
 
+	allowedPeers, err := resolveAllowedPeers(netCfg.Host, wire.AllowedPeers)
+	if err != nil {
+		return resolvedSettings{}, err
+	}
+
 	intervalNs := math.Round(float64(time.Second) / skgHz)
 	return resolvedSettings{
 		udpHost:            netCfg.Host,
@@ -219,11 +228,58 @@ func resolveConfig(rawConfig json.RawMessage) (resolvedSettings, error) {
 		skgInterval:        time.Duration(intervalNs),
 		linkTimeout:        time.Duration(linkTimeoutMs) * time.Millisecond,
 		supervisoryTimeout: time.Duration(supervisoryTimeoutMs) * time.Millisecond,
+		allowedPeers:       allowedPeers,
 		telemetryPrefix:    telemetryPrefix,
 		entitySubject:      entitySubject,
 		inputPort:          inPort,
 		outputPorts:        outputs,
 	}, nil
+}
+
+func resolveAllowedPeers(udpHost string, rawPeers []string) ([]netip.Prefix, error) {
+	if len(rawPeers) == 0 {
+		trimmedHost := strings.TrimSpace(udpHost)
+		if strings.EqualFold(trimmedHost, "localhost") {
+			return []netip.Prefix{
+				netip.MustParsePrefix("127.0.0.0/8"),
+				netip.MustParsePrefix("::1/128"),
+			}, nil
+		}
+		if addr, err := netip.ParseAddr(trimmedHost); err == nil && addr.Unmap().IsLoopback() {
+			return []netip.Prefix{
+				netip.MustParsePrefix("127.0.0.0/8"),
+				netip.MustParsePrefix("::1/128"),
+			}, nil
+		}
+		return nil, nil
+	}
+	prefixes := make([]netip.Prefix, 0, len(rawPeers))
+	for _, entry := range rawPeers {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			return nil, errors.New("mavlink: empty entry in allowed_peers")
+		}
+		if strings.Contains(trimmed, "/") {
+			pfx, err := netip.ParsePrefix(trimmed)
+			if err != nil {
+				return nil, fmt.Errorf("mavlink: invalid allowed_peers CIDR %q: %w", entry, err)
+			}
+			unmapped := pfx.Addr().Unmap()
+			bits := pfx.Bits()
+			if pfx.Addr().Is4In6() && bits >= 96 {
+				bits -= 96
+			}
+			prefixes = append(prefixes, netip.PrefixFrom(unmapped, bits).Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("mavlink: invalid allowed_peers address %q: %w", entry, err)
+		}
+		unmapped := addr.Unmap()
+		prefixes = append(prefixes, netip.PrefixFrom(unmapped, unmapped.BitLen()))
+	}
+	return prefixes, nil
 }
 
 func deriveTelemetryPrefix(subject string) (string, error) {

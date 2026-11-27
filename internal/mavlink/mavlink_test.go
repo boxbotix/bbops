@@ -537,13 +537,19 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		t.Fatalf("PeerAddr(2) = (%v, %v), want (%v, true)", gotPeer, ok, peerA)
 	}
 
-	// Identical HEARTBEAT from rotated peerB updates PeerAddr without emitting an edge event.
-	steadyOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 4, validRoverHB), peerB, t0.Add(time.Second))
+	// OQ1 Option A: Mismatched peerB while sysid=2 is live is rejected without redirecting PeerAddr or emitting events.
+	spoofOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 4, validRoverHB), peerB, t0.Add(500*time.Millisecond))
+	if spoofOut.Accepted || !spoofOut.CountedError || len(spoofOut.Events) != 0 || spoofOut.UrgentSKGSync {
+		t.Fatalf("spoofed peerB HEARTBEAT while live outcome = %+v, want rejected", spoofOut)
+	}
+	if gotPeer, ok := tracker.PeerAddr(2); !ok || gotPeer != peerA {
+		t.Fatalf("PeerAddr(2) after spoofed peerB = (%v, %v), want (%v, true)", gotPeer, ok, peerA)
+	}
+
+	// Steady HEARTBEAT from pinned peerA refreshes liveness without emitting an edge event.
+	steadyOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 4, validRoverHB), peerA, t0.Add(time.Second))
 	if !steadyOut.Accepted || len(steadyOut.Events) != 0 || steadyOut.UrgentSKGSync {
 		t.Fatalf("steady HEARTBEAT outcome = %+v", steadyOut)
-	}
-	if gotPeer, ok := tracker.PeerAddr(2); !ok || gotPeer != peerB {
-		t.Fatalf("PeerAddr(2) after rotation = (%v, %v), want (%v, true)", gotPeer, ok, peerB)
 	}
 
 	// 4. Heading fallback (#33 before #31) and quaternion precedence (#31 overrides #33.Hdg).
@@ -553,7 +559,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		Alt: 12345,
 		Hdg: 65535, // UINT16_MAX = unknown
 	}
-	gpOut1 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpUnknownHdg), peerB, t0.Add(2*time.Second))
+	gpOut1 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpUnknownHdg), peerA, t0.Add(2*time.Second))
 	if !gpOut1.Accepted || gpOut1.Telemetry == nil || !gpOut1.Telemetry.HasGlobalPos || gpOut1.Telemetry.HasLocalPos ||
 		gpOut1.Telemetry.HasAttitude || gpOut1.Telemetry.HasHeading || gpOut1.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || gpOut1.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535) outcome = %+v, want HasHeading=false", gpOut1)
@@ -565,7 +571,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	gpZeroNorthHdg := gpUnknownHdg
 	gpZeroNorthHdg.Hdg = 0 // measured 0.00 deg North before any #31
-	gpOutZero := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpZeroNorthHdg), peerB, t0.Add(2500*time.Millisecond))
+	gpOutZero := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 5, gpZeroNorthHdg), peerA, t0.Add(2500*time.Millisecond))
 	if !gpOutZero.Accepted || gpOutZero.Telemetry == nil || gpOutZero.Telemetry.HasAttitude ||
 		!gpOutZero.Telemetry.HasHeading || gpOutZero.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0) outcome = %+v, want HasHeading=true HdgDeg=0", gpOutZero.Telemetry)
@@ -577,7 +583,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	gpFallbackHdg := gpUnknownHdg
 	gpFallbackHdg.Hdg = 27450 // 274.50 deg before any #31
-	gpOut2 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpFallbackHdg), peerB, t0.Add(3*time.Second))
+	gpOut2 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpFallbackHdg), peerA, t0.Add(3*time.Second))
 	if !gpOut2.Accepted || gpOut2.Telemetry == nil || gpOut2.Telemetry.HasAttitude || gpOut2.Telemetry.HasLocalPos ||
 		!gpOut2.Telemetry.HasHeading || gpOut2.Telemetry.QuatWXYZ != [4]float64{0, 0, 0, 0} || math.Abs(gpOut2.Telemetry.HdgDeg-274.5) > 1e-6 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=27450) HdgDeg = %v, want 274.5 with HasAttitude=false HasHeading=true", gpOut2.Telemetry)
@@ -604,7 +610,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	// Subsequent #33 with unknown Hdg=65535 before any #31 MUST invalidate fallback heading on both lanes
 	// AND carry obsNs so SemEngine graph.ReplaceBySource replaces the stored 274.5 deg triple!
 	tLostHdg := t0.Add(3250 * time.Millisecond)
-	gpOutLostHdg := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpUnknownHdg), peerB, tLostHdg)
+	gpOutLostHdg := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpUnknownHdg), peerA, tLostHdg)
 	if !gpOutLostHdg.Accepted || gpOutLostHdg.Telemetry == nil || gpOutLostHdg.Telemetry.HasAttitude ||
 		gpOutLostHdg.Telemetry.HasHeading || gpOutLostHdg.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=65535 after 274.5) = %+v, want HasHeading=false HdgDeg=0", gpOutLostHdg.Telemetry)
@@ -621,7 +627,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	// Health-only update while heading is unknown MUST keep heading unmeasured at tLostHdg (neither reverting to 274.5 nor advancing heading timestamp).
 	tHealthWhileUnknown := t0.Add(3375 * time.Millisecond)
 	hbSteadyWhileUnknown := makeVehicleHB(mavcodec.DomainRover, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierSITLLocal, uxsvocab.HealthFlags{})
-	if hbWhileUnknownOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, hbSteadyWhileUnknown), peerB, tHealthWhileUnknown); !hbWhileUnknownOut.Accepted {
+	if hbWhileUnknownOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, hbSteadyWhileUnknown), peerA, tHealthWhileUnknown); !hbWhileUnknownOut.Accepted {
 		t.Fatalf("HEARTBEAT while heading unknown outcome = %+v", hbWhileUnknownOut)
 	}
 	snapHealthWhileUnknown, _ := tracker.Snapshot(2)
@@ -638,7 +644,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	// Measured 0.00 deg North restores HasHeading=true and Confidence=1 / Context="measured" in ReplaceBySource.
 	tRestoredNorth := t0.Add(3500 * time.Millisecond)
-	gpOutRestoredNorth := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpZeroNorthHdg), peerB, tRestoredNorth)
+	gpOutRestoredNorth := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 6, gpZeroNorthHdg), peerA, tRestoredNorth)
 	if !gpOutRestoredNorth.Accepted || gpOutRestoredNorth.Telemetry == nil || gpOutRestoredNorth.Telemetry.HasAttitude ||
 		!gpOutRestoredNorth.Telemetry.HasHeading || gpOutRestoredNorth.Telemetry.HdgDeg != 0 {
 		t.Fatalf("GLOBAL_POSITION_INT(Hdg=0 after unknown) = %+v, want HasHeading=true HdgDeg=0", gpOutRestoredNorth.Telemetry)
@@ -655,7 +661,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	// #31 arrives with 90 deg East yaw ([cos(45), 0, 0, sin(45)]).
 	s45 := float32(math.Sqrt2 / 2)
 	attEast := mavcodec.AttitudeQuaternion{Q1: s45, Q2: 0, Q3: 0, Q4: s45, Yawspeed: 0.25}
-	attOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 7, attEast), peerB, t0.Add(4*time.Second))
+	attOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 7, attEast), peerA, t0.Add(4*time.Second))
 	if !attOut.Accepted || attOut.Telemetry == nil || !attOut.Telemetry.HasAttitude || attOut.Telemetry.HasLocalPos ||
 		math.Abs(attOut.Telemetry.HdgDeg-90.0) > 1e-4 || !attOut.Telemetry.HasGlobalPos {
 		t.Fatalf("ATTITUDE_QUATERNION East outcome = %+v", attOut.Telemetry)
@@ -663,7 +669,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	// Subsequent #33 with Hdg=18000 must NOT overwrite #31's 90.0 deg heading!
 	gpSouthHdg := mavcodec.GlobalPositionInt{Lat: -900_000_000, Lon: 1_800_000_000, Alt: -500, Hdg: 18000}
-	gpOut3 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 8, gpSouthHdg), peerB, t0.Add(5*time.Second))
+	gpOut3 := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 8, gpSouthHdg), peerA, t0.Add(5*time.Second))
 	if !gpOut3.Accepted || gpOut3.Telemetry == nil {
 		t.Fatalf("GLOBAL_POSITION_INT boundary outcome = %+v", gpOut3)
 	}
@@ -677,7 +683,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	// #32 LOCAL_POSITION_NED fuses with existing attitude + global position.
 	nedOut := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 9, mavcodec.LocalPositionNED{
 		X: 12.5, Y: -4.25, Z: -0.5, Vx: 1.5, Vy: -0.5, Vz: 0.0,
-	}), peerB, t0.Add(6*time.Second))
+	}), peerA, t0.Add(6*time.Second))
 	if !nedOut.Accepted || nedOut.Telemetry == nil || !nedOut.Telemetry.HasLocalPos ||
 		nedOut.Telemetry.NEDXYZ != [3]float64{12.5, -4.25, -0.5} ||
 		nedOut.Telemetry.NEDVel != [3]float64{1.5, -0.5, 0} || !nedOut.Telemetry.HasGlobalPos {
@@ -713,8 +719,8 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	if snapAfterBad != snapBeforeBad {
 		t.Fatalf("sanitization failure mutated snapshot:\nbefore=%+v\nafter =%+v", snapBeforeBad, snapAfterBad)
 	}
-	if gotPeer, _ := tracker.PeerAddr(2); gotPeer != peerB {
-		t.Fatalf("rejected packet overwrote PeerAddr: got %v, want %v", gotPeer, peerB)
+	if gotPeer, _ := tracker.PeerAddr(2); gotPeer != peerA {
+		t.Fatalf("rejected packet overwrote PeerAddr: got %v, want %v", gotPeer, peerA)
 	}
 
 	// 6. Lane 3 edge transitions: HEARTBEAT preemption, #1 SYS_STATUS failsafe increment, and event-only #253 STATUSTEXT.
@@ -726,7 +732,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		mavcodec.LinkTierMeshHighRate,
 		uxsvocab.HealthFlags{TeleopDeadmanClamped: true},
 	)
-	hbEdge := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 40, preemptHB), peerB, t0.Add(8*time.Second))
+	hbEdge := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 40, preemptHB), peerA, t0.Add(8*time.Second))
 	if !hbEdge.Accepted || !hbEdge.UrgentSKGSync || len(hbEdge.Events) != 1 {
 		t.Fatalf("HEARTBEAT preemption outcome = %+v", hbEdge)
 	}
@@ -743,7 +749,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	// strict increment (7 -> 8) emits exactly one failsafe_increment edge; decrement (8 -> 6) updates without edge.
 	sysBaseline := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 41, mavcodec.SysStatus{
 		Load: 1200, ErrorsComm: 3, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 900,
-	}), peerB, t0.Add(9*time.Second))
+	}), peerA, t0.Add(9*time.Second))
 	if !sysBaseline.Accepted || sysBaseline.UrgentSKGSync || len(sysBaseline.Events) != 0 {
 		t.Fatalf("SYS_STATUS initial baseline(7) outcome = %+v, want no false failsafe alert", sysBaseline)
 	}
@@ -753,7 +759,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	sysSteady := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 42, mavcodec.SysStatus{
 		Load: 1100, ErrorsComm: 4, ErrorsCount1: 7, ErrorsCount2: 1850, ErrorsCount3: 850,
-	}), peerB, t0.Add(10*time.Second))
+	}), peerA, t0.Add(10*time.Second))
 	if !sysSteady.Accepted || sysSteady.UrgentSKGSync || len(sysSteady.Events) != 0 {
 		t.Fatalf("SYS_STATUS steady(7->7) outcome = %+v, want no edge event", sysSteady)
 	}
@@ -763,7 +769,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	sysInc := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 43, mavcodec.SysStatus{
 		Load: 1050, ErrorsComm: 5, ErrorsCount1: 8, ErrorsCount2: 1900, ErrorsCount3: 820,
-	}), peerB, t0.Add(11*time.Second))
+	}), peerA, t0.Add(11*time.Second))
 	if !sysInc.Accepted || !sysInc.UrgentSKGSync || len(sysInc.Events) != 1 || sysInc.Events[0].Kind != EventKindFailsafeIncrement || sysInc.Events[0].Failsafes != 8 {
 		t.Fatalf("SYS_STATUS increment(7->8) outcome = %+v, want failsafe_increment(8)", sysInc)
 	}
@@ -773,7 +779,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 
 	sysDec := tracker.IngestDatagram(encodeFrameBytes(t, 2, 1, 44, mavcodec.SysStatus{
 		Load: 1000, ErrorsComm: 5, ErrorsCount1: 6, ErrorsCount2: 1900, ErrorsCount3: 800,
-	}), peerB, t0.Add(12*time.Second))
+	}), peerA, t0.Add(12*time.Second))
 	if !sysDec.Accepted || sysDec.UrgentSKGSync || len(sysDec.Events) != 0 {
 		t.Fatalf("SYS_STATUS decrement(8->6) outcome = %+v, want no edge event", sysDec)
 	}
@@ -787,7 +793,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 		Text:     "CRSF OVERRIDE ENGAGED",
 		ID:       7,
 		ChunkSeq: 0,
-	}), peerB, t0.Add(13*time.Second))
+	}), peerA, t0.Add(13*time.Second))
 	if !stOut.Accepted || stOut.UrgentSKGSync || len(stOut.Events) != 1 || stOut.Events[0].Kind != EventKindStatusText ||
 		stOut.Events[0].StatusText == nil || stOut.Events[0].StatusText.Text != "CRSF OVERRIDE ENGAGED" {
 		t.Fatalf("STATUSTEXT wire outcome = %+v, want UrgentSKGSync=false and statustext event", stOut)
@@ -795,7 +801,7 @@ func TestTrackerSessionAdmissionSanitizationAndThreeLanes(t *testing.T) {
 	stNulOut := tracker.IngestFrame(mavcodec.Frame{
 		SystemID: 2, ComponentID: 1, Sequence: 46,
 		Message: mavcodec.StatusText{Severity: 4, Text: "PADDED\x00\x00"},
-	}, peerB, t0.Add(14*time.Second))
+	}, peerA, t0.Add(14*time.Second))
 	if !stNulOut.Accepted || stNulOut.UrgentSKGSync || len(stNulOut.Events) != 1 || stNulOut.Events[0].StatusText.Text != "PADDED" {
 		t.Fatalf("STATUSTEXT NUL-trim outcome = %+v", stNulOut)
 	}
@@ -1763,6 +1769,7 @@ func TestTrackerRestartClearsRetainedGraphPoseDomains(t *testing.T) {
 }
 
 // spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+// spec: uxs-control / Pin-on-admission MAVLink v2 UDP command egress and 1 Hz GCS liveness
 func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 	if err := uxsvocab.Register(); err != nil {
 		t.Fatalf("uxsvocab.Register: %v", err)
@@ -1775,6 +1782,7 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	type refVehicle struct {
 		admitted      bool
+		peerAddr      netip.AddrPort
 		domain        string
 		armed         bool
 		authority     string
@@ -1827,6 +1835,8 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 		sawFailsafeEdge          int
 		sawStatusText            int
 		sawSanitizedReject       int
+		sawPinnedPeerReject      int
+		sawPeerRebindAfterLoss   int
 		sawCoalescedPeriodic     int
 		sawTrackerRestart        int
 		sawLinkLost              int
@@ -1982,8 +1992,14 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 			now = now.Add(50 * time.Millisecond)
 			sysid := uint8(1 + rng.IntN(3))
-			peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(40000+int(sysid)*10+rng.IntN(5)))
 			rv := ref[sysid]
+			peer := rv.peerAddr
+			if !rv.admitted {
+				peer = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(40000+int(sysid)*10+rng.IntN(5)))
+			} else if rng.IntN(5) == 0 {
+				altPort := uint16(40000 + int(sysid)*10 + int((rv.peerAddr.Port()-uint16(40000+int(sysid)*10)+1)%5))
+				peer = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), altPort)
+			}
 
 			switch rng.IntN(8) {
 			case 0: // #0 HEARTBEAT
@@ -1996,6 +2012,16 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				hb := makeVehicleHB(dom, armed, auth, mode, tier, flags)
 
 				out := tracker.IngestFrame(mavcodec.Frame{SystemID: sysid, ComponentID: 1, Sequence: uint8(step), Message: hb}, peer, now)
+				if rv.admitted && !rv.linkLost && peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d step %d: mismatched peer HB while live not rejected: %+v", seed, step, out)
+					}
+					if gotPeer, ok := tracker.PeerAddr(sysid); !ok || gotPeer != rv.peerAddr {
+						t.Fatalf("seed %d step %d: PeerAddr redirected on live mismatch: got %v, want %v", seed, step, gotPeer, rv.peerAddr)
+					}
+					sawPinnedPeerReject++
+					continue
+				}
 				if !out.Accepted || out.CountedError {
 					t.Fatalf("seed %d step %d: valid HB rejected: %+v", seed, step, out)
 				}
@@ -2006,12 +2032,17 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				tierS, _ := tier.VocabString()
 				if !rv.admitted {
 					rv.admitted = true
+					rv.peerAddr = peer
 					sawAdmission++
 					if len(out.Events) != 0 || out.UrgentSKGSync {
 						t.Fatalf("seed %d step %d: first HB emitted edge event: %+v", seed, step, out)
 					}
 				} else {
 					wasLost := rv.linkLost
+					if wasLost && peer != rv.peerAddr {
+						sawPeerRebindAfterLoss++
+					}
+					rv.peerAddr = peer
 					changed := rv.domain != domS || rv.armed != armed || rv.authority != authS ||
 						rv.mode != modeS || rv.tier != tierS || rv.flags != flags
 					var wantKinds []string
@@ -2067,6 +2098,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					if out.Accepted {
 						t.Fatalf("seed %d: unadmitted SYS_STATUS accepted", seed)
 					}
+					continue
+				}
+				if peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d: mismatched peer SYS_STATUS accepted", seed)
+					}
+					sawPinnedPeerReject++
 					continue
 				}
 				wasLost := rv.linkLost
@@ -2131,6 +2169,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
+				if peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d: mismatched peer #31 accepted", seed)
+					}
+					sawPinnedPeerReject++
+					continue
+				}
 				wasLost := rv.linkLost
 				if wasLost {
 					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
@@ -2186,6 +2231,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					}
 					continue
 				}
+				if peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d: mismatched peer #33 accepted", seed)
+					}
+					sawPinnedPeerReject++
+					continue
+				}
 				wasLost := rv.linkLost
 				if wasLost {
 					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
@@ -2228,6 +2280,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 				if !rv.admitted {
 					continue
 				}
+				if peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d: mismatched peer #32 accepted", seed)
+					}
+					sawPinnedPeerReject++
+					continue
+				}
 				wasLost := rv.linkLost
 				if wasLost {
 					if len(out.Events) != 1 || out.Events[0].Kind != EventKindLinkRestored || !out.UrgentSKGSync {
@@ -2254,6 +2313,13 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 					Message: mavcodec.StatusText{Severity: 6, Text: "OK\x00"},
 				}, peer, now)
 				if !rv.admitted {
+					continue
+				}
+				if peer != rv.peerAddr {
+					if out.Accepted || !out.CountedError {
+						t.Fatalf("seed %d: mismatched peer #253 accepted", seed)
+					}
+					sawPinnedPeerReject++
 					continue
 				}
 				sawStatusText++
@@ -2420,13 +2486,14 @@ func TestPropertyThreeLaneHistoryAgainstReferenceModel(t *testing.T) {
 
 	if sawAdmission == 0 || sawSysStatusBaseline == 0 || sawQuatOverride == 0 || sawHdgFallback == 0 || sawHdgInvalidation == 0 ||
 		sawHeartbeatEdge == 0 || sawFailsafeEdge == 0 || sawStatusText == 0 ||
-		sawSanitizedReject == 0 || sawCoalescedPeriodic == 0 || sawTrackerRestart == 0 ||
+		sawSanitizedReject == 0 || sawPinnedPeerReject == 0 || sawPeerRebindAfterLoss == 0 ||
+		sawCoalescedPeriodic == 0 || sawTrackerRestart == 0 ||
 		sawLinkLost == 0 || sawSupervisoryHold == 0 || sawLinkRestored == 0 ||
 		sawConcurrentRestoreEdge == 0 || sawSilentNoReupsert == 0 {
-		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d coalesced=%d restart=%d lost=%d supHold=%d restored=%d concurrent=%d silentSkip=%d",
+		t.Fatalf("insufficient property boundary reach: admit=%d sysBaseline=%d quatOverride=%d hdgFallback=%d hdgInvalid=%d hbEdge=%d fsEdge=%d st=%d reject=%d peerReject=%d peerRebind=%d coalesced=%d restart=%d lost=%d supHold=%d restored=%d concurrent=%d silentSkip=%d",
 			sawAdmission, sawSysStatusBaseline, sawQuatOverride, sawHdgFallback, sawHdgInvalidation,
-			sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawCoalescedPeriodic,
-			sawTrackerRestart, sawLinkLost, sawSupervisoryHold, sawLinkRestored, sawConcurrentRestoreEdge, sawSilentNoReupsert)
+			sawHeartbeatEdge, sawFailsafeEdge, sawStatusText, sawSanitizedReject, sawPinnedPeerReject, sawPeerRebindAfterLoss,
+			sawCoalescedPeriodic, sawTrackerRestart, sawLinkLost, sawSupervisoryHold, sawLinkRestored, sawConcurrentRestoreEdge, sawSilentNoReupsert)
 	}
 }
 
@@ -2623,5 +2690,375 @@ func TestTrackerPositionOnlyPacketsFreezeHeartbeatTripleTimestamps(t *testing.T)
 		if !byPred7[pred].Timestamp.Equal(t7) {
 			t.Fatalf("after +7s HEARTBEAT, %s Timestamp = %v, want %v", pred, byPred7[pred].Timestamp, t7)
 		}
+	}
+}
+
+// spec: uxs-control / Pin-on-admission MAVLink v2 UDP command egress and 1 Hz GCS liveness
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+func TestTrackerPeerPinningAndCommandAck(t *testing.T) {
+	if err := uxsvocab.Register(); err != nil {
+		t.Fatalf("uxsvocab.Register: %v", err)
+	}
+
+	// Verify resolveConfig default loopback allowed_peers vs explicit CIDR/IP parsing.
+	defaultCfg, err := resolveConfig(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("resolveConfig default: %v", err)
+	}
+	if len(defaultCfg.allowedPeers) != 2 {
+		t.Fatalf("default loopback allowedPeers = %v, want [127.0.0.0/8 ::1/128]", defaultCfg.allowedPeers)
+	}
+	wildcardCfg, err := resolveConfig(json.RawMessage(`{"ports":{"inputs":[{"name":"mavlink_udp","external":true,"config":{"kind":"network","protocol":"udp","host":"0.0.0.0","port":14550}}]}}`))
+	if err != nil {
+		t.Fatalf("resolveConfig 0.0.0.0: %v", err)
+	}
+	if len(wildcardCfg.allowedPeers) != 0 {
+		t.Fatalf("0.0.0.0 default allowedPeers = %v, want empty unless configured", wildcardCfg.allowedPeers)
+	}
+	customCfg, err := resolveConfig(json.RawMessage(`{"allowed_peers":["127.0.0.1","10.42.0.0/16","::1"]}`))
+	if err != nil {
+		t.Fatalf("resolveConfig custom allowed_peers: %v", err)
+	}
+	if len(customCfg.allowedPeers) != 3 {
+		t.Fatalf("custom allowedPeers = %v, want 3 entries", customCfg.allowedPeers)
+	}
+	for _, badJSON := range []string{
+		`{"allowed_peers":[""]}`,
+		`{"allowed_peers":["not-a-cidr"]}`,
+	} {
+		if _, badErr := resolveConfig(json.RawMessage(badJSON)); badErr == nil {
+			t.Fatalf("resolveConfig(%s) succeeded, want error", badJSON)
+		}
+	}
+
+	tracker, err := NewTrackerWithOptions(
+		"boxbotix",
+		"bbops",
+		3*time.Second,
+		10*time.Second,
+		customCfg.allowedPeers,
+	)
+	if err != nil {
+		t.Fatalf("NewTrackerWithOptions: %v", err)
+	}
+
+	t0 := time.Date(2026, 11, 26, 15, 0, 0, 0, time.UTC)
+	peerPinned := netip.MustParseAddrPort("127.0.0.1:41001")
+	peerPinnedV6Mapped := netip.MustParseAddrPort("[::ffff:127.0.0.1]:41001")
+	peerSpoofAllowed := netip.MustParseAddrPort("10.42.1.9:55555")
+	peerDisallowed := netip.MustParseAddrPort("192.168.1.77:14550")
+	peerRotated := netip.MustParseAddrPort("10.42.2.10:41002")
+
+	hbTeleop := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+
+	// Disallowed peer outside allowed_peers is rejected on admission.
+	disallowedOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 1, hbTeleop), peerDisallowed, t0)
+	if disallowedOut.Accepted || !disallowedOut.CountedError {
+		t.Fatalf("disallowed peer admission outcome = %+v, want CountedError=true", disallowedOut)
+	}
+	if _, ok := tracker.ActuationTarget(1); ok {
+		t.Fatal("disallowed peer must not admit sysid=1")
+	}
+
+	// #77 COMMAND_ACK before admission is ignored without accepting or counting an error.
+	preAdmitAck := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 2, mavcodec.CommandAck{
+		Command: mavcodec.MAVCmdComponentArmDisarm,
+		Result:  mavcodec.MAVResultAccepted,
+	}), peerPinned, t0)
+	if preAdmitAck.Accepted || preAdmitAck.CountedError || preAdmitAck.CommandAck != nil {
+		t.Fatalf("pre-admission COMMAND_ACK outcome = %+v, want ignored", preAdmitAck)
+	}
+
+	// Admit sysid=1 from peerPinned (via IPv4-mapped IPv6 to verify canonical normalization).
+	admitOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 3, hbTeleop), peerPinnedV6Mapped, t0)
+	if !admitOut.Accepted || admitOut.CountedError {
+		t.Fatalf("admission outcome = %+v, want Accepted", admitOut)
+	}
+	target, ok := tracker.ActuationTarget(1)
+	if !ok || target.PeerAddr != peerPinned || !target.Armed || target.Authority != uxsvocab.AuthorityCompanionTeleop || target.LinkLost {
+		t.Fatalf("ActuationTarget(1) = (%+v, %v), want pinned %v armed companion-teleop", target, ok, peerPinned)
+	}
+
+	snapBeforeSpoof, _ := tracker.Snapshot(1)
+
+	// While live (!linkLost), spoofed packets from another allowed peer MUST be rejected across all message types
+	// without mutating VehicleSnapshot, redirecting PeerAddr, or refreshing freshness!
+	spoofMsgs := []mavcodec.Message{
+		makeVehicleHB(mavcodec.DomainRover, false, mavcodec.AuthorityMCUFailsafe, mavcodec.ModeDisarmed, mavcodec.LinkTierMeshSupervisory, uxsvocab.HealthFlags{}),
+		mavcodec.SysStatus{Load: 999, ErrorsCount1: 5},
+		mavcodec.AttitudeQuaternion{Q1: 1},
+		mavcodec.LocalPositionNED{X: 99},
+		mavcodec.GlobalPositionInt{Lat: 100, Lon: 200, Hdg: 9000},
+		mavcodec.CommandAck{Command: mavcodec.MAVCmdComponentArmDisarm, Result: mavcodec.MAVResultDenied},
+		mavcodec.StatusText{Severity: 1, Text: "SPOOF"},
+	}
+	for i, msg := range spoofMsgs {
+		out := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, uint8(10+i), msg), peerSpoofAllowed, t0.Add(2*time.Second))
+		if out.Accepted || !out.CountedError || out.CommandAck != nil || len(out.Events) != 0 || out.Telemetry != nil {
+			t.Fatalf("spoofed message %d (%T) while live = %+v, want rejected", i, msg, out)
+		}
+	}
+	snapAfterSpoof, _ := tracker.Snapshot(1)
+	if snapAfterSpoof != snapBeforeSpoof {
+		t.Fatalf("spoofed peer mutated snapshot:\nbefore=%+v\nafter =%+v", snapBeforeSpoof, snapAfterSpoof)
+	}
+	if gotPeer, _ := tracker.PeerAddr(1); gotPeer != peerPinned {
+		t.Fatalf("PeerAddr(1) after spoof = %v, want %v", gotPeer, peerPinned)
+	}
+
+	// Because spoofed packets at t0+2s did NOT refresh freshness, silence evaluation at t0+3.1s marks sysid=1 link_lost!
+	lostEvs := tracker.EvaluateSilence(t0.Add(3100 * time.Millisecond))
+	if len(lostEvs) != 1 || lostEvs[0].SysID != 1 || lostEvs[0].Kind != EventKindLinkLost {
+		t.Fatalf("EvaluateSilence after spoof = %+v, want link_lost on sysid=1", lostEvs)
+	}
+	if targetLost, ok := tracker.ActuationTarget(1); !ok || !targetLost.LinkLost {
+		t.Fatalf("ActuationTarget(1) after silence = (%+v, %v), want LinkLost=true", targetLost, ok)
+	}
+
+	// Even after link_lost, a non-HEARTBEAT frame (#32 or #77) from rotated peer MUST still be rejected!
+	rotNonHB := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 30, mavcodec.LocalPositionNED{X: 5}), peerRotated, t0.Add(3500*time.Millisecond))
+	if rotNonHB.Accepted || !rotNonHB.CountedError {
+		t.Fatalf("non-HEARTBEAT from rotated peer after link_lost = %+v, want rejected", rotNonHB)
+	}
+	rotDisallowedHB := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 31, hbTeleop), peerDisallowed, t0.Add(3600*time.Millisecond))
+	if rotDisallowedHB.Accepted || !rotDisallowedHB.CountedError {
+		t.Fatalf("disallowed peer HEARTBEAT after link_lost = %+v, want rejected", rotDisallowedHB)
+	}
+
+	// Valid 0xB1 #0 HEARTBEAT from allowed rotated peer after link_lost cleanly re-binds PeerAddr and emits link_restored.
+	rebindOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 32, hbTeleop), peerRotated, t0.Add(4*time.Second))
+	if !rebindOut.Accepted || rebindOut.CountedError || len(rebindOut.Events) != 1 || rebindOut.Events[0].Kind != EventKindLinkRestored {
+		t.Fatalf("rebind HEARTBEAT after link_lost = %+v, want Accepted + link_restored", rebindOut)
+	}
+	if gotPeer, _ := tracker.PeerAddr(1); gotPeer != peerRotated {
+		t.Fatalf("PeerAddr(1) after rebind = %v, want %v", gotPeer, peerRotated)
+	}
+
+	// #77 COMMAND_ACK from the newly pinned peer is accepted and surfaced on IngestOutcome.CommandAck.
+	ackOut := tracker.IngestDatagram(encodeFrameBytes(t, 1, 1, 33, mavcodec.CommandAck{
+		Command:      mavcodec.MAVCmdComponentArmDisarm,
+		Result:       mavcodec.MAVResultAccepted,
+		TargetSystem: mavcodec.GCSSystemID,
+	}), peerRotated, t0.Add(4200*time.Millisecond))
+	if !ackOut.Accepted || ackOut.CountedError || ackOut.CommandAck == nil ||
+		ackOut.CommandAck.Command != mavcodec.MAVCmdComponentArmDisarm ||
+		ackOut.CommandAck.Result != mavcodec.MAVResultAccepted {
+		t.Fatalf("COMMAND_ACK from pinned peer = %+v, want CommandAck(400, Accepted)", ackOut)
+	}
+}
+
+// spec: uxs-control / Pin-on-admission MAVLink v2 UDP command egress and 1 Hz GCS liveness
+func TestComponentActuationCallbacksAndSendFrame(t *testing.T) {
+	if err := uxsvocab.Register(); err != nil {
+		t.Fatalf("uxsvocab.Register: %v", err)
+	}
+
+	srv, err := natsserver.NewServer(&natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		NoLog:     true,
+		NoSigs:    true,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.Start()
+	t.Cleanup(func() {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+	})
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatal("embedded NATS server not ready")
+	}
+
+	nc, err := natsclient.NewClient(srv.ClientURL(), natsclient.WithMaxReconnects(0))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := nc.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close(context.Background()) })
+
+	udpPort := allocateLoopbackUDPPort(t)
+	rawCfg, err := json.Marshal(map[string]any{
+		"skg_hz":          4,
+		"link_timeout_ms": 250,
+		"ports": map[string]any{
+			"inputs": []map[string]any{
+				{
+					"name":     "mavlink_udp",
+					"external": true,
+					"config": map[string]any{
+						"kind":     "network",
+						"protocol": "udp",
+						"host":     "127.0.0.1",
+						"port":     udpPort,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal config: %v", err)
+	}
+
+	comp, err := NewComponent(rawCfg, component.Dependencies{
+		NATSClient: nc,
+		Platform:   types.PlatformMeta{Org: "boxbotix", Platform: "bbops"},
+	})
+	if err != nil {
+		t.Fatalf("NewComponent: %v", err)
+	}
+
+	// SendFrame before Start returns an error cleanly.
+	if err := comp.SendFrame(mavcodec.Frame{
+		SystemID:    mavcodec.GCSSystemID,
+		ComponentID: mavcodec.CompIDMissionPlanner,
+		Message:     mavcodec.Heartbeat{Type: mavcodec.MAVTypeGCS, SystemStatus: mavcodec.MAVStateActive},
+	}, netip.MustParseAddrPort("127.0.0.1:45550")); err == nil {
+		t.Fatal("SendFrame before Start succeeded, want error")
+	}
+
+	evCh := make(chan TransitionEvent, 8)
+	ackCh := make(chan mavcodec.CommandAck, 4)
+	comp.SetActuationCallbacks(
+		func(ev TransitionEvent) { evCh <- ev },
+		func(sysid uint8, ack mavcodec.CommandAck, _ time.Time) {
+			if sysid == 1 {
+				ackCh <- ack
+			}
+		},
+	)
+
+	if err := comp.Initialize(); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := comp.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = comp.Stop(stopCtx)
+	})
+
+	simConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("simConn ListenUDP: %v", err)
+	}
+	t.Cleanup(func() { _ = simConn.Close() })
+
+	bound := comp.BoundAddr()
+	hbInit := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	if _, err := simConn.WriteToUDPAddrPort(encodeFrameBytes(t, 1, 1, 1, hbInit), bound); err != nil {
+		t.Fatalf("WriteToUDPAddrPort admission HB: %v", err)
+	}
+
+	var target ActuationTarget
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if tgt, ok := comp.ActuationTarget(1); ok {
+			target = tgt
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !target.PeerAddr.IsValid() {
+		t.Fatal("timed out waiting for sysid=1 admission")
+	}
+
+	// Send outbound #76 COMMAND_LONG via SendFrame and verify simConn receives exact wire frame.
+	if err := comp.SendFrame(mavcodec.Frame{
+		Sequence:    9,
+		SystemID:    mavcodec.GCSSystemID,
+		ComponentID: mavcodec.CompIDMissionPlanner,
+		Message: mavcodec.CommandLong{
+			TargetSystem:    1,
+			TargetComponent: mavcodec.CompIDAutopilot1,
+			Command:         mavcodec.MAVCmdComponentArmDisarm,
+			Param1:          1,
+		},
+	}, target.PeerAddr); err != nil {
+		t.Fatalf("SendFrame(#76): %v", err)
+	}
+
+	_ = simConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 512)
+	n, _, err := simConn.ReadFromUDPAddrPort(buf)
+	if err != nil {
+		t.Fatalf("simConn ReadFromUDPAddrPort: %v", err)
+	}
+	rxFrame, err := mavcodec.DecodeFrame(buf[:n])
+	if err != nil {
+		t.Fatalf("DecodeFrame outbound #76: %v", err)
+	}
+	cmdLong, ok := rxFrame.Message.(mavcodec.CommandLong)
+	if !ok || rxFrame.SystemID != mavcodec.GCSSystemID || rxFrame.ComponentID != mavcodec.CompIDMissionPlanner ||
+		cmdLong.Command != mavcodec.MAVCmdComponentArmDisarm || cmdLong.TargetSystem != 1 || cmdLong.Param1 != 1 {
+		t.Fatalf("decoded outbound #76 = (%+v, %+v)", rxFrame, cmdLong)
+	}
+
+	// Reply with #77 COMMAND_ACK + a preempting #0 HEARTBEAT and verify callbacks fire synchronously.
+	if _, err := simConn.WriteToUDPAddrPort(encodeFrameBytes(t, 1, 1, 2, mavcodec.CommandAck{
+		Command: mavcodec.MAVCmdComponentArmDisarm,
+		Result:  mavcodec.MAVResultAccepted,
+	}), bound); err != nil {
+		t.Fatalf("WriteToUDPAddrPort #77: %v", err)
+	}
+	hbOverride := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityDirectCRSFOverride,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	if _, err := simConn.WriteToUDPAddrPort(encodeFrameBytes(t, 1, 1, 3, hbOverride), bound); err != nil {
+		t.Fatalf("WriteToUDPAddrPort override HB: %v", err)
+	}
+
+	select {
+	case gotAck := <-ackCh:
+		if gotAck.Command != mavcodec.MAVCmdComponentArmDisarm || gotAck.Result != mavcodec.MAVResultAccepted {
+			t.Fatalf("onAck callback = %+v, want (400, Accepted)", gotAck)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onAck callback")
+	}
+
+	select {
+	case gotEv := <-evCh:
+		if gotEv.Kind != EventKindHeartbeatEdge || gotEv.Authority != uxsvocab.AuthorityDirectCRSFOverride {
+			t.Fatalf("onEvent callback = %+v, want heartbeat_edge -> direct-crsf-override", gotEv)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onEvent heartbeat_edge callback")
+	}
+
+	// Wait past link_timeout_ms (250ms) and verify link_lost also invokes onEvent!
+	select {
+	case lostEv := <-evCh:
+		if lostEv.Kind != EventKindLinkLost || lostEv.SysID != 1 {
+			t.Fatalf("onEvent silence callback = %+v, want link_lost on sysid=1", lostEv)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onEvent link_lost callback")
 	}
 }

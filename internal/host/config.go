@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/boxbotix/bbops/configs"
+	"github.com/boxbotix/bbops/internal/control"
 	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
@@ -309,6 +310,9 @@ func ValidateOffline(cfg *config.Config) (*composition.Result, error) {
 	}
 	if err := uxsvocab.Register(); err != nil {
 		return nil, fmt.Errorf("register uxs vocabulary pack: %w", err)
+	}
+	if err := control.RegisterVocab(); err != nil {
+		return nil, fmt.Errorf("register control vocabulary pack: %w", err)
 	}
 	entityStream, ok := cfg.Streams[EntityStreamName]
 	if !ok {

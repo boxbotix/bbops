@@ -2495,4 +2495,263 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     expect(copStack.pageErrors).toEqual([]);
     expect(copStack.consoleErrors).toEqual([]);
   });
+
+  // spec: uxs-control / Pin-on-admission MAVLink v2 UDP command egress and 1 Hz GCS liveness
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  // spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  test("drives closed-loop 20 Hz #84 velocity teleop, latches P1 CRSF preemption until explicit re-engage, reconciles dropped-ACK #76 commit_unknown without retries, collapses mesh-supervisory pad, gates SITL lab to sitl-local, and keeps #41/#43 non-actuating (#11)", async ({
+    copStack,
+  }) => {
+    const { page, info } = copStack;
+    const commandPosts: Array<Record<string, unknown>> = [];
+    const teleopPosts: Array<Record<string, unknown>> = [];
+
+    page.on("request", (req) => {
+      if (req.method() !== "POST") {
+        return;
+      }
+      const pathname = new URL(req.url()).pathname;
+      const body = (req.postDataJSON() ?? {}) as Record<string, unknown>;
+      if (pathname === "/control/command") {
+        commandPosts.push(body);
+      } else if (pathname === "/control/teleop") {
+        teleopPosts.push(body);
+      }
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(info.baseURL);
+
+    await expect(page.getByTestId("fleet-nominal-badge")).toHaveText(
+      "FLEET NOMINAL (3)",
+      { timeout: 15_000 },
+    );
+
+    // 1. Global #41 workspace hotkeys and #43 Diagnostics parameter staging MUST trigger zero /control/* HTTP requests.
+    for (const key of [
+      "1",
+      "d",
+      "b",
+      "k",
+      "g",
+      "2",
+      "1",
+      "c",
+      "h",
+      "t",
+      "Escape",
+    ]) {
+      await page.keyboard.press(key);
+    }
+    await page.getByTestId("workspace-tab-bench").click();
+    await expect(page.getByTestId("workspace-shell")).toHaveAttribute(
+      "data-workspace",
+      "bench",
+    );
+    await page
+      .locator('[data-param-key="uxs.control.heading_kp"] input[type="number"]')
+      .fill("3.4");
+    await expect(page.getByTestId("bench-staged-count")).toHaveText("1 staged");
+    expect(commandPosts).toHaveLength(0);
+    expect(teleopPosts).toHaveLength(0);
+
+    // 2. Open Vehicle [D] on Quadcopter (#1, sitl-local, armed, companion-teleop): unengaged pad ignores hold keys.
+    await page.getByTestId("workspace-tab-pilot").click();
+    const panel = page.getByTestId("control-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute("data-sysid", "1");
+    await expect(panel).toHaveAttribute("data-link-tier", "sitl-local");
+    await expect(panel).toHaveAttribute("data-authority", "companion-teleop");
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await expect(page.getByTestId("sitl-lab-toggle")).toBeVisible();
+
+    await page.keyboard.press("w");
+    expect(teleopPosts).toHaveLength(0);
+
+    // 3. Explicit Engage Teleop focuses velocity pad, streams 20 Hz #84 nudges on hold "w", updates live vehicle groundspeed, and zeroes on release.
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    await expect(page.getByTestId("teleop-velocity-pad")).toBeFocused();
+
+    await page.keyboard.down("w");
+    await expect(page.getByTestId("teleop-axes-readout")).toContainText(
+      "vx: 4.0 m/s",
+    );
+    await expect
+      .poll(
+        () =>
+          teleopPosts.filter(
+            (p) => p.sysid === 1 && p.vx === 4 && p.stop !== true,
+          ).length,
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThanOrEqual(4);
+    await expect(page.getByTestId("hud-readout-gs").locator("dd")).toHaveText(
+      "4.0 m/s",
+      { timeout: 5_000 },
+    );
+
+    await page.keyboard.up("w");
+    await expect(page.getByTestId("teleop-axes-readout")).toContainText(
+      "vx: 0.0 m/s",
+    );
+    await expect
+      .poll(
+        () =>
+          teleopPosts.some(
+            (p) => p.sysid === 1 && p.vx === 0 && p.vy === 0 && p.vz === 0,
+          ),
+        { timeout: 3_000 },
+      )
+      .toBe(true);
+
+    // 4. Hardware P1 CRSF override while holding "w" zeroes sticks on the frame edge, latches PREEMPTED, and does NOT auto-resume when P2 returns.
+    await page.keyboard.down("w");
+    await expect(page.getByTestId("teleop-axes-readout")).toContainText(
+      "vx: 4.0 m/s",
+    );
+
+    await copStack.pulseCrsfOverride(1);
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await expect(panel).toHaveAttribute(
+      "data-authority",
+      "direct-crsf-override",
+    );
+    await expect(page.getByTestId("teleop-axes-readout")).toContainText(
+      "vx: 0.0 m/s",
+    );
+    const preemptBanner = page.getByTestId("control-preemption-banner");
+    await expect(preemptBanner).toBeVisible();
+    await expect(preemptBanner).toContainText("PREEMPTED");
+    await page.keyboard.up("w");
+
+    const teleopCountBeforeRestore = teleopPosts.length;
+    await copStack.restoreCompanionTeleop(1);
+    await expect(panel).toHaveAttribute("data-authority", "companion-teleop", {
+      timeout: 5_000,
+    });
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await expect(preemptBanner).toBeVisible();
+    await page.waitForTimeout(250);
+    expect(teleopPosts.length).toBe(teleopCountBeforeRestore);
+
+    // Explicit re-engagement clears preemption latch; Disengage Teleop sends explicit stop zero frame.
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    await expect(preemptBanner).toHaveCount(0);
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    expect(
+      teleopPosts.some((p) => p.sysid === 1 && p.stop === true && p.vx === 0),
+    ).toBe(true);
+
+    // 5. ADR-111 Decision 3: dropped #77 COMMAND_ACK transitions pending -> commit_unknown with zero retries, then reconciles to confirmed on next #0 HEARTBEAT.
+    await copStack.setDropCommandAck(1, 1);
+    const cmdCountBeforeDrop = commandPosts.length;
+    await page.getByTestId("cmd-hold-position").click();
+
+    const cmdStatus = page.getByTestId("control-command-status");
+    await expect(cmdStatus).toHaveAttribute("data-phase", "commit_unknown", {
+      timeout: 5_000,
+    });
+    await expect(cmdStatus).toContainText(
+      "Status unconfirmed — awaiting vehicle heartbeat",
+    );
+    expect(commandPosts.length).toBe(cmdCountBeforeDrop + 1);
+
+    await expect(cmdStatus).toHaveAttribute("data-phase", "confirmed", {
+      timeout: 6_000,
+    });
+    expect(commandPosts.length).toBe(cmdCountBeforeDrop + 1);
+
+    // 6. SITL Fault & Current Lab is omitted on mesh-high-rate/direct-bench and exposed strictly on sitl-local.
+    await expect(panel).toHaveAttribute("data-link-tier", "mesh-high-rate");
+    await expect(page.getByTestId("sitl-lab-toggle")).toHaveCount(0);
+    await copStack.setLinkTier(1, "sitl-local");
+    await expect(panel).toHaveAttribute("data-link-tier", "sitl-local", {
+      timeout: 5_000,
+    });
+    await page.getByTestId("sitl-lab-toggle").click();
+    await expect(page.getByTestId("sitl-lab-drawer")).toBeVisible();
+    await page.getByTestId("sitl-blackout-btn").click();
+    await expect(panel).toHaveAttribute("data-authority", "mcu-failsafe", {
+      timeout: 3_000,
+    });
+    await expect(panel).toHaveAttribute("data-authority", "companion-teleop", {
+      timeout: 5_000,
+    });
+
+    await page
+      .locator(
+        `[data-testid="filmstrip-item"][data-entity-id="${info.vehicles.surfaceBoat}"]`,
+      )
+      .click();
+    await expect(panel).toHaveAttribute("data-sysid", "3");
+    await expect(panel).toHaveAttribute("data-link-tier", "direct-bench");
+    await expect(page.getByTestId("sitl-lab-toggle")).toHaveCount(0);
+
+    await copStack.setLinkTier(3, "sitl-local");
+    await expect(panel).toHaveAttribute("data-link-tier", "sitl-local", {
+      timeout: 5_000,
+    });
+    await page.getByTestId("sitl-lab-toggle").click();
+    await page.getByTestId("sitl-current-north").fill("1.8");
+    await page.getByTestId("sitl-current-east").fill("-1.4");
+    await page.getByTestId("sitl-current-apply-btn").click();
+    await expect(cmdStatus).toHaveAttribute("data-phase", "confirmed", {
+      timeout: 5_000,
+    });
+
+    // 7. MeshSupervisory LinkTier collapses active 10-30 Hz velocity pad while keeping discrete 1 Hz supervisory commands operational.
+    await page
+      .locator(
+        `[data-testid="filmstrip-item"][data-entity-id="${info.vehicles.rover}"]`,
+      )
+      .click();
+    await expect(panel).toHaveAttribute("data-sysid", "2");
+    await expect(panel).toHaveAttribute("data-link-tier", "mesh-high-rate");
+    await expect(page.getByTestId("sitl-lab-toggle")).toHaveCount(0);
+
+    await page.getByTestId("cmd-mode-teleop").click();
+    await expect(panel).toHaveAttribute("data-authority", "companion-teleop", {
+      timeout: 5_000,
+    });
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+
+    await copStack.setLinkTier(2, "mesh-supervisory");
+    await expect(panel).toHaveAttribute("data-link-tier", "mesh-supervisory", {
+      timeout: 5_000,
+    });
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await expect(page.getByTestId("teleop-velocity-pad")).toHaveCount(0);
+    await expect(page.getByTestId("control-supervisory-only")).toContainText(
+      "SUPERVISORY LINK TIER (1 Hz)",
+    );
+
+    await page.getByTestId("cmd-disarm").click();
+    await expect(cmdStatus).toHaveAttribute("data-phase", "confirmed", {
+      timeout: 5_000,
+    });
+    await expect(page.getByTestId("armed-badge")).toContainText("DISARMED", {
+      timeout: 5_000,
+    });
+    await page.getByTestId("cmd-arm").click();
+    await expect(cmdStatus).toHaveAttribute("data-phase", "confirmed", {
+      timeout: 5_000,
+    });
+    await expect(page.getByTestId("armed-badge")).toContainText("ARMED", {
+      timeout: 5_000,
+    });
+
+    expect(copStack.pageErrors).toEqual([]);
+    const unexpectedConsoleErrors = copStack.consoleErrors.filter(
+      (msg) =>
+        !/^Failed to load resource: the server responded with a status of 40[39] \((Conflict|Forbidden)\)$/.test(
+          msg,
+        ),
+    );
+    expect(unexpectedConsoleErrors).toEqual([]);
+  });
 });

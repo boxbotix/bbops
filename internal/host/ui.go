@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/boxbotix/bbops/internal/control"
 	"github.com/c360studio/semengine/service"
 )
 
@@ -22,11 +23,12 @@ const (
 
 // WebSocketProxyRoutes holds the resolved internal output/websocket URLs to
 // expose at same-origin /ws/telemetry and /ws/graph on the HTTP front door,
-// plus the optional read-only SKG search requester for /graph-gateway/search.
+// plus the optional read-only SKG search requester and same-origin UXS control service.
 type WebSocketProxyRoutes struct {
 	TelemetryWS string
 	GraphWS     string
 	GraphSearch GraphRequester
+	Control     *control.Service
 	ShutdownCtx context.Context
 }
 
@@ -39,8 +41,8 @@ func NewStaticUIMiddleware(uiDir string, isReady func() bool) service.HTTPMiddle
 }
 
 // NewUIMiddleware extends NewStaticUIMiddleware with same-origin WebSocket
-// reverse-proxying for /ws/telemetry and /ws/graph and the read-only SKG
-// POST /graph-gateway/search bridge gated on runtime readiness.
+// reverse-proxying for /ws/telemetry and /ws/graph, the read-only SKG
+// POST /graph-gateway/search bridge, and same-origin UXS control routes gated on readiness.
 func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyRoutes) (service.HTTPMiddleware, error) {
 	telemetryProxy, err := newSingleEndpointWSProxy("telemetry_ws", wsRoutes.TelemetryWS)
 	if err != nil {
@@ -70,6 +72,33 @@ func NewUIMiddleware(uiDir string, isReady func() bool, wsRoutes WebSocketProxyR
 					return
 				}
 				serveGraphSearch(w, r, wsRoutes.GraphSearch, wsRoutes.ShutdownCtx)
+				return
+			}
+
+			if normalizedPath == control.CommandFrontDoorPath || normalizedPath == control.TeleopFrontDoorPath {
+				if r.Method != http.MethodPost {
+					w.Header().Set("Allow", http.MethodPost)
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				if !isSameOriginWebSocketRequest(r) {
+					http.Error(w, "forbidden control origin", http.StatusForbidden)
+					return
+				}
+				if isReady != nil && !isReady() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte("NOT READY"))
+					return
+				}
+				if wsRoutes.Control == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
+				if normalizedPath == control.CommandFrontDoorPath {
+					wsRoutes.Control.ServeCommand(w, r, wsRoutes.ShutdownCtx)
+					return
+				}
+				wsRoutes.Control.ServeTeleop(w, r, wsRoutes.ShutdownCtx)
 				return
 			}
 
@@ -286,13 +315,14 @@ func isReservedBackendPath(urlPath string) bool {
 	cleaned := strings.ToLower(path.Clean("/" + urlPath))
 	switch cleaned {
 	case "/health", "/healthz", "/readyz", "/services", "/openapi.json", "/docs",
-		"/components", "/graph", "/graph-gateway", "/message-logger", "/storage-observability":
+		"/components", "/control", "/graph", "/graph-gateway", "/message-logger", "/storage-observability":
 		return true
 	}
 	for _, prefix := range []string{
 		"/services/",
 		"/docs/",
 		"/components/",
+		"/control/",
 		"/graph/",
 		"/graph-gateway/",
 		"/message-logger/",

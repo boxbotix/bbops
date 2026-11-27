@@ -3,9 +3,16 @@
   Copyright (c) 2026 boxbotix
 -->
 <script lang="ts">
+  import { onMount } from "svelte";
   import type { Snippet } from "svelte";
+  import ControlPanel from "$lib/components/ControlPanel.svelte";
   import TacticalCanvas from "$lib/components/TacticalCanvas.svelte";
   import VehicleHud from "$lib/components/VehicleHud.svelte";
+  import {
+    type ActuationController,
+    type ControlClient,
+    createActuationController,
+  } from "$lib/control/actuation.svelte";
   import {
     type FleetFreshnessContext,
     buildExternalContactSummary,
@@ -28,10 +35,10 @@
     telemetryStore: TelemetryStore;
     skgStore: SkgStore;
     viewportStore: ViewportStore;
+    controlClient?: ControlClient;
     freshnessContext?: FleetFreshnessContext;
     now?: () => number;
     onSyncHash?: (hash: string) => void;
-    // shortcut: Pilot guarded action slot renders read-only placeholder when unpopulated in M2.4, wire ADR-111 arm/disarm/mode/e-stop actions in M3.1 (#11)
     guardedActions?: Snippet<[VehicleEntityState]>;
   }
 
@@ -39,11 +46,45 @@
     telemetryStore,
     skgStore,
     viewportStore,
+    controlClient,
     freshnessContext,
     now,
     onSyncHash,
     guardedActions,
   }: Props = $props();
+
+  let ownedController: ActuationController | null = null;
+  function getActuationController(): ActuationController {
+    if (!ownedController) {
+      ownedController = createActuationController({
+        telemetryStore,
+        skgStore,
+        client: controlClient,
+        now,
+      });
+    }
+    return ownedController;
+  }
+  const actuationController = $derived(getActuationController());
+
+  onMount(() => {
+    return () => {
+      if (ownedController) {
+        ownedController.dispose();
+        ownedController = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    if (
+      viewportStore.pilotLayout === "map" &&
+      viewportStore.lightsOut &&
+      actuationController.engaged
+    ) {
+      void actuationController.disengageTeleop({ sendZero: true });
+    }
+  });
 
   const selectedEntity = $derived(viewportStore.selectedEntity);
   const selectedVehicle = $derived(
@@ -244,12 +285,14 @@
               {#if guardedActions}
                 {@render guardedActions(commandableVehicle)}
               {:else}
-                <div class="seam-placeholder">
-                  <span class="seam-title">GUARDED ACTUATION SEAM</span>
-                  <span>
-                    Actuation offline (M3.1) · UXS #{commandableVehicle.sysid} ({commandableVehicle.domain})
-                  </span>
-                </div>
+                <ControlPanel
+                  vehicle={commandableVehicle}
+                  {telemetryStore}
+                  {skgStore}
+                  {freshnessContext}
+                  controller={actuationController}
+                  {now}
+                />
               {/if}
             </div>
           {:else if isPoisonedOwnshipSelected}
@@ -277,12 +320,14 @@
               {#if guardedActions}
                 {@render guardedActions(commandableVehicle)}
               {:else}
-                <div class="seam-placeholder">
-                  <span class="seam-title">GUARDED ACTUATION SEAM</span>
-                  <span>
-                    Actuation offline (M3.1) · UXS #{commandableVehicle.sysid} ({commandableVehicle.domain})
-                  </span>
-                </div>
+                <ControlPanel
+                  vehicle={commandableVehicle}
+                  {telemetryStore}
+                  {skgStore}
+                  {freshnessContext}
+                  controller={actuationController}
+                  {now}
+                />
               {/if}
             </div>
           {:else if isPoisonedOwnshipSelected}
@@ -404,30 +449,21 @@
   .pilot-action-seam {
     padding: 8px 10px;
     border-radius: 6px;
-    border: 1px dashed var(--ui-border-strong, #334155);
-    background: rgba(16, 23, 38, 0.92);
+    border: 1px solid var(--ui-border-strong, #334155);
+    background: rgba(15, 23, 42, 0.95);
     font-size: 11px;
-    color: var(--ui-text-secondary, #94a3b8);
+    color: var(--ui-text-primary, #e2e8f0);
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
   }
 
   .pilot-action-seam.floating {
     position: absolute;
     right: 12px;
     bottom: 12px;
-    max-width: 320px;
-    z-index: 4;
-  }
-
-  .seam-placeholder {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .seam-title {
-    font-size: 10px;
-    font-weight: 700;
-    color: var(--ui-text-muted, #64748b);
+    width: min(332px, calc(100% - 24px));
+    max-height: calc(100% - 24px);
+    overflow-y: auto;
+    z-index: 5;
   }
 
   .pilot-poisoned-guard {
