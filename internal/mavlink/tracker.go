@@ -103,6 +103,7 @@ type TransitionEvent struct {
 	PrevAuthority        string               `json:"prev_authority,omitempty"`
 	AuthorityIncarnation string               `json:"authority_incarnation,omitempty"`
 	AuthorityEpoch       uint64               `json:"authority_epoch,omitempty"`
+	ObservationRev       uint64               `json:"observation_rev,omitempty"`
 	CompanionMode        string               `json:"companion_mode"`
 	LinkTier             string               `json:"link_tier"`
 	Flags                uxsvocab.HealthFlags `json:"flags"`
@@ -131,6 +132,8 @@ type ActuationTarget struct {
 	Authority               string
 	AuthorityIncarnation    string
 	AuthorityEpoch          uint64
+	ObservationRev          uint64
+	HeartbeatSeq            uint64
 	LinkEpoch               uint64
 	PacketOrder             uint64
 	LastAckOrder            uint64
@@ -159,12 +162,24 @@ type ackFrameSlot struct {
 	packetOrder uint64
 }
 
+type authorityObsRecord struct {
+	rev   uint64
+	epoch uint64
+	obsMs int64
+}
+
 type vehicleSession struct {
 	snap           uxsvocab.VehicleSnapshot
 	rev            uint64
 	authorityEpoch uint64
+	obsRev         uint64
+	heartbeatSeq   uint64
+	obsHistory     [256]authorityObsRecord
+	obsIdx         int
 	linkEpoch      uint64
-	rxPacketOrder  uint64
+	hasSeqStream   bool
+	lastStreamSeq  uint8
+	seqStreamPos   uint64
 	lastAckOrder   uint64
 	seenAckFrames  [256]ackFrameSlot
 	lastPacketAt   time.Time
@@ -186,14 +201,50 @@ func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 }
 
+func (s *vehicleSession) computeSeqStreamPos(seq uint8) (pos uint64, advanceHead bool) {
+	if !s.hasSeqStream {
+		return 1, true
+	}
+	delta := uint8(seq - s.lastStreamSeq)
+	if delta == 0 {
+		return s.seqStreamPos, false
+	}
+	if delta <= 64 {
+		return s.seqStreamPos + uint64(delta), true
+	}
+	back := uint64(uint8(s.lastStreamSeq - seq))
+	if s.seqStreamPos > back {
+		return s.seqStreamPos - back, false
+	}
+	return 1, false
+}
+
+func (s *vehicleSession) recordAuthorityObservation(wallUTC time.Time) {
+	s.obsRev++
+	s.obsHistory[s.obsIdx] = authorityObsRecord{
+		rev:   s.obsRev,
+		epoch: s.authorityEpoch,
+		obsMs: wallUTC.UnixMilli(),
+	}
+	s.obsIdx = (s.obsIdx + 1) % len(s.obsHistory)
+}
+
 func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, monoSample time.Time) {
 	if s.linkLost {
 		s.authorityEpoch++
 		s.linkEpoch++
+		s.hasSeqStream = false
+		s.seqStreamPos = 0
+		s.lastAckOrder = 0
 		s.seenAckFrames = [256]ackFrameSlot{}
 	}
 	if msgID != mavcodec.MsgIDCommandAck {
-		s.rxPacketOrder++
+		candPos, advanceHead := s.computeSeqStreamPos(seq)
+		if advanceHead {
+			s.hasSeqStream = true
+			s.seqStreamPos = candPos
+			s.lastStreamSeq = seq
+		}
 	}
 	if s.lastPacketAt.IsZero() || !monoSample.Before(s.lastPacketAt) {
 		s.lastPacketAt = monoSample
@@ -222,7 +273,7 @@ func monoOrEpoch(ts time.Time) time.Time {
 	return ts
 }
 
-func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, incarnation string, authorityEpoch uint64, seq uint8, msgID uint32, kind, reason string, ts time.Time) TransitionEvent {
+func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, incarnation string, authorityEpoch, obsRev uint64, seq uint8, msgID uint32, kind, reason string, ts time.Time) TransitionEvent {
 	return TransitionEvent{
 		SysID:                snap.SysID,
 		EntityID:             snap.EntityID(),
@@ -235,6 +286,7 @@ func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, incarnation string, a
 		Authority:            snap.Authority,
 		AuthorityIncarnation: incarnation,
 		AuthorityEpoch:       authorityEpoch,
+		ObservationRev:       obsRev,
 		CompanionMode:        snap.CompanionMode,
 		LinkTier:             snap.LinkTier,
 		Flags:                snap.Flags,
@@ -451,9 +503,11 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			snap:           *snap,
 			rev:            1,
 			authorityEpoch: 1,
+			heartbeatSeq:   1,
 			linkEpoch:      1,
 		}
 		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+		newSess.recordAuthorityObservation(wallUTC)
 		t.sessions[sysid] = newSess
 		return IngestOutcome{
 			Accepted: true,
@@ -485,17 +539,19 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 
 	sess.snap = next
 	sess.rev++
+	sess.heartbeatSeq++
 	if !wasLost && (prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier) {
 		sess.authorityEpoch++
 	}
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+	sess.recordAuthorityObservation(wallUTC)
 
 	out := IngestOutcome{
 		Accepted: true,
 		SysID:    sysid,
 	}
 	if wasLost {
-		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	if len(reasons) > 0 {
@@ -516,6 +572,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			PrevAuthority:        prevAuth,
 			AuthorityIncarnation: t.incarnation,
 			AuthorityEpoch:       sess.authorityEpoch,
+			ObservationRev:       sess.obsRev,
 			CompanionMode:        next.CompanionMode,
 			LinkTier:             next.LinkTier,
 			Flags:                next.Flags,
@@ -588,16 +645,20 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	sess.hasSysStatus = true
 	sess.rev++
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDSysStatus, peer, monoSample)
+	failsafeInc := hadSysStatus && next.Failsafes > prevFailsafes
+	if wasLost || failsafeInc {
+		sess.recordAuthorityObservation(wallUTC)
+	}
 
 	out := IngestOutcome{
 		Accepted: true,
 		SysID:    sysid,
 	}
 	if wasLost {
-		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", wallUTC))
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
-	if hadSysStatus && next.Failsafes > prevFailsafes {
+	if failsafeInc {
 		out.Events = append(out.Events, TransitionEvent{
 			SysID:                sysid,
 			EntityID:             next.EntityID(),
@@ -610,6 +671,7 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 			Authority:            next.Authority,
 			AuthorityIncarnation: t.incarnation,
 			AuthorityEpoch:       sess.authorityEpoch,
+			ObservationRev:       sess.obsRev,
 			CompanionMode:        next.CompanionMode,
 			LinkTier:             next.LinkTier,
 			Flags:                next.Flags,
@@ -691,7 +753,8 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC)}
+		sess.recordAuthorityObservation(wallUTC)
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -748,7 +811,8 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC)}
+		sess.recordAuthorityObservation(wallUTC)
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -825,7 +889,8 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		Telemetry: &tf,
 	}
 	if wasLost {
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC)}
+		sess.recordAuthorityObservation(wallUTC)
+		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC)}
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -852,9 +917,15 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	}
 
 	wasLost := sess.linkLost
-	prevSlot := sess.seenAckFrames[seq]
-	nextOrder := sess.rxPacketOrder + 1
-	isDupAck := !wasLost && prevSlot.active && prevSlot.ack == msg && nextOrder-prevSlot.packetOrder < 256
+	var candPos uint64
+	var advanceHead bool
+	isDupAck := false
+	if !wasLost {
+		candPos, advanceHead = sess.computeSeqStreamPos(seq)
+		prevSlot := sess.seenAckFrames[seq]
+		isDupAck = prevSlot.active && prevSlot.ack == msg &&
+			(candPos <= prevSlot.packetOrder || candPos-prevSlot.packetOrder < 256)
+	}
 
 	var events []TransitionEvent
 	urgent := false
@@ -870,7 +941,10 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	}
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDCommandAck, normPeer, monoSample)
 	if wasLost {
-		events = append(events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
+		candPos = 1
+		advanceHead = true
+		sess.recordAuthorityObservation(wallUTC)
+		events = append(events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
 	}
 	if isDupAck {
 		return IngestOutcome{
@@ -880,12 +954,16 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 			UrgentSKGSync: urgent,
 		}
 	}
-	sess.rxPacketOrder = nextOrder
-	sess.lastAckOrder = nextOrder
+	if advanceHead {
+		sess.hasSeqStream = true
+		sess.seqStreamPos = candPos
+		sess.lastStreamSeq = seq
+	}
+	sess.lastAckOrder = candPos
 	sess.seenAckFrames[seq] = ackFrameSlot{
 		active:      true,
 		ack:         msg,
-		packetOrder: nextOrder,
+		packetOrder: candPos,
 	}
 	ackCopy := msg
 	return IngestOutcome{
@@ -933,7 +1011,8 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 	}
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDStatusText, normPeer, monoSample)
 	if wasLost {
-		events = append(events, newLinkTransitionEvent(snap, t.incarnation, sess.authorityEpoch, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", wallUTC))
+		sess.recordAuthorityObservation(wallUTC)
+		events = append(events, newLinkTransitionEvent(snap, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", wallUTC))
 	}
 
 	cleanText := strings.TrimRight(msg.Text, "\x00")
@@ -949,6 +1028,7 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 		Authority:            snap.Authority,
 		AuthorityIncarnation: t.incarnation,
 		AuthorityEpoch:       sess.authorityEpoch,
+		ObservationRev:       sess.obsRev,
 		CompanionMode:        snap.CompanionMode,
 		LinkTier:             snap.LinkTier,
 		Flags:                snap.Flags,
@@ -1098,11 +1178,16 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	sess.linkLost = true
 	sess.authorityEpoch++
 	sess.linkEpoch++
+	sess.hasSeqStream = false
+	sess.seqStreamPos = 0
+	sess.lastAckOrder = 0
 	sess.seenAckFrames = [256]ackFrameSlot{}
+	sess.recordAuthorityObservation(wallUTC)
 	return newLinkTransitionEvent(
 		sess.snap,
 		t.incarnation,
 		sess.authorityEpoch,
+		sess.obsRev,
 		sess.lastSeq,
 		sess.lastMsgID,
 		EventKindLinkLost,
@@ -1153,14 +1238,70 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 		Authority:               sess.snap.Authority,
 		AuthorityIncarnation:    t.incarnation,
 		AuthorityEpoch:          sess.authorityEpoch,
+		ObservationRev:          sess.obsRev,
+		HeartbeatSeq:            sess.heartbeatSeq,
 		LinkEpoch:               sess.linkEpoch,
-		PacketOrder:             sess.rxPacketOrder,
+		PacketOrder:             sess.seqStreamPos,
 		LastAckOrder:            sess.lastAckOrder,
 		CompanionMode:           sess.snap.CompanionMode,
 		LinkTier:                sess.snap.LinkTier,
 		LinkLost:                sess.linkLost,
 		HeartbeatObservedUnixNs: sess.snap.HeartbeatObservedUnixNs,
 	}, true
+}
+
+// ResolveObservation resolves an inbound operator observation (optional obsRev,
+// authorityEpoch, and UTC observedMs) to the matching host-monotonic observation
+// revision recorded for sysid.
+func (t *Tracker) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	sess, ok := t.sessions[sysid]
+	if !ok || sess.obsRev == 0 {
+		return 0, false
+	}
+	if obsRev > sess.obsRev {
+		return 0, false
+	}
+	n := len(sess.obsHistory)
+	if obsRev > 0 {
+		for i := 1; i <= n; i++ {
+			idx := (sess.obsIdx - i + n) % n
+			entry := sess.obsHistory[idx]
+			if entry.rev != obsRev {
+				continue
+			}
+			if (authorityEpoch == 0 || entry.epoch == authorityEpoch) &&
+				(observedMs <= 0 || entry.obsMs == observedMs) {
+				return entry.rev, true
+			}
+			return 0, false
+		}
+		if obsRev == sess.obsRev &&
+			(authorityEpoch == 0 || sess.authorityEpoch == authorityEpoch) &&
+			(observedMs <= 0 || sess.snap.HeartbeatObservedUnixNs/int64(time.Millisecond) == observedMs) {
+			return sess.obsRev, true
+		}
+		return 0, false
+	}
+	if observedMs <= 0 {
+		return 0, false
+	}
+	for i := 1; i <= n; i++ {
+		idx := (sess.obsIdx - i + n) % n
+		entry := sess.obsHistory[idx]
+		if entry.rev == 0 {
+			continue
+		}
+		if (authorityEpoch == 0 || entry.epoch == authorityEpoch) && entry.obsMs == observedMs {
+			return entry.rev, true
+		}
+	}
+	if (authorityEpoch == 0 || sess.authorityEpoch == authorityEpoch) &&
+		sess.snap.HeartbeatObservedUnixNs/int64(time.Millisecond) == observedMs {
+		return sess.obsRev, true
+	}
+	return 0, false
 }
 
 // BuildPeriodicBatch marshals BaseMessage(VehicleSnapshot) items at flush time in ascending

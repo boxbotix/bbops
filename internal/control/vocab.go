@@ -103,7 +103,7 @@ type CommandEntity struct {
 	AckPoolMask  int    `json:"ack_pool_mask,omitempty" lifecycle:"predicate=uxs.command.ackpoolmask,operator_writable"`
 	Detail       string `lifecycle:"predicate=uxs.command.detail"`
 	IssuedMs     int64  `lifecycle:"predicate=uxs.command.issuedms"`
-	UpdatedMs    int64  `json:"updated_ms" lifecycle:"predicate=uxs.command.updatedms,operator_writable"`
+	UpdatedMs    int64  `lifecycle:"predicate=uxs.command.updatedms"`
 }
 
 var _ lifecycle.Participant = (*CommandEntity)(nil)
@@ -253,6 +253,10 @@ func Workflow() lifecycle.Workflow {
 		PhasePredicate:  PredicateCommandPhase,
 		Schema:          reflect.TypeOf(CommandEntity{}),
 		Transitions:     commandTransitions,
+		OperatorWritablePredicates: []string{
+			PredicateCommandAckAccounted,
+			PredicateCommandAckPoolMask,
+		},
 	}
 }
 

@@ -40,6 +40,7 @@ function buildTransitionFrame(
     authority?: ControlAuthority;
     authorityIncarnation?: string;
     authorityEpoch?: number;
+    observationRev?: number;
     companionMode?:
       "disarmed" | "hold-position" | "teleop-velocity" | "autonomous-velocity";
     linkTier?: LinkTier;
@@ -64,6 +65,9 @@ function buildTransitionFrame(
         : {}),
       ...(opts.authorityEpoch !== undefined
         ? { authority_epoch: opts.authorityEpoch }
+        : {}),
+      ...(opts.observationRev !== undefined
+        ? { observation_rev: opts.observationRev }
         : {}),
       companion_mode: opts.companionMode ?? "teleop-velocity",
       link_tier: opts.linkTier ?? "mesh-high-rate",
@@ -2450,5 +2454,160 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("forwards observation_rev from TransitionEvent onto Engage and avoids bogus RC-override latch on teleop_not_engaged", async () => {
+    const nowMs = Date.parse("2026-11-27T18:30:00.000Z");
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: ws2Rig.createSocket,
+      now: () => nowMs,
+    });
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: ws1Rig.createSocket,
+      now: () => nowMs,
+    });
+    telemetryStore.connect();
+    skgStore.connect();
+    ws1Rig.latest.serverOpen();
+    ws2Rig.latest.serverOpen();
+
+    const veh = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.authority.state": "companion-teleop",
+        "uxs.mode.companion": "teleop-velocity",
+        "uxs.link.tier": "sitl-local",
+        "uxs.health.armed": true,
+      },
+      { observedAt: new Date(nowMs - 50).toISOString() },
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: veh.id,
+        revision: 1,
+        payload: veh,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+
+    // Malformed negative observation_rev is rejected without poisoning valid events.
+    telemetryStore.ingestRawFrame(
+      JSON.stringify({
+        type: "data",
+        subject: "bbops.telemetry.events.1",
+        payload: {
+          sysid: 1,
+          entity_id: veh.id,
+          domain: "quadcopter",
+          seq: 1,
+          msg_id: 0,
+          kind: "heartbeat_edge",
+          reasons: ["authority"],
+          armed: true,
+          authority: "companion-teleop",
+          observation_rev: -3,
+          companion_mode: "teleop-velocity",
+          link_tier: "sitl-local",
+          flags: {
+            clock_sync_locked: true,
+            teleop_deadman_clamped: false,
+            crsf_link_healthy: true,
+            companion_trunk_healthy: true,
+          },
+          failsafes: 0,
+          timestamp: nowMs,
+        },
+      }),
+    );
+    expect(telemetryStore.events).toHaveLength(0);
+    expect(telemetryStore.malformedFrameCount).toBe(1);
+
+    telemetryStore.ingestRawFrame(
+      buildTransitionFrame(1, {
+        seq: 2,
+        kind: "heartbeat_edge",
+        authority: "companion-teleop",
+        authorityIncarnation: "inc-mono",
+        authorityEpoch: 5,
+        observationRev: 17,
+        linkTier: "sitl-local",
+        timestamp: nowMs,
+      }),
+    );
+    expect(telemetryStore.events[0]?.observation_rev).toBe(17);
+
+    const sentTeleops: ControlTeleopRequest[] = [];
+    let failFirstWithStaleEpoch = true;
+    const controller = createActuationController({
+      telemetryStore,
+      skgStore,
+      now: () => nowMs,
+      client: {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          sentTeleops.push(req);
+          if (failFirstWithStaleEpoch) {
+            failFirstWithStaleEpoch = false;
+            return {
+              ok: false,
+              error: {
+                code: "teleop_not_engaged",
+                message:
+                  "vehicle sysid 1 teleop authority epoch 3 superseded by current epoch 5",
+                status: 409,
+              },
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: nowMs + 240,
+            },
+          };
+        },
+      },
+    });
+
+    // 1) Stale disarm/rearm epoch refusal (teleop_not_engaged) rejects cleanly without setting bogus RC-override banner.
+    expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+      false,
+    );
+    expect(sentTeleops[0]).toMatchObject({
+      sysid: 1,
+      engage: true,
+      observed_ms: nowMs,
+      observation_rev: 17,
+      authority_incarnation: "inc-mono",
+      authority_epoch: 5,
+    });
+    expect(controller.preemptionLatch).toBeNull();
+    expect(controller.lastError).toContain("superseded by current epoch 5");
+
+    // 2) Subsequent Engage succeeds and forwards observation_rev ONLY on the initial Engage request.
+    expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+      true,
+    );
+    expect(sentTeleops[1]?.observation_rev).toBe(17);
+    controller.handlePadKeyDown({ key: "w" });
+    await Promise.resolve();
+    expect(sentTeleops[2]?.observation_rev).toBeUndefined();
+
+    controller.dispose();
+    telemetryStore.disconnect();
+    skgStore.disconnect();
   });
 });

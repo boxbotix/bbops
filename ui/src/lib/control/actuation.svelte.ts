@@ -103,6 +103,7 @@ export interface ControlTeleopRequest {
   readonly engage?: boolean;
   readonly stop?: boolean;
   readonly observed_ms?: number;
+  readonly observation_rev?: number;
   readonly authority_incarnation?: string;
   readonly authority_epoch?: number;
 }
@@ -160,6 +161,7 @@ export interface LiveActuationSafety {
   readonly fresh: boolean;
   readonly statusLabel: string;
   readonly stateObservedMs: number | null;
+  readonly observationRev?: number;
   readonly authorityIncarnation?: string;
   readonly authorityEpoch?: number;
   readonly isSupervisoryOnly: boolean;
@@ -555,6 +557,12 @@ export function resolveLiveActuationSafety(
     latestEv.authority_epoch > 0
       ? latestEv.authority_epoch
       : undefined;
+  const observationRev =
+    useEventOverlay &&
+    latestEv.observation_rev !== undefined &&
+    latestEv.observation_rev > 0
+      ? latestEv.observation_rev
+      : undefined;
 
   const armed = useEventOverlay ? latestEv.armed : vehicle.armed;
   const authority = useEventOverlay ? latestEv.authority : vehicle.authority;
@@ -604,6 +612,7 @@ export function resolveLiveActuationSafety(
     fresh: freshness.fresh,
     statusLabel: freshness.statusLabel,
     stateObservedMs,
+    ...(observationRev !== undefined ? { observationRev } : {}),
     ...(authorityIncarnation !== undefined ? { authorityIncarnation } : {}),
     ...(authorityEpoch !== undefined ? { authorityEpoch } : {}),
     isSupervisoryOnly,
@@ -856,6 +865,7 @@ export function createActuationController(
     engageFlag: boolean,
     engageMeta?: {
       observedMs: number | null;
+      observationRev?: number;
       authorityIncarnation?: string;
       authorityEpoch?: number;
     },
@@ -885,6 +895,11 @@ export function createActuationController(
       engageMeta?.observedMs !== null &&
       engageMeta?.observedMs !== undefined
         ? { observed_ms: Math.trunc(engageMeta.observedMs) }
+        : {}),
+      ...(engageFlag &&
+      engageMeta?.observationRev !== undefined &&
+      engageMeta.observationRev > 0
+        ? { observation_rev: engageMeta.observationRev }
         : {}),
       ...(engageFlag &&
       engageMeta?.authorityIncarnation !== undefined &&
@@ -1168,6 +1183,7 @@ export function createActuationController(
 
     const ok = await dispatchTeleopNudge(vehicle.sysid, true, {
       observedMs: safety.stateObservedMs,
+      observationRev: safety.observationRev,
       authorityIncarnation: safety.authorityIncarnation,
       authorityEpoch: safety.authorityEpoch,
     });

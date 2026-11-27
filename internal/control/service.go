@@ -48,6 +48,12 @@ type TargetSource interface {
 	ActuationTarget(sysid uint8) (mavlink.ActuationTarget, bool)
 }
 
+// ObservationResolver optionally resolves a vehicle observation (optional obsRev,
+// authorityEpoch, and UTC observedMs) to a host-monotonic observation revision (`*mavlink.Tracker`).
+type ObservationResolver interface {
+	ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool)
+}
+
 // FrameSender transmits a single MAVLink v2 frame to a pinned peer UDP endpoint.
 type FrameSender interface {
 	SendFrame(frame mavcodec.Frame, peer netip.AddrPort) error
@@ -63,7 +69,7 @@ type CommandStore interface {
 // consumed-ACK pool updates, and full-history enumeration for restart recovery and ambiguity preservation.
 type RecoverableCommandStore interface {
 	CommandStore
-	RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int, updatedMs int64) error
+	RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int) error
 	Get(ctx context.Context, entityID string) (*CommandEntity, error)
 	ListCommands(ctx context.Context) ([]CommandEntity, error)
 	ListNonTerminal(ctx context.Context) ([]CommandEntity, error)
@@ -122,12 +128,11 @@ func (s *LifecycleStore) Transition(
 
 // RecordConsumedAck executes a revision-fenced CAS triple update recording owner-neutral
 // #77 COMMAND_ACK pool accounting on an already-created CommandEntity without mutating
-// its PhaseState or attributing AckResult to a specific command.
-func (s *LifecycleStore) RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int, updatedMs int64) error {
+// its PhaseState, UpdatedMs transition timestamp, or attributing AckResult to a specific command.
+func (s *LifecycleStore) RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int) error {
 	return s.mgr.UpdateFromOperator(ctx, WorkflowName, entityID, map[string]any{
 		"ack_accounted": ackAccounted,
 		"ack_pool_mask": ackPoolMask,
-		"updated_ms":    updatedMs,
 	})
 }
 
@@ -224,6 +229,7 @@ type TeleopRequest struct {
 	Engage               bool    `json:"engage,omitempty"`
 	Stop                 bool    `json:"stop,omitempty"`
 	ObservedMs           int64   `json:"observed_ms,omitempty"`
+	ObservationRev       uint64  `json:"observation_rev,omitempty"`
 	AuthorityIncarnation string  `json:"authority_incarnation,omitempty"`
 	AuthorityEpoch       uint64  `json:"authority_epoch,omitempty"`
 }
@@ -256,6 +262,7 @@ type teleopLease struct {
 	coordFrame         uint8
 	session            string
 	lastSeq            uint64
+	engagedObsRev      uint64
 	engagedObsMs       int64
 	engagedEpoch       uint64
 	engagedIncarnation string
@@ -265,8 +272,11 @@ type teleopLease struct {
 type preemptRecoveryState struct {
 	latched             bool
 	preemptedAtMs       int64
+	preemptEpoch        uint64
+	preemptObsRev       uint64
 	recoveryReady       bool
 	recoveryObservedMs  int64
+	recoveryObsRev      uint64
 	recoveryEpoch       uint64
 	recoveryIncarnation string
 }
@@ -329,6 +339,35 @@ type serviceAckSlot struct {
 	streamOrder uint64
 }
 
+type directSeqTracker struct {
+	hasSeq  bool
+	lastSeq uint8
+	pos     uint64
+}
+
+func (d *directSeqTracker) computePos(seq uint8) (pos uint64, advanceHead bool) {
+	if !d.hasSeq {
+		return 1, true
+	}
+	delta := uint8(seq - d.lastSeq)
+	if delta == 0 {
+		return d.pos, false
+	}
+	if delta <= 64 {
+		return d.pos + uint64(delta), true
+	}
+	back := uint64(uint8(d.lastSeq - seq))
+	if d.pos > back {
+		return d.pos - back, false
+	}
+	return 1, false
+}
+
+type ackMetaState struct {
+	ackAccounted int
+	ackPoolMask  int
+}
+
 type inFlightCommand struct {
 	entityID        string
 	orderSeq        uint64
@@ -344,7 +383,10 @@ type inFlightCommand struct {
 	ackAccounted    bool
 	ackAmbiguous    bool
 	ackDeadline     time.Time
+	issuedHbObsNs   int64
+	issuedHbSeq     uint64
 	unknownAtUnixNs int64
+	unknownHbSeq    uint64
 	earlyAcks       []earlyCommandAck
 }
 
@@ -397,17 +439,21 @@ type Service struct {
 	leases                  map[uint8]*teleopLease
 	stoppedSessions         map[uint8]*stoppedSessionRing
 	preemptState            map[uint8]*preemptRecoveryState
+	minEngageObsRev         map[uint8]uint64
 	minEngageObsMs          map[uint8]int64
+	lastObsIncarnation      map[uint8]string
 	inFlight                map[string]*inFlightCommand
 	unackedCount            map[cmdKey]int
 	unackedDetachedIDs      map[cmdKey][]string
-	accountedSlotIDs        map[cmdKey][]string
+	ambiguousSlotIDs        map[cmdKey][]string
+	persistedAckMeta        map[string]ackMetaState
 	seenAckFrames           map[uint8]*[256]serviceAckSlot
-	directAckExtraOrder     map[uint8]uint64
+	directAckSeq            map[uint8]directSeqTracker
 	lastSeenTrackerAckOrder map[uint8]uint64
 	lastAckIncarnation      map[uint8]string
 	lastAckLinkEpoch        map[uint8]uint64
 	seenAckResultMask       map[cmdKey]uint64
+	seenAckResultMaskBySeq  map[cmdKey]*[256]uint64
 	preResetAckResultMask   map[cmdKey]uint64
 	surplusAckTainted       map[cmdKey]bool
 	dispatchedInBoot        map[cmdKey]bool
@@ -507,17 +553,21 @@ func NewService(opts Options) (*Service, error) {
 		leases:                  make(map[uint8]*teleopLease),
 		stoppedSessions:         make(map[uint8]*stoppedSessionRing),
 		preemptState:            make(map[uint8]*preemptRecoveryState),
+		minEngageObsRev:         make(map[uint8]uint64),
 		minEngageObsMs:          make(map[uint8]int64),
+		lastObsIncarnation:      make(map[uint8]string),
 		inFlight:                make(map[string]*inFlightCommand),
 		unackedCount:            make(map[cmdKey]int),
 		unackedDetachedIDs:      make(map[cmdKey][]string),
-		accountedSlotIDs:        make(map[cmdKey][]string),
+		ambiguousSlotIDs:        make(map[cmdKey][]string),
+		persistedAckMeta:        make(map[string]ackMetaState),
 		seenAckFrames:           make(map[uint8]*[256]serviceAckSlot),
-		directAckExtraOrder:     make(map[uint8]uint64),
+		directAckSeq:            make(map[uint8]directSeqTracker),
 		lastSeenTrackerAckOrder: make(map[uint8]uint64),
 		lastAckIncarnation:      make(map[uint8]string),
 		lastAckLinkEpoch:        make(map[uint8]uint64),
 		seenAckResultMask:       make(map[cmdKey]uint64),
+		seenAckResultMaskBySeq:  make(map[cmdKey]*[256]uint64),
 		preResetAckResultMask:   make(map[cmdKey]uint64),
 		surplusAckTainted:       make(map[cmdKey]bool),
 		dispatchedInBoot:        make(map[cmdKey]bool),
@@ -920,8 +970,12 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			s.preResetAckResultMask[key] |= mask
 		}
 		accounted := ce.AckAccounted > 0 || ce.AckResult >= 0
-		if accounted {
-			s.accountedSlotIDs[key] = appendBoundedIDs(s.accountedSlotIDs[key], ce.ID)
+		s.persistedAckMeta[ce.ID] = ackMetaState{
+			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
+			ackPoolMask:  max(ce.AckPoolMask, poolMaskInt(mask)),
+		}
+		if accounted && ce.AckResult < 0 {
+			s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], ce.ID)
 		}
 		isUnacked := (ce.AckResult == UnacknowledgedResult || ce.PhaseState == PhasePending) && !accounted
 		if isUnacked {
@@ -958,8 +1012,12 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		if ceUpdatedNs := ce.UpdatedMs * int64(time.Millisecond); ceUpdatedNs > unknownNs {
 			unknownNs = ceUpdatedNs
 		}
-		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok && target.HeartbeatObservedUnixNs > unknownNs {
-			unknownNs = target.HeartbeatObservedUnixNs
+		var unknownHbSeq uint64
+		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok {
+			if target.HeartbeatObservedUnixNs > unknownNs {
+				unknownNs = target.HeartbeatObservedUnixNs
+			}
+			unknownHbSeq = target.HeartbeatSeq
 		}
 		seq := s.cmdCounter.Add(1)
 		s.inFlight[ce.ID] = &inFlightCommand{
@@ -976,6 +1034,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			ackAmbiguous:    true,
 			ackDeadline:     now,
 			unknownAtUnixNs: unknownNs,
+			unknownHbSeq:    unknownHbSeq,
 		}
 	}
 	hasWrites := len(s.pendingWrites) > 0
@@ -1008,6 +1067,23 @@ func appendBoundedIDs(ids []string, id string) []string {
 	return append(ids, id)
 }
 
+func (s *Service) enqueueConsumedAckLocked(entityID string, ackAccounted, ackPoolMask int) bool {
+	if entityID == "" {
+		return false
+	}
+	curMeta := s.persistedAckMeta[entityID]
+	if curMeta.ackAccounted >= ackAccounted && (curMeta.ackPoolMask&ackPoolMask) == ackPoolMask {
+		return false
+	}
+	s.enqueueWriteLocked(pendingCommandWrite{
+		entityID:     entityID,
+		ackOnly:      true,
+		ackAccounted: ackAccounted,
+		ackPoolMask:  ackPoolMask,
+	})
+	return true
+}
+
 func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
 	if prev, exists := s.pendingWrites[w.entityID]; exists {
 		if w.ackOnly {
@@ -1015,9 +1091,6 @@ func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
 				prev.ackAccounted = w.ackAccounted
 			}
 			prev.ackPoolMask |= w.ackPoolMask
-			if w.updatedMs > prev.updatedMs {
-				prev.updatedMs = w.updatedMs
-			}
 			s.pendingWrites[w.entityID] = prev
 			return
 		}
@@ -1070,7 +1143,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 					s.mu.Unlock()
 					continue
 				}
-				err := recStore.RecordConsumedAck(ctx, w.entityID, w.ackAccounted, w.ackPoolMask, w.updatedMs)
+				err := recStore.RecordConsumedAck(ctx, w.entityID, w.ackAccounted, w.ackPoolMask)
 				verified := err == nil
 				if !verified && ctx.Err() == nil {
 					if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil &&
@@ -1080,6 +1153,12 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				}
 				if verified {
 					s.mu.Lock()
+					meta := s.persistedAckMeta[w.entityID]
+					if w.ackAccounted > meta.ackAccounted {
+						meta.ackAccounted = w.ackAccounted
+					}
+					meta.ackPoolMask |= w.ackPoolMask
+					s.persistedAckMeta[w.entityID] = meta
 					if cur, exists := s.pendingWrites[w.entityID]; exists && cur.ackOnly &&
 						cur.ackAccounted <= w.ackAccounted && (cur.ackPoolMask&^w.ackPoolMask) == 0 {
 						delete(s.pendingWrites, w.entityID)
@@ -1114,8 +1193,18 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 			}
 			if verified {
 				s.mu.Lock()
+				if w.ackResult >= 0 {
+					meta := s.persistedAckMeta[w.entityID]
+					meta.ackAccounted = 1
+					if w.ackResult < 30 {
+						meta.ackPoolMask |= 1 << uint(w.ackResult)
+					}
+					s.persistedAckMeta[w.entityID] = meta
+				}
 				if cur, exists := s.pendingWrites[w.entityID]; exists && !cur.ackOnly && cur.phase == w.phase {
-					needPoolPatch := hasReader && cur.ackResult < 0 && (cur.ackAccounted > 0 || cur.ackPoolMask > 0)
+					curMeta := s.persistedAckMeta[w.entityID]
+					needPoolPatch := hasReader && cur.ackResult < 0 &&
+						(cur.ackAccounted > curMeta.ackAccounted || (cur.ackPoolMask&^curMeta.ackPoolMask) != 0)
 					if !needPoolPatch {
 						delete(s.pendingWrites, w.entityID)
 					} else {
@@ -1124,7 +1213,6 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 							ackOnly:      true,
 							ackAccounted: cur.ackAccounted,
 							ackPoolMask:  cur.ackPoolMask,
-							updatedMs:    cur.updatedMs,
 						}
 						needsFollowupPass = true
 					}
@@ -1256,6 +1344,28 @@ func (s *Service) recordStoppedSessionLocked(sysid uint8, session string) {
 	ring.add(session)
 }
 
+func (s *Service) syncObsIncarnationLocked(sysid uint8, inc string) {
+	if inc == "" {
+		return
+	}
+	prev := s.lastObsIncarnation[sysid]
+	if prev != "" && prev != inc {
+		delete(s.minEngageObsRev, sysid)
+		delete(s.minEngageObsMs, sysid)
+		if st := s.preemptState[sysid]; st != nil {
+			st.preemptedAtMs = 0
+			st.preemptEpoch = 0
+			st.preemptObsRev = 0
+			st.recoveryReady = false
+			st.recoveryObservedMs = 0
+			st.recoveryObsRev = 0
+			st.recoveryEpoch = 0
+			st.recoveryIncarnation = ""
+		}
+	}
+	s.lastObsIncarnation[sysid] = inc
+}
+
 func (s *Service) ensurePreemptRecoveryObservedLocked(sysid uint8, target mavlink.ActuationTarget, ok bool) {
 	st := s.preemptState[sysid]
 	if st == nil || !ok || target.LinkLost ||
@@ -1263,38 +1373,50 @@ func (s *Service) ensurePreemptRecoveryObservedLocked(sysid uint8, target mavlin
 		!target.Armed || target.Authority != uxsvocab.AuthorityCompanionTeleop {
 		return
 	}
+	_, hasResolver := s.targets.(ObservationResolver)
+	useObsRev := hasResolver && target.ObservationRev > 0
 	if !st.recoveryReady {
 		recMs := target.HeartbeatObservedUnixNs / int64(time.Millisecond)
-		if recMs <= st.preemptedAtMs {
+		if !useObsRev && recMs <= st.preemptedAtMs {
 			recMs = st.preemptedAtMs + 1
 		}
 		st.recoveryReady = true
 		st.recoveryObservedMs = recMs
+		if useObsRev {
+			st.recoveryObsRev = target.ObservationRev
+			if target.ObservationRev > s.minEngageObsRev[sysid] {
+				s.minEngageObsRev[sysid] = target.ObservationRev
+			}
+		} else if recMs > s.minEngageObsMs[sysid] {
+			s.minEngageObsMs[sysid] = recMs
+		}
 		if target.AuthorityEpoch > 0 {
 			st.recoveryEpoch = target.AuthorityEpoch
 		}
 		if target.AuthorityIncarnation != "" {
 			st.recoveryIncarnation = target.AuthorityIncarnation
 		}
-		if recMs > s.minEngageObsMs[sysid] {
-			s.minEngageObsMs[sysid] = recMs
-		}
 		return
 	}
 	if target.AuthorityIncarnation != "" && st.recoveryIncarnation != target.AuthorityIncarnation {
 		st.recoveryIncarnation = target.AuthorityIncarnation
 		st.recoveryEpoch = target.AuthorityEpoch
+		if useObsRev {
+			st.recoveryObsRev = target.ObservationRev
+		}
 	}
 }
 
-func (s *Service) validateEngageObservationLocked(sysid uint8, session string, req TeleopRequest, target mavlink.ActuationTarget, ok bool, now time.Time) error {
+func (s *Service) validateEngageObservationLocked(sysid uint8, session string, req TeleopRequest, target mavlink.ActuationTarget, ok bool, now time.Time) (uint64, bool, error) {
 	if !req.Engage {
-		return nil
+		return 0, false, nil
 	}
 	curInc := ""
 	if ok {
 		curInc = target.AuthorityIncarnation
 	}
+	s.syncObsIncarnationLocked(sysid, curInc)
+
 	st := s.preemptState[sysid]
 	rejectPreempt := func(msg string) error {
 		s.recordStoppedSessionLocked(sysid, session)
@@ -1315,48 +1437,87 @@ func (s *Service) validateEngageObservationLocked(sysid uint8, session string, r
 
 	if req.AuthorityIncarnation != "" && curInc != "" && req.AuthorityIncarnation != curInc {
 		if st != nil {
-			return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop authority incarnation mismatch (%q != %q)", sysid, req.AuthorityIncarnation, curInc))
+			return 0, false, rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop authority incarnation mismatch (%q != %q)", sysid, req.AuthorityIncarnation, curInc))
 		}
-		return rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority incarnation changed (%q -> %q) prior to engage", sysid, req.AuthorityIncarnation, curInc))
+		return 0, false, rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority incarnation changed (%q -> %q) prior to engage", sysid, req.AuthorityIncarnation, curInc))
+	}
+
+	resolver, hasResolver := s.targets.(ObservationResolver)
+	useObsRev := hasResolver && ok && target.ObservationRev > 0
+	hasObsInput := req.ObservationRev > 0 || req.ObservedMs > 0
+	var reqObsRev uint64
+	if useObsRev && hasObsInput {
+		resolvedRev, matched := resolver.ResolveObservation(sysid, req.ObservationRev, req.AuthorityEpoch, req.ObservedMs)
+		if !matched {
+			if st != nil {
+				isPreOverride := st.latched || (st.preemptEpoch > 0 && req.AuthorityEpoch > 0 && req.AuthorityEpoch <= st.preemptEpoch)
+				if !isPreOverride && req.ObservedMs > 0 && st.preemptObsRev > 0 {
+					if anyRev, anyOK := resolver.ResolveObservation(sysid, 0, 0, req.ObservedMs); anyOK && anyRev <= st.preemptObsRev {
+						isPreOverride = true
+					}
+				}
+				if isPreOverride {
+					return 0, true, rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop observation does not match current post-recovery state", sysid))
+				}
+			}
+			return 0, true, rejectNotEngaged(fmt.Sprintf("vehicle sysid %d teleop observation does not match current vehicle state", sysid))
+		}
+		reqObsRev = resolvedRev
 	}
 
 	if st != nil {
 		s.ensurePreemptRecoveryObservedLocked(sysid, target, ok)
+		rejectStaleForState := func(msg string) error {
+			if st.latched ||
+				(st.preemptEpoch > 0 && req.AuthorityEpoch > 0 && req.AuthorityEpoch <= st.preemptEpoch) ||
+				(useObsRev && st.preemptObsRev > 0 && reqObsRev > 0 && reqObsRev <= st.preemptObsRev) ||
+				(!useObsRev && st.preemptedAtMs > 0 && req.ObservedMs > 0 && req.ObservedMs <= st.preemptedAtMs) {
+				return rejectPreempt(msg)
+			}
+			return rejectNotEngaged(msg)
+		}
 		if !st.recoveryReady {
-			return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop was preempted — re-engage requires current post-recovery authority observation", sysid))
+			return 0, useObsRev, rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop was preempted — re-engage requires current post-recovery authority observation", sysid))
 		}
 		hasValidEpoch := false
 		if req.AuthorityEpoch > 0 {
 			if st.recoveryEpoch == 0 || req.AuthorityEpoch < st.recoveryEpoch {
-				return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop was preempted — re-engage authority epoch %d precedes recovery epoch %d", sysid, req.AuthorityEpoch, st.recoveryEpoch))
+				return 0, useObsRev, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop authority epoch %d precedes recovery epoch %d", sysid, req.AuthorityEpoch, st.recoveryEpoch))
 			}
-			if ok && target.AuthorityEpoch > 0 && req.AuthorityEpoch > target.AuthorityEpoch {
-				return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop authority epoch %d exceeds current vehicle epoch %d", sysid, req.AuthorityEpoch, target.AuthorityEpoch))
+			if ok && target.AuthorityEpoch > 0 && req.AuthorityEpoch != target.AuthorityEpoch {
+				return 0, useObsRev, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop authority epoch %d does not match current vehicle epoch %d", sysid, req.AuthorityEpoch, target.AuthorityEpoch))
 			}
 			if curInc != "" && req.AuthorityIncarnation == "" {
-				if req.ObservedMs <= 0 {
-					return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop re-engage requires authority_incarnation or post-recovery observed_ms", sysid))
+				if !hasObsInput {
+					return 0, useObsRev, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop re-engage requires authority_incarnation or post-recovery observation", sysid))
 				}
 			} else {
 				hasValidEpoch = true
 			}
 		}
 		hasValidObs := false
-		if req.ObservedMs > 0 {
+		if useObsRev {
+			if reqObsRev > 0 {
+				if st.recoveryObsRev == 0 || reqObsRev < st.recoveryObsRev || (st.preemptObsRev > 0 && reqObsRev <= st.preemptObsRev) {
+					return 0, true, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop observation_rev %d precedes post-recovery floor %d", sysid, reqObsRev, st.recoveryObsRev))
+				}
+				hasValidObs = true
+			}
+		} else if req.ObservedMs > 0 {
 			if st.recoveryObservedMs == 0 || req.ObservedMs < st.recoveryObservedMs || req.ObservedMs <= st.preemptedAtMs {
-				return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop was preempted — observed_ms %d precedes post-recovery floor %d", sysid, req.ObservedMs, st.recoveryObservedMs))
+				return 0, false, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop was preempted — observed_ms %d precedes post-recovery floor %d", sysid, req.ObservedMs, st.recoveryObservedMs))
 			}
 			hasValidObs = true
 		}
 		if !hasValidEpoch && !hasValidObs {
-			return rejectPreempt(fmt.Sprintf("vehicle sysid %d teleop was preempted — re-engage requires current post-recovery authority observation", sysid))
+			return 0, useObsRev, rejectStaleForState(fmt.Sprintf("vehicle sysid %d teleop was preempted — re-engage requires current post-recovery authority observation", sysid))
 		}
 	} else if ok && req.AuthorityEpoch > 0 {
-		if target.AuthorityEpoch > 0 && (req.AuthorityEpoch < target.AuthorityEpoch || req.AuthorityEpoch > target.AuthorityEpoch) {
-			return rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority epoch mismatch (%d vs %d) prior to engage", sysid, req.AuthorityEpoch, target.AuthorityEpoch))
+		if target.AuthorityEpoch > 0 && req.AuthorityEpoch != target.AuthorityEpoch {
+			return 0, useObsRev, rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority epoch mismatch (%d vs %d) prior to engage", sysid, req.AuthorityEpoch, target.AuthorityEpoch))
 		}
-		if curInc != "" && req.AuthorityIncarnation == "" && req.ObservedMs <= 0 {
-			return rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority_epoch requires authority_incarnation or observed_ms", sysid))
+		if curInc != "" && req.AuthorityIncarnation == "" && !hasObsInput {
+			return 0, useObsRev, rejectNotEngaged(fmt.Sprintf("vehicle sysid %d authority_epoch requires authority_incarnation or observed_ms", sysid))
 		}
 	}
 
@@ -1364,10 +1525,41 @@ func (s *Service) validateEngageObservationLocked(sysid uint8, session string, r
 	if curLease != nil && !now.Before(curLease.expiresAt) {
 		curLease = nil
 	}
+	if useObsRev {
+		minRev := s.minEngageObsRev[sysid]
+		if reqObsRev > 0 && minRev > 0 && reqObsRev < minRev {
+			s.recordStoppedSessionLocked(sysid, session)
+			return 0, true, &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "teleop_session_superseded",
+				Message: fmt.Sprintf("teleop engage observation_rev %d is older than active floor %d on vehicle sysid %d", reqObsRev, minRev, sysid),
+			}
+		}
+		if curLease != nil && curLease.session != "" && curLease.session != session {
+			if reqObsRev == 0 && curLease.engagedObsRev > 0 {
+				s.recordStoppedSessionLocked(sysid, session)
+				return 0, true, &ControlError{
+					Status:  http.StatusConflict,
+					Code:    "teleop_session_superseded",
+					Message: fmt.Sprintf("teleop engage without observation cannot evict newer session %q on vehicle sysid %d", curLease.session, sysid),
+				}
+			}
+			if req.AuthorityEpoch == 0 && curLease.engagedEpoch > 0 && reqObsRev < curLease.engagedObsRev {
+				s.recordStoppedSessionLocked(sysid, session)
+				return 0, true, &ControlError{
+					Status:  http.StatusConflict,
+					Code:    "teleop_session_superseded",
+					Message: fmt.Sprintf("teleop engage cannot evict newer epoch-fenced session %q on vehicle sysid %d", curLease.session, sysid),
+				}
+			}
+		}
+		return reqObsRev, true, nil
+	}
+
 	minObs := s.minEngageObsMs[sysid]
 	if req.ObservedMs > 0 && minObs > 0 && req.ObservedMs < minObs {
 		s.recordStoppedSessionLocked(sysid, session)
-		return &ControlError{
+		return 0, false, &ControlError{
 			Status:  http.StatusConflict,
 			Code:    "teleop_session_superseded",
 			Message: fmt.Sprintf("teleop engage observed_ms %d is older than active floor %d on vehicle sysid %d", req.ObservedMs, minObs, sysid),
@@ -1376,7 +1568,7 @@ func (s *Service) validateEngageObservationLocked(sysid uint8, session string, r
 	if curLease != nil && curLease.session != "" && curLease.session != session {
 		if req.ObservedMs <= 0 && curLease.engagedObsMs > 0 {
 			s.recordStoppedSessionLocked(sysid, session)
-			return &ControlError{
+			return 0, false, &ControlError{
 				Status:  http.StatusConflict,
 				Code:    "teleop_session_superseded",
 				Message: fmt.Sprintf("teleop engage without observed_ms cannot evict newer session %q on vehicle sysid %d", curLease.session, sysid),
@@ -1384,14 +1576,14 @@ func (s *Service) validateEngageObservationLocked(sysid uint8, session string, r
 		}
 		if req.AuthorityEpoch == 0 && curLease.engagedEpoch > 0 && req.ObservedMs < curLease.engagedObsMs {
 			s.recordStoppedSessionLocked(sysid, session)
-			return &ControlError{
+			return 0, false, &ControlError{
 				Status:  http.StatusConflict,
 				Code:    "teleop_session_superseded",
 				Message: fmt.Sprintf("teleop engage cannot evict newer epoch-fenced session %q on vehicle sysid %d", curLease.session, sysid),
 			}
 		}
 	}
-	return nil
+	return 0, false, nil
 }
 
 func (s *Service) checkTeleopSessionLocked(sysid uint8, session string, seq uint64, engage bool, now time.Time) error {
@@ -1525,7 +1717,7 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			Message: fmt.Sprintf("vehicle sysid %d teleop was preempted — explicit re-engage required", req.SysID),
 		}
 	}
-	if err := s.validateEngageObservationLocked(req.SysID, session, req, initialTarget, ok, now); err != nil {
+	if _, _, err := s.validateEngageObservationLocked(req.SysID, session, req, initialTarget, ok, now); err != nil {
 		s.mu.Unlock()
 		return TeleopResult{}, err
 	}
@@ -1536,7 +1728,7 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 		hasLiveLease = true
 	}
 	shouldSendGCSHB := (req.Engage || hasLiveLease) &&
-		(!seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)))
+		(!seenHB || now.Before(lastHB) || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)))
 	s.mu.Unlock()
 
 	if shouldSendGCSHB {
@@ -1610,10 +1802,11 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			Message: fmt.Sprintf("vehicle sysid %d teleop lease was revoked prior to transmit", req.SysID),
 		}
 	}
-	if err := s.validateEngageObservationLocked(req.SysID, session, req, curTarget, curOK, now); err != nil {
+	resolvedObsRev, useObsRev, obsErr := s.validateEngageObservationLocked(req.SysID, session, req, curTarget, curOK, now)
+	if obsErr != nil {
 		s.mu.Unlock()
 		s.egressMu[req.SysID].Unlock()
-		return TeleopResult{}, err
+		return TeleopResult{}, obsErr
 	}
 	if err := s.checkTeleopSessionLocked(req.SysID, session, req.Seq, req.Engage, now); err != nil {
 		s.mu.Unlock()
@@ -1658,6 +1851,7 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 	}
 
 	s.mu.Lock()
+	var leaseObsRev uint64
 	var leaseObsMs int64
 	var leaseEpoch uint64
 	var leaseInc string
@@ -1666,6 +1860,7 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			s.recordStoppedSessionLocked(req.SysID, prev.session)
 		}
 		if !req.Engage {
+			leaseObsRev = prev.engagedObsRev
 			leaseObsMs = prev.engagedObsMs
 			leaseEpoch = prev.engagedEpoch
 			leaseInc = prev.engagedIncarnation
@@ -1675,7 +1870,12 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 		if st := s.preemptState[req.SysID]; st != nil {
 			st.latched = false
 		}
-		if req.ObservedMs > s.minEngageObsMs[req.SysID] {
+		if useObsRev {
+			if resolvedObsRev > s.minEngageObsRev[req.SysID] {
+				s.minEngageObsRev[req.SysID] = resolvedObsRev
+			}
+			leaseObsRev = resolvedObsRev
+		} else if req.ObservedMs > s.minEngageObsMs[req.SysID] {
 			s.minEngageObsMs[req.SysID] = req.ObservedMs
 		}
 		leaseObsMs = req.ObservedMs
@@ -1687,6 +1887,7 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 		coordFrame:         coordFrame,
 		session:            effectiveSession,
 		lastSeq:            effectiveSeq,
+		engagedObsRev:      leaseObsRev,
 		engagedObsMs:       leaseObsMs,
 		engagedEpoch:       leaseEpoch,
 		engagedIncarnation: leaseInc,
@@ -1735,7 +1936,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	now := s.nowFn().UTC()
 	s.mu.Lock()
 	lastHB, seenHB := s.lastGCSHB[req.SysID]
-	shouldSendGCSHB := !seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval))
+	shouldSendGCSHB := !seenHB || now.Before(lastHB) || !now.Before(lastHB.Add(s.gcsHeartbeatInterval))
 	s.mu.Unlock()
 
 	if shouldSendGCSHB {
@@ -1960,8 +2161,12 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	hasSupersededWrite := false
 	s.mu.Lock()
 	hbBaselineNs := dispatchNow.UnixNano()
-	if curT, ok := s.targets.ActuationTarget(req.SysID); ok && curT.HeartbeatObservedUnixNs > hbBaselineNs {
-		hbBaselineNs = curT.HeartbeatObservedUnixNs
+	var hbBaselineSeq uint64
+	if curT, ok := s.targets.ActuationTarget(req.SysID); ok {
+		if curT.HeartbeatObservedUnixNs > hbBaselineNs {
+			hbBaselineNs = curT.HeartbeatObservedUnixNs
+		}
+		hbBaselineSeq = curT.HeartbeatSeq
 	}
 	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
 	for otherID, other := range s.inFlight {
@@ -1995,7 +2200,10 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	inflight.dispatch = dispatchSent
 	inflight.ackAmbiguous = !s.recovered.Load() || priorUnacked || s.surplusAckTainted[key]
 	inflight.ackDeadline = dispatchNow.Add(ackWait)
+	inflight.issuedHbObsNs = hbBaselineNs
+	inflight.issuedHbSeq = hbBaselineSeq
 	inflight.unknownAtUnixNs = hbBaselineNs
+	inflight.unknownHbSeq = hbBaselineSeq
 	earlyAcks := inflight.earlyAcks
 	inflight.earlyAcks = nil
 	if shouldSendGCSHB {
@@ -2039,9 +2247,21 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 			s.preResetAckResultMask[k] |= mask
 		}
 	}
+	for k := range s.seenAckResultMaskBySeq {
+		if k.sysid == sysid {
+			delete(s.seenAckResultMaskBySeq, k)
+		}
+	}
 	delete(s.seenAckFrames, sysid)
-	delete(s.directAckExtraOrder, sysid)
+	delete(s.directAckSeq, sysid)
 	delete(s.lastSeenTrackerAckOrder, sysid)
+}
+
+func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, baselineHbSeq uint64) bool {
+	if baselineHbSeq > 0 && target.HeartbeatSeq > 0 {
+		return target.HeartbeatSeq > baselineHbSeq
+	}
+	return target.HeartbeatObservedUnixNs > baselineNs
 }
 
 // OnCommandAck correlates a sequence-less inbound #77 COMMAND_ACK against any dispatched
@@ -2091,27 +2311,40 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 			s.seenAckFrames[sysid] = slots
 		}
 		fromTracker := targetOK &&
-			target.PacketOrder > 0 &&
 			target.LastAckOrder > 0 &&
-			target.LastAckOrder == target.PacketOrder &&
-			target.LastAckOrder > s.lastSeenTrackerAckOrder[sysid]
+			target.LastAckOrder != s.lastSeenTrackerAckOrder[sysid]
 		var candidateOrder uint64
+		var advanceDirect bool
+		var nextDirect directSeqTracker
 		if fromTracker {
-			candidateOrder = target.PacketOrder + s.directAckExtraOrder[sysid]
-		} else if targetOK && target.PacketOrder > 0 {
-			candidateOrder = target.PacketOrder + s.directAckExtraOrder[sysid] + 1
+			candidateOrder = target.LastAckOrder
 		} else {
-			candidateOrder = s.directAckExtraOrder[sysid] + 1
+			nextDirect = s.directAckSeq[sysid]
+			relPos, adv := nextDirect.computePos(seq)
+			advanceDirect = adv
+			if targetOK && target.PacketOrder > 0 {
+				candidateOrder = target.PacketOrder + relPos
+			} else {
+				candidateOrder = relPos
+			}
 		}
 		prev := slots[seq]
-		if prev.active && prev.ack == ack && candidateOrder-prev.streamOrder < 256 {
+		if prev.active && prev.ack == ack &&
+			(candidateOrder <= prev.streamOrder || candidateOrder-prev.streamOrder < 256) {
 			s.mu.Unlock()
 			return
 		}
 		if fromTracker {
 			s.lastSeenTrackerAckOrder[sysid] = target.LastAckOrder
-		} else {
-			s.directAckExtraOrder[sysid]++
+		} else if advanceDirect {
+			relPos := candidateOrder
+			if targetOK && target.PacketOrder > 0 && relPos > target.PacketOrder {
+				relPos -= target.PacketOrder
+			}
+			nextDirect.hasSeq = true
+			nextDirect.lastSeq = seq
+			nextDirect.pos = relPos
+			s.directAckSeq[sysid] = nextDirect
 		}
 		slots[seq] = serviceAckSlot{
 			active:      true,
@@ -2164,8 +2397,17 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 
 	seenSameResultBefore := ack.Result < 64 && (s.seenAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
 	seenBeforeSeqReset := ack.Result < 64 && (s.preResetAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
+	seqMasks := s.seenAckResultMaskBySeq[key]
+	seenSameSeqResultBefore := hasSeq && seqMasks != nil && ack.Result < 64 && (seqMasks[seq]&(uint64(1)<<ack.Result)) != 0
 	if ack.Result < 64 {
 		s.seenAckResultMask[key] |= uint64(1) << ack.Result
+		if hasSeq {
+			if seqMasks == nil {
+				seqMasks = &[256]uint64{}
+				s.seenAckResultMaskBySeq[key] = seqMasks
+			}
+			seqMasks[seq] |= uint64(1) << ack.Result
+		}
 	}
 	poolMask := poolMaskInt(s.seenAckResultMask[key])
 
@@ -2178,20 +2420,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 				if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
 					detachedID := ids[0]
 					s.unackedDetachedIDs[key] = ids[1:]
-					s.accountedSlotIDs[key] = appendBoundedIDs(s.accountedSlotIDs[key], detachedID)
+					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
 				}
 			} else {
 				s.surplusAckTainted[key] = true
 			}
-			for _, accID := range s.accountedSlotIDs[key] {
-				s.enqueueWriteLocked(pendingCommandWrite{
-					entityID:     accID,
-					ackOnly:      true,
-					ackAccounted: 1,
-					ackPoolMask:  poolMask,
-					updatedMs:    updatedMs,
-				})
-				wroteAck = true
+			for _, accID := range s.ambiguousSlotIDs[key] {
+				if s.enqueueConsumedAckLocked(accID, 1, poolMask) {
+					wroteAck = true
+				}
 			}
 		}
 		s.mu.Unlock()
@@ -2204,13 +2441,30 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 		return
 	}
 
+	target, targetOK := s.targets.ActuationTarget(sysid)
+	wrapPositiveAmbiguous := false
+	if len(matches) == 1 &&
+		!matches[0].sitlOnly &&
+		ack.Result == mavcodec.MAVResultAccepted &&
+		hasSeq &&
+		seenSameSeqResultBefore {
+		hasPostDispatchMatchingHB := targetOK &&
+			!target.LinkLost &&
+			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq) &&
+			matchesExpectedVehicleState(matches[0].action, target.Armed, target.CompanionMode, target.Authority)
+		if !hasPostDispatchMatchingHB {
+			wrapPositiveAmbiguous = true
+		}
+	}
+
 	ambiguous := !s.recovered.Load() ||
 		priorUnacked > 1 ||
 		len(matches) > 1 ||
 		matches[0].ackAmbiguous ||
 		s.surplusAckTainted[key] ||
 		seenBeforeSeqReset ||
-		(!hasSeq && seenSameResultBefore)
+		(!hasSeq && seenSameResultBefore) ||
+		wrapPositiveAmbiguous
 
 	if ambiguous {
 		wroteAny := false
@@ -2219,12 +2473,12 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 			if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
 				detachedID := ids[0]
 				s.unackedDetachedIDs[key] = ids[1:]
-				s.accountedSlotIDs[key] = appendBoundedIDs(s.accountedSlotIDs[key], detachedID)
+				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
 			} else {
 				for _, cmd := range matches {
 					if !cmd.ackAccounted {
 						cmd.ackAccounted = true
-						s.accountedSlotIDs[key] = appendBoundedIDs(s.accountedSlotIDs[key], cmd.entityID)
+						s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
 						break
 					}
 				}
@@ -2233,13 +2487,20 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 			s.surplusAckTainted[key] = true
 		}
 		hbFloor := obsNs
-		if target, ok := s.targets.ActuationTarget(sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
-			hbFloor = target.HeartbeatObservedUnixNs
+		var hbFloorSeq uint64
+		if targetOK {
+			if target.HeartbeatObservedUnixNs > hbFloor {
+				hbFloor = target.HeartbeatObservedUnixNs
+			}
+			hbFloorSeq = target.HeartbeatSeq
 		}
 		for _, cmd := range matches {
 			cmd.ackAmbiguous = true
 			if hbFloor > cmd.unknownAtUnixNs {
 				cmd.unknownAtUnixNs = hbFloor
+			}
+			if hbFloorSeq > cmd.unknownHbSeq {
+				cmd.unknownHbSeq = hbFloorSeq
 			}
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
@@ -2259,15 +2520,10 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 			}
 		}
 		if s.recovered.Load() {
-			for _, accID := range s.accountedSlotIDs[key] {
-				s.enqueueWriteLocked(pendingCommandWrite{
-					entityID:     accID,
-					ackOnly:      true,
-					ackAccounted: 1,
-					ackPoolMask:  poolMask,
-					updatedMs:    updatedMs,
-				})
-				wroteAny = true
+			for _, accID := range s.ambiguousSlotIDs[key] {
+				if s.enqueueConsumedAckLocked(accID, 1, poolMask) {
+					wroteAny = true
+				}
 			}
 		}
 		s.mu.Unlock()
@@ -2283,7 +2539,6 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 	matched := matches[0]
 	s.unackedCount[key] = 0
 	matched.ackAccounted = true
-	s.accountedSlotIDs[key] = appendBoundedIDs(s.accountedSlotIDs[key], matched.entityID)
 	nextPhase := PhaseRejected
 	note := "command_ack_rejected"
 	detail := formatAckResultDetail(ack.Result)
@@ -2305,17 +2560,6 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq bool, ack ma
 		detail:       detail,
 		updatedMs:    updatedMs,
 	})
-	for _, accID := range s.accountedSlotIDs[key] {
-		if accID != matched.entityID {
-			s.enqueueWriteLocked(pendingCommandWrite{
-				entityID:     accID,
-				ackOnly:      true,
-				ackAccounted: 1,
-				ackPoolMask:  poolMask,
-				updatedMs:    updatedMs,
-			})
-		}
-	}
 	s.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -2345,19 +2589,31 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 	}
 	s.mu.Lock()
 	wroteAny := false
+	targetForObs, targetForObsOK := s.targets.ActuationTarget(ev.SysID)
+	obsInc := ev.AuthorityIncarnation
+	if obsInc == "" && targetForObsOK {
+		obsInc = targetForObs.AuthorityIncarnation
+	}
+	s.syncObsIncarnationLocked(ev.SysID, obsInc)
+	_, hasResolver := s.targets.(ObservationResolver)
+	evObsRev := ev.ObservationRev
+	if evObsRev == 0 && targetForObsOK && targetForObs.ObservationRev > 0 {
+		evObsRev = targetForObs.ObservationRev
+	}
+	useObsRev := hasResolver && evObsRev > 0
+
 	if ev.Kind == mavlink.EventKindLinkLost || ev.Kind == mavlink.EventKindLinkRestored {
-		target, ok := s.targets.ActuationTarget(ev.SysID)
-		alreadySnapshotted := ev.Kind == mavlink.EventKindLinkRestored && ok &&
-			target.LinkEpoch != 0 && s.lastAckLinkEpoch[ev.SysID] == target.LinkEpoch
+		alreadySnapshotted := ev.Kind == mavlink.EventKindLinkRestored && targetForObsOK &&
+			targetForObs.LinkEpoch != 0 && s.lastAckLinkEpoch[ev.SysID] == targetForObs.LinkEpoch
 		if !alreadySnapshotted {
 			s.snapshotPreResetAckHistoryLocked(ev.SysID)
 		}
-		if ok {
-			if target.AuthorityIncarnation != "" {
-				s.lastAckIncarnation[ev.SysID] = target.AuthorityIncarnation
+		if targetForObsOK {
+			if targetForObs.AuthorityIncarnation != "" {
+				s.lastAckIncarnation[ev.SysID] = targetForObs.AuthorityIncarnation
 			}
-			if target.LinkEpoch != 0 {
-				s.lastAckLinkEpoch[ev.SysID] = target.LinkEpoch
+			if targetForObs.LinkEpoch != 0 {
+				s.lastAckLinkEpoch[ev.SysID] = targetForObs.LinkEpoch
 			}
 		}
 	}
@@ -2373,18 +2629,32 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 			s.preemptState[ev.SysID] = st
 		}
 		preemptMs := updatedMs
-		if st.preemptedAtMs > preemptMs {
+		if !useObsRev && st.preemptedAtMs > preemptMs {
 			preemptMs = st.preemptedAtMs
 		}
 		st.latched = true
 		st.preemptedAtMs = preemptMs
-		st.recoveryReady = false
-		st.recoveryObservedMs = 0
-		st.recoveryEpoch = 0
-		st.recoveryIncarnation = ""
-		if preemptMs > s.minEngageObsMs[ev.SysID] {
+		if ev.AuthorityEpoch > st.preemptEpoch {
+			st.preemptEpoch = ev.AuthorityEpoch
+		}
+		if targetForObsOK && targetForObs.AuthorityEpoch > st.preemptEpoch {
+			st.preemptEpoch = targetForObs.AuthorityEpoch
+		}
+		if useObsRev {
+			if evObsRev > st.preemptObsRev {
+				st.preemptObsRev = evObsRev
+			}
+			if evObsRev > s.minEngageObsRev[ev.SysID] {
+				s.minEngageObsRev[ev.SysID] = evObsRev
+			}
+		} else if preemptMs > s.minEngageObsMs[ev.SysID] {
 			s.minEngageObsMs[ev.SysID] = preemptMs
 		}
+		st.recoveryReady = false
+		st.recoveryObservedMs = 0
+		st.recoveryObsRev = 0
+		st.recoveryEpoch = 0
+		st.recoveryIncarnation = ""
 
 		preemptNote := "authority_preempted"
 		preemptDetail := fmt.Sprintf("Preempted by %s", ev.Authority)
@@ -2403,6 +2673,8 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
 				if cmd.dispatch == dispatchSent && !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
+				} else if cmd.dispatch == dispatchSent && cmd.ackAccounted {
+					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
 				}
 				cmd.phase = PhasePreempted
 				cmd.detail = preemptDetail
@@ -2430,9 +2702,13 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				s.recordStoppedSessionLocked(ev.SysID, prev.session)
 				delete(s.leases, ev.SysID)
 			}
-			if st != nil && st.latched {
+			if useObsRev && evObsRev > s.minEngageObsRev[ev.SysID] {
+				s.minEngageObsRev[ev.SysID] = evObsRev
+			}
+			if st != nil {
 				st.recoveryReady = false
 				st.recoveryObservedMs = 0
+				st.recoveryObsRev = 0
 				st.recoveryEpoch = 0
 				st.recoveryIncarnation = ""
 			}
@@ -2441,46 +2717,58 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				recMs := updatedMs
 				recEpoch := ev.AuthorityEpoch
 				recInc := ev.AuthorityIncarnation
-				if target, ok := s.targets.ActuationTarget(ev.SysID); ok {
-					if hbMs := target.HeartbeatObservedUnixNs / int64(time.Millisecond); hbMs > recMs {
+				if targetForObsOK {
+					if hbMs := targetForObs.HeartbeatObservedUnixNs / int64(time.Millisecond); !useObsRev && hbMs > recMs {
 						recMs = hbMs
+					} else if useObsRev && targetForObs.HeartbeatObservedUnixNs > 0 {
+						recMs = targetForObs.HeartbeatObservedUnixNs / int64(time.Millisecond)
 					}
-					if recEpoch == 0 && target.AuthorityEpoch > 0 {
-						recEpoch = target.AuthorityEpoch
+					if recEpoch == 0 && targetForObs.AuthorityEpoch > 0 {
+						recEpoch = targetForObs.AuthorityEpoch
 					}
-					if recInc == "" && target.AuthorityIncarnation != "" {
-						recInc = target.AuthorityIncarnation
+					if recInc == "" && targetForObs.AuthorityIncarnation != "" {
+						recInc = targetForObs.AuthorityIncarnation
 					}
 				}
-				if recMs <= st.preemptedAtMs {
+				if !useObsRev && recMs <= st.preemptedAtMs {
 					recMs = st.preemptedAtMs + 1
 				}
 				st.recoveryReady = true
 				st.recoveryObservedMs = recMs
 				st.recoveryEpoch = recEpoch
 				st.recoveryIncarnation = recInc
-				if recMs > s.minEngageObsMs[ev.SysID] {
+				if useObsRev {
+					st.recoveryObsRev = evObsRev
+					if evObsRev > s.minEngageObsRev[ev.SysID] {
+						s.minEngageObsRev[ev.SysID] = evObsRev
+					}
+				} else if recMs > s.minEngageObsMs[ev.SysID] {
 					s.minEngageObsMs[ev.SysID] = recMs
 				}
 			} else if ev.AuthorityIncarnation != "" && st.recoveryIncarnation != ev.AuthorityIncarnation {
 				st.recoveryIncarnation = ev.AuthorityIncarnation
 				st.recoveryEpoch = ev.AuthorityEpoch
+				if useObsRev {
+					st.recoveryObsRev = evObsRev
+				}
 			}
 		}
 		if isHeartbeatEvidence {
-			if target, ok := s.targets.ActuationTarget(ev.SysID); ok && !target.LinkLost {
+			if targetForObsOK && !targetForObs.LinkLost {
 				for id, cmd := range s.inFlight {
 					if cmd.dispatch == dispatchSent &&
 						cmd.sysid == ev.SysID &&
 						cmd.phase == PhaseCommitUnknown &&
-						target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
-						matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
+						hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
+						matchesExpectedVehicleState(cmd.action, targetForObs.Armed, targetForObs.CompanionMode, targetForObs.Authority) {
 						cmd.phase = PhaseConfirmed
 						cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 						delete(s.inFlight, id)
 						key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
 						if !cmd.ackAccounted {
 							s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
+						} else {
+							s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
 						}
 						s.enqueueWriteLocked(pendingCommandWrite{
 							entityID:     cmd.entityID,
@@ -2576,7 +2864,7 @@ func (s *Service) advanceRealtime(now time.Time, async bool) {
 			continue
 		}
 		lastHB, seen := s.lastGCSHB[sysid]
-		if !seen || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)) {
+		if !seen || now.Before(lastHB) || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)) {
 			if target, ok := s.targets.ActuationTarget(sysid); ok && !target.LinkLost && target.PeerAddr.IsValid() {
 				s.lastGCSHB[sysid] = now
 				gcsTargets = append(gcsTargets, gcsHeartbeatTarget{
@@ -2653,8 +2941,13 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 			cmd.phase = PhaseCommitUnknown
 			cmd.detail = CommitUnknownDetail
 			hbFloor := nowNs
-			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
-				hbFloor = target.HeartbeatObservedUnixNs
+			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok {
+				if target.HeartbeatObservedUnixNs > hbFloor {
+					hbFloor = target.HeartbeatObservedUnixNs
+				}
+				if target.HeartbeatSeq > cmd.unknownHbSeq {
+					cmd.unknownHbSeq = target.HeartbeatSeq
+				}
 			}
 			if hbFloor > cmd.unknownAtUnixNs {
 				cmd.unknownAtUnixNs = hbFloor
@@ -2674,13 +2967,15 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		}
 		if cmd.phase == PhaseCommitUnknown {
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
-				target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
+				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
 				matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
 				if !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
+				} else {
+					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
 				}
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,

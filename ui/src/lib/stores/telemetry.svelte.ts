@@ -88,6 +88,7 @@ export interface TransitionEvent {
   prev_authority?: ControlAuthority;
   authority_incarnation?: string;
   authority_epoch?: number;
+  observation_rev?: number;
   companion_mode: CompanionMode;
   link_tier: LinkTier;
   flags: HealthFlags;
@@ -392,6 +393,19 @@ function parseTransitionEventPayload(
     }
   }
 
+  let observationRev: number | undefined;
+  if (
+    payload.observation_rev !== undefined &&
+    payload.observation_rev !== null
+  ) {
+    if (!isNonNegativeInt(payload.observation_rev)) {
+      return null;
+    }
+    if (payload.observation_rev > 0) {
+      observationRev = payload.observation_rev;
+    }
+  }
+
   let statusText: StatusTextPayload | undefined;
   if (payload.status_text !== undefined && payload.status_text !== null) {
     const parsedStatus = parseStatusText(payload.status_text);
@@ -425,6 +439,9 @@ function parseTransitionEventPayload(
   }
   if (authorityEpoch !== undefined) {
     event.authority_epoch = authorityEpoch;
+  }
+  if (observationRev !== undefined) {
+    event.observation_rev = observationRev;
   }
   if (statusText !== undefined) {
     event.status_text = statusText;
