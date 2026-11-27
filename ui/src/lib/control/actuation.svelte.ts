@@ -93,6 +93,8 @@ export interface ControlCommandWireResult {
 
 export interface ControlTeleopRequest {
   readonly sysid: number;
+  readonly session?: string;
+  readonly seq?: number;
   readonly frame: TeleopFrame;
   readonly vx: number;
   readonly vy: number;
@@ -502,6 +504,7 @@ export function resolveLiveActuationSafety(
   telemetryStore: TelemetryStore,
   skgStore: SkgStore,
   freshnessContext?: FleetFreshnessContext,
+  fallbackNowMs?: number,
 ): LiveActuationSafety {
   const linkState =
     freshnessContext?.telemetryLink ??
@@ -512,7 +515,7 @@ export function resolveLiveActuationSafety(
     telemetryStatus: freshnessContext?.telemetryStatus ?? telemetryStore.status,
     skgStatus: freshnessContext?.skgStatus ?? skgStore.status,
     skgSynced: freshnessContext?.skgSynced ?? skgStore.synced,
-    nowMs: freshnessContext?.nowMs,
+    nowMs: freshnessContext?.nowMs ?? fallbackNowMs,
   });
 
   const latestEv = findLatestControlTransitionEvent(
@@ -547,6 +550,7 @@ export function resolveLiveActuationSafety(
   const canEngageTeleop =
     !vehicle.poisoned &&
     !linkLost &&
+    freshness.fresh &&
     !isSupervisoryOnly &&
     armed &&
     authority === "companion-teleop";
@@ -668,6 +672,11 @@ export function createActuationController(
   const heldKeys = new Set<PadHoldKey>();
   let teleopTimer: ReturnType<typeof setInterval> | null = null;
   let needsEngageFlagOnNextTick = false;
+  let engageCounter = 0;
+  let engagedEntityId: string | null = null;
+  let engagedSession: string | null = null;
+  let teleopSeq = 0;
+  let lastFreshnessContext: FleetFreshnessContext | undefined;
 
   const skgLatestCommand = $derived(
     extractLatestVehicleCommand(skgStore.entities.values(), activeSysId),
@@ -702,6 +711,16 @@ export function createActuationController(
       clearIntervalFn(teleopTimer);
       teleopTimer = null;
     }
+  }
+
+  function clearEngagedSessionLocal(): void {
+    stopTeleopTimer();
+    engagedSysId = null;
+    engagedEntityId = null;
+    engagedSession = null;
+    teleopSeq = 0;
+    needsEngageFlagOnNextTick = false;
+    resetStickState();
   }
 
   function resetStickState(): void {
@@ -744,17 +763,83 @@ export function createActuationController(
     };
   }
 
+  function verifyEngagedVehicleLive(sysid: number): boolean {
+    if (engagedSysId !== sysid) {
+      return false;
+    }
+    const liveVehicle =
+      (engagedEntityId
+        ? skgStore.getCommandableVehicle(engagedEntityId)
+        : null) ??
+      skgStore.commandableVehicles.find((v) => v.sysid === sysid) ??
+      null;
+    if (!liveVehicle) {
+      void disengageTeleop({ sendZero: true });
+      return false;
+    }
+    const currentNow = now();
+    const liveSafety = resolveLiveActuationSafety(
+      liveVehicle,
+      telemetryStore,
+      skgStore,
+      lastFreshnessContext
+        ? { ...lastFreshnessContext, nowMs: currentNow }
+        : undefined,
+      currentNow,
+    );
+    if (liveSafety.canEngageTeleop) {
+      return true;
+    }
+    if (liveSafety.authority === "direct-crsf-override") {
+      applyPreemptionEdge(
+        sysid,
+        "direct-crsf-override",
+        "P1 RC PILOT OVERRIDE preempted teleop — click Engage Teleop after P2 returns",
+      );
+    } else if (liveSafety.authority === "mcu-failsafe") {
+      applyPreemptionEdge(
+        sysid,
+        "mcu-failsafe",
+        "P0 MCU FAILSAFE preempted teleop — click Engage Teleop after recovery",
+      );
+    } else if (liveSafety.linkLost) {
+      applyPreemptionEdge(
+        sysid,
+        "link-lost",
+        `UXS #${sysid} link lost — teleop disengaged`,
+      );
+    } else if (
+      liveSafety.isSupervisoryOnly ||
+      !liveSafety.armed ||
+      liveSafety.authority !== "companion-teleop"
+    ) {
+      clearEngagedSessionLocal();
+    } else {
+      lastError = `UXS #${sysid} telemetry is stale (${liveSafety.statusLabel}) — teleop disengaged`;
+      void disengageTeleop({ sendZero: true });
+    }
+    return false;
+  }
+
   async function dispatchTeleopNudge(
     sysid: number,
     engageFlag: boolean,
   ): Promise<boolean> {
-    if (engagedSysId !== sysid) {
+    if (engagedSysId !== sysid || engagedSession === null) {
       return false;
     }
+    if (!engageFlag && !verifyEngagedVehicleLive(sysid)) {
+      return false;
+    }
+    const session = engagedSession;
+    teleopSeq += 1;
+    const seq = teleopSeq;
     teleopPacketsSent += 1;
     const currentAxes = axes;
     const res = await client.submitTeleop({
       sysid,
+      session,
+      seq,
       frame,
       vx: currentAxes.vx,
       vy: currentAxes.vy,
@@ -763,14 +848,10 @@ export function createActuationController(
       engage: engageFlag || undefined,
     });
     if (!res.ok) {
-      if (engagedSysId !== sysid && !engageFlag) {
+      if (engagedSession !== session || engagedSysId !== sysid) {
         return false;
       }
-      if (engagedSysId === sysid) {
-        stopTeleopTimer();
-        engagedSysId = null;
-        resetStickState();
-      }
+      clearEngagedSessionLocal();
       lastError = res.error.message;
       if (
         res.error.code === "preemption_latched" ||
@@ -785,7 +866,7 @@ export function createActuationController(
       }
       return false;
     }
-    return true;
+    return engagedSession === session && engagedSysId === sysid;
   }
 
   function startTeleopTimer(sysid: number): void {
@@ -793,6 +874,9 @@ export function createActuationController(
     teleopTimer = setIntervalFn(() => {
       if (engagedSysId !== sysid) {
         stopTeleopTimer();
+        return;
+      }
+      if (!verifyEngagedVehicleLive(sysid)) {
         return;
       }
       const sendEngage = needsEngageFlagOnNextTick;
@@ -810,9 +894,7 @@ export function createActuationController(
     const wasEngaged = engagedSysId === sysid;
     let mutated = false;
     if (wasEngaged) {
-      stopTeleopTimer();
-      engagedSysId = null;
-      resetStickState();
+      clearEngagedSessionLocal();
       mutated = true;
     } else if (activeSysId === sysid) {
       resetStickState();
@@ -879,16 +961,20 @@ export function createActuationController(
           !ev.armed ||
           ev.authority !== "companion-teleop")
       ) {
-        stopTeleopTimer();
-        engagedSysId = null;
-        resetStickState();
+        clearEngagedSessionLocal();
       }
     }) ?? null;
 
-  async function sendStopRelease(sysid: number): Promise<void> {
+  async function sendStopRelease(
+    sysid: number,
+    session?: string,
+    seq?: number,
+  ): Promise<void> {
     teleopPacketsSent += 1;
     await client.submitTeleop({
       sysid,
+      ...(session !== undefined ? { session } : {}),
+      ...(seq !== undefined ? { seq } : {}),
       frame,
       vx: 0,
       vy: 0,
@@ -902,12 +988,11 @@ export function createActuationController(
     opts: { sendZero?: boolean } = {},
   ): Promise<void> {
     const prevSysId = engagedSysId;
-    stopTeleopTimer();
-    engagedSysId = null;
-    needsEngageFlagOnNextTick = false;
-    resetStickState();
+    const prevSession = engagedSession ?? undefined;
+    const stopSeq = prevSession !== undefined ? teleopSeq + 1 : undefined;
+    clearEngagedSessionLocal();
     if (prevSysId !== null && (opts.sendZero ?? true)) {
-      await sendStopRelease(prevSysId);
+      await sendStopRelease(prevSysId, prevSession, stopSeq);
     }
   }
 
@@ -915,6 +1000,7 @@ export function createActuationController(
     vehicle: VehicleEntityState | null,
     freshnessContext?: FleetFreshnessContext,
   ): LiveActuationSafety | null {
+    lastFreshnessContext = freshnessContext;
     if (!vehicle || vehicle.poisoned) {
       untrack(() => {
         const prevEngaged = engagedSysId;
@@ -935,6 +1021,7 @@ export function createActuationController(
       telemetryStore,
       skgStore,
       freshnessContext,
+      now(),
     );
 
     untrack(() => {
@@ -971,9 +1058,10 @@ export function createActuationController(
           !safety.armed ||
           safety.authority !== "companion-teleop")
       ) {
-        stopTeleopTimer();
-        engagedSysId = null;
-        resetStickState();
+        clearEngagedSessionLocal();
+      } else if (engagedSysId === vehicle.sysid && !safety.fresh) {
+        lastError = `UXS #${vehicle.sysid} telemetry is stale (${safety.statusLabel}) — teleop disengaged`;
+        void disengageTeleop({ sendZero: true });
       }
     });
 
@@ -994,21 +1082,28 @@ export function createActuationController(
         ? "Continuous #84 velocity teleop is disabled on mesh-supervisory links"
         : safety?.linkLost
           ? `UXS #${vehicle.sysid} link is silent (LINK LOST)`
-          : !safety?.armed
-            ? `UXS #${vehicle.sysid} must be ARMED before engaging velocity teleop`
-            : `UXS #${vehicle.sysid} authority is ${safety?.authority ?? vehicle.authority} (companion-teleop required)`;
+          : safety && !safety.fresh
+            ? `UXS #${vehicle.sysid} telemetry is stale (${safety.statusLabel})`
+            : !safety?.armed
+              ? `UXS #${vehicle.sysid} must be ARMED before engaging velocity teleop`
+              : `UXS #${vehicle.sysid} authority is ${safety?.authority ?? vehicle.authority} (companion-teleop required)`;
       return false;
     }
 
     lastError = null;
     preemptBySysId.delete(vehicle.sysid);
+    engageCounter += 1;
+    const session = `s${vehicle.sysid}-e${engageCounter}-${now()}`;
     activeSysId = vehicle.sysid;
     engagedSysId = vehicle.sysid;
+    engagedEntityId = vehicle.id;
+    engagedSession = session;
+    teleopSeq = 0;
     resetStickState();
     needsEngageFlagOnNextTick = false;
 
     const ok = await dispatchTeleopNudge(vehicle.sysid, true);
-    if (!ok || engagedSysId !== vehicle.sysid) {
+    if (!ok || engagedSysId !== vehicle.sysid || engagedSession !== session) {
       return false;
     }
     startTeleopTimer(vehicle.sysid);
@@ -1030,7 +1125,6 @@ export function createActuationController(
       vz: axes.vz,
       yawRate: axes.yawRate,
     };
-    void dispatchTeleopNudge(engagedSysId, false);
   }
 
   function releasePadPointer(): void {
@@ -1243,12 +1337,12 @@ export function createActuationController(
     },
     dispose() {
       const prevSysId = engagedSysId;
-      stopTeleopTimer();
-      engagedSysId = null;
-      resetStickState();
+      const prevSession = engagedSession ?? undefined;
+      const stopSeq = prevSession !== undefined ? teleopSeq + 1 : undefined;
+      clearEngagedSessionLocal();
       unsubscribeTransitions?.();
       if (prevSysId !== null) {
-        void sendStopRelease(prevSysId);
+        void sendStopRelease(prevSysId, prevSession, stopSeq);
       }
     },
   };

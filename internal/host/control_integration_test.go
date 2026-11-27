@@ -302,3 +302,252 @@ func TestRuntimeControlEndpointsAndLifecycleCAS(t *testing.T) {
 	phase, ackRes := readCommandPhase()
 	t.Fatalf("ENTITY_STATES after #77 ACCEPTED = (phase=%q, ackRes=%d), want (%q, 0)", phase, ackRes, control.PhaseConfirmed)
 }
+
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	retainedDataDir := t.TempDir()
+	uiDir := t.TempDir()
+
+	peerConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP peer: %v", err)
+	}
+	defer func() { _ = peerConn.Close() }()
+
+	readPeerFrames := func(maxFrames int, wait time.Duration) []mavcodec.Frame {
+		t.Helper()
+		var out []mavcodec.Frame
+		_ = peerConn.SetReadDeadline(time.Now().Add(wait))
+		buf := make([]byte, 512)
+		for len(out) < maxFrames {
+			n, _, readErr := peerConn.ReadFromUDP(buf)
+			if readErr != nil {
+				break
+			}
+			f, decErr := mavcodec.DecodeFrame(buf[:n])
+			if decErr != nil {
+				t.Fatalf("DecodeFrame outbound: %v", decErr)
+			}
+			out = append(out, f)
+		}
+		return out
+	}
+
+	readKVPhase := func(rt *Runtime, commandID string) string {
+		js, jsErr := rt.NATSClient().JetStream()
+		if jsErr != nil {
+			return ""
+		}
+		kv, kvErr := js.KeyValue(ctx, graph.BucketEntityStates)
+		if kvErr != nil {
+			return ""
+		}
+		entry, getErr := kv.Get(ctx, commandID)
+		if getErr != nil {
+			return ""
+		}
+		var es graph.EntityState
+		if jsonErr := json.Unmarshal(entry.Value(), &es); jsonErr != nil {
+			return ""
+		}
+		for _, tr := range es.Triples {
+			if tr.Predicate == control.PredicateCommandPhase {
+				if s, ok := tr.Object.(string); ok {
+					return s
+				}
+			}
+		}
+		return ""
+	}
+
+	postCommand := func(baseURL, body string) control.CommandResult {
+		t.Helper()
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+control.CommandFrontDoorPath, bytes.NewBufferString(body))
+		if reqErr != nil {
+			t.Fatalf("NewRequest: %v", reqErr)
+		}
+		req.Header.Set("Origin", baseURL)
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatalf("POST /control/command: %v", doErr)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST /control/command status=%d body=%s", resp.StatusCode, string(raw))
+		}
+		var env control.Envelope[control.CommandResult]
+		if decErr := json.Unmarshal(raw, &env); decErr != nil || !env.OK || env.Result == nil {
+			t.Fatalf("decode command envelope: %+v err=%v", env, decErr)
+		}
+		return *env.Result
+	}
+
+	// --- Boot #1 on retainedDataDir ---
+	rt1, err := StartEphemeral(ctx, Options{
+		DataDir:   retainedDataDir,
+		Logger:    slog.New(slog.DiscardHandler),
+		Overrides: PortOverrides{MetricsPort: -1},
+		UIDir:     uiDir,
+		Version:   "test-m3.1-boot1",
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral boot 1: %v", err)
+	}
+	if err := rt1.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady boot 1: %v", err)
+	}
+
+	udpDst1, err := net.ResolveUDPAddr("udp4", rt1.Endpoints().MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr boot 1: %v", err)
+	}
+	hbMsg1, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed:        true,
+		SystemStatus: mavcodec.MAVStateActive,
+		Custom: mavcodec.CustomMode{
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+			HealthFlags:      mavcodec.HealthFlags{CRSFLinkHealthy: true, CompanionTrunkHealthy: true},
+			Domain:           mavcodec.DomainQuadcopter,
+			CompanionMode:    mavcodec.ModeTeleopVelocity,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat hb1: %v", err)
+	}
+	hb1, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    1,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message:     hbMsg1,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame hb1: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(hb1, udpDst1); err != nil {
+		t.Fatalf("WriteToUDP hb1: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	// 1) Complete one command on Boot #1.
+	cmdDone := postCommand(rt1.Endpoints().HTTPBaseURL, `{"sysid":1,"action":"mode-autonomous"}`)
+	_ = readPeerFrames(2, 500*time.Millisecond)
+	ackDone, _ := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    2,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message: mavcodec.CommandAck{
+			Command:      mavcodec.MAVCmdDoSetMode,
+			Result:       mavcodec.MAVResultAccepted,
+			TargetSystem: mavcodec.GCSSystemID,
+		},
+	})
+	_, _ = peerConn.WriteToUDP(ackDone, udpDst1)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt1, cmdDone.CommandID) != control.PhaseConfirmed {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if got := readKVPhase(rt1, cmdDone.CommandID); got != control.PhaseConfirmed {
+		t.Fatalf("boot 1 completed command phase = %q, want confirmed", got)
+	}
+
+	// 2) Submit a second command (`hold-position`) whose ACK is never sent before Boot #1 stops.
+	cmdIndeterminate := postCommand(rt1.Endpoints().HTTPBaseURL, `{"sysid":1,"action":"hold-position"}`)
+	_ = readPeerFrames(2, 500*time.Millisecond)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt1, cmdIndeterminate.CommandID) == "" {
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	stopCtx1, stopCancel1 := context.WithTimeout(ctx, 10*time.Second)
+	stopErr1 := rt1.Stop(stopCtx1)
+	stopCancel1()
+	if stopErr1 != nil {
+		t.Fatalf("Stop boot 1: %v", stopErr1)
+	}
+
+	// --- Boot #2 on the SAME retainedDataDir ---
+	rt2, err := StartEphemeral(ctx, Options{
+		DataDir:   retainedDataDir,
+		Logger:    slog.New(slog.DiscardHandler),
+		Overrides: PortOverrides{MetricsPort: -1},
+		UIDir:     uiDir,
+		Version:   "test-m3.1-boot2",
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral boot 2: %v", err)
+	}
+	defer func() {
+		stopCtx2, stopCancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel2()
+		_ = rt2.Stop(stopCtx2)
+	}()
+	if err := rt2.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady boot 2: %v", err)
+	}
+
+	// Pre-restart pending command MUST recover to commit_unknown in ENTITY_STATES without retransmitting #76!
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt2, cmdIndeterminate.CommandID) != control.PhaseCommitUnknown {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readKVPhase(rt2, cmdIndeterminate.CommandID); got != control.PhaseCommitUnknown {
+		t.Fatalf("boot 2 recovered indeterminate command phase = %q, want commit_unknown", got)
+	}
+	for _, f := range readPeerFrames(4, 150*time.Millisecond) {
+		if cl, isCmd := f.Message.(mavcodec.CommandLong); isCmd {
+			t.Fatalf("boot 2 retransmitted pre-restart COMMAND_LONG: %+v", cl)
+		}
+	}
+
+	// Admit vehicle on Boot #2 with fresh Hold-Position HEARTBEAT -> reconciles recovered command to confirmed,
+	// and a new command on Boot #2 succeeds with a collision-free restart-safe ID!
+	udpDst2, err := net.ResolveUDPAddr("udp4", rt2.Endpoints().MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr boot 2: %v", err)
+	}
+	hbMsg2, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed:        true,
+		SystemStatus: mavcodec.MAVStateActive,
+		Custom: mavcodec.CustomMode{
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+			HealthFlags:      mavcodec.HealthFlags{CRSFLinkHealthy: true, CompanionTrunkHealthy: true},
+			Domain:           mavcodec.DomainQuadcopter,
+			CompanionMode:    mavcodec.ModeHoldPosition,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat hb2: %v", err)
+	}
+	hb2, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    3,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message:     hbMsg2,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame hb2: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(hb2, udpDst2); err != nil {
+		t.Fatalf("WriteToUDP hb2: %v", err)
+	}
+
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt2, cmdIndeterminate.CommandID) != control.PhaseConfirmed {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readKVPhase(rt2, cmdIndeterminate.CommandID); got != control.PhaseConfirmed {
+		t.Fatalf("boot 2 post-restart HEARTBEAT failed to reconcile recovered command: phase=%q", got)
+	}
+
+	cmdBoot2 := postCommand(rt2.Endpoints().HTTPBaseURL, `{"sysid":1,"action":"mode-teleop"}`)
+	if cmdBoot2.CommandID == cmdDone.CommandID || cmdBoot2.CommandID == cmdIndeterminate.CommandID {
+		t.Fatalf("boot 2 reused pre-restart command entity ID: %s", cmdBoot2.CommandID)
+	}
+}

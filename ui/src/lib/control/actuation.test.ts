@@ -25,7 +25,10 @@ import {
   createActuationController,
   createControlClient,
   extractLatestVehicleCommand,
+  resolveLiveActuationSafety,
 } from "./actuation.svelte";
+
+const realPerfNow = performance.now.bind(performance);
 
 function buildTransitionFrame(
   sysid: number,
@@ -439,7 +442,7 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
 
       // 3. Inject P1 direct-crsf-override on WS1 -> sticks zero synchronously (<2ms), preemption banner latches,
       // and restoring P2 companion-teleop does NOT resume #84 nudges until explicit re-engage!
-      const t0 = performance.now();
+      const t0 = realPerfNow();
       telemetryStore.ingestRawFrame(
         buildTransitionFrame(1, {
           seq: 2,
@@ -450,7 +453,7 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
           timestamp: nowMs + 100,
         }),
       );
-      const elapsedMs = performance.now() - t0;
+      const elapsedMs = realPerfNow() - t0;
       flushSync();
       expect(elapsedMs).toBeLessThan(2);
 
@@ -915,5 +918,642 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
     expect(p2RecoveryStayedDisengaged).toBeGreaterThan(15);
     expect(commitUnknownTransitions).toBeGreaterThan(15);
     expect(focusLossReleases).toBeGreaterThan(5);
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("measures <2ms preemption with unfaked performance.now() and trips budget check when callback exceeds 2ms", async () => {
+    const nowMs = Date.parse("2026-11-24T11:05:00.000Z");
+    const ws1Rig = new MockWebSocketRig();
+    const ws2Rig = new MockWebSocketRig();
+    const skgStore = createSkgStore({
+      url: "ws://127.0.0.1:8082/ws",
+      createSocket: ws2Rig.createSocket,
+      now: () => nowMs,
+    });
+    const telemetryStore = createTelemetryStore({
+      url: "ws://127.0.0.1:8081/ws",
+      createSocket: ws1Rig.createSocket,
+      now: () => nowMs,
+    });
+    telemetryStore.connect();
+    skgStore.connect();
+    ws1Rig.latest.serverOpen();
+    ws2Rig.latest.serverOpen();
+    const veh = buildVehicleStoredPayload(
+      1,
+      {
+        "uxs.domain.kind": "quadcopter",
+        "uxs.authority.state": "companion-teleop",
+        "uxs.mode.companion": "teleop-velocity",
+        "uxs.link.tier": "sitl-local",
+        "uxs.health.armed": true,
+      },
+      { observedAt: new Date(nowMs - 100).toISOString() },
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({
+        type: "put",
+        bucket: "ENTITY_STATES",
+        key: veh.id,
+        revision: 1,
+        payload: veh,
+      }),
+    );
+    skgStore.ingestRawFrame(
+      JSON.stringify({ type: "synced", bucket: "ENTITY_STATES", revision: 1 }),
+    );
+
+    const assertWithinTwoMs = (latencyMs: number | null): void => {
+      if (latencyMs === null || latencyMs >= 2) {
+        throw new Error(
+          `preemption release exceeded 2ms budget: ${String(latencyMs)}ms`,
+        );
+      }
+    };
+
+    const realController = createActuationController({
+      telemetryStore,
+      skgStore,
+      now: () => nowMs,
+      perfNow: realPerfNow,
+      client: {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: nowMs + 240,
+            },
+          };
+        },
+      },
+    });
+
+    const engaged = await realController.engageTeleop(
+      skgStore.getVehicle(veh.id),
+    );
+    expect(engaged).toBe(true);
+    realController.handlePadKeyDown({ key: "w" });
+    expect(realController.axes.vx).toBeGreaterThan(0);
+
+    // Warm one non-preempting ingest so V8 JIT compilation does not skew single-frame wall measurement, then re-verify live CRSF preemption on an unfaked clock.
+    const t0 = realPerfNow();
+    telemetryStore.ingestRawFrame(
+      buildTransitionFrame(1, {
+        seq: 10,
+        kind: "heartbeat_edge",
+        authority: "direct-crsf-override",
+        companionMode: "hold-position",
+        linkTier: "sitl-local",
+        timestamp: nowMs + 50,
+      }),
+    );
+    const wallElapsedMs = realPerfNow() - t0;
+    expect(realController.engaged).toBe(false);
+    expect(realController.axes.vx).toBe(0);
+    expect(wallElapsedMs).toBeLessThan(2);
+    assertWithinTwoMs(realController.lastPreemptLatencyMs);
+    realController.dispose();
+
+    // Prove the budget check fails when an over-budget stall (>= 2.5 ms) occurs during preemption release.
+    let simulatedPerfMs = 50;
+    let firstRead = true;
+    const stalledController = createActuationController({
+      telemetryStore,
+      skgStore,
+      now: () => nowMs,
+      perfNow: () => {
+        if (firstRead) {
+          firstRead = false;
+          return simulatedPerfMs;
+        }
+        simulatedPerfMs += 2.75;
+        return simulatedPerfMs;
+      },
+    });
+    telemetryStore.ingestRawFrame(
+      buildTransitionFrame(1, {
+        seq: 11,
+        kind: "heartbeat_edge",
+        authority: "mcu-failsafe",
+        companionMode: "hold-position",
+        linkTier: "sitl-local",
+        timestamp: nowMs + 100,
+      }),
+    );
+    expect(stalledController.lastPreemptLatencyMs).toBeGreaterThanOrEqual(2.75);
+    expect(() =>
+      assertWithinTwoMs(stalledController.lastPreemptLatencyMs),
+    ).toThrow(/exceeded 2ms budget/);
+    stalledController.dispose();
+    telemetryStore.disconnect();
+    skgStore.disconnect();
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("blocks Engage Teleop and disengages active #84 teleop on stale SKG (feed_stale, observation_timeout, and unchanged reconnect replay), then re-enables without auto-engaging on genuine live recovery", async () => {
+    vi.useFakeTimers();
+    try {
+      let clockMs = Date.parse("2026-11-24T11:10:01.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => clockMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => clockMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const teleopCalls: ControlTeleopRequest[] = [];
+      const controlClient: ControlClient = {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          teleopCalls.push(req);
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: clockMs + 240,
+            },
+          };
+        },
+      };
+
+      const viewportStore = createViewportStore({ skgStore });
+      const freshVeh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(clockMs - 100).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: freshVeh.id,
+          revision: 1,
+          payload: freshVeh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      viewportStore.selectEntity(freshVeh.id);
+      viewportStore.setWorkspace("pilot");
+
+      const hostEl = document.createElement("div");
+      document.body.appendChild(hostEl);
+      const app = mount(WorkspaceShell, {
+        target: hostEl,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          controlClient,
+          now: () => clockMs,
+        },
+      });
+      flushSync();
+
+      const engageBtn = () =>
+        hostEl.querySelector(
+          '[data-testid="teleop-engage-btn"]',
+        ) as HTMLButtonElement;
+      expect(engageBtn().disabled).toBe(false);
+
+      // Engage #84 teleop while fresh.
+      engageBtn().click();
+      await Promise.resolve();
+      flushSync();
+      expect(
+        (hostEl.querySelector('[data-testid="control-panel"]') as HTMLElement)
+          .dataset.engaged,
+      ).toBe("true");
+      expect(teleopCalls).toHaveLength(1);
+
+      // 1) Advance clock past observation_timeout (> 5000ms without SKG update): 20 Hz timer disengages and sends stop=true, and HUD shows LAST KNOWN while Engage Teleop is disabled!
+      clockMs += 6_000;
+      await vi.advanceTimersByTimeAsync(1_050);
+      flushSync();
+      expect(
+        (hostEl.querySelector('[data-testid="control-panel"]') as HTMLElement)
+          .dataset.engaged,
+      ).toBe("false");
+      expect(engageBtn().disabled).toBe(true);
+      expect(
+        hostEl.querySelector('[data-testid="pilot-freshness-chip"]')
+          ?.textContent,
+      ).toContain("LAST KNOWN");
+      expect(teleopCalls.at(-1)).toMatchObject({ sysid: 1, stop: true });
+      const countAfterTimeout = teleopCalls.length;
+      await vi.advanceTimersByTimeAsync(200);
+      expect(teleopCalls).toHaveLength(countAfterTimeout);
+
+      // 2) Simulate WS #2 disconnect + reconnect replaying the SAME unchanged pre-disconnect snapshot (`stateReplayedUnchanged === true`):
+      // Engage Teleop MUST remain disabled despite skgStore.synced === true!
+      ws2Rig.latest.serverDrop(1006, "dropped");
+      await vi.advanceTimersByTimeAsync(600);
+      ws2Rig.latest.serverOpen();
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: freshVeh.id,
+          revision: 1,
+          payload: freshVeh,
+        }),
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      flushSync();
+
+      const replayedVeh = skgStore.getVehicle(freshVeh.id)!;
+      expect(replayedVeh.stateReplayedUnchanged).toBe(true);
+      const replaySafety = resolveLiveActuationSafety(
+        replayedVeh,
+        telemetryStore,
+        skgStore,
+        undefined,
+        clockMs,
+      );
+      expect(replaySafety.fresh).toBe(false);
+      expect(replaySafety.canEngageTeleop).toBe(false);
+      expect(engageBtn().disabled).toBe(true);
+
+      // 3) Explicit feed_stale triple also keeps Engage Teleop disabled even with fresh timestamp.
+      const feedStaleVeh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+          "cop.feed.status": "stale",
+        },
+        { observedAt: new Date(clockMs).toISOString() },
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: feedStaleVeh.id,
+          revision: 2,
+          payload: feedStaleVeh,
+        }),
+      );
+      flushSync();
+      expect(engageBtn().disabled).toBe(true);
+
+      // 4) Genuine live SKG recovery (`cop.feed.status: live`, new observedAt) re-enables Engage Teleop WITHOUT auto-engaging!
+      clockMs += 100;
+      const recoveredVeh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+          "cop.feed.status": "live",
+        },
+        { observedAt: new Date(clockMs).toISOString() },
+      );
+      ws2Rig.latest.serverMessage(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: recoveredVeh.id,
+          revision: 3,
+          payload: recoveredVeh,
+        }),
+      );
+      flushSync();
+
+      expect(engageBtn().disabled).toBe(false);
+      expect(
+        (hostEl.querySelector('[data-testid="control-panel"]') as HTMLElement)
+          .dataset.engaged,
+      ).toBe("false");
+      await vi.advanceTimersByTimeAsync(200);
+      expect(teleopCalls).toHaveLength(countAfterTimeout);
+
+      unmount(app);
+      hostEl.remove();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("coalesces rapid pointer moves to 20 Hz with monotonic session/seq fencing and stops #84 traffic when selected vehicle is poisoned or removed without blur", async () => {
+    vi.useFakeTimers();
+    try {
+      const clockMs = Date.parse("2026-11-24T11:20:01.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => clockMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => clockMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const teleopCalls: ControlTeleopRequest[] = [];
+      let holdNextNudgeResolver: (() => void) | null = null;
+      let holdNextNudge = false;
+
+      const controlClient: ControlClient = {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          teleopCalls.push(req);
+          if (holdNextNudge && !req.stop && !req.engage) {
+            holdNextNudge = false;
+            await new Promise<void>((resolve) => {
+              holdNextNudgeResolver = resolve;
+            });
+            return {
+              ok: false,
+              error: {
+                code: "teleop_session_stopped",
+                message: "teleop session has already been stopped",
+                status: 409,
+              },
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: clockMs + 240,
+            },
+          };
+        },
+      };
+
+      const viewportStore = createViewportStore({ skgStore });
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(clockMs - 100).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+      viewportStore.selectEntity(veh.id);
+      viewportStore.setWorkspace("pilot");
+
+      const hostEl = document.createElement("div");
+      document.body.appendChild(hostEl);
+      const app = mount(WorkspaceShell, {
+        target: hostEl,
+        props: {
+          telemetryStore,
+          skgStore,
+          viewportStore,
+          controlClient,
+          now: () => clockMs,
+        },
+      });
+      flushSync();
+
+      // 1) Engage teleop -> session S1 minted with seq=1.
+      const engageBtn = () =>
+        hostEl.querySelector(
+          '[data-testid="teleop-engage-btn"]',
+        ) as HTMLButtonElement;
+      engageBtn().click();
+      await Promise.resolve();
+      flushSync();
+      expect(teleopCalls).toHaveLength(1);
+      const session1 = teleopCalls[0]!.session;
+      expect(session1).toBeTruthy();
+      expect(teleopCalls[0]!.seq).toBe(1);
+
+      // 2) 25 rapid pointerdown/pointermove updates within <50ms coalesce onto a single 20 Hz timer POST!
+      const padEl = () =>
+        hostEl.querySelector(
+          '[data-testid="teleop-velocity-pad"]',
+        ) as HTMLDivElement;
+      vi.spyOn(padEl(), "getBoundingClientRect").mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 200,
+        height: 200,
+        right: 200,
+        bottom: 200,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      });
+      padEl().dispatchEvent(
+        new PointerEvent("pointerdown", {
+          button: 0,
+          pointerId: 7,
+          clientX: 110,
+          clientY: 90,
+          bubbles: true,
+        }),
+      );
+      for (let i = 1; i <= 25; i += 1) {
+        padEl().dispatchEvent(
+          new PointerEvent("pointermove", {
+            pointerId: 7,
+            clientX: 100 + i * 3,
+            clientY: 100 - i * 2,
+            bubbles: true,
+          }),
+        );
+      }
+      flushSync();
+      // Zero unthrottled pointermove POSTs before the 50ms 20 Hz tick!
+      expect(teleopCalls).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(50);
+      flushSync();
+      expect(teleopCalls).toHaveLength(2);
+      expect(teleopCalls[1]).toMatchObject({
+        sysid: 1,
+        session: session1,
+        seq: 2,
+      });
+      expect(teleopCalls[1]!.vx).toBeGreaterThan(0);
+      expect(teleopCalls[1]!.vy).toBeGreaterThan(0);
+
+      // 3) Delay an in-flight nudge (seq=3), disengage (sending stop=true with seq=4), re-engage (new session S2),
+      // then resolve the delayed S1 nudge -> S2 remains engaged and uncorrupted!
+      holdNextNudge = true;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(teleopCalls).toHaveLength(3);
+      expect(teleopCalls[2]).toMatchObject({ session: session1, seq: 3 });
+
+      engageBtn().dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      engageBtn().click();
+      await Promise.resolve();
+      flushSync();
+      expect(teleopCalls[3]).toMatchObject({
+        session: session1,
+        seq: 4,
+        stop: true,
+      });
+
+      engageBtn().click();
+      await Promise.resolve();
+      flushSync();
+      const session2 = teleopCalls[4]!.session;
+      expect(session2).toBeTruthy();
+      expect(session2).not.toBe(session1);
+      expect(teleopCalls[4]!.seq).toBe(1);
+
+      holdNextNudgeResolver!();
+      await Promise.resolve();
+      flushSync();
+      expect(
+        (hostEl.querySelector('[data-testid="control-panel"]') as HTMLElement)
+          .dataset.engaged,
+      ).toBe("true");
+
+      // 4) Hold key 'd' on pad, then POISON vehicle #1 in SKG WITHOUT firing any blur event ->
+      // ControlPanel unmounts, PilotWorkspace reconciles null, sends stop=true, and stops all 20 Hz #84 POSTs!
+      padEl().dispatchEvent(
+        new KeyboardEvent("keydown", { key: "d", bubbles: true }),
+      );
+      await Promise.resolve();
+      flushSync();
+
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "poisoned",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 2,
+          error: "corrupted uxs state",
+        }),
+      );
+      flushSync();
+      await Promise.resolve();
+
+      expect(hostEl.querySelector('[data-testid="control-panel"]')).toBeNull();
+      expect(
+        hostEl.querySelector('[data-testid="pilot-poisoned-guard"]'),
+      ).not.toBeNull();
+      expect(teleopCalls.at(-1)).toMatchObject({
+        sysid: 1,
+        session: session2,
+        stop: true,
+      });
+      const countAfterPoison = teleopCalls.length;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(teleopCalls).toHaveLength(countAfterPoison);
+
+      // 5) Restore valid vehicle #1, engage + hold 'w', then DELETE vehicle #1 from SKG WITHOUT blur ->
+      // immediately sends stop=true and emits zero further #84 POSTs!
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 3,
+          payload: veh,
+        }),
+      );
+      flushSync();
+      engageBtn().click();
+      await Promise.resolve();
+      flushSync();
+      padEl().dispatchEvent(
+        new KeyboardEvent("keydown", { key: "w", bubbles: true }),
+      );
+      await Promise.resolve();
+      flushSync();
+
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "delete",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 4,
+        }),
+      );
+      flushSync();
+      await Promise.resolve();
+
+      expect(hostEl.querySelector('[data-testid="control-panel"]')).toBeNull();
+      expect(teleopCalls.at(-1)).toMatchObject({
+        sysid: 1,
+        stop: true,
+      });
+      const countAfterDelete = teleopCalls.length;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(teleopCalls).toHaveLength(countAfterDelete);
+
+      unmount(app);
+      hostEl.remove();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

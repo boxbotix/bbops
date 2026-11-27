@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +38,8 @@ const (
 
 	// DefaultSupervisoryAckTimeout is the non-retrying #77 COMMAND_ACK wait bound on mesh-supervisory links.
 	DefaultSupervisoryAckTimeout = 3500 * time.Millisecond
+
+	maxStoppedSessionsPerVehicle = 64
 )
 
 // TargetSource provides atomic per-sysid pinned peer and safety snapshots (`OQ1 Option A`).
@@ -54,12 +58,22 @@ type CommandStore interface {
 	Transition(ctx context.Context, entityID, newPhase, note string, source lifecycle.TransitionSource, ackResult int, detail string, updatedMs int64) error
 }
 
-// LifecycleStore adapts semengine/pkg/lifecycle.Manager to CommandStore (`OQ2 Option A`).
+// RecoverableCommandStore extends CommandStore with authoritative reads and active-instance
+// enumeration for restart recovery and transient-persistence verification.
+type RecoverableCommandStore interface {
+	CommandStore
+	Get(ctx context.Context, entityID string) (*CommandEntity, error)
+	ListNonTerminal(ctx context.Context) ([]CommandEntity, error)
+}
+
+// LifecycleStore adapts semengine/pkg/lifecycle.Manager to RecoverableCommandStore (`OQ2 Option A`).
 type LifecycleStore struct {
 	mgr *lifecycle.Manager
 }
 
-// NewLifecycleStore registers the uxs-command workflow on mgr and returns a CAS-backed CommandStore.
+var _ RecoverableCommandStore = (*LifecycleStore)(nil)
+
+// NewLifecycleStore registers the uxs-command workflow on mgr and returns a CAS-backed LifecycleStore.
 func NewLifecycleStore(mgr *lifecycle.Manager) (*LifecycleStore, error) {
 	if err := RegisterWorkflow(mgr); err != nil {
 		return nil, err
@@ -97,6 +111,37 @@ func (s *LifecycleStore) Transition(
 	})
 }
 
+// Get reads the projected CommandEntity for entityID from ENTITY_STATES.
+func (s *LifecycleStore) Get(ctx context.Context, entityID string) (*CommandEntity, error) {
+	p, err := s.mgr.Get(ctx, WorkflowName, entityID)
+	if err != nil {
+		return nil, err
+	}
+	ce, ok := p.(*CommandEntity)
+	if !ok {
+		return nil, fmt.Errorf("control: unexpected participant type %T", p)
+	}
+	cp := *ce
+	return &cp, nil
+}
+
+// ListNonTerminal enumerates non-terminal CommandEntity records (`pending`, `commit_unknown`) in ENTITY_STATES.
+func (s *LifecycleStore) ListNonTerminal(ctx context.Context) ([]CommandEntity, error) {
+	items, err := s.mgr.List(ctx, WorkflowName, lifecycle.ListOptions{Active: true})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CommandEntity, 0, len(items))
+	for _, p := range items {
+		ce, ok := p.(*CommandEntity)
+		if !ok || ce == nil {
+			continue
+		}
+		out = append(out, *ce)
+	}
+	return out, nil
+}
+
 // ControlError classifies deterministic safety-gate, validation, and transport refusals.
 type ControlError struct {
 	Status  int
@@ -132,6 +177,8 @@ type CommandResult struct {
 // TeleopRequest is the inbound 10-30 Hz velocity setpoint or stop payload for POST /control/teleop.
 type TeleopRequest struct {
 	SysID   uint8   `json:"sysid"`
+	Session string  `json:"session,omitempty"`
+	Seq     uint64  `json:"seq,omitempty"`
 	Frame   string  `json:"frame,omitempty"`
 	Vx      float64 `json:"vx"`
 	Vy      float64 `json:"vy"`
@@ -167,18 +214,65 @@ type Options struct {
 type teleopLease struct {
 	peer       netip.AddrPort
 	coordFrame uint8
+	session    string
+	lastSeq    uint64
 	expiresAt  time.Time
+}
+
+type stoppedSessionRing struct {
+	order []string
+	set   map[string]struct{}
+}
+
+func (r *stoppedSessionRing) add(session string) {
+	if session == "" {
+		return
+	}
+	if r.set == nil {
+		r.set = make(map[string]struct{})
+	}
+	if _, exists := r.set[session]; exists {
+		return
+	}
+	if len(r.order) >= maxStoppedSessionsPerVehicle {
+		evict := r.order[0]
+		r.order = r.order[1:]
+		delete(r.set, evict)
+	}
+	r.order = append(r.order, session)
+	r.set[session] = struct{}{}
+}
+
+func (r *stoppedSessionRing) contains(session string) bool {
+	if session == "" || r == nil || r.set == nil {
+		return false
+	}
+	_, ok := r.set[session]
+	return ok
 }
 
 type inFlightCommand struct {
 	entityID        string
+	orderSeq        uint64
 	sysid           uint8
 	cmdID           uint16
 	action          string
 	sitlOnly        bool
 	phase           string
+	ackAmbiguous    bool
+	superseded      bool
 	ackDeadline     time.Time
 	unknownAtUnixNs int64
+}
+
+type pendingCommandWrite struct {
+	entityID  string
+	phase     string
+	note      string
+	source    lifecycle.TransitionSource
+	ackResult int
+	detail    string
+	updatedMs int64
 }
 
 // Service enforces UXS safety gates, non-retrying #76 -> #77 discrete actuation,
@@ -186,6 +280,7 @@ type inFlightCommand struct {
 type Service struct {
 	org                   string
 	platform              string
+	bootNonce             string
 	targets               TargetSource
 	sender                FrameSender
 	store                 CommandStore
@@ -200,16 +295,35 @@ type Service struct {
 
 	seqCounter atomic.Uint32
 	cmdCounter atomic.Uint64
+	recovered  atomic.Bool
 
-	mu             sync.Mutex
-	leases         map[uint8]*teleopLease
-	preemptLatched map[uint8]bool
-	inFlight       map[string]*inFlightCommand
-	lastGCSHB      map[uint8]time.Time
+	recoverMu sync.Mutex
+	persistMu sync.Mutex
+
+	mu              sync.Mutex
+	authEpoch       map[uint8]uint64
+	leases          map[uint8]*teleopLease
+	stoppedSessions map[uint8]*stoppedSessionRing
+	preemptLatched  map[uint8]bool
+	inFlight        map[string]*inFlightCommand
+	pendingWrites   map[string]pendingCommandWrite
+	lastGCSHB       map[uint8]time.Time
+
+	leaseWake   chan struct{}
+	persistWake chan struct{}
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
-	wg        sync.WaitGroup
+	leaseWG   sync.WaitGroup
+	cmdWG     sync.WaitGroup
+}
+
+func newBootNonce() string {
+	var raw [6]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return strconv.FormatUint(uint64(time.Now().UnixNano()), 16)
+	}
+	return hex.EncodeToString(raw[:])
 }
 
 // NewService validates opts and constructs an unstarted control.Service.
@@ -269,9 +383,10 @@ func NewService(opts Options) (*Service, error) {
 		supAckTimeout = DefaultSupervisoryAckTimeout
 	}
 
-	return &Service{
+	svc := &Service{
 		org:                   org,
 		platform:              platform,
+		bootNonce:             newBootNonce(),
 		targets:               opts.Targets,
 		sender:                opts.Sender,
 		store:                 opts.Store,
@@ -283,18 +398,29 @@ func NewService(opts Options) (*Service, error) {
 		gcsHeartbeatInterval:  gcsHB,
 		commandAckTimeout:     ackTimeout,
 		supervisoryAckTimeout: supAckTimeout,
+		authEpoch:             make(map[uint8]uint64),
 		leases:                make(map[uint8]*teleopLease),
+		stoppedSessions:       make(map[uint8]*stoppedSessionRing),
 		preemptLatched:        make(map[uint8]bool),
 		inFlight:              make(map[string]*inFlightCommand),
+		pendingWrites:         make(map[string]pendingCommandWrite),
 		lastGCSHB:             make(map[uint8]time.Time),
-	}, nil
+		leaseWake:             make(chan struct{}, 1),
+		persistWake:           make(chan struct{}, 1),
+	}
+	if _, ok := opts.Store.(RecoverableCommandStore); !ok {
+		svc.recovered.Store(true)
+	}
+	return svc, nil
 }
 
-// Start launches the background lease-deadman, command-ACK timeout, and 1 Hz GCS heartbeat loop.
+// Start launches decoupled real-time lease-deadman scheduling and background command persistence loops.
 func (s *Service) Start(ctx context.Context) error {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
+	s.ensureRecovered(ctx)
+
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 	if s.runCancel != nil {
@@ -302,24 +428,81 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.runCancel = cancel
-	s.wg.Add(1)
+
+	leaseTick := s.tickInterval
+	if leaseTick > 10*time.Millisecond {
+		leaseTick = 10 * time.Millisecond
+	}
+
+	// Real-time deadman & GCS heartbeat loop: strictly decoupled from CommandStore I/O.
+	s.leaseWG.Add(1)
 	go func() {
-		defer s.wg.Done()
+		defer s.leaseWG.Done()
+		ticker := time.NewTicker(leaseTick)
+		defer ticker.Stop()
+		var timer *time.Timer
+		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
+		}()
+
+		for {
+			var timerCh <-chan time.Time
+			if nextExpiry, ok := s.nextLeaseExpiry(); ok {
+				wait := nextExpiry.Sub(s.nowFn())
+				if wait < 0 {
+					wait = 0
+				}
+				if timer == nil {
+					timer = time.NewTimer(wait)
+				} else {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(wait)
+				}
+				timerCh = timer.C
+			}
+
+			select {
+			case <-runCtx.Done():
+				return
+			case <-s.leaseWake:
+				s.advanceRealtime(s.nowFn())
+			case <-timerCh:
+				s.advanceRealtime(s.nowFn())
+			case <-ticker.C:
+				s.advanceRealtime(s.nowFn())
+			}
+		}
+	}()
+
+	// Command timeout, heartbeat reconciliation, and durable transition retry loop.
+	s.cmdWG.Add(1)
+	go func() {
+		defer s.cmdWG.Done()
 		ticker := time.NewTicker(s.tickInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-runCtx.Done():
 				return
+			case <-s.persistWake:
+				s.flushPendingWrites(runCtx)
 			case <-ticker.C:
-				s.Advance(runCtx, s.nowFn())
+				s.advanceCommands(runCtx, s.nowFn())
 			}
 		}
 	}()
+
 	return nil
 }
 
-// Stop cancels the background ticker and waits for completion.
+// Stop cancels background loops and waits for completion.
 func (s *Service) Stop(ctx context.Context) error {
 	s.runMu.Lock()
 	cancel := s.runCancel
@@ -330,7 +513,8 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 	done := make(chan struct{})
 	go func() {
-		s.wg.Wait()
+		s.leaseWG.Wait()
+		s.cmdWG.Wait()
 		close(done)
 	}()
 	if ctx == nil {
@@ -345,6 +529,32 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 }
 
+func (s *Service) signalLeaseWake() {
+	select {
+	case s.leaseWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) signalPersistWake() {
+	select {
+	case s.persistWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) nextLeaseExpiry() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var earliest time.Time
+	for _, lease := range s.leases {
+		if earliest.IsZero() || lease.expiresAt.Before(earliest) {
+			earliest = lease.expiresAt
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
 func (s *Service) nextSeq() uint8 {
 	return uint8(s.seqCounter.Add(1) - 1)
 }
@@ -355,6 +565,26 @@ func isValidVehicleSysID(sysid uint8) bool {
 
 func isFiniteFloat(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func narrowFiniteFloat32(v float64) (float32, bool) {
+	if !isFiniteFloat(v) {
+		return 0, false
+	}
+	f32 := float32(v)
+	if math.IsNaN(float64(f32)) || math.IsInf(float64(f32), 0) {
+		return 0, false
+	}
+	return f32, true
+}
+
+func isSITLOnlyAction(action string) bool {
+	switch action {
+	case ActionSITLCompanionBlackout, ActionSITLCRSFOverride, ActionSITLCrossCurrent:
+		return true
+	default:
+		return false
+	}
 }
 
 func resolveCoordinateFrame(frame string) (uint8, error) {
@@ -378,13 +608,17 @@ type resolvedCommandSpec struct {
 }
 
 func resolveActionSpec(req CommandRequest) (resolvedCommandSpec, error) {
-	if !isFiniteFloat(req.Param1) || !isFiniteFloat(req.Param2) || !isFiniteFloat(req.Param3) {
+	p1, ok1 := narrowFiniteFloat32(req.Param1)
+	p2, ok2 := narrowFiniteFloat32(req.Param2)
+	p3, ok3 := narrowFiniteFloat32(req.Param3)
+	if !ok1 || !ok2 || !ok3 {
 		return resolvedCommandSpec{}, &ControlError{
 			Status:  http.StatusBadRequest,
 			Code:    "non_finite_value",
-			Message: "command parameters must be finite numbers",
+			Message: "command parameters must be finite float32 numbers",
 		}
 	}
+	_ = p3
 	base := mavcodec.CommandLong{
 		TargetSystem:    req.SysID,
 		TargetComponent: mavcodec.CompIDAutopilot1,
@@ -413,24 +647,24 @@ func resolveActionSpec(req CommandRequest) (resolvedCommandSpec, error) {
 		base.Param2 = float32(mavcodec.ModeAutonomousVelocity)
 		return resolvedCommandSpec{msg: base}, nil
 	case ActionSITLCompanionBlackout:
-		durMs := req.Param1
+		durMs := p1
 		if durMs <= 0 {
 			durMs = 350
 		}
 		base.Command = mavcodec.MAVCmdUser1
 		base.Param1 = 1
-		base.Param2 = float32(durMs)
+		base.Param2 = durMs
 		return resolvedCommandSpec{msg: base, sitlOnly: true}, nil
 	case ActionSITLCRSFOverride:
 		base.Command = mavcodec.MAVCmdUser1
 		base.Param1 = 2
-		base.Param2 = float32(req.Param1)
+		base.Param2 = p1
 		return resolvedCommandSpec{msg: base, sitlOnly: true}, nil
 	case ActionSITLCrossCurrent:
 		base.Command = mavcodec.MAVCmdUser1
 		base.Param1 = 3
-		base.Param2 = float32(req.Param1)
-		base.Param3 = float32(req.Param2)
+		base.Param2 = p1
+		base.Param3 = p2
 		return resolvedCommandSpec{msg: base, sitlOnly: true}, nil
 	default:
 		return resolvedCommandSpec{}, &ControlError{
@@ -438,6 +672,155 @@ func resolveActionSpec(req CommandRequest) (resolvedCommandSpec, error) {
 			Code:    "unsupported_action",
 			Message: fmt.Sprintf("unsupported discrete command action %q", req.Action),
 		}
+	}
+}
+
+func (s *Service) ensureRecovered(ctx context.Context) {
+	if s.recovered.Load() {
+		return
+	}
+	recStore, ok := s.store.(RecoverableCommandStore)
+	if !ok {
+		s.recovered.Store(true)
+		return
+	}
+
+	s.recoverMu.Lock()
+	defer s.recoverMu.Unlock()
+	if s.recovered.Load() {
+		return
+	}
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+	}
+
+	active, err := recStore.ListNonTerminal(ctx)
+	if err != nil {
+		s.logger.Debug("control: deferred non-terminal command recovery", slog.Any("error", err))
+		return
+	}
+
+	now := s.nowFn().UTC()
+	bootNs := s.bootTime.UTC().UnixNano()
+	updatedMs := now.UnixMilli()
+
+	s.mu.Lock()
+	for _, ce := range active {
+		if ce.ID == "" || ce.SysID < 1 || ce.SysID > 254 {
+			continue
+		}
+		if _, exists := s.inFlight[ce.ID]; exists {
+			continue
+		}
+		unknownNs := bootNs
+		if ceUpdatedNs := ce.UpdatedMs * int64(time.Millisecond); ceUpdatedNs > unknownNs {
+			unknownNs = ceUpdatedNs
+		}
+		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok && target.HeartbeatObservedUnixNs > unknownNs {
+			unknownNs = target.HeartbeatObservedUnixNs
+		}
+		seq := s.cmdCounter.Add(1)
+		s.inFlight[ce.ID] = &inFlightCommand{
+			entityID:        ce.ID,
+			orderSeq:        seq,
+			sysid:           uint8(ce.SysID),
+			cmdID:           uint16(ce.CmdID),
+			action:          ce.Action,
+			sitlOnly:        isSITLOnlyAction(ce.Action),
+			phase:           PhaseCommitUnknown,
+			ackAmbiguous:    true,
+			ackDeadline:     now,
+			unknownAtUnixNs: unknownNs,
+		}
+		if ce.PhaseState == PhasePending {
+			s.enqueueWriteLocked(pendingCommandWrite{
+				entityID:  ce.ID,
+				phase:     PhaseCommitUnknown,
+				note:      "recovered_indeterminate_after_restart",
+				source:    lifecycle.TransitionSourceComponent,
+				ackResult: UnacknowledgedResult,
+				detail:    CommitUnknownDetail,
+				updatedMs: updatedMs,
+			})
+		}
+	}
+	hasWrites := len(s.pendingWrites) > 0
+	s.recovered.Store(true)
+	s.mu.Unlock()
+
+	if hasWrites {
+		s.flushPendingWrites(ctx)
+	}
+}
+
+func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
+	if prev, exists := s.pendingWrites[w.entityID]; exists {
+		if commandTransitions.IsTerminal(prev.phase) {
+			return
+		}
+	}
+	s.pendingWrites[w.entityID] = w
+}
+
+func (s *Service) flushPendingWrites(ctx context.Context) {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+	}
+
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	s.mu.Lock()
+	if len(s.pendingWrites) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	batch := make([]pendingCommandWrite, 0, len(s.pendingWrites))
+	for _, w := range s.pendingWrites {
+		batch = append(batch, w)
+	}
+	s.mu.Unlock()
+
+	recStore, hasReader := s.store.(RecoverableCommandStore)
+	for _, w := range batch {
+		if ctx.Err() != nil {
+			return
+		}
+		err := s.store.Transition(
+			ctx,
+			w.entityID,
+			w.phase,
+			w.note,
+			w.source,
+			w.ackResult,
+			w.detail,
+			w.updatedMs,
+		)
+		verified := err == nil
+		if !verified && hasReader && ctx.Err() == nil {
+			if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil {
+				if got.PhaseState == w.phase || commandTransitions.IsTerminal(got.PhaseState) {
+					verified = true
+				}
+			}
+		}
+		if verified {
+			s.mu.Lock()
+			if cur, exists := s.pendingWrites[w.entityID]; exists && cur.phase == w.phase {
+				delete(s.pendingWrites, w.entityID)
+			}
+			s.mu.Unlock()
+			continue
+		}
+		s.logger.Warn("control: transient command state write failed; retaining for retry",
+			slog.String("command_id", w.entityID),
+			slog.String("phase", w.phase),
+			slog.Any("error", err),
+		)
 	}
 }
 
@@ -456,6 +839,140 @@ func (s *Service) HasActiveLease(sysid uint8) bool {
 	return ok
 }
 
+func validateTeleopTarget(sysid uint8, target mavlink.ActuationTarget, ok bool) error {
+	if !ok || !target.PeerAddr.IsValid() {
+		return &ControlError{
+			Status:  http.StatusNotFound,
+			Code:    "vehicle_not_admitted",
+			Message: fmt.Sprintf("vehicle sysid %d is not admitted", sysid),
+		}
+	}
+	if target.LinkLost {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "vehicle_link_lost",
+			Message: fmt.Sprintf("vehicle sysid %d link is silent (LINK LOST)", sysid),
+		}
+	}
+	if target.LinkTier == uxsvocab.LinkTierMeshSupervisory {
+		return &ControlError{
+			Status:  http.StatusForbidden,
+			Code:    "supervisory_link_tier",
+			Message: "continuous #84 velocity teleop is prohibited on mesh-supervisory links",
+		}
+	}
+	if !target.Armed {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "vehicle_disarmed",
+			Message: fmt.Sprintf("vehicle sysid %d is disarmed", sysid),
+		}
+	}
+	if target.Authority != uxsvocab.AuthorityCompanionTeleop {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "authority_not_teleop",
+			Message: fmt.Sprintf("vehicle sysid %d authority is %q (companion-teleop required)", sysid, target.Authority),
+		}
+	}
+	return nil
+}
+
+func validateCommandTarget(sysid uint8, actionSlug string, sitlOnly bool, target mavlink.ActuationTarget, ok bool) error {
+	if !ok || !target.PeerAddr.IsValid() {
+		return &ControlError{
+			Status:  http.StatusNotFound,
+			Code:    "vehicle_not_admitted",
+			Message: fmt.Sprintf("vehicle sysid %d is not admitted", sysid),
+		}
+	}
+	if target.LinkLost {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "vehicle_link_lost",
+			Message: fmt.Sprintf("vehicle sysid %d link is silent (LINK LOST)", sysid),
+		}
+	}
+	if sitlOnly && target.LinkTier != uxsvocab.LinkTierSITLLocal {
+		return &ControlError{
+			Status:  http.StatusForbidden,
+			Code:    "sitl_only_action",
+			Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
+		}
+	}
+	if !sitlOnly {
+		if target.Authority == uxsvocab.AuthorityDirectCRSFOverride {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "authority_preempted",
+				Message: "hardware RC pilot override (direct-crsf-override) holds actuator authority",
+			}
+		}
+		if target.Authority == uxsvocab.AuthorityMCUFailsafe && target.Armed && actionSlug != ActionDisarm {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "authority_preempted",
+				Message: "MCU hardware failsafe (mcu-failsafe) holds actuator authority",
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) recordStoppedSessionLocked(sysid uint8, session string) {
+	if session == "" {
+		return
+	}
+	ring := s.stoppedSessions[sysid]
+	if ring == nil {
+		ring = &stoppedSessionRing{}
+		s.stoppedSessions[sysid] = ring
+	}
+	ring.add(session)
+}
+
+func (s *Service) checkTeleopSessionLocked(sysid uint8, session string, seq uint64, engage bool) error {
+	if session != "" && s.stoppedSessions[sysid].contains(session) {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "teleop_session_stopped",
+			Message: fmt.Sprintf("teleop session %q on vehicle sysid %d has already disengaged", session, sysid),
+		}
+	}
+	if s.preemptLatched[sysid] && !engage {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "preemption_latched",
+			Message: fmt.Sprintf("vehicle sysid %d teleop was preempted — explicit re-engage required", sysid),
+		}
+	}
+	cur := s.leases[sysid]
+	if !engage {
+		if cur == nil {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "teleop_not_engaged",
+				Message: fmt.Sprintf("vehicle sysid %d has no active teleop lease — explicit engage required", sysid),
+			}
+		}
+		if session != "" && cur.session != "" && session != cur.session {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "teleop_session_superseded",
+				Message: fmt.Sprintf("teleop session %q was superseded on vehicle sysid %d", session, sysid),
+			}
+		}
+		if seq > 0 && cur.lastSeq > 0 && (session == cur.session) && seq <= cur.lastSeq {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "teleop_seq_superseded",
+				Message: fmt.Sprintf("teleop sequence %d is older than latest %d on vehicle sysid %d", seq, cur.lastSeq, sysid),
+			}
+		}
+	}
+	return nil
+}
+
 // SubmitTeleop validates safety gates and forwards an at-most-once #84 velocity setpoint
 // (or explicit zero-velocity release on Stop) to the pinned peer UDP endpoint.
 func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResult, error) {
@@ -466,110 +983,137 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			Message: fmt.Sprintf("sysid %d must be in range [1..254]", req.SysID),
 		}
 	}
-	if !isFiniteFloat(req.Vx) || !isFiniteFloat(req.Vy) || !isFiniteFloat(req.Vz) || !isFiniteFloat(req.YawRate) {
+	vx32, okVx := narrowFiniteFloat32(req.Vx)
+	vy32, okVy := narrowFiniteFloat32(req.Vy)
+	vz32, okVz := narrowFiniteFloat32(req.Vz)
+	yaw32, okYaw := narrowFiniteFloat32(req.YawRate)
+	if !okVx || !okVy || !okVz || !okYaw {
 		return TeleopResult{}, &ControlError{
 			Status:  http.StatusBadRequest,
 			Code:    "non_finite_value",
-			Message: "teleop velocity and yaw_rate values must be finite numbers",
+			Message: "teleop velocity and yaw_rate values must be finite float32 numbers",
 		}
 	}
 	coordFrame, err := resolveCoordinateFrame(req.Frame)
 	if err != nil {
 		return TeleopResult{}, err
 	}
+	session := strings.TrimSpace(req.Session)
 
 	now := s.nowFn()
 	if req.Stop {
 		var releasePeer netip.AddrPort
 		var releaseFrame uint8
+		var shouldZero bool
+
 		s.mu.Lock()
+		s.recordStoppedSessionLocked(req.SysID, session)
 		prev, hadLease := s.leases[req.SysID]
-		if hadLease {
+		if hadLease && (session == "" || prev.session == "" || prev.session == session) {
 			delete(s.leases, req.SysID)
+			s.authEpoch[req.SysID]++
 			releaseFrame = prev.coordFrame
+			releasePeer = prev.peer
+			shouldZero = true
 		}
 		s.mu.Unlock()
 
-		if hadLease {
+		if shouldZero {
 			if target, ok := s.targets.ActuationTarget(req.SysID); ok &&
 				!target.LinkLost && target.PeerAddr.IsValid() &&
+				target.PeerAddr == releasePeer &&
 				target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
 				target.Authority == uxsvocab.AuthorityCompanionTeleop {
-				releasePeer = target.PeerAddr
+				_ = s.sendZeroVelocity(req.SysID, releaseFrame, target.PeerAddr, now)
 			}
-		}
-		if releasePeer.IsValid() {
-			_ = s.sendZeroVelocity(req.SysID, releaseFrame, releasePeer, now)
 		}
 		return TeleopResult{SysID: req.SysID, LeaseActive: false}, nil
 	}
 
-	target, ok := s.targets.ActuationTarget(req.SysID)
-	if !ok || !target.PeerAddr.IsValid() {
-		return TeleopResult{}, &ControlError{
-			Status:  http.StatusNotFound,
-			Code:    "vehicle_not_admitted",
-			Message: fmt.Sprintf("vehicle sysid %d is not admitted", req.SysID),
-		}
+	initialTarget, ok := s.targets.ActuationTarget(req.SysID)
+	if err := validateTeleopTarget(req.SysID, initialTarget, ok); err != nil {
+		return TeleopResult{}, err
 	}
-	if target.LinkLost {
-		return TeleopResult{}, &ControlError{
-			Status:  http.StatusConflict,
-			Code:    "vehicle_link_lost",
-			Message: fmt.Sprintf("vehicle sysid %d link is silent (LINK LOST)", req.SysID),
-		}
-	}
-	if target.LinkTier == uxsvocab.LinkTierMeshSupervisory {
-		return TeleopResult{}, &ControlError{
-			Status:  http.StatusForbidden,
-			Code:    "supervisory_link_tier",
-			Message: "continuous #84 velocity teleop is prohibited on mesh-supervisory links",
-		}
-	}
-	if !target.Armed {
-		return TeleopResult{}, &ControlError{
-			Status:  http.StatusConflict,
-			Code:    "vehicle_disarmed",
-			Message: fmt.Sprintf("vehicle sysid %d is disarmed", req.SysID),
-		}
-	}
-	if target.Authority != uxsvocab.AuthorityCompanionTeleop {
-		return TeleopResult{}, &ControlError{
-			Status:  http.StatusConflict,
-			Code:    "authority_not_teleop",
-			Message: fmt.Sprintf("vehicle sysid %d authority is %q (companion-teleop required)", req.SysID, target.Authority),
-		}
-	}
-
-	expiresAt := now.Add(s.teleopTTL)
-	var shouldSendGCSHB bool
 
 	s.mu.Lock()
-	if s.preemptLatched[req.SysID] {
-		if !req.Engage {
-			s.mu.Unlock()
-			return TeleopResult{}, &ControlError{
-				Status:  http.StatusConflict,
-				Code:    "preemption_latched",
-				Message: fmt.Sprintf("vehicle sysid %d teleop was preempted — explicit re-engage required", req.SysID),
-			}
-		}
-		delete(s.preemptLatched, req.SysID)
+	if err := s.checkTeleopSessionLocked(req.SysID, session, req.Seq, req.Engage); err != nil {
+		s.mu.Unlock()
+		return TeleopResult{}, err
 	}
-	s.leases[req.SysID] = &teleopLease{
-		peer:       target.PeerAddr,
-		coordFrame: coordFrame,
-		expiresAt:  expiresAt,
-	}
-	if lastHB, seen := s.lastGCSHB[req.SysID]; !seen || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)) {
-		s.lastGCSHB[req.SysID] = now
-		shouldSendGCSHB = true
-	}
+	startEpoch := s.authEpoch[req.SysID]
+	lastHB, seenHB := s.lastGCSHB[req.SysID]
+	shouldSendGCSHB := !seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval))
 	s.mu.Unlock()
 
 	if shouldSendGCSHB {
-		_ = s.sendGCSHeartbeat(target.PeerAddr)
+		_ = s.sendGCSHeartbeat(initialTarget.PeerAddr)
 	}
+
+	// Final pre-send fence: re-validate target, pinned peer, authority epoch, and session ordering
+	// immediately before committing the lease and transmitting #84.
+	now = s.nowFn()
+	expiresAt := now.Add(s.teleopTTL)
+
+	s.mu.Lock()
+	curTarget, curOK := s.targets.ActuationTarget(req.SysID)
+	if err := validateTeleopTarget(req.SysID, curTarget, curOK); err != nil {
+		s.mu.Unlock()
+		return TeleopResult{}, err
+	}
+	if curTarget.PeerAddr != initialTarget.PeerAddr {
+		s.mu.Unlock()
+		return TeleopResult{}, &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "vehicle_peer_changed",
+			Message: fmt.Sprintf("vehicle sysid %d pinned peer changed prior to transmit", req.SysID),
+		}
+	}
+	if s.authEpoch[req.SysID] != startEpoch {
+		latched := s.preemptLatched[req.SysID]
+		s.mu.Unlock()
+		if latched {
+			return TeleopResult{}, &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "preemption_latched",
+				Message: fmt.Sprintf("vehicle sysid %d teleop was preempted prior to transmit — explicit re-engage required", req.SysID),
+			}
+		}
+		return TeleopResult{}, &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "teleop_not_engaged",
+			Message: fmt.Sprintf("vehicle sysid %d teleop lease was revoked prior to transmit", req.SysID),
+		}
+	}
+	if err := s.checkTeleopSessionLocked(req.SysID, session, req.Seq, req.Engage); err != nil {
+		s.mu.Unlock()
+		return TeleopResult{}, err
+	}
+	if req.Engage {
+		delete(s.preemptLatched, req.SysID)
+	}
+	effectiveSession := session
+	effectiveSeq := req.Seq
+	if prev := s.leases[req.SysID]; prev != nil && !req.Engage {
+		if effectiveSession == "" {
+			effectiveSession = prev.session
+		}
+		if effectiveSeq == 0 {
+			effectiveSeq = prev.lastSeq
+		}
+	}
+	lease := &teleopLease{
+		peer:       curTarget.PeerAddr,
+		coordFrame: coordFrame,
+		session:    effectiveSession,
+		lastSeq:    effectiveSeq,
+		expiresAt:  expiresAt,
+	}
+	s.leases[req.SysID] = lease
+	if shouldSendGCSHB {
+		s.lastGCSHB[req.SysID] = now
+	}
+	s.mu.Unlock()
+	s.signalLeaseWake()
 
 	if err := s.sender.SendFrame(mavcodec.Frame{
 		Sequence:    s.nextSeq(),
@@ -581,12 +1125,17 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			TargetComponent: mavcodec.CompIDAutopilot1,
 			CoordinateFrame: coordFrame,
 			TypeMask:        mavcodec.PositionTargetTypeMaskVelocityOnly,
-			Vx:              float32(req.Vx),
-			Vy:              float32(req.Vy),
-			Vz:              float32(req.Vz),
-			YawRate:         float32(req.YawRate),
+			Vx:              vx32,
+			Vy:              vy32,
+			Vz:              vz32,
+			YawRate:         yaw32,
 		},
-	}, target.PeerAddr); err != nil {
+	}, curTarget.PeerAddr); err != nil {
+		s.mu.Lock()
+		if s.leases[req.SysID] == lease {
+			delete(s.leases, req.SysID)
+		}
+		s.mu.Unlock()
 		return TeleopResult{}, &ControlError{
 			Status:  http.StatusServiceUnavailable,
 			Code:    "transport_unavailable",
@@ -602,7 +1151,8 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 }
 
 // SubmitCommand validates safety gates, persists a pending CommandEntity via lifecycle CAS,
-// and transmits a single non-retrying #76 COMMAND_LONG (`Confirmation = 0`) datagram.
+// fences against concurrent preemption/peer revocation, and transmits a single non-retrying
+// #76 COMMAND_LONG (`Confirmation = 0`) datagram.
 func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (CommandResult, error) {
 	if !isValidVehicleSysID(req.SysID) {
 		return CommandResult{}, &ControlError{
@@ -618,93 +1168,127 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		return CommandResult{}, err
 	}
 
-	target, ok := s.targets.ActuationTarget(req.SysID)
-	if !ok || !target.PeerAddr.IsValid() {
-		return CommandResult{}, &ControlError{
-			Status:  http.StatusNotFound,
-			Code:    "vehicle_not_admitted",
-			Message: fmt.Sprintf("vehicle sysid %d is not admitted", req.SysID),
-		}
-	}
-	if target.LinkLost {
-		return CommandResult{}, &ControlError{
-			Status:  http.StatusConflict,
-			Code:    "vehicle_link_lost",
-			Message: fmt.Sprintf("vehicle sysid %d link is silent (LINK LOST)", req.SysID),
-		}
-	}
-	if spec.sitlOnly && target.LinkTier != uxsvocab.LinkTierSITLLocal {
-		return CommandResult{}, &ControlError{
-			Status:  http.StatusForbidden,
-			Code:    "sitl_only_action",
-			Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
-		}
-	}
-	if !spec.sitlOnly {
-		if target.Authority == uxsvocab.AuthorityDirectCRSFOverride {
-			return CommandResult{}, &ControlError{
-				Status:  http.StatusConflict,
-				Code:    "authority_preempted",
-				Message: "hardware RC pilot override (direct-crsf-override) holds actuator authority",
-			}
-		}
-		if target.Authority == uxsvocab.AuthorityMCUFailsafe && target.Armed && actionSlug != ActionDisarm {
-			return CommandResult{}, &ControlError{
-				Status:  http.StatusConflict,
-				Code:    "authority_preempted",
-				Message: "MCU hardware failsafe (mcu-failsafe) holds actuator authority",
-			}
-		}
+	s.ensureRecovered(ctx)
+
+	initialTarget, ok := s.targets.ActuationTarget(req.SysID)
+	if err := validateCommandTarget(req.SysID, actionSlug, spec.sitlOnly, initialTarget, ok); err != nil {
+		return CommandResult{}, err
 	}
 
 	now := s.nowFn().UTC()
+	s.mu.Lock()
+	lastHB, seenHB := s.lastGCSHB[req.SysID]
+	shouldSendGCSHB := !seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval))
+	s.mu.Unlock()
+
+	if shouldSendGCSHB {
+		_ = s.sendGCSHeartbeat(initialTarget.PeerAddr)
+	}
+
+	now = s.nowFn().UTC()
 	ackWait := s.commandAckTimeout
-	if target.LinkTier == uxsvocab.LinkTierMeshSupervisory {
+	if initialTarget.LinkTier == uxsvocab.LinkTierMeshSupervisory {
 		ackWait = s.supervisoryAckTimeout
 	}
 
 	cmdSeq := s.cmdCounter.Add(1)
-	instance := fmt.Sprintf("s%dc%d", req.SysID, cmdSeq)
+	instance := fmt.Sprintf("s%dt%sn%sc%d", req.SysID, strconv.FormatInt(now.UnixNano(), 36), s.bootNonce, cmdSeq)
 	entityID, err := CommandEntityID(s.org, s.platform, instance)
 	if err != nil {
 		return CommandResult{}, err
 	}
 
-	var shouldSendGCSHB bool
 	s.mu.Lock()
-	for id, existing := range s.inFlight {
-		if existing.sysid == req.SysID && existing.cmdID == spec.msg.Command {
-			if existing.phase == PhasePending {
-				s.mu.Unlock()
-				return CommandResult{}, &ControlError{
-					Status:  http.StatusConflict,
-					Code:    "command_in_flight",
-					Message: fmt.Sprintf("command %d is already pending on vehicle sysid %d", spec.msg.Command, req.SysID),
-				}
-			}
-			delete(s.inFlight, id)
+	curTarget, curOK := s.targets.ActuationTarget(req.SysID)
+	if err := validateCommandTarget(req.SysID, actionSlug, spec.sitlOnly, curTarget, curOK); err != nil {
+		s.mu.Unlock()
+		return CommandResult{}, err
+	}
+	if curTarget.PeerAddr != initialTarget.PeerAddr {
+		s.mu.Unlock()
+		return CommandResult{}, &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "vehicle_peer_changed",
+			Message: fmt.Sprintf("vehicle sysid %d pinned peer changed prior to command registration", req.SysID),
 		}
 	}
+
+	ackAmbiguous := false
+	hasSupersededWrite := false
+	hbBaselineNs := now.UnixNano()
+	if curTarget.HeartbeatObservedUnixNs > hbBaselineNs {
+		hbBaselineNs = curTarget.HeartbeatObservedUnixNs
+	}
+
+	for _, existing := range s.inFlight {
+		if existing.sysid != req.SysID || existing.cmdID != spec.msg.Command {
+			continue
+		}
+		if existing.phase == PhasePending {
+			// Emergency Disarm MUST remain available even if Arm (MAV_CMD 400) is still pending.
+			if actionSlug == ActionDisarm && existing.action != ActionDisarm {
+				existing.phase = PhaseCommitUnknown
+				existing.ackAmbiguous = true
+				existing.superseded = true
+				existing.unknownAtUnixNs = hbBaselineNs
+				ackAmbiguous = true
+				s.enqueueWriteLocked(pendingCommandWrite{
+					entityID:  existing.entityID,
+					phase:     PhaseCommitUnknown,
+					note:      "superseded_by_emergency_disarm",
+					source:    lifecycle.TransitionSourceComponent,
+					ackResult: UnacknowledgedResult,
+					detail:    CommitUnknownDetail,
+					updatedMs: now.UnixMilli(),
+				})
+				hasSupersededWrite = true
+				continue
+			}
+			s.mu.Unlock()
+			return CommandResult{}, &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "command_in_flight",
+				Message: fmt.Sprintf("command %d is already pending on vehicle sysid %d", spec.msg.Command, req.SysID),
+			}
+		}
+		// Preserve unresolved indeterminate commands rather than discarding them;
+		// mark both ambiguous so a delayed COMMAND_ACK cannot falsely confirm the newer action.
+		existing.ackAmbiguous = true
+		existing.superseded = true
+		if hbBaselineNs > existing.unknownAtUnixNs {
+			existing.unknownAtUnixNs = hbBaselineNs
+		}
+		ackAmbiguous = true
+	}
+
+	startEpoch := s.authEpoch[req.SysID]
+	pinnedPeer := curTarget.PeerAddr
 	inflight := &inFlightCommand{
-		entityID:    entityID,
-		sysid:       req.SysID,
-		cmdID:       spec.msg.Command,
-		action:      actionSlug,
-		sitlOnly:    spec.sitlOnly,
-		phase:       PhasePending,
-		ackDeadline: now.Add(ackWait),
+		entityID:        entityID,
+		orderSeq:        cmdSeq,
+		sysid:           req.SysID,
+		cmdID:           spec.msg.Command,
+		action:          actionSlug,
+		sitlOnly:        spec.sitlOnly,
+		phase:           PhasePending,
+		ackAmbiguous:    ackAmbiguous,
+		ackDeadline:     now.Add(ackWait),
+		unknownAtUnixNs: hbBaselineNs,
 	}
 	s.inFlight[entityID] = inflight
-	if lastHB, seen := s.lastGCSHB[req.SysID]; !seen || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)) {
+	if shouldSendGCSHB {
 		s.lastGCSHB[req.SysID] = now
-		shouldSendGCSHB = true
 	}
 	s.mu.Unlock()
+
+	if hasSupersededWrite {
+		s.flushPendingWrites(ctx)
+	}
 
 	entity := &CommandEntity{
 		ID:         entityID,
 		PhaseState: PhasePending,
-		Target:     target.EntityID,
+		Target:     curTarget.EntityID,
 		SysID:      int(req.SysID),
 		CmdID:      int(spec.msg.Command),
 		Action:     actionSlug,
@@ -716,33 +1300,91 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	if err := s.store.Create(ctx, entity); err != nil {
 		s.mu.Lock()
 		delete(s.inFlight, entityID)
+		delete(s.pendingWrites, entityID)
 		s.mu.Unlock()
 		return CommandResult{}, fmt.Errorf("control: create command entity: %w", err)
 	}
 
-	if shouldSendGCSHB {
-		_ = s.sendGCSHeartbeat(target.PeerAddr)
+	// Final pre-transmit fence: ensure no preemption, link loss, authority revocation,
+	// or peer re-pinning occurred while Create was committing.
+	postCreateMs := s.nowFn().UTC().UnixMilli()
+	s.mu.Lock()
+	sendTarget, sendOK := s.targets.ActuationTarget(req.SysID)
+	targetErr := validateCommandTarget(req.SysID, actionSlug, spec.sitlOnly, sendTarget, sendOK)
+	peerChanged := targetErr == nil && sendTarget.PeerAddr != pinnedPeer
+	epochRevoked := !spec.sitlOnly && s.authEpoch[req.SysID] != startEpoch &&
+		(s.preemptLatched[req.SysID] || inflight.phase != PhasePending)
+
+	if inflight.phase != PhasePending || epochRevoked || targetErr != nil || peerChanged {
+		delete(s.inFlight, entityID)
+		abortPhase := PhasePreempted
+		abortNote := "preempted_before_send"
+		abortDetail := "Preempted prior to UDP command transmit"
+		retErr := targetErr
+		if retErr == nil {
+			if peerChanged {
+				abortPhase = PhaseRejected
+				abortNote = "peer_changed_before_send"
+				abortDetail = "Pinned vehicle peer changed prior to UDP command transmit"
+				retErr = &ControlError{
+					Status:  http.StatusConflict,
+					Code:    "vehicle_peer_changed",
+					Message: fmt.Sprintf("vehicle sysid %d pinned peer changed prior to transmit", req.SysID),
+				}
+			} else {
+				retErr = &ControlError{
+					Status:  http.StatusConflict,
+					Code:    "authority_preempted",
+					Message: "actuator authority was preempted prior to UDP command transmit",
+				}
+			}
+		} else {
+			var ce *ControlError
+			if errors.As(retErr, &ce) && ce.Code == "sitl_only_action" {
+				abortPhase = PhaseRejected
+				abortNote = "link_tier_changed_before_send"
+				abortDetail = ce.Message
+			} else if errors.As(retErr, &ce) && ce.Code == "vehicle_link_lost" {
+				abortNote = "link_lost_before_send"
+				abortDetail = "Preempted by vehicle link loss prior to transmit"
+			}
+		}
+		s.enqueueWriteLocked(pendingCommandWrite{
+			entityID:  entityID,
+			phase:     abortPhase,
+			note:      abortNote,
+			source:    lifecycle.TransitionSourceComponent,
+			ackResult: UnacknowledgedResult,
+			detail:    abortDetail,
+			updatedMs: postCreateMs,
+		})
+		s.mu.Unlock()
+		s.flushPendingWrites(ctx)
+		s.signalPersistWake()
+		return CommandResult{}, retErr
 	}
+	s.mu.Unlock()
 
 	if err := s.sender.SendFrame(mavcodec.Frame{
 		Sequence:    s.nextSeq(),
 		SystemID:    mavcodec.GCSSystemID,
 		ComponentID: mavcodec.CompIDMissionPlanner,
 		Message:     spec.msg,
-	}, target.PeerAddr); err != nil {
+	}, pinnedPeer); err != nil {
 		s.mu.Lock()
 		delete(s.inFlight, entityID)
+		s.enqueueWriteLocked(pendingCommandWrite{
+			entityID:  entityID,
+			phase:     PhaseRejected,
+			note:      "udp_send_failed",
+			source:    lifecycle.TransitionSourceComponent,
+			ackResult: int(mavcodec.MAVResultFailed),
+			detail:    "UDP command transmit failed",
+			updatedMs: s.nowFn().UTC().UnixMilli(),
+		})
 		s.mu.Unlock()
-		_ = s.store.Transition(
-			ctx,
-			entityID,
-			PhaseRejected,
-			"udp_send_failed",
-			lifecycle.TransitionSourceComponent,
-			int(mavcodec.MAVResultFailed),
-			"UDP command transmit failed",
-			now.UnixMilli(),
-		)
+		s.flushPendingWrites(ctx)
+		s.signalPersistWake()
 		return CommandResult{}, &ControlError{
 			Status:  http.StatusServiceUnavailable,
 			Code:    "transport_unavailable",
@@ -770,27 +1412,60 @@ func (s *Service) OnCommandAck(sysid uint8, ack mavcodec.CommandAck, observedAt 
 	if observedAt.IsZero() {
 		observedAt = s.nowFn()
 	}
-	updatedMs := observedAt.UTC().UnixMilli()
+	obsUTC := observedAt.UTC()
+	updatedMs := obsUTC.UnixMilli()
+	obsNs := obsUTC.UnixNano()
 
-	var matched *inFlightCommand
-	var matchedID string
 	s.mu.Lock()
-	for id, cmd := range s.inFlight {
-		if cmd.sysid == sysid && cmd.cmdID == ack.Command {
-			if matched == nil || (matched.phase != PhasePending && cmd.phase == PhasePending) {
-				matched = cmd
-				matchedID = id
-			}
+	var matches []*inFlightCommand
+	for _, cmd := range s.inFlight {
+		if cmd.sysid == sysid && cmd.cmdID == ack.Command &&
+			(cmd.phase == PhasePending || cmd.phase == PhaseCommitUnknown) {
+			matches = append(matches, cmd)
 		}
 	}
-	if matched != nil {
-		delete(s.inFlight, matchedID)
-	}
-	s.mu.Unlock()
-	if matched == nil {
+	if len(matches) == 0 {
+		s.mu.Unlock()
 		return
 	}
 
+	ambiguous := len(matches) > 1 || matches[0].ackAmbiguous || matches[0].superseded
+	if ambiguous {
+		hbFloor := obsNs
+		if target, ok := s.targets.ActuationTarget(sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
+			hbFloor = target.HeartbeatObservedUnixNs
+		}
+		wroteAny := false
+		for _, cmd := range matches {
+			cmd.ackAmbiguous = true
+			if hbFloor > cmd.unknownAtUnixNs {
+				cmd.unknownAtUnixNs = hbFloor
+			}
+			if cmd.phase == PhasePending {
+				cmd.phase = PhaseCommitUnknown
+				s.enqueueWriteLocked(pendingCommandWrite{
+					entityID:  cmd.entityID,
+					phase:     PhaseCommitUnknown,
+					note:      "command_ack_ambiguous",
+					source:    lifecycle.TransitionSourceComponent,
+					ackResult: UnacknowledgedResult,
+					detail:    CommitUnknownDetail,
+					updatedMs: updatedMs,
+				})
+				wroteAny = true
+			}
+		}
+		s.mu.Unlock()
+		if wroteAny {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			s.flushPendingWrites(ctx)
+			s.signalPersistWake()
+		}
+		return
+	}
+
+	matched := matches[0]
 	nextPhase := PhaseRejected
 	note := "command_ack_rejected"
 	detail := formatAckResultDetail(ack.Result)
@@ -798,30 +1473,28 @@ func (s *Service) OnCommandAck(sysid uint8, ack mavcodec.CommandAck, observedAt 
 		nextPhase = PhaseConfirmed
 		note = "command_ack_accepted"
 	}
+	matched.phase = nextPhase
+	delete(s.inFlight, matched.entityID)
+	s.enqueueWriteLocked(pendingCommandWrite{
+		entityID:  matched.entityID,
+		phase:     nextPhase,
+		note:      note,
+		source:    lifecycle.TransitionSourceComponent,
+		ackResult: int(ack.Result),
+		detail:    detail,
+		updatedMs: updatedMs,
+	})
+	s.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := s.store.Transition(
-		ctx,
-		matched.entityID,
-		nextPhase,
-		note,
-		lifecycle.TransitionSourceComponent,
-		int(ack.Result),
-		detail,
-		updatedMs,
-	); err != nil {
-		s.logger.Warn("control: failed to transition command on COMMAND_ACK",
-			slog.String("command_id", matched.entityID),
-			slog.String("phase", nextPhase),
-			slog.Any("error", err),
-		)
-	}
+	s.flushPendingWrites(ctx)
+	s.signalPersistWake()
 }
 
 // OnTransitionEvent reacts synchronously to Lane 3 authority, LinkTier, and link-loss edges,
 // revoking #84 velocity leases, latching preemption, preempting pending discrete commands,
-// and reconciling commit_unknown commands when vehicle state edges confirm execution.
+// and reconciling commit_unknown commands only on fresh post-timeout #0 HEARTBEAT state evidence.
 func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 	isPreempt := ev.Kind == mavlink.EventKindLinkLost ||
 		ev.Authority == uxsvocab.AuthorityDirectCRSFOverride ||
@@ -832,91 +1505,85 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 		updatedMs = s.nowFn().UTC().UnixMilli()
 	}
 
-	var toPreempt []*inFlightCommand
-	var toConfirm []*inFlightCommand
+	isHeartbeatEvidence := ev.MsgID == mavcodec.MsgIDHeartbeat &&
+		(ev.Kind == mavlink.EventKindHeartbeatEdge || ev.Kind == mavlink.EventKindLinkRestored)
 
 	s.mu.Lock()
+	wroteAny := false
 	if isPreempt {
+		s.authEpoch[ev.SysID]++
 		delete(s.leases, ev.SysID)
 		s.preemptLatched[ev.SysID] = true
+
+		preemptNote := "authority_preempted"
+		preemptDetail := fmt.Sprintf("Preempted by %s", ev.Authority)
+		if ev.Kind == mavlink.EventKindLinkLost {
+			preemptNote = "link_lost"
+			preemptDetail = "Preempted by vehicle link loss"
+		}
 		for id, cmd := range s.inFlight {
 			if cmd.sysid == ev.SysID && !cmd.sitlOnly {
-				toPreempt = append(toPreempt, cmd)
+				cmd.phase = PhasePreempted
 				delete(s.inFlight, id)
+				s.enqueueWriteLocked(pendingCommandWrite{
+					entityID:  cmd.entityID,
+					phase:     PhasePreempted,
+					note:      preemptNote,
+					source:    lifecycle.TransitionSourceComponent,
+					ackResult: UnacknowledgedResult,
+					detail:    preemptDetail,
+					updatedMs: updatedMs,
+				})
+				wroteAny = true
 			}
 		}
 	} else {
 		if ev.LinkTier == uxsvocab.LinkTierMeshSupervisory ||
 			!ev.Armed ||
 			ev.Authority != uxsvocab.AuthorityCompanionTeleop {
-			delete(s.leases, ev.SysID)
+			if _, had := s.leases[ev.SysID]; had {
+				s.authEpoch[ev.SysID]++
+				delete(s.leases, ev.SysID)
+			}
 		}
-		for id, cmd := range s.inFlight {
-			if cmd.sysid == ev.SysID && cmd.phase == PhaseCommitUnknown &&
-				matchesExpectedVehicleState(cmd.action, ev.Armed, ev.CompanionMode, ev.Authority) {
-				toConfirm = append(toConfirm, cmd)
-				delete(s.inFlight, id)
+		if isHeartbeatEvidence {
+			if target, ok := s.targets.ActuationTarget(ev.SysID); ok && !target.LinkLost {
+				for id, cmd := range s.inFlight {
+					if cmd.sysid == ev.SysID &&
+						cmd.phase == PhaseCommitUnknown &&
+						!cmd.superseded &&
+						target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
+						matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
+						cmd.phase = PhaseConfirmed
+						delete(s.inFlight, id)
+						s.enqueueWriteLocked(pendingCommandWrite{
+							entityID:  cmd.entityID,
+							phase:     PhaseConfirmed,
+							note:      "reconciled_by_heartbeat",
+							source:    lifecycle.TransitionSourceComponent,
+							ackResult: UnacknowledgedResult,
+							detail:    "Confirmed via vehicle HEARTBEAT state reconciliation",
+							updatedMs: updatedMs,
+						})
+						wroteAny = true
+					}
+				}
 			}
 		}
 	}
 	s.mu.Unlock()
 
-	if len(toPreempt) == 0 && len(toConfirm) == 0 {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	preemptNote := "authority_preempted"
-	preemptDetail := fmt.Sprintf("Preempted by %s", ev.Authority)
-	if ev.Kind == mavlink.EventKindLinkLost {
-		preemptNote = "link_lost"
-		preemptDetail = "Preempted by vehicle link loss"
-	}
-	for _, cmd := range toPreempt {
-		if err := s.store.Transition(
-			ctx,
-			cmd.entityID,
-			PhasePreempted,
-			preemptNote,
-			lifecycle.TransitionSourceComponent,
-			UnacknowledgedResult,
-			preemptDetail,
-			updatedMs,
-		); err != nil {
-			s.logger.Warn("control: failed to mark command preempted",
-				slog.String("command_id", cmd.entityID),
-				slog.Any("error", err),
-			)
-		}
-	}
-
-	for _, cmd := range toConfirm {
-		if err := s.store.Transition(
-			ctx,
-			cmd.entityID,
-			PhaseConfirmed,
-			"reconciled_by_heartbeat",
-			lifecycle.TransitionSourceComponent,
-			UnacknowledgedResult,
-			"Confirmed via vehicle HEARTBEAT state reconciliation",
-			updatedMs,
-		); err != nil {
-			s.logger.Warn("control: failed to reconcile commit_unknown command",
-				slog.String("command_id", cmd.entityID),
-				slog.Any("error", err),
-			)
-		}
+	if wroteAny {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		s.flushPendingWrites(ctx)
+		s.signalPersistWake()
 	}
 }
 
-// Advance evaluates #84 lease expiry (< 250ms deadman), non-retrying #76 -> commit_unknown
-// timeouts, steady-heartbeat reconciliation, and 1 Hz outbound GCS #0 HEARTBEAT liveness at now.
-func (s *Service) Advance(ctx context.Context, now time.Time) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// advanceRealtime evaluates < 250ms #84 lease deadman expiry and 1 Hz outbound GCS #0 HEARTBEAT
+// liveness without touching CommandStore persistence.
+func (s *Service) advanceRealtime(now time.Time) {
 	type expiredLease struct {
 		sysid      uint8
 		peer       netip.AddrPort
@@ -924,8 +1591,6 @@ func (s *Service) Advance(ctx context.Context, now time.Time) {
 	}
 
 	var expired []expiredLease
-	var timedOut []*inFlightCommand
-	var reconciled []*inFlightCommand
 	activeSysIDs := make(map[uint8]struct{})
 
 	s.mu.Lock()
@@ -937,28 +1602,12 @@ func (s *Service) Advance(ctx context.Context, now time.Time) {
 				coordFrame: lease.coordFrame,
 			})
 			delete(s.leases, sysid)
+			s.authEpoch[sysid]++
 			continue
 		}
 		activeSysIDs[sysid] = struct{}{}
 	}
-
-	for id, cmd := range s.inFlight {
-		if cmd.phase == PhasePending && !now.Before(cmd.ackDeadline) {
-			cmd.phase = PhaseCommitUnknown
-			cmd.unknownAtUnixNs = now.UTC().UnixNano()
-			timedOut = append(timedOut, cmd)
-			activeSysIDs[cmd.sysid] = struct{}{}
-			continue
-		}
-		if cmd.phase == PhaseCommitUnknown {
-			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
-				target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
-				matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
-				reconciled = append(reconciled, cmd)
-				delete(s.inFlight, id)
-				continue
-			}
-		}
+	for _, cmd := range s.inFlight {
 		activeSysIDs[cmd.sysid] = struct{}{}
 	}
 
@@ -982,52 +1631,82 @@ func (s *Service) Advance(ctx context.Context, now time.Time) {
 	for _, exp := range expired {
 		if target, ok := s.targets.ActuationTarget(exp.sysid); ok &&
 			!target.LinkLost && target.PeerAddr.IsValid() &&
+			target.PeerAddr == exp.peer &&
 			target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
 			target.Authority == uxsvocab.AuthorityCompanionTeleop {
 			_ = s.sendZeroVelocity(exp.sysid, exp.coordFrame, target.PeerAddr, now)
 		}
 	}
 
-	updatedMs := now.UTC().UnixMilli()
-	for _, cmd := range timedOut {
-		if err := s.store.Transition(
-			ctx,
-			cmd.entityID,
-			PhaseCommitUnknown,
-			"command_ack_timeout",
-			lifecycle.TransitionSourceComponent,
-			UnacknowledgedResult,
-			CommitUnknownDetail,
-			updatedMs,
-		); err != nil {
-			s.logger.Warn("control: failed to transition command to commit_unknown",
-				slog.String("command_id", cmd.entityID),
-				slog.Any("error", err),
-			)
-		}
-	}
-
-	for _, cmd := range reconciled {
-		if err := s.store.Transition(
-			ctx,
-			cmd.entityID,
-			PhaseConfirmed,
-			"reconciled_by_heartbeat",
-			lifecycle.TransitionSourceComponent,
-			UnacknowledgedResult,
-			"Confirmed via vehicle HEARTBEAT state reconciliation",
-			updatedMs,
-		); err != nil {
-			s.logger.Warn("control: failed to reconcile commit_unknown command",
-				slog.String("command_id", cmd.entityID),
-				slog.Any("error", err),
-			)
-		}
-	}
-
 	for _, peer := range gcsPeers {
 		_ = s.sendGCSHeartbeat(peer)
 	}
+}
+
+func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ensureRecovered(ctx)
+
+	nowUTC := now.UTC()
+	nowNs := nowUTC.UnixNano()
+	updatedMs := nowUTC.UnixMilli()
+
+	s.mu.Lock()
+	for id, cmd := range s.inFlight {
+		if cmd.phase == PhasePending && !now.Before(cmd.ackDeadline) {
+			cmd.phase = PhaseCommitUnknown
+			hbFloor := nowNs
+			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
+				hbFloor = target.HeartbeatObservedUnixNs
+			}
+			if hbFloor > cmd.unknownAtUnixNs {
+				cmd.unknownAtUnixNs = hbFloor
+			}
+			s.enqueueWriteLocked(pendingCommandWrite{
+				entityID:  cmd.entityID,
+				phase:     PhaseCommitUnknown,
+				note:      "command_ack_timeout",
+				source:    lifecycle.TransitionSourceComponent,
+				ackResult: UnacknowledgedResult,
+				detail:    CommitUnknownDetail,
+				updatedMs: updatedMs,
+			})
+			continue
+		}
+		if cmd.phase == PhaseCommitUnknown && !cmd.superseded {
+			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
+				target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
+				matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
+				cmd.phase = PhaseConfirmed
+				delete(s.inFlight, id)
+				s.enqueueWriteLocked(pendingCommandWrite{
+					entityID:  cmd.entityID,
+					phase:     PhaseConfirmed,
+					note:      "reconciled_by_heartbeat",
+					source:    lifecycle.TransitionSourceComponent,
+					ackResult: UnacknowledgedResult,
+					detail:    "Confirmed via vehicle HEARTBEAT state reconciliation",
+					updatedMs: updatedMs,
+				})
+				continue
+			}
+		}
+	}
+	hasPendingWrites := len(s.pendingWrites) > 0
+	s.mu.Unlock()
+
+	if hasPendingWrites {
+		s.flushPendingWrites(ctx)
+	}
+}
+
+// Advance evaluates #84 lease expiry (< 250ms deadman), 1 Hz outbound GCS #0 HEARTBEAT liveness,
+// non-retrying #76 -> commit_unknown timeouts, fresh-heartbeat reconciliation, and retained store writes.
+func (s *Service) Advance(ctx context.Context, now time.Time) {
+	s.advanceRealtime(now)
+	s.advanceCommands(ctx, now)
 }
 
 func (s *Service) sendZeroVelocity(sysid, coordFrame uint8, peer netip.AddrPort, now time.Time) error {

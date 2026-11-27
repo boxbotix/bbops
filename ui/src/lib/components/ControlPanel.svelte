@@ -59,6 +59,7 @@
       telemetryStore,
       skgStore,
       freshnessContext,
+      now?.(),
     ),
   );
 
