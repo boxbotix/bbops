@@ -460,45 +460,37 @@ type commandInvokeSpec struct {
 	param3Bits uint32
 }
 
-type seqResultKey struct {
-	sysid  uint8
-	cmdID  uint16
-	seq    uint8
-	result uint8
-}
-
-type seqResultOrigin struct {
-	seen           bool
-	ambiguousOwner bool
-	spec           commandInvokeSpec
-}
-
 type ackMetaState struct {
 	ackAccounted int
 	ackPoolMask  int
 }
 
 type inFlightCommand struct {
-	entityID        string
-	orderSeq        uint64
-	sysid           uint8
-	cmdID           uint16
-	action          string
-	invokeSpec      commandInvokeSpec
-	sitlOnly        bool
-	dispatch        cmdDispatchState
-	abortedNote     string
-	abortedDetail   string
-	phase           string
-	detail          string
-	ackAccounted    bool
-	ackAmbiguous    bool
-	ackDeadline     time.Time
-	issuedHbObsNs   int64
-	issuedHbSeq     uint64
-	unknownAtUnixNs int64
-	unknownHbSeq    uint64
-	earlyAcks       []earlyCommandAck
+	entityID            string
+	orderSeq            uint64
+	sysid               uint8
+	cmdID               uint16
+	action              string
+	invokeSpec          commandInvokeSpec
+	issuedAuthority     string
+	priorUnackedAtIssue bool
+	sitlOnly            bool
+	dispatch            cmdDispatchState
+	abortedNote         string
+	abortedDetail       string
+	phase               string
+	detail              string
+	ackAccounted        bool
+	ackAmbiguous        bool
+	wrapReceiptHeld     bool
+	ackDeadline         time.Time
+	issuedHbObsNs       int64
+	issuedHbSeq         uint64
+	issuedPacketOrder   uint64
+	unknownAtUnixNs     int64
+	unknownHbSeq        uint64
+	unknownPacketOrder  uint64
+	earlyAcks           []earlyCommandAck
 }
 
 type pendingCommandWrite struct {
@@ -555,6 +547,7 @@ type Service struct {
 	lastObsIncarnation      map[uint8]string
 	inFlight                map[string]*inFlightCommand
 	unackedCount            map[cmdKey]int
+	wrapAckCredit           map[cmdKey]int
 	unackedDetachedIDs      map[cmdKey][]string
 	ambiguousSlotIDs        map[cmdKey][]string
 	persistedAckMeta        map[string]ackMetaState
@@ -566,7 +559,6 @@ type Service struct {
 	lastAckLinkEpoch        map[uint8]uint64
 	seenAckResultMask       map[cmdKey]uint64
 	seenAckResultMaskBySeq  map[cmdKey]*[256]uint64
-	seenSeqResultOrigin     map[seqResultKey]seqResultOrigin
 	preResetAckResultMask   map[cmdKey]uint64
 	surplusAckTainted       map[cmdKey]bool
 	dispatchedInBoot        map[cmdKey]bool
@@ -671,6 +663,7 @@ func NewService(opts Options) (*Service, error) {
 		lastObsIncarnation:      make(map[uint8]string),
 		inFlight:                make(map[string]*inFlightCommand),
 		unackedCount:            make(map[cmdKey]int),
+		wrapAckCredit:           make(map[cmdKey]int),
 		unackedDetachedIDs:      make(map[cmdKey][]string),
 		ambiguousSlotIDs:        make(map[cmdKey][]string),
 		persistedAckMeta:        make(map[string]ackMetaState),
@@ -682,7 +675,6 @@ func NewService(opts Options) (*Service, error) {
 		lastAckLinkEpoch:        make(map[uint8]uint64),
 		seenAckResultMask:       make(map[cmdKey]uint64),
 		seenAckResultMaskBySeq:  make(map[cmdKey]*[256]uint64),
-		seenSeqResultOrigin:     make(map[seqResultKey]seqResultOrigin),
 		preResetAckResultMask:   make(map[cmdKey]uint64),
 		surplusAckTainted:       make(map[cmdKey]bool),
 		dispatchedInBoot:        make(map[cmdKey]bool),
@@ -1127,30 +1119,33 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		if ceUpdatedNs := ce.UpdatedMs * int64(time.Millisecond); ceUpdatedNs > unknownNs {
 			unknownNs = ceUpdatedNs
 		}
-		var unknownHbSeq uint64
+		var unknownHbSeq, unknownPacketOrder uint64
 		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok {
 			if target.HeartbeatObservedUnixNs > unknownNs {
 				unknownNs = target.HeartbeatObservedUnixNs
 			}
 			unknownHbSeq = target.HeartbeatSeq
+			unknownPacketOrder = target.PacketOrder
 		}
 		seq := s.cmdCounter.Add(1)
 		s.inFlight[ce.ID] = &inFlightCommand{
-			entityID:        ce.ID,
-			orderSeq:        seq,
-			sysid:           uint8(ce.SysID),
-			cmdID:           uint16(ce.CmdID),
-			action:          ce.Action,
-			invokeSpec:      commandInvokeSpec{action: ce.Action},
-			sitlOnly:        isSITLOnlyAction(ce.Action),
-			dispatch:        dispatchSent,
-			phase:           PhaseCommitUnknown,
-			detail:          CommitUnknownDetail,
-			ackAccounted:    accounted,
-			ackAmbiguous:    true,
-			ackDeadline:     now,
-			unknownAtUnixNs: unknownNs,
-			unknownHbSeq:    unknownHbSeq,
+			entityID:            ce.ID,
+			orderSeq:            seq,
+			sysid:               uint8(ce.SysID),
+			cmdID:               uint16(ce.CmdID),
+			action:              ce.Action,
+			invokeSpec:          commandInvokeSpec{action: ce.Action},
+			priorUnackedAtIssue: true,
+			sitlOnly:            isSITLOnlyAction(ce.Action),
+			dispatch:            dispatchSent,
+			phase:               PhaseCommitUnknown,
+			detail:              CommitUnknownDetail,
+			ackAccounted:        accounted,
+			ackAmbiguous:        true,
+			ackDeadline:         now,
+			unknownAtUnixNs:     unknownNs,
+			unknownHbSeq:        unknownHbSeq,
+			unknownPacketOrder:  unknownPacketOrder,
 		}
 	}
 	hasWrites := len(s.pendingWrites) > 0
@@ -2245,6 +2240,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.signalPersistWake()
 		return CommandResult{}, retErr
 	}
+	inflight.issuedAuthority = sendTarget.Authority
 	inflight.dispatch = dispatchSending
 	s.mu.Unlock()
 
@@ -2285,19 +2281,26 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	hasSupersededWrite := false
 	s.mu.Lock()
 	hbBaselineNs := dispatchNow.UnixNano()
-	var hbBaselineSeq uint64
+	var hbBaselineSeq, packetOrderBaseline uint64
 	if curT, ok := s.targets.ActuationTarget(req.SysID); ok {
 		if curT.HeartbeatObservedUnixNs > hbBaselineNs {
 			hbBaselineNs = curT.HeartbeatObservedUnixNs
 		}
 		hbBaselineSeq = curT.HeartbeatSeq
+		packetOrderBaseline = curT.PacketOrder
 	}
 	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
+	supersededWrapHeld := false
 	for otherID, other := range s.inFlight {
 		if otherID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command || other.dispatch != dispatchSent {
 			continue
 		}
 		delete(s.inFlight, otherID)
+		if other.wrapReceiptHeld {
+			other.wrapReceiptHeld = false
+			s.wrapAckCredit[key]++
+			supersededWrapHeld = true
+		}
 		if !other.ackAccounted {
 			s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], other.entityID)
 		}
@@ -2318,16 +2321,19 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			hasSupersededWrite = true
 		}
 	}
-	priorUnacked := s.unackedCount[key] > 0
+	priorUnacked := s.unackedCount[key] > 0 || s.wrapAckCredit[key] > 0 || supersededWrapHeld
 	s.unackedCount[key]++
 	s.dispatchedInBoot[key] = true
 	inflight.dispatch = dispatchSent
+	inflight.priorUnackedAtIssue = !s.recovered.Load() || priorUnacked || s.surplusAckTainted[key]
 	inflight.ackAmbiguous = !s.recovered.Load() || priorUnacked || s.surplusAckTainted[key]
 	inflight.ackDeadline = dispatchNow.Add(ackWait)
 	inflight.issuedHbObsNs = hbBaselineNs
 	inflight.issuedHbSeq = hbBaselineSeq
+	inflight.issuedPacketOrder = packetOrderBaseline
 	inflight.unknownAtUnixNs = hbBaselineNs
 	inflight.unknownHbSeq = hbBaselineSeq
+	inflight.unknownPacketOrder = packetOrderBaseline
 	earlyAcks := inflight.earlyAcks
 	inflight.earlyAcks = nil
 	if shouldSendGCSHB {
@@ -2376,9 +2382,9 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 			delete(s.seenAckResultMaskBySeq, k)
 		}
 	}
-	for k := range s.seenSeqResultOrigin {
+	for k := range s.wrapAckCredit {
 		if k.sysid == sysid {
-			delete(s.seenSeqResultOrigin, k)
+			delete(s.wrapAckCredit, k)
 		}
 	}
 	delete(s.seenAckFrames, sysid)
@@ -2387,9 +2393,18 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 	delete(s.lastSeenTrackerAckSeq, sysid)
 }
 
-func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, baselineHbSeq uint64) bool {
-	if baselineHbSeq > 0 && target.HeartbeatSeq > 0 {
-		return target.HeartbeatSeq > baselineHbSeq
+func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, baselineHbSeq, baselinePacketOrder uint64) bool {
+	if target.HeartbeatSeq > 0 {
+		if target.HeartbeatSeq <= baselineHbSeq {
+			return false
+		}
+		if baselineHbSeq == 0 && target.HeartbeatObservedUnixNs <= baselineNs {
+			return false
+		}
+		if target.HeartbeatOrder > 0 || baselinePacketOrder > 0 {
+			return target.HeartbeatOrder > baselinePacketOrder
+		}
+		return target.HeartbeatObservedUnixNs > baselineNs
 	}
 	return target.HeartbeatObservedUnixNs > baselineNs
 }
@@ -2532,7 +2547,6 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	seenBeforeSeqReset := ack.Result < 64 && (s.preResetAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
 	seqMasks := s.seenAckResultMaskBySeq[key]
 	seenSameSeqResultBefore := hasSeq && seqMasks != nil && ack.Result < 64 && (seqMasks[seq]&(uint64(1)<<ack.Result)) != 0
-	var prevOrigin seqResultOrigin
 	if ack.Result < 64 {
 		s.seenAckResultMask[key] |= uint64(1) << ack.Result
 		if hasSeq {
@@ -2541,15 +2555,6 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 				s.seenAckResultMaskBySeq[key] = seqMasks
 			}
 			seqMasks[seq] |= uint64(1) << ack.Result
-			seqKey := seqResultKey{sysid: sysid, cmdID: ack.Command, seq: seq, result: ack.Result}
-			prevOrigin = s.seenSeqResultOrigin[seqKey]
-			if len(matches) != 1 || ackOrderUncertain {
-				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, ambiguousOwner: true}
-			} else if !prevOrigin.seen {
-				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, spec: matches[0].invokeSpec}
-			} else if prevOrigin.ambiguousOwner || prevOrigin.spec != matches[0].invokeSpec {
-				s.seenSeqResultOrigin[seqKey] = seqResultOrigin{seen: true, ambiguousOwner: true}
-			}
 		}
 	}
 	poolMask := poolMaskInt(s.seenAckResultMask[key])
@@ -2565,6 +2570,8 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 					s.unackedDetachedIDs[key] = ids[1:]
 					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
 				}
+			} else if s.wrapAckCredit[key] > 0 {
+				s.wrapAckCredit[key]--
 			} else {
 				s.surplusAckTainted[key] = true
 			}
@@ -2590,7 +2597,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		hasPostDispatchMatchingHB := targetOK &&
 			!target.LinkLost &&
 			!ackOrderUncertain &&
-			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq) &&
+			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq, matches[0].issuedPacketOrder) &&
 			matchesExpectedCommandState(matches[0], target)
 		if ackOrderUncertain {
 			wrapAmbiguous = true
@@ -2599,24 +2606,30 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 				if !hasPostDispatchMatchingHB {
 					wrapAmbiguous = true
 				}
-			} else if prevOrigin.ambiguousOwner || prevOrigin.spec != matches[0].invokeSpec || hasPostDispatchMatchingHB {
+			} else {
 				wrapAmbiguous = true
 			}
 		}
 	}
 
-	ambiguous := !s.recovered.Load() ||
+	holdingWrapReceipt := len(matches) == 1 && matches[0].wrapReceiptHeld
+	nonWrapAmbiguous := !s.recovered.Load() ||
 		priorUnacked > 1 ||
+		s.wrapAckCredit[key] > 0 ||
 		len(matches) > 1 ||
 		matches[0].ackAmbiguous ||
 		s.surplusAckTainted[key] ||
 		seenBeforeSeqReset ||
-		(!hasSeq && seenSameResultBefore) ||
-		wrapAmbiguous
+		(!hasSeq && seenSameResultBefore)
+	ambiguous := nonWrapAmbiguous || wrapAmbiguous
 
 	if ambiguous {
 		wroteAny := false
-		if s.recovered.Load() && priorUnacked > 0 {
+		markAllAmbiguous := nonWrapAmbiguous
+		if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
+			s.wrapAckCredit[key]--
+			markAllAmbiguous = true
+		} else if s.recovered.Load() && priorUnacked > 0 {
 			s.unackedCount[key] = priorUnacked - 1
 			if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
 				detachedID := ids[0]
@@ -2631,24 +2644,39 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 					}
 				}
 			}
+			if !nonWrapAmbiguous && len(matches) == 1 && !holdingWrapReceipt {
+				matches[0].wrapReceiptHeld = true
+			}
 		} else if s.recovered.Load() && priorUnacked == 0 {
-			s.surplusAckTainted[key] = true
+			if holdingWrapReceipt {
+				matches[0].wrapReceiptHeld = false
+				markAllAmbiguous = true
+			} else {
+				s.surplusAckTainted[key] = true
+				markAllAmbiguous = true
+			}
 		}
 		hbFloor := obsNs
-		var hbFloorSeq uint64
+		var hbFloorSeq, packetOrderFloor uint64
 		if targetOK {
 			if target.HeartbeatObservedUnixNs > hbFloor {
 				hbFloor = target.HeartbeatObservedUnixNs
 			}
 			hbFloorSeq = target.HeartbeatSeq
+			packetOrderFloor = target.PacketOrder
 		}
 		for _, cmd := range matches {
-			cmd.ackAmbiguous = true
+			if markAllAmbiguous {
+				cmd.ackAmbiguous = true
+			}
 			if hbFloor > cmd.unknownAtUnixNs {
 				cmd.unknownAtUnixNs = hbFloor
 			}
 			if hbFloorSeq > cmd.unknownHbSeq {
 				cmd.unknownHbSeq = hbFloorSeq
+			}
+			if packetOrderFloor > cmd.unknownPacketOrder {
+				cmd.unknownPacketOrder = packetOrderFloor
 			}
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
@@ -2686,7 +2714,14 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 
 	matched := matches[0]
 	s.unackedCount[key] = 0
+	wasWrapHeld := matched.wrapReceiptHeld
+	matched.wrapReceiptHeld = false
 	matched.ackAccounted = true
+	if wasWrapHeld {
+		s.ambiguousSlotIDs[key] = slices.DeleteFunc(s.ambiguousSlotIDs[key], func(id string) bool {
+			return id == matched.entityID
+		})
+	}
 	nextPhase := PhaseRejected
 	note := "command_ack_rejected"
 	detail := formatAckResultDetail(ack.Result)
@@ -2819,6 +2854,10 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					continue
 				}
 				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
+				if cmd.wrapReceiptHeld {
+					cmd.wrapReceiptHeld = false
+					s.wrapAckCredit[key]++
+				}
 				if cmd.dispatch == dispatchSent && !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
 				} else if cmd.dispatch == dispatchSent && cmd.ackAccounted {
@@ -2901,37 +2940,39 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				}
 			}
 		}
-		if isHeartbeatEvidence {
-			if targetForObsOK && !targetForObs.LinkLost {
-				for id, cmd := range s.inFlight {
-					if cmd.dispatch == dispatchSent &&
-						cmd.sysid == ev.SysID &&
-						cmd.phase == PhaseCommitUnknown &&
-						hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
-						matchesExpectedCommandState(cmd, targetForObs) {
-						cmd.phase = PhaseConfirmed
-						cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
-						delete(s.inFlight, id)
-						key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
-						if !cmd.ackAccounted {
-							s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
-						} else {
-							s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
-						}
-						s.enqueueWriteLocked(pendingCommandWrite{
-							entityID:     cmd.entityID,
-							phase:        PhaseConfirmed,
-							note:         "reconciled_by_heartbeat",
-							source:       lifecycle.TransitionSourceComponent,
-							ackResult:    UnacknowledgedResult,
-							ackAccounted: boolToInt(cmd.ackAccounted),
-							ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
-							detail:       cmd.detail,
-							updatedMs:    updatedMs,
-						})
-						wroteAny = true
-					}
+	}
+	if isHeartbeatEvidence && targetForObsOK && !targetForObs.LinkLost {
+		for id, cmd := range s.inFlight {
+			if cmd.dispatch == dispatchSent &&
+				cmd.sysid == ev.SysID &&
+				cmd.phase == PhaseCommitUnknown &&
+				hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownPacketOrder) &&
+				matchesExpectedCommandState(cmd, targetForObs) {
+				cmd.phase = PhaseConfirmed
+				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
+				delete(s.inFlight, id)
+				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
+				if cmd.wrapReceiptHeld {
+					cmd.wrapReceiptHeld = false
+					s.wrapAckCredit[key]++
 				}
+				if !cmd.ackAccounted {
+					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
+				} else {
+					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
+				}
+				s.enqueueWriteLocked(pendingCommandWrite{
+					entityID:     cmd.entityID,
+					phase:        PhaseConfirmed,
+					note:         "reconciled_by_heartbeat",
+					source:       lifecycle.TransitionSourceComponent,
+					ackResult:    UnacknowledgedResult,
+					ackAccounted: boolToInt(cmd.ackAccounted),
+					ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+					detail:       cmd.detail,
+					updatedMs:    updatedMs,
+				})
+				wroteAny = true
 			}
 		}
 	}
@@ -3096,6 +3137,9 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				if target.HeartbeatSeq > cmd.unknownHbSeq {
 					cmd.unknownHbSeq = target.HeartbeatSeq
 				}
+				if target.PacketOrder > cmd.unknownPacketOrder {
+					cmd.unknownPacketOrder = target.PacketOrder
+				}
 			}
 			if hbFloor > cmd.unknownAtUnixNs {
 				cmd.unknownAtUnixNs = hbFloor
@@ -3115,11 +3159,15 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		}
 		if cmd.phase == PhaseCommitUnknown {
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
-				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq) &&
+				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownPacketOrder) &&
 				matchesExpectedCommandState(cmd, target) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
+				if cmd.wrapReceiptHeld {
+					cmd.wrapReceiptHeld = false
+					s.wrapAckCredit[key]++
+				}
 				if !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
 				} else {
@@ -3206,10 +3254,25 @@ func matchesExpectedCommandState(cmd *inFlightCommand, target mavlink.ActuationT
 		if cmd.invokeSpec.param1Bits != math.Float32bits(2) {
 			return false
 		}
-		if math.Float32frombits(cmd.invokeSpec.param2Bits) > 0 {
+		param2 := float64(math.Float32frombits(cmd.invokeSpec.param2Bits))
+		if math.IsNaN(param2) {
+			return false
+		}
+		if param2 >= 0.5 {
 			return target.Authority == uxsvocab.AuthorityDirectCRSFOverride
 		}
-		return target.Authority != uxsvocab.AuthorityDirectCRSFOverride
+		if param2 <= -0.5 {
+			return target.Authority == uxsvocab.AuthorityCompanionTeleop ||
+				target.Authority == uxsvocab.AuthorityCompanionAutonomous
+		}
+		if cmd.issuedAuthority == "" || cmd.priorUnackedAtIssue {
+			return false
+		}
+		if cmd.issuedAuthority == uxsvocab.AuthorityDirectCRSFOverride {
+			return target.Authority == uxsvocab.AuthorityCompanionTeleop ||
+				target.Authority == uxsvocab.AuthorityCompanionAutonomous
+		}
+		return target.Authority == uxsvocab.AuthorityDirectCRSFOverride
 	}
 	return matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority)
 }

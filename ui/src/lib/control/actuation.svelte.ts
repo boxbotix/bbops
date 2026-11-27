@@ -28,6 +28,7 @@ export const CONTROL_COMMAND_PATH = "/control/command";
 export const CONTROL_TELEOP_PATH = "/control/teleop";
 
 export const DEFAULT_TELEOP_INTERVAL_MS = 50; // 20 Hz within [10..30 Hz] contract
+export const DEFAULT_TELEOP_LEASE_TTL_MS = 240; // Conservative match for server 240 ms #84 lease TTL
 export const DEFAULT_MAX_LINEAR_MPS = 4.0;
 export const DEFAULT_MAX_VERTICAL_MPS = 2.0;
 export const DEFAULT_MAX_YAW_RAD_S = 1.2;
@@ -195,6 +196,7 @@ export interface CreateActuationControllerOptions {
   readonly skgStore: SkgStore;
   readonly client?: ControlClient;
   readonly teleopIntervalMs?: number;
+  readonly leaseTtlMs?: number;
   readonly maxLinearMps?: number;
   readonly maxVerticalMps?: number;
   readonly maxYawRadS?: number;
@@ -676,6 +678,7 @@ export function createActuationController(
   const client = options.client ?? createControlClient();
   const teleopIntervalMs =
     options.teleopIntervalMs ?? DEFAULT_TELEOP_INTERVAL_MS;
+  const leaseTtlMs = options.leaseTtlMs ?? DEFAULT_TELEOP_LEASE_TTL_MS;
   const maxLinearMps = options.maxLinearMps ?? DEFAULT_MAX_LINEAR_MPS;
   const maxVerticalMps = options.maxVerticalMps ?? DEFAULT_MAX_VERTICAL_MPS;
   const maxYawRadS = options.maxYawRadS ?? DEFAULT_MAX_YAW_RAD_S;
@@ -694,6 +697,7 @@ export function createActuationController(
 
   let activeSysId = $state<number | null>(null);
   let engagedSysId = $state<number | null>(null);
+  let leaseAccepted = $state(false);
   let frame = $state<TeleopFrame>("local-ned");
   let axes = $state<TeleopAxes>(ZERO_TELEOP_AXES);
   let padNormX = $state(0);
@@ -710,12 +714,14 @@ export function createActuationController(
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const heldKeys = new Set<PadHoldKey>();
   let teleopTimer: ReturnType<typeof setInterval> | null = null;
+  let leaseExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  let confirmedLeaseDeadlinePerf: number | null = null;
+  let inFlightRenewals: Array<{ seq: number; sentPerf: number }> = [];
   let timerRenewalsInFlight = 0;
   let timerGen = 0;
   let engageCounter = 0;
   let engagedEntityId: string | null = null;
   let engagedSession: string | null = null;
-  let leaseAccepted = false;
   let teleopSeq = 0;
   let lastFreshnessContext: FleetFreshnessContext | undefined;
 
@@ -747,9 +753,17 @@ export function createActuationController(
     activeSysId !== null ? (preemptBySysId.get(activeSysId) ?? null) : null,
   );
 
+  function clearLeaseExpiryTimer(): void {
+    if (leaseExpiryTimer !== null) {
+      clearTimeout(leaseExpiryTimer);
+      leaseExpiryTimer = null;
+    }
+  }
+
   function stopTeleopTimer(): void {
     timerGen += 1;
     timerRenewalsInFlight = 0;
+    clearLeaseExpiryTimer();
     if (teleopTimer !== null) {
       clearIntervalFn(teleopTimer);
       teleopTimer = null;
@@ -762,8 +776,70 @@ export function createActuationController(
     engagedEntityId = null;
     engagedSession = null;
     leaseAccepted = false;
+    confirmedLeaseDeadlinePerf = null;
+    inFlightRenewals = [];
     teleopSeq = 0;
     resetStickState();
+  }
+
+  function hasConfirmedLeaseForDispatch(nowPerf = perfNow()): boolean {
+    return (
+      leaseAccepted &&
+      confirmedLeaseDeadlinePerf !== null &&
+      nowPerf < confirmedLeaseDeadlinePerf
+    );
+  }
+
+  function getEffectiveLeaseDeadlinePerf(): number | null {
+    if (!leaseAccepted || confirmedLeaseDeadlinePerf === null) {
+      return null;
+    }
+    let best = confirmedLeaseDeadlinePerf;
+    for (const entry of inFlightRenewals) {
+      const cand = entry.sentPerf + leaseTtlMs;
+      if (cand > best) {
+        best = cand;
+      }
+    }
+    return best;
+  }
+
+  function hasActiveConfirmedLease(nowPerf = perfNow()): boolean {
+    const deadline = getEffectiveLeaseDeadlinePerf();
+    return deadline !== null && nowPerf < deadline;
+  }
+
+  function expireConfirmedLeaseLocal(sysid: number): void {
+    clearEngagedSessionLocal();
+    lastError = `UXS #${sysid} teleop lease expired — click Engage Teleop to resume`;
+  }
+
+  function scheduleLeaseExpiryTimer(sysid: number, session: string): void {
+    clearLeaseExpiryTimer();
+    const deadline = getEffectiveLeaseDeadlinePerf();
+    if (deadline === null) {
+      return;
+    }
+    const delayMs = Math.max(0, deadline - perfNow());
+    leaseExpiryTimer = setTimeout(() => {
+      leaseExpiryTimer = null;
+      if (
+        engagedSysId !== sysid ||
+        engagedSession !== session ||
+        !leaseAccepted
+      ) {
+        return;
+      }
+      const nextDeadline = getEffectiveLeaseDeadlinePerf();
+      if (nextDeadline === null) {
+        return;
+      }
+      if (nextDeadline - perfNow() > 0) {
+        scheduleLeaseExpiryTimer(sysid, session);
+        return;
+      }
+      expireConfirmedLeaseLocal(sysid);
+    }, delayMs);
   }
 
   function resetStickState(): void {
@@ -808,6 +884,10 @@ export function createActuationController(
 
   function verifyEngagedVehicleLive(sysid: number): boolean {
     if (engagedSysId !== sysid) {
+      return false;
+    }
+    if (leaseAccepted && !hasActiveConfirmedLease()) {
+      expireConfirmedLeaseLocal(sysid);
       return false;
     }
     const liveVehicle =
@@ -864,7 +944,11 @@ export function createActuationController(
     return false;
   }
 
-  async function dispatchTeleopNudge(
+  function removeInFlightRenewal(seq: number): void {
+    inFlightRenewals = inFlightRenewals.filter((entry) => entry.seq !== seq);
+  }
+
+  function dispatchTeleopNudge(
     sysid: number,
     engageFlag: boolean,
     engageMeta?: {
@@ -875,82 +959,138 @@ export function createActuationController(
     },
   ): Promise<boolean> {
     if (engagedSysId !== sysid || engagedSession === null) {
-      return false;
+      return Promise.resolve(false);
     }
-    if (!engageFlag && (!leaseAccepted || !verifyEngagedVehicleLive(sysid))) {
-      return false;
+    const sentPerf = perfNow();
+    if (!engageFlag) {
+      if (!leaseAccepted || !verifyEngagedVehicleLive(sysid)) {
+        return Promise.resolve(false);
+      }
+      if (!hasConfirmedLeaseForDispatch(sentPerf)) {
+        return Promise.resolve(false);
+      }
     }
     const session = engagedSession;
     teleopSeq += 1;
     const seq = teleopSeq;
     teleopPacketsSent += 1;
     const currentAxes = axes;
-    const res = await client.submitTeleop({
-      sysid,
-      session,
-      seq,
-      frame,
-      vx: currentAxes.vx,
-      vy: currentAxes.vy,
-      vz: currentAxes.vz,
-      yaw_rate: currentAxes.yawRate,
-      engage: engageFlag || undefined,
-      ...(engageFlag &&
-      engageMeta?.observedMs !== null &&
-      engageMeta?.observedMs !== undefined
-        ? { observed_ms: Math.trunc(engageMeta.observedMs) }
-        : {}),
-      ...(engageFlag &&
-      engageMeta?.observationRev !== undefined &&
-      engageMeta.observationRev > 0
-        ? { observation_rev: engageMeta.observationRev }
-        : {}),
-      ...(engageFlag &&
-      engageMeta?.authorityIncarnation !== undefined &&
-      engageMeta.authorityIncarnation.length > 0
-        ? { authority_incarnation: engageMeta.authorityIncarnation }
-        : {}),
-      ...(engageFlag && engageMeta?.authorityEpoch !== undefined
-        ? { authority_epoch: engageMeta.authorityEpoch }
-        : {}),
-    });
-    if (!res.ok) {
-      if (
-        engagedSession !== session ||
-        engagedSysId !== sysid ||
-        res.error.code === "teleop_seq_superseded"
-      ) {
-        return false;
-      }
-      clearEngagedSessionLocal();
-      lastError = res.error.message;
-      if (
-        res.error.code === "preemption_latched" ||
-        res.error.code === "authority_not_teleop"
-      ) {
-        preemptBySysId.set(sysid, {
-          sysid,
-          source: "direct-crsf-override",
-          message: res.error.message,
-          latchedAtMs: now(),
-        });
-      }
-      return false;
+    if (!engageFlag) {
+      inFlightRenewals = [...inFlightRenewals, { seq, sentPerf }];
+      scheduleLeaseExpiryTimer(sysid, session);
     }
-    if (engagedSession !== session || engagedSysId !== sysid) {
-      return false;
-    }
-    if (engageFlag) {
-      if (!verifyEngagedVehicleLive(sysid)) {
-        return false;
-      }
-      leaseAccepted = true;
-      startTeleopTimer(sysid);
-      if (heldKeys.size > 0) {
-        void dispatchTeleopNudge(sysid, false);
-      }
-    }
-    return true;
+    return client
+      .submitTeleop({
+        sysid,
+        session,
+        seq,
+        frame,
+        vx: currentAxes.vx,
+        vy: currentAxes.vy,
+        vz: currentAxes.vz,
+        yaw_rate: currentAxes.yawRate,
+        engage: engageFlag || undefined,
+        ...(engageFlag &&
+        engageMeta?.observedMs !== null &&
+        engageMeta?.observedMs !== undefined
+          ? { observed_ms: Math.trunc(engageMeta.observedMs) }
+          : {}),
+        ...(engageFlag &&
+        engageMeta?.observationRev !== undefined &&
+        engageMeta.observationRev > 0
+          ? { observation_rev: engageMeta.observationRev }
+          : {}),
+        ...(engageFlag &&
+        engageMeta?.authorityIncarnation !== undefined &&
+        engageMeta.authorityIncarnation.length > 0
+          ? { authority_incarnation: engageMeta.authorityIncarnation }
+          : {}),
+        ...(engageFlag && engageMeta?.authorityEpoch !== undefined
+          ? { authority_epoch: engageMeta.authorityEpoch }
+          : {}),
+      })
+      .then(
+        (res) => {
+          if (engagedSession === session && !engageFlag) {
+            removeInFlightRenewal(seq);
+          }
+          if (!res.ok) {
+            if (
+              engagedSession !== session ||
+              engagedSysId !== sysid ||
+              res.error.code === "teleop_seq_superseded"
+            ) {
+              if (engagedSession === session && engagedSysId === sysid) {
+                if (!hasActiveConfirmedLease()) {
+                  expireConfirmedLeaseLocal(sysid);
+                } else {
+                  scheduleLeaseExpiryTimer(sysid, session);
+                }
+              }
+              return false;
+            }
+            clearEngagedSessionLocal();
+            lastError = res.error.message;
+            if (
+              res.error.code === "preemption_latched" ||
+              res.error.code === "authority_not_teleop"
+            ) {
+              preemptBySysId.set(sysid, {
+                sysid,
+                source: "direct-crsf-override",
+                message: res.error.message,
+                latchedAtMs: now(),
+              });
+            }
+            return false;
+          }
+          if (engagedSession !== session || engagedSysId !== sysid) {
+            return false;
+          }
+          if (!res.result.lease_active) {
+            expireConfirmedLeaseLocal(sysid);
+            return false;
+          }
+          if (!engageFlag && !leaseAccepted) {
+            return false;
+          }
+          const candidateDeadline = sentPerf + leaseTtlMs;
+          const nextDeadline =
+            confirmedLeaseDeadlinePerf === null
+              ? candidateDeadline
+              : Math.max(confirmedLeaseDeadlinePerf, candidateDeadline);
+          if (perfNow() >= nextDeadline && !hasActiveConfirmedLease()) {
+            expireConfirmedLeaseLocal(sysid);
+            return false;
+          }
+          if (perfNow() >= candidateDeadline) {
+            scheduleLeaseExpiryTimer(sysid, session);
+            return false;
+          }
+          if (engageFlag) {
+            if (!verifyEngagedVehicleLive(sysid)) {
+              return false;
+            }
+            confirmedLeaseDeadlinePerf = nextDeadline;
+            leaseAccepted = true;
+            startTeleopTimer(sysid);
+            scheduleLeaseExpiryTimer(sysid, session);
+            if (heldKeys.size > 0) {
+              void dispatchTeleopNudge(sysid, false);
+            }
+          } else {
+            confirmedLeaseDeadlinePerf = nextDeadline;
+            scheduleLeaseExpiryTimer(sysid, session);
+          }
+          return true;
+        },
+        (err: unknown) => {
+          if (engagedSession === session && !engageFlag) {
+            removeInFlightRenewal(seq);
+          }
+          throw err;
+        },
+      );
   }
 
   function startTeleopTimer(sysid: number): void {
@@ -1153,6 +1293,12 @@ export function createActuationController(
       } else if (engagedSysId === vehicle.sysid && !safety.fresh) {
         lastError = `UXS #${vehicle.sysid} telemetry is stale (${safety.statusLabel}) — teleop disengaged`;
         void disengageTeleop({ sendZero: true });
+      } else if (
+        engagedSysId === vehicle.sysid &&
+        leaseAccepted &&
+        !hasActiveConfirmedLease()
+      ) {
+        expireConfirmedLeaseLocal(vehicle.sysid);
       }
     });
 
@@ -1191,6 +1337,7 @@ export function createActuationController(
     engagedEntityId = vehicle.id;
     engagedSession = session;
     leaseAccepted = false;
+    confirmedLeaseDeadlinePerf = null;
     teleopSeq = 0;
     resetStickState();
 
@@ -1210,7 +1357,15 @@ export function createActuationController(
   }
 
   function setPadVector(normX: number, normY: number, dragging: boolean): void {
-    if (engagedSysId === null || engagedSysId !== activeSysId) {
+    if (
+      engagedSysId === null ||
+      engagedSysId !== activeSysId ||
+      !leaseAccepted
+    ) {
+      return;
+    }
+    if (!hasActiveConfirmedLease()) {
+      expireConfirmedLeaseLocal(engagedSysId);
       return;
     }
     const clampedX = clampUnit(normX);
@@ -1239,7 +1394,11 @@ export function createActuationController(
       axes = ZERO_TELEOP_AXES;
     }
     if (engagedSysId !== null && leaseAccepted) {
-      void dispatchTeleopNudge(engagedSysId, false);
+      if (!hasActiveConfirmedLease()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+      } else {
+        void dispatchTeleopNudge(engagedSysId, false);
+      }
     }
   }
 
@@ -1247,10 +1406,15 @@ export function createActuationController(
     if (
       engagedSysId === null ||
       engagedSysId !== activeSysId ||
+      !leaseAccepted ||
       event.ctrlKey ||
       event.metaKey ||
       event.altKey
     ) {
+      return false;
+    }
+    if (!hasActiveConfirmedLease()) {
+      expireConfirmedLeaseLocal(engagedSysId);
       return false;
     }
     const classified = classifyPadHoldKey(event);
@@ -1269,9 +1433,7 @@ export function createActuationController(
     }
     heldKeys.add(classified);
     recomputeKeyboardAxes();
-    if (leaseAccepted) {
-      void dispatchTeleopNudge(engagedSysId, false);
-    }
+    void dispatchTeleopNudge(engagedSysId, false);
     return true;
   }
 
@@ -1288,7 +1450,11 @@ export function createActuationController(
     heldKeys.delete(classified);
     recomputeKeyboardAxes();
     if (engagedSysId !== null && leaseAccepted) {
-      void dispatchTeleopNudge(engagedSysId, false);
+      if (!hasActiveConfirmedLease()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+      } else {
+        void dispatchTeleopNudge(engagedSysId, false);
+      }
     }
     return true;
   }
@@ -1378,10 +1544,14 @@ export function createActuationController(
       return activeSysId;
     },
     get engaged() {
-      return engagedSysId !== null && engagedSysId === activeSysId;
+      return (
+        engagedSysId !== null &&
+        engagedSysId === activeSysId &&
+        hasActiveConfirmedLease()
+      );
     },
     get engagedSysId() {
-      return engagedSysId;
+      return hasActiveConfirmedLease() ? engagedSysId : null;
     },
     get frame() {
       return frame;

@@ -2698,9 +2698,9 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       );
       expect(sentTeleops).toHaveLength(1);
 
-      // Advance 5 timer ticks (250ms total) while transport responses stall:
-      // periodic timer renewals must cap at 2 in-flight requests (not 5).
-      for (let i = 0; i < 5; i++) {
+      // Advance 4 timer ticks (200ms < 240ms lease TTL) while transport responses stall:
+      // periodic timer renewals must cap at 2 in-flight requests (not 4).
+      for (let i = 0; i < 4; i++) {
         nowMs += 50;
         telemetryStore.ingestRawFrame(
           buildTransitionFrame(1, {
@@ -2714,6 +2714,7 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
         await vi.advanceTimersByTimeAsync(50);
       }
       expect(sentTeleops).toHaveLength(3); // 1 engage + 2 capped periodic renewals
+      expect(controller.engaged).toBe(true);
 
       // Interactive pad keydown still dispatches immediately without waiting on timer slots!
       controller.handlePadKeyDown({ key: "w" });
@@ -2721,7 +2722,8 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       expect(sentTeleops).toHaveLength(4);
       expect(sentTeleops[3]?.vx).toBeGreaterThan(0);
 
-      // Once 1 periodic renewal resolves, the next timer tick is allowed to send again.
+      // Once 1 periodic renewal resolves (extending conservative deadline to 50 + 240 = 290ms),
+      // the next timer tick at 250ms is allowed to send again.
       pendingRenewals.shift()?.({
         ok: true,
         result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
@@ -2730,6 +2732,384 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       nowMs += 50;
       await vi.advanceTimersByTimeAsync(50);
       expect(sentTeleops).toHaveLength(5);
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  it("expires displayed engagement on conservative monotonic lease deadline when periodic renewals stall, ignores late responses, and requires fresh Engage", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-27T20:55:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      const sentTeleops: ControlTeleopRequest[] = [];
+      let stallRenewals = true;
+      const stalledResolvers: Array<
+        (res: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void
+      > = [];
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push(req);
+            if (req.engage || req.stop || !stallRenewals) {
+              return {
+                ok: true,
+                result: {
+                  sysid: req.sysid,
+                  lease_active: !req.stop,
+                  expires_ms: nowMs + 240,
+                },
+              };
+            }
+            return await new Promise((resolve) => {
+              stalledResolvers.push(resolve);
+            });
+          },
+        },
+      });
+
+      // Case A: Engage confirmed at 0ms; periodic renewals at 50ms & 100ms stall under the 2-request cap.
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      expect(controller.engaged).toBe(true);
+      expect(controller.engagedSysId).toBe(1);
+
+      let hbSeq = 1;
+      const stepHealthyMs = async (deltaMs: number): Promise<void> => {
+        nowMs += deltaMs;
+        hbSeq += 1;
+        telemetryStore.ingestRawFrame(
+          buildTransitionFrame(1, {
+            seq: hbSeq,
+            kind: "heartbeat_edge",
+            authority: "companion-teleop",
+            linkTier: "sitl-local",
+            timestamp: nowMs,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(deltaMs);
+      };
+
+      // Advance to 200ms (4 ticks: renewals sent at 50ms & 100ms, capped at 150ms & 200ms).
+      for (let i = 0; i < 4; i++) {
+        await stepHealthyMs(50);
+      }
+      expect(sentTeleops).toHaveLength(3);
+      expect(controller.engaged).toBe(true);
+
+      // Past 240ms (confirmed deadline from 0ms engage), no new unconfirmed dispatches are allowed
+      // even on interactive keydown, and the 100ms in-flight renewal bounds expiry strictly at <= 340ms!
+      await stepHealthyMs(45); // 245ms
+      expect(controller.handlePadKeyDown({ key: "w" })).toBe(true);
+      expect(sentTeleops).toHaveLength(3);
+      await stepHealthyMs(94); // 339ms
+      expect(controller.engaged).toBe(true);
+      await stepHealthyMs(1); // 340ms (100ms + 240ms server bound) -> expires!
+      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBeNull();
+      expect(controller.lastError).toMatch(/teleop lease expired/i);
+      expect(controller.handlePadKeyDown({ key: "w" })).toBe(false);
+
+      // Remain disengaged through 800ms even while vehicle telemetry stays fresh and healthy.
+      for (let i = 0; i < 9; i++) {
+        await stepHealthyMs(50); // +450ms => 790ms
+      }
+      await stepHealthyMs(10); // 800ms
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops).toHaveLength(3);
+
+      // Late responses from the stalled 50ms/100ms renewals arriving after lease loss MUST NOT revive engagement!
+      while (stalledResolvers.length > 0) {
+        stalledResolvers.shift()?.({
+          ok: true,
+          result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+        });
+      }
+      await Promise.resolve();
+      expect(controller.engaged).toBe(false);
+      await stepHealthyMs(100);
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops).toHaveLength(3);
+
+      // Case B: Fresh explicit Engage Teleop resumes cleanly; confirm renewals at +50ms and +100ms
+      // (confirmed deadline +340ms), then stall renewals at +150ms and +200ms (server upper bound +440ms).
+      stallRenewals = false;
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      expect(controller.engaged).toBe(true);
+      await stepHealthyMs(50); // +50ms renewal confirmed -> deadline +290ms
+      await stepHealthyMs(50); // +100ms renewal confirmed -> deadline +340ms
+      expect(controller.engaged).toBe(true);
+
+      stallRenewals = true;
+      await stepHealthyMs(50); // +150ms renewal stalls (#1)
+      await stepHealthyMs(50); // +200ms renewal stalls (#2, capped)
+      await stepHealthyMs(239); // +439ms -> within +200ms + 240ms
+      expect(controller.engaged).toBe(true);
+      await stepHealthyMs(1); // +440ms -> server 240ms lease from +200ms expires!
+      expect(controller.engaged).toBe(false);
+      await stepHealthyMs(360); // +800ms -> still disengaged!
+      expect(controller.engaged).toBe(false);
+
+      // Late responses from +150ms/+200ms arriving at +800ms still cannot revive engagement without fresh Engage.
+      while (stalledResolvers.length > 0) {
+        stalledResolvers.shift()?.({
+          ok: true,
+          result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+        });
+      }
+      await Promise.resolve();
+      expect(controller.engaged).toBe(false);
+
+      // Case C: If a renewal sent at +100ms resolves at +300ms (< 340ms) after a main-thread pause,
+      // engagement survives and extends confirmed deadline to +340ms without resetting held keys.
+      stallRenewals = false;
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      stallRenewals = true;
+      await stepHealthyMs(50); // +50ms stalled (#1)
+      await stepHealthyMs(50); // +100ms stalled (#2)
+      await stepHealthyMs(200); // +300ms (> +240ms initial, < +340ms in-flight bound)
+      expect(controller.engaged).toBe(true);
+      stalledResolvers.pop()?.({
+        ok: true,
+        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+      });
+      stalledResolvers.length = 0;
+      await Promise.resolve();
+      expect(controller.engaged).toBe(true);
+      await stepHealthyMs(40); // +340ms (no newer in-flight renewals remain) -> expires at +340ms sharp!
+      expect(controller.engaged).toBe(false);
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  it("rejects over-TTL delayed initial engage response and preserves monotonic max deadline across out-of-order renewals", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-27T21:00:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      let mode: "slow-engage" | "reorder-renewals" | "stall-all" =
+        "slow-engage";
+      const seq2Resolvers: Array<
+        (res: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void
+      > = [];
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            if (mode === "stall-all" && !req.stop) {
+              return await new Promise(() => {});
+            }
+            if (mode === "slow-engage" && req.engage) {
+              return await new Promise((resolve) => {
+                setTimeout(() => {
+                  resolve({
+                    ok: true,
+                    result: {
+                      sysid: req.sysid,
+                      lease_active: true,
+                      expires_ms: nowMs + 240,
+                    },
+                  });
+                }, 250);
+              });
+            }
+            if (mode === "reorder-renewals" && req.seq === 2) {
+              return await new Promise((resolve) => {
+                seq2Resolvers.push(resolve);
+              });
+            }
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: !req.stop,
+                expires_ms: nowMs + 240,
+              },
+            };
+          },
+        },
+      });
+
+      // 1) Initial engage=true response delayed 250ms (>= 240ms lease TTL): conservatively rejected on arrival.
+      const slowEngage = controller.engageTeleop(skgStore.getVehicle(veh.id));
+      expect(controller.engaged).toBe(false);
+      nowMs += 250;
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 1,
+          kind: "heartbeat_edge",
+          authority: "companion-teleop",
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(250);
+      expect(await slowEngage).toBe(false);
+      expect(controller.engaged).toBe(false);
+
+      // 2) Out-of-order renewal: seq=2 sent at +50ms stalls while seq=3 sent at +100ms resolves immediately
+      // (deadline = +340ms). Resolving seq=2 late at +160ms (candidate +290ms) must NOT shorten +340ms!
+      mode = "reorder-renewals";
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      nowMs += 50;
+      await vi.advanceTimersByTimeAsync(50); // seq=2 sent at +50ms (stalled)
+      nowMs += 50;
+      await vi.advanceTimersByTimeAsync(50); // seq=3 sent at +100ms (resolved -> deadline +340ms)
+      expect(seq2Resolvers).toHaveLength(1);
+
+      // Now stall any subsequent renewals to isolate the +340ms deadline vs +290ms candidate!
+      mode = "stall-all";
+      nowMs += 60;
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 2,
+          kind: "heartbeat_edge",
+          authority: "companion-teleop",
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(60); // +160ms
+      seq2Resolvers[0]!({
+        ok: true,
+        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+      });
+      await Promise.resolve();
+
+      // At +310ms (past seq=2's +290ms candidate, before seq=3's +340ms deadline), still engaged!
+      nowMs += 150;
+      telemetryStore.ingestRawFrame(
+        buildTransitionFrame(1, {
+          seq: 3,
+          kind: "heartbeat_edge",
+          authority: "companion-teleop",
+          linkTier: "sitl-local",
+          timestamp: nowMs,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(150); // +310ms
+      expect(controller.engaged).toBe(true);
 
       controller.dispose();
       telemetryStore.disconnect();

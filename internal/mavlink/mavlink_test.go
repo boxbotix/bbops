@@ -3205,3 +3205,119 @@ func TestTrackerDuplicateCommandAckSuppressionAndAuthorityEpoch(t *testing.T) {
 		t.Fatal("expected Sequence=42 COMMAND_ACK to be delivered after link_lost/link_restored reset")
 	}
 }
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerIgnoresStaleAndDuplicateHeartbeatsForStateAndFreshness(t *testing.T) {
+	tracker, err := NewTracker("boxbotix", "bbops")
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:45210")
+	t0 := time.Date(2026, 11, 27, 21, 0, 0, 0, time.UTC)
+	monoBase := time.Now()
+
+	hbArmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	hbDisarmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		false,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeDisarmed,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+
+	// 1. Admit armed vehicle at seq=10, monoBase + 100ms.
+	outAdmit := tracker.IngestFrameWithClock(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    10,
+		Message:     hbArmed,
+	}, peer, t0, monoBase.Add(100*time.Millisecond))
+	if !outAdmit.Accepted || len(outAdmit.Events) != 0 {
+		t.Fatalf("admit outcome = %+v, want Accepted with 0 birth events", outAdmit)
+	}
+	baseTarget, ok := tracker.ActuationTarget(1)
+	if !ok || !baseTarget.Armed || baseTarget.HeartbeatSeq != 1 || baseTarget.HeartbeatOrder == 0 {
+		t.Fatalf("base target = %+v (ok=%v), want Armed=true HeartbeatSeq=1 HeartbeatOrder>0", baseTarget, ok)
+	}
+
+	// 2. Older monotonic sample (monoBase + 50ms < monoBase + 100ms) carrying disarmed seq=11 MUST NOT overwrite state or freshness.
+	outOldMono := tracker.IngestFrameWithClock(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    11,
+		Message:     hbDisarmed,
+	}, peer, t0.Add(-50*time.Millisecond), monoBase.Add(50*time.Millisecond))
+	if !outOldMono.Accepted || len(outOldMono.Events) != 0 || outOldMono.UrgentSKGSync {
+		t.Fatalf("older monotonic heartbeat outcome = %+v, want Accepted=true with zero state/event mutation", outOldMono)
+	}
+	if got, _ := tracker.ActuationTarget(1); !got.Armed || got.HeartbeatSeq != baseTarget.HeartbeatSeq || got.HeartbeatOrder != baseTarget.HeartbeatOrder || got.ObservationRev != baseTarget.ObservationRev {
+		t.Fatalf("target mutated on older monotonic heartbeat: got %+v, want %+v", got, baseTarget)
+	}
+
+	// 3. Duplicate seq=10 and out-of-order older seq=9 arriving at newer monotonic timestamps MUST NOT overwrite armed state or advance HeartbeatSeq/HeartbeatOrder.
+	for i, staleSeq := range []uint8{10, 9} {
+		outStale := tracker.IngestFrameWithClock(mavcodec.Frame{
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Sequence:    staleSeq,
+			Message:     hbDisarmed,
+		}, peer, t0.Add(time.Duration(i+1)*10*time.Millisecond), monoBase.Add(time.Duration(110+i*10)*time.Millisecond))
+		if !outStale.Accepted || len(outStale.Events) != 0 || outStale.UrgentSKGSync {
+			t.Fatalf("stale seq=%d heartbeat outcome = %+v, want zero events/sync", staleSeq, outStale)
+		}
+		if got, _ := tracker.ActuationTarget(1); !got.Armed || got.HeartbeatSeq != baseTarget.HeartbeatSeq || got.HeartbeatOrder != baseTarget.HeartbeatOrder {
+			t.Fatalf("target mutated on stale seq=%d: got %+v, want %+v", staleSeq, got, baseTarget)
+		}
+		if snap, _ := tracker.Snapshot(1); !snap.Armed {
+			t.Fatalf("snapshot Armed became false on stale seq=%d", staleSeq)
+		}
+	}
+
+	// 4. Unconfirmed large gap (seq=80, delta=70 in 65..128) WITHholds HeartbeatOrder advancement until confirmed by seq=81.
+	outGap := tracker.IngestFrameWithClock(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    80,
+		Message:     hbArmed,
+	}, peer, t0.Add(40*time.Millisecond), monoBase.Add(140*time.Millisecond))
+	if !outGap.Accepted {
+		t.Fatal("expected gap heartbeat seq=80 to be accepted")
+	}
+	if gotGap, _ := tracker.ActuationTarget(1); gotGap.HeartbeatOrder != baseTarget.HeartbeatOrder {
+		t.Fatalf("unconfirmed gap seq=80 advanced HeartbeatOrder to %d, want held at %d", gotGap.HeartbeatOrder, baseTarget.HeartbeatOrder)
+	}
+	// Confirm gap with telemetry seq=81 -> promotes pending gap heartbeat order!
+	_ = tracker.IngestFrameWithClock(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    81,
+		Message:     mavcodec.AttitudeQuaternion{Q1: 1},
+	}, peer, t0.Add(45*time.Millisecond), monoBase.Add(145*time.Millisecond))
+	if gotConfirmed, _ := tracker.ActuationTarget(1); gotConfirmed.HeartbeatOrder <= baseTarget.HeartbeatOrder {
+		t.Fatalf("confirmed gap seq=80->81 did not promote HeartbeatOrder: got %d, base %d", gotConfirmed.HeartbeatOrder, baseTarget.HeartbeatOrder)
+	}
+
+	// 5. Genuine forward seq=82 disarmed heartbeat updates state, increments HeartbeatSeq & HeartbeatOrder, and emits TransitionEvent.
+	preDisarmTarget, _ := tracker.ActuationTarget(1)
+	outFresh := tracker.IngestFrameWithClock(mavcodec.Frame{
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Sequence:    82,
+		Message:     hbDisarmed,
+	}, peer, t0.Add(60*time.Millisecond), monoBase.Add(160*time.Millisecond))
+	if !outFresh.Accepted || len(outFresh.Events) != 1 || outFresh.Events[0].Armed {
+		t.Fatalf("fresh seq=82 disarmed outcome = %+v, want 1 disarmed event", outFresh)
+	}
+	postTarget, _ := tracker.ActuationTarget(1)
+	if postTarget.Armed || postTarget.HeartbeatSeq <= preDisarmTarget.HeartbeatSeq || postTarget.HeartbeatOrder <= preDisarmTarget.HeartbeatOrder {
+		t.Fatalf("fresh seq=82 target = %+v, want Armed=false and monotonically higher HeartbeatSeq/HeartbeatOrder than %+v", postTarget, preDisarmTarget)
+	}
+}
