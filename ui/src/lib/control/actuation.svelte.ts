@@ -848,7 +848,11 @@ export function createActuationController(
       engage: engageFlag || undefined,
     });
     if (!res.ok) {
-      if (engagedSession !== session || engagedSysId !== sysid) {
+      if (
+        engagedSession !== session ||
+        engagedSysId !== sysid ||
+        res.error.code === "teleop_seq_superseded"
+      ) {
         return false;
       }
       clearEngagedSessionLocal();
@@ -1102,11 +1106,19 @@ export function createActuationController(
     resetStickState();
     needsEngageFlagOnNextTick = false;
 
+    const dispatchedAt = now();
     const ok = await dispatchTeleopNudge(vehicle.sysid, true);
     if (!ok || engagedSysId !== vehicle.sysid || engagedSession !== session) {
       return false;
     }
     startTeleopTimer(vehicle.sysid);
+    if (
+      now() - dispatchedAt >= teleopIntervalMs &&
+      !preemptBySysId.has(vehicle.sysid) &&
+      verifyEngagedVehicleLive(vehicle.sysid)
+    ) {
+      void dispatchTeleopNudge(vehicle.sysid, true);
+    }
     return true;
   }
 

@@ -1556,4 +1556,160 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       vi.useRealTimers();
     }
   });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("ignores obsolete teleop_seq_superseded HTTP responses in the active session while still disengaging on genuine revocations", async () => {
+    vi.useFakeTimers();
+    try {
+      const nowMs = Date.parse("2026-11-24T11:20:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 50).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      const sentTeleops: ControlTeleopRequest[] = [];
+      let resolveDelayedSeq2:
+        | ((value: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void)
+        | null = null;
+      let failNextWithPreemption = false;
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push(req);
+            if (req.seq === 2) {
+              return await new Promise((resolve) => {
+                resolveDelayedSeq2 = resolve;
+              });
+            }
+            if (failNextWithPreemption && !req.stop) {
+              return {
+                ok: false,
+                error: {
+                  code: "preemption_latched",
+                  message: "vehicle sysid 1 teleop was preempted",
+                  status: 409,
+                },
+              };
+            }
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: !req.stop,
+                expires_ms: nowMs + 200,
+              },
+            };
+          },
+        },
+      });
+
+      const engaged = await controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(engaged).toBe(true);
+      expect(sentTeleops).toHaveLength(1);
+      expect(sentTeleops[0]?.seq).toBe(1);
+      const activeSession = sentTeleops[0]?.session;
+
+      // Hold 'w' -> fires immediate seq=2 nudge (delayed in flight).
+      controller.handlePadKeyDown({ key: "w" });
+      await Promise.resolve();
+      expect(sentTeleops.at(-1)?.seq).toBe(2);
+      expect(resolveDelayedSeq2).not.toBeNull();
+
+      // Next 50ms timer tick sends seq=3 and succeeds ahead of seq=2!
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: activeSession,
+        seq: 3,
+      });
+      expect(controller.engaged).toBe(true);
+
+      // Delayed seq=2 response arrives out of order with 409 teleop_seq_superseded:
+      // MUST NOT disengage, clear axes, or record lastError!
+      resolveDelayedSeq2!({
+        ok: false,
+        error: {
+          code: "teleop_seq_superseded",
+          message:
+            "teleop sequence 2 is older than latest 3 on vehicle sysid 1",
+          status: 409,
+        },
+      });
+      await Promise.resolve();
+      expect(controller.engaged).toBe(true);
+      expect(controller.lastError).toBeNull();
+      expect(controller.axes.vx).toBeGreaterThan(0);
+
+      // Next 50ms tick continues streaming seq=4 normally in the same session!
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: activeSession,
+        seq: 4,
+      });
+
+      // Genuine preemption_latched rejection still disengages and latches immediately!
+      failNextWithPreemption = true;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(controller.engaged).toBe(false);
+      expect(controller.axes.vx).toBe(0);
+      expect(controller.preemptionLatch).not.toBeNull();
+      expect(controller.lastError).toContain("preempted");
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
