@@ -58,11 +58,12 @@ type CommandStore interface {
 	Transition(ctx context.Context, entityID, newPhase, note string, source lifecycle.TransitionSource, ackResult int, detail string, updatedMs int64) error
 }
 
-// RecoverableCommandStore extends CommandStore with authoritative reads and active-instance
-// enumeration for restart recovery and transient-persistence verification.
+// RecoverableCommandStore extends CommandStore with authoritative reads and full-history
+// enumeration for restart recovery, ACK-ambiguity preservation, and transient-persistence verification.
 type RecoverableCommandStore interface {
 	CommandStore
 	Get(ctx context.Context, entityID string) (*CommandEntity, error)
+	ListCommands(ctx context.Context) ([]CommandEntity, error)
 	ListNonTerminal(ctx context.Context) ([]CommandEntity, error)
 }
 
@@ -123,6 +124,23 @@ func (s *LifecycleStore) Get(ctx context.Context, entityID string) (*CommandEnti
 	}
 	cp := *ce
 	return &cp, nil
+}
+
+// ListCommands enumerates all CommandEntity records (active and terminal) in ENTITY_STATES.
+func (s *LifecycleStore) ListCommands(ctx context.Context) ([]CommandEntity, error) {
+	items, err := s.mgr.List(ctx, WorkflowName, lifecycle.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CommandEntity, 0, len(items))
+	for _, p := range items {
+		ce, ok := p.(*CommandEntity)
+		if !ok || ce == nil {
+			continue
+		}
+		out = append(out, *ce)
+	}
+	return out, nil
 }
 
 // ListNonTerminal enumerates non-terminal CommandEntity records (`pending`, `commit_unknown`) in ENTITY_STATES.
@@ -256,6 +274,19 @@ type cmdKey struct {
 	cmdID uint16
 }
 
+type cmdDispatchState uint8
+
+const (
+	dispatchReserved cmdDispatchState = iota
+	dispatchSending
+	dispatchSent
+)
+
+type earlyCommandAck struct {
+	ack        mavcodec.CommandAck
+	observedAt time.Time
+}
+
 type inFlightCommand struct {
 	entityID        string
 	orderSeq        uint64
@@ -263,13 +294,15 @@ type inFlightCommand struct {
 	cmdID           uint16
 	action          string
 	sitlOnly        bool
-	dispatched      bool
+	dispatch        cmdDispatchState
 	abortedNote     string
 	abortedDetail   string
 	phase           string
+	detail          string
 	ackAmbiguous    bool
 	ackDeadline     time.Time
 	unknownAtUnixNs int64
+	earlyAcks       []earlyCommandAck
 }
 
 type pendingCommandWrite struct {
@@ -307,9 +340,11 @@ type Service struct {
 	// Lock hierarchy: egressMu[sysid] -> mu; recoverMu -> mu; persistMu -> mu.
 	// Never acquire egressMu, recoverMu, or persistMu while holding mu, and never call
 	// ensureRecovered or flushPendingWrites while holding egressMu[sysid].
-	egressMu  [256]sync.Mutex
-	recoverMu sync.Mutex
-	persistMu sync.Mutex
+	egressMu   [256]sync.Mutex
+	expiring   [256]atomic.Bool
+	gcsSending [256]atomic.Bool
+	recoverMu  sync.Mutex
+	persistMu  sync.Mutex
 
 	mu               sync.Mutex
 	authEpoch        map[uint8]uint64
@@ -487,11 +522,11 @@ func (s *Service) Start(ctx context.Context) error {
 			case <-runCtx.Done():
 				return
 			case <-s.leaseWake:
-				s.advanceRealtime(s.nowFn())
+				s.advanceRealtime(s.nowFn(), true)
 			case <-timerCh:
-				s.advanceRealtime(s.nowFn())
+				s.advanceRealtime(s.nowFn(), true)
 			case <-ticker.C:
-				s.advanceRealtime(s.nowFn())
+				s.advanceRealtime(s.nowFn(), true)
 			}
 		}
 	}()
@@ -562,7 +597,10 @@ func (s *Service) nextLeaseExpiry() (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var earliest time.Time
-	for _, lease := range s.leases {
+	for sysid, lease := range s.leases {
+		if s.expiring[sysid].Load() {
+			continue
+		}
 		if earliest.IsZero() || lease.expiresAt.Before(earliest) {
 			earliest = lease.expiresAt
 		}
@@ -694,9 +732,48 @@ func (s *Service) isCurrentBootEntityID(entityID string) bool {
 	return s.bootNonce != "" && strings.Contains(entityID, "n"+s.bootNonce+"c")
 }
 
+func parseCommandInstance(entityID string) (nano int64, nonce string, seq uint64, ok bool) {
+	inst := entityID
+	if dot := strings.LastIndexByte(entityID, '.'); dot >= 0 {
+		inst = entityID[dot+1:]
+	}
+	if len(inst) < 7 || inst[0] != 's' {
+		return 0, "", 0, false
+	}
+	tIdx := strings.IndexByte(inst, 't')
+	cIdx := strings.LastIndexByte(inst, 'c')
+	if tIdx <= 1 || cIdx <= tIdx+2 || cIdx >= len(inst)-1 {
+		return 0, "", 0, false
+	}
+	nIdx := strings.LastIndexByte(inst[:cIdx], 'n')
+	if nIdx <= tIdx+1 || nIdx >= cIdx-1 {
+		return 0, "", 0, false
+	}
+	if _, err := strconv.ParseUint(inst[1:tIdx], 10, 16); err != nil {
+		return 0, "", 0, false
+	}
+	parsedNano, err := strconv.ParseInt(inst[tIdx+1:nIdx], 36, 64)
+	if err != nil {
+		return 0, "", 0, false
+	}
+	parsedSeq, err := strconv.ParseUint(inst[cIdx+1:], 10, 64)
+	if err != nil {
+		return 0, "", 0, false
+	}
+	return parsedNano, inst[nIdx+1 : cIdx], parsedSeq, true
+}
+
 func isNewerRecoveredEntity(candidate, incumbent CommandEntity) bool {
+	candNano, candNonce, candSeq, candOK := parseCommandInstance(candidate.ID)
+	incNano, incNonce, incSeq, incOK := parseCommandInstance(incumbent.ID)
+	if candOK && incOK && candNonce == incNonce && candSeq != incSeq {
+		return candSeq > incSeq
+	}
 	if candidate.IssuedMs != incumbent.IssuedMs {
 		return candidate.IssuedMs > incumbent.IssuedMs
+	}
+	if candOK && incOK && candNano != incNano {
+		return candNano > incNano
 	}
 	if candidate.UpdatedMs != incumbent.UpdatedMs {
 		return candidate.UpdatedMs > incumbent.UpdatedMs
@@ -725,9 +802,9 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		defer cancel()
 	}
 
-	active, err := recStore.ListNonTerminal(ctx)
+	allCmds, err := recStore.ListCommands(ctx)
 	if err != nil {
-		s.logger.Debug("control: deferred non-terminal command recovery", slog.Any("error", err))
+		s.logger.Debug("control: deferred command history recovery", slog.Any("error", err))
 		return
 	}
 
@@ -735,26 +812,31 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 	bootNs := s.bootTime.UTC().UnixNano()
 	updatedMs := now.UnixMilli()
 
-	preRestart := make([]CommandEntity, 0, len(active))
-	newestByKey := make(map[cmdKey]CommandEntity)
-	for _, ce := range active {
+	preRestartSent := make([]CommandEntity, 0, len(allCmds))
+	latestSentByKey := make(map[cmdKey]CommandEntity)
+	for _, ce := range allCmds {
 		if ce.ID == "" || ce.SysID < 1 || ce.SysID > 254 || s.isCurrentBootEntityID(ce.ID) {
 			continue
 		}
-		preRestart = append(preRestart, ce)
+		if ce.AckResult == UnsentAckResult {
+			continue
+		}
+		preRestartSent = append(preRestartSent, ce)
 		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}
-		if cur, exists := newestByKey[key]; !exists || isNewerRecoveredEntity(ce, cur) {
-			newestByKey[key] = ce
+		if cur, exists := latestSentByKey[key]; !exists || isNewerRecoveredEntity(ce, cur) {
+			latestSentByKey[key] = ce
 		}
 	}
 
 	s.mu.Lock()
-	for _, ce := range preRestart {
+	for _, ce := range preRestartSent {
 		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}
-		s.unackedCount[key]++
-		for _, curCmd := range s.inFlight {
-			if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
-				curCmd.ackAmbiguous = true
+		if ce.AckResult == UnacknowledgedResult || ce.PhaseState == PhasePending {
+			s.unackedCount[key]++
+			for _, curCmd := range s.inFlight {
+				if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
+					curCmd.ackAmbiguous = true
+				}
 			}
 		}
 		if ce.PhaseState == PhasePending {
@@ -768,7 +850,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 				updatedMs: updatedMs,
 			})
 		}
-		if s.dispatchedInBoot[key] || newestByKey[key].ID != ce.ID {
+		if s.dispatchedInBoot[key] || latestSentByKey[key].ID != ce.ID || commandTransitions.IsTerminal(ce.PhaseState) {
 			continue
 		}
 		if _, exists := s.inFlight[ce.ID]; exists {
@@ -789,8 +871,9 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			cmdID:           uint16(ce.CmdID),
 			action:          ce.Action,
 			sitlOnly:        isSITLOnlyAction(ce.Action),
-			dispatched:      true,
+			dispatch:        dispatchSent,
 			phase:           PhaseCommitUnknown,
+			detail:          CommitUnknownDetail,
 			ackAmbiguous:    true,
 			ackDeadline:     now,
 			unknownAtUnixNs: unknownNs,
@@ -983,6 +1066,13 @@ func (s *Service) recordStoppedSessionLocked(sysid uint8, session string) {
 
 func (s *Service) checkTeleopSessionLocked(sysid uint8, session string, seq uint64, engage bool) error {
 	if session != "" && s.stoppedSessions[sysid].contains(session) {
+		if s.preemptLatched[sysid] {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "preemption_latched",
+				Message: fmt.Sprintf("vehicle sysid %d teleop session %q was preempted — explicit re-engage required", sysid, session),
+			}
+		}
 		return &ControlError{
 			Status:  http.StatusConflict,
 			Code:    "teleop_session_stopped",
@@ -1089,13 +1179,23 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 
 	now := s.nowFn()
 	s.mu.Lock()
-	if err := s.checkTeleopSessionLocked(req.SysID, session, req.Seq, req.Engage); err != nil {
+	if session != "" && s.stoppedSessions[req.SysID].contains(session) {
+		err := s.checkTeleopSessionLocked(req.SysID, session, req.Seq, req.Engage)
 		s.mu.Unlock()
 		return TeleopResult{}, err
 	}
+	if s.preemptLatched[req.SysID] && !req.Engage {
+		s.mu.Unlock()
+		return TeleopResult{}, &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "preemption_latched",
+			Message: fmt.Sprintf("vehicle sysid %d teleop was preempted — explicit re-engage required", req.SysID),
+		}
+	}
 	startEpoch := s.authEpoch[req.SysID]
 	lastHB, seenHB := s.lastGCSHB[req.SysID]
-	shouldSendGCSHB := !seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval))
+	shouldSendGCSHB := (req.Engage || s.leases[req.SysID] != nil) &&
+		(!seenHB || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)))
 	s.mu.Unlock()
 
 	if shouldSendGCSHB {
@@ -1185,6 +1285,9 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 	}
 
 	s.mu.Lock()
+	if prev := s.leases[req.SysID]; prev != nil && prev.session != "" && prev.session != effectiveSession {
+		s.recordStoppedSessionLocked(req.SysID, prev.session)
+	}
 	if req.Engage {
 		delete(s.preemptLatched, req.SysID)
 	}
@@ -1277,10 +1380,10 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		if existing.sysid != req.SysID || existing.cmdID != spec.msg.Command {
 			continue
 		}
-		if !existing.dispatched || existing.phase == PhasePending {
-			// Emergency Disarm MUST remain available even if Arm (MAV_CMD 400) is reserved or pending.
+		if existing.dispatch == dispatchReserved || existing.phase == PhasePending {
+			// Emergency Disarm MUST remain available even if Arm (MAV_CMD 400) is reserved, sending, or pending.
 			if actionSlug == ActionDisarm && existing.action != ActionDisarm {
-				if !existing.dispatched {
+				if existing.dispatch == dispatchReserved {
 					existing.abortedNote = "superseded_before_send"
 					existing.abortedDetail = "Superseded by Disarm prior to UDP command transmit"
 					delete(s.inFlight, existingID)
@@ -1305,7 +1408,9 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		cmdID:    spec.msg.Command,
 		action:   actionSlug,
 		sitlOnly: spec.sitlOnly,
+		dispatch: dispatchReserved,
 		phase:    PhasePending,
+		detail:   "Awaiting COMMAND_ACK",
 	}
 	s.inFlight[entityID] = inflight
 	s.mu.Unlock()
@@ -1348,7 +1453,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			if other.entityID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command {
 				continue
 			}
-			if other.dispatched && other.phase == PhasePending && (actionSlug != ActionDisarm || other.action == ActionDisarm) {
+			if other.dispatch != dispatchReserved && other.phase == PhasePending && (actionSlug != ActionDisarm || other.action == ActionDisarm) {
 				targetErr = &ControlError{
 					Status:  http.StatusConflict,
 					Code:    "command_in_flight",
@@ -1411,7 +1516,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			phase:     abortPhase,
 			note:      abortNote,
 			source:    lifecycle.TransitionSourceComponent,
-			ackResult: UnacknowledgedResult,
+			ackResult: UnsentAckResult,
 			detail:    abortDetail,
 			updatedMs: postCreateMs,
 		})
@@ -1421,6 +1526,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.signalPersistWake()
 		return CommandResult{}, retErr
 	}
+	inflight.dispatch = dispatchSending
 	s.mu.Unlock()
 
 	if err := s.sender.SendFrame(mavcodec.Frame{
@@ -1430,13 +1536,15 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		Message:     spec.msg,
 	}, pinnedPeer); err != nil {
 		s.mu.Lock()
+		earlyAcks := inflight.earlyAcks
+		inflight.earlyAcks = nil
 		delete(s.inFlight, entityID)
 		s.enqueueWriteLocked(pendingCommandWrite{
 			entityID:  entityID,
 			phase:     PhaseRejected,
 			note:      "udp_send_failed",
 			source:    lifecycle.TransitionSourceComponent,
-			ackResult: int(mavcodec.MAVResultFailed),
+			ackResult: UnsentAckResult,
 			detail:    "UDP command transmit failed",
 			updatedMs: s.nowFn().UTC().UnixMilli(),
 		})
@@ -1444,6 +1552,9 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.egressMu[req.SysID].Unlock()
 		s.flushPendingWrites(ctx)
 		s.signalPersistWake()
+		for _, ea := range earlyAcks {
+			s.OnCommandAck(req.SysID, ea.ack, ea.observedAt)
+		}
 		return CommandResult{}, &ControlError{
 			Status:  http.StatusServiceUnavailable,
 			Code:    "transport_unavailable",
@@ -1460,11 +1571,13 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	}
 	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
 	for otherID, other := range s.inFlight {
-		if otherID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command || !other.dispatched {
+		if otherID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command || other.dispatch != dispatchSent {
 			continue
 		}
 		delete(s.inFlight, otherID)
 		if other.phase == PhasePending {
+			other.phase = PhaseCommitUnknown
+			other.detail = CommitUnknownDetail
 			s.enqueueWriteLocked(pendingCommandWrite{
 				entityID:  other.entityID,
 				phase:     PhaseCommitUnknown,
@@ -1480,10 +1593,12 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	priorUnacked := s.unackedCount[key] > 0
 	s.unackedCount[key]++
 	s.dispatchedInBoot[key] = true
-	inflight.dispatched = true
+	inflight.dispatch = dispatchSent
 	inflight.ackAmbiguous = !s.recovered.Load() || priorUnacked
 	inflight.ackDeadline = dispatchNow.Add(ackWait)
 	inflight.unknownAtUnixNs = hbBaselineNs
+	earlyAcks := inflight.earlyAcks
+	inflight.earlyAcks = nil
 	if shouldSendGCSHB {
 		s.lastGCSHB[req.SysID] = dispatchNow
 	}
@@ -1494,15 +1609,27 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.flushPendingWrites(ctx)
 		s.signalPersistWake()
 	}
+	for _, ea := range earlyAcks {
+		s.OnCommandAck(req.SysID, ea.ack, ea.observedAt)
+	}
 	s.signalLeaseWake()
+
+	resPhase := PhasePending
+	resDetail := entity.Detail
+	if len(earlyAcks) > 0 {
+		s.mu.Lock()
+		resPhase = inflight.phase
+		resDetail = inflight.detail
+		s.mu.Unlock()
+	}
 
 	return CommandResult{
 		CommandID: entityID,
 		SysID:     req.SysID,
 		CmdID:     spec.msg.Command,
 		Action:    actionSlug,
-		Phase:     PhasePending,
-		Detail:    entity.Detail,
+		Phase:     resPhase,
+		Detail:    resDetail,
 		IssuedMs:  entity.IssuedMs,
 	}, nil
 }
@@ -1522,19 +1649,37 @@ func (s *Service) OnCommandAck(sysid uint8, ack mavcodec.CommandAck, observedAt 
 	key := cmdKey{sysid: sysid, cmdID: ack.Command}
 
 	s.mu.Lock()
+	for _, cmd := range s.inFlight {
+		if cmd.dispatch == dispatchSending && cmd.sysid == sysid && cmd.cmdID == ack.Command {
+			cmd.earlyAcks = append(cmd.earlyAcks, earlyCommandAck{
+				ack:        ack,
+				observedAt: obsUTC,
+			})
+			s.mu.Unlock()
+			return
+		}
+	}
+
 	var matches []*inFlightCommand
 	for _, cmd := range s.inFlight {
-		if cmd.dispatched && cmd.sysid == sysid && cmd.cmdID == ack.Command &&
+		if cmd.dispatch == dispatchSent && cmd.sysid == sysid && cmd.cmdID == ack.Command &&
 			(cmd.phase == PhasePending || cmd.phase == PhaseCommitUnknown) {
 			matches = append(matches, cmd)
 		}
 	}
+	priorUnacked := s.unackedCount[key]
 	if len(matches) == 0 {
+		if s.recovered.Load() && priorUnacked > 0 {
+			s.unackedCount[key] = priorUnacked - 1
+		}
 		s.mu.Unlock()
 		return
 	}
 
-	ambiguous := !s.recovered.Load() || s.unackedCount[key] > 1 || len(matches) > 1 || matches[0].ackAmbiguous
+	ambiguous := !s.recovered.Load() || priorUnacked > 1 || len(matches) > 1 || matches[0].ackAmbiguous
+	if s.recovered.Load() && priorUnacked > 0 {
+		s.unackedCount[key] = priorUnacked - 1
+	}
 	if ambiguous {
 		hbFloor := obsNs
 		if target, ok := s.targets.ActuationTarget(sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
@@ -1548,6 +1693,7 @@ func (s *Service) OnCommandAck(sysid uint8, ack mavcodec.CommandAck, observedAt 
 			}
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
+				cmd.detail = CommitUnknownDetail
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:  cmd.entityID,
 					phase:     PhaseCommitUnknown,
@@ -1580,6 +1726,7 @@ func (s *Service) OnCommandAck(sysid uint8, ack mavcodec.CommandAck, observedAt 
 		note = "command_ack_accepted"
 	}
 	matched.phase = nextPhase
+	matched.detail = detail
 	delete(s.inFlight, matched.entityID)
 	s.enqueueWriteLocked(pendingCommandWrite{
 		entityID:  matched.entityID,
@@ -1621,7 +1768,10 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 	wroteAny := false
 	if isPreempt {
 		s.authEpoch[ev.SysID]++
-		delete(s.leases, ev.SysID)
+		if prev, had := s.leases[ev.SysID]; had {
+			s.recordStoppedSessionLocked(ev.SysID, prev.session)
+			delete(s.leases, ev.SysID)
+		}
 		s.preemptLatched[ev.SysID] = true
 
 		preemptNote := "authority_preempted"
@@ -1633,12 +1783,13 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 		for id, cmd := range s.inFlight {
 			if cmd.sysid == ev.SysID && !cmd.sitlOnly {
 				delete(s.inFlight, id)
-				if !cmd.dispatched {
+				if cmd.dispatch == dispatchReserved {
 					cmd.abortedNote = preemptNote
 					cmd.abortedDetail = preemptDetail
 					continue
 				}
 				cmd.phase = PhasePreempted
+				cmd.detail = preemptDetail
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:  cmd.entityID,
 					phase:     PhasePreempted,
@@ -1655,20 +1806,22 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 		if ev.LinkTier == uxsvocab.LinkTierMeshSupervisory ||
 			!ev.Armed ||
 			ev.Authority != uxsvocab.AuthorityCompanionTeleop {
-			if _, had := s.leases[ev.SysID]; had {
+			if prev, had := s.leases[ev.SysID]; had {
 				s.authEpoch[ev.SysID]++
+				s.recordStoppedSessionLocked(ev.SysID, prev.session)
 				delete(s.leases, ev.SysID)
 			}
 		}
 		if isHeartbeatEvidence {
 			if target, ok := s.targets.ActuationTarget(ev.SysID); ok && !target.LinkLost {
 				for id, cmd := range s.inFlight {
-					if cmd.dispatched &&
+					if cmd.dispatch == dispatchSent &&
 						cmd.sysid == ev.SysID &&
 						cmd.phase == PhaseCommitUnknown &&
 						target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
 						matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
 						cmd.phase = PhaseConfirmed
+						cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 						delete(s.inFlight, id)
 						s.enqueueWriteLocked(pendingCommandWrite{
 							entityID:  cmd.entityID,
@@ -1676,7 +1829,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 							note:      "reconciled_by_heartbeat",
 							source:    lifecycle.TransitionSourceComponent,
 							ackResult: UnacknowledgedResult,
-							detail:    "Confirmed via vehicle HEARTBEAT state reconciliation",
+							detail:    cmd.detail,
 							updatedMs: updatedMs,
 						})
 						wroteAny = true
@@ -1698,33 +1851,77 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 	}
 }
 
+type gcsHeartbeatTarget struct {
+	sysid uint8
+	peer  netip.AddrPort
+}
+
+func (s *Service) expireVehicleLease(sysid uint8, now time.Time) {
+	s.egressMu[sysid].Lock()
+	defer s.egressMu[sysid].Unlock()
+
+	var expPeer netip.AddrPort
+	var expFrame uint8
+	var shouldZero bool
+	s.mu.Lock()
+	if lease, ok := s.leases[sysid]; ok && !now.Before(lease.expiresAt) {
+		expPeer = lease.peer
+		expFrame = lease.coordFrame
+		s.recordStoppedSessionLocked(sysid, lease.session)
+		delete(s.leases, sysid)
+		s.authEpoch[sysid]++
+		shouldZero = true
+	}
+	s.mu.Unlock()
+
+	if shouldZero {
+		if target, ok := s.targets.ActuationTarget(sysid); ok &&
+			!target.LinkLost && target.PeerAddr.IsValid() &&
+			target.PeerAddr == expPeer &&
+			target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
+			target.Authority == uxsvocab.AuthorityCompanionTeleop {
+			_ = s.sendZeroVelocity(sysid, expFrame, target.PeerAddr, now)
+		}
+	}
+}
+
 // advanceRealtime evaluates < 250ms #84 lease deadman expiry and 1 Hz outbound GCS #0 HEARTBEAT
-// liveness without touching CommandStore persistence.
-func (s *Service) advanceRealtime(now time.Time) {
+// liveness without touching CommandStore persistence. When async is true (background real-time
+// scheduler), per-vehicle egress is isolated so a blocked writer on one vehicle cannot starve
+// another vehicle's deadman deadline.
+func (s *Service) advanceRealtime(now time.Time, async bool) {
 	var expiredSysIDs []uint8
 	activeSysIDs := make(map[uint8]struct{})
 
 	s.mu.Lock()
 	for sysid, lease := range s.leases {
 		if !now.Before(lease.expiresAt) {
-			expiredSysIDs = append(expiredSysIDs, sysid)
+			if !async || !s.expiring[sysid].Load() {
+				expiredSysIDs = append(expiredSysIDs, sysid)
+			}
 			continue
 		}
 		activeSysIDs[sysid] = struct{}{}
 	}
 	for _, cmd := range s.inFlight {
-		if cmd.dispatched && cmd.phase == PhasePending && now.Before(cmd.ackDeadline) {
+		if cmd.dispatch == dispatchSent && cmd.phase == PhasePending && now.Before(cmd.ackDeadline) {
 			activeSysIDs[cmd.sysid] = struct{}{}
 		}
 	}
 
-	var gcsPeers []netip.AddrPort
+	var gcsTargets []gcsHeartbeatTarget
 	for sysid := range activeSysIDs {
+		if async && s.gcsSending[sysid].Load() {
+			continue
+		}
 		lastHB, seen := s.lastGCSHB[sysid]
 		if !seen || !now.Before(lastHB.Add(s.gcsHeartbeatInterval)) {
 			if target, ok := s.targets.ActuationTarget(sysid); ok && !target.LinkLost && target.PeerAddr.IsValid() {
 				s.lastGCSHB[sysid] = now
-				gcsPeers = append(gcsPeers, target.PeerAddr)
+				gcsTargets = append(gcsTargets, gcsHeartbeatTarget{
+					sysid: sysid,
+					peer:  target.PeerAddr,
+				})
 			}
 		}
 	}
@@ -1735,34 +1932,43 @@ func (s *Service) advanceRealtime(now time.Time) {
 	}
 	s.mu.Unlock()
 
-	for _, sysid := range expiredSysIDs {
-		s.egressMu[sysid].Lock()
-		var expPeer netip.AddrPort
-		var expFrame uint8
-		var shouldZero bool
-		s.mu.Lock()
-		if lease, ok := s.leases[sysid]; ok && !now.Before(lease.expiresAt) {
-			expPeer = lease.peer
-			expFrame = lease.coordFrame
-			delete(s.leases, sysid)
-			s.authEpoch[sysid]++
-			shouldZero = true
+	if !async {
+		for _, sysid := range expiredSysIDs {
+			s.expireVehicleLease(sysid, now)
 		}
-		s.mu.Unlock()
-		if shouldZero {
-			if target, ok := s.targets.ActuationTarget(sysid); ok &&
-				!target.LinkLost && target.PeerAddr.IsValid() &&
-				target.PeerAddr == expPeer &&
-				target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
-				target.Authority == uxsvocab.AuthorityCompanionTeleop {
-				_ = s.sendZeroVelocity(sysid, expFrame, target.PeerAddr, now)
-			}
+		for _, gt := range gcsTargets {
+			_ = s.sendGCSHeartbeat(gt.peer)
 		}
-		s.egressMu[sysid].Unlock()
+		return
 	}
 
-	for _, peer := range gcsPeers {
-		_ = s.sendGCSHeartbeat(peer)
+	for _, sysid := range expiredSysIDs {
+		if s.expiring[sysid].CompareAndSwap(false, true) {
+			s.leaseWG.Add(1)
+			go func(id uint8, expNow time.Time) {
+				defer s.leaseWG.Done()
+				defer func() {
+					s.expiring[id].Store(false)
+					s.signalLeaseWake()
+				}()
+				checkNow := s.nowFn()
+				if expNow.After(checkNow) {
+					checkNow = expNow
+				}
+				s.expireVehicleLease(id, checkNow)
+			}(sysid, now)
+		}
+	}
+
+	for _, gt := range gcsTargets {
+		if s.gcsSending[gt.sysid].CompareAndSwap(false, true) {
+			s.leaseWG.Add(1)
+			go func(id uint8, peer netip.AddrPort) {
+				defer s.leaseWG.Done()
+				defer s.gcsSending[id].Store(false)
+				_ = s.sendGCSHeartbeat(peer)
+			}(gt.sysid, gt.peer)
+		}
 	}
 }
 
@@ -1778,11 +1984,12 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 
 	s.mu.Lock()
 	for id, cmd := range s.inFlight {
-		if !cmd.dispatched {
+		if cmd.dispatch != dispatchSent {
 			continue
 		}
 		if cmd.phase == PhasePending && !now.Before(cmd.ackDeadline) {
 			cmd.phase = PhaseCommitUnknown
+			cmd.detail = CommitUnknownDetail
 			hbFloor := nowNs
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && target.HeartbeatObservedUnixNs > hbFloor {
 				hbFloor = target.HeartbeatObservedUnixNs
@@ -1806,6 +2013,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				target.HeartbeatObservedUnixNs > cmd.unknownAtUnixNs &&
 				matchesExpectedVehicleState(cmd.action, target.Armed, target.CompanionMode, target.Authority) {
 				cmd.phase = PhaseConfirmed
+				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:  cmd.entityID,
@@ -1813,7 +2021,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 					note:      "reconciled_by_heartbeat",
 					source:    lifecycle.TransitionSourceComponent,
 					ackResult: UnacknowledgedResult,
-					detail:    "Confirmed via vehicle HEARTBEAT state reconciliation",
+					detail:    cmd.detail,
 					updatedMs: updatedMs,
 				})
 				continue
@@ -1831,7 +2039,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 // Advance evaluates #84 lease expiry (< 250ms deadman), 1 Hz outbound GCS #0 HEARTBEAT liveness,
 // non-retrying #76 -> commit_unknown timeouts, fresh-heartbeat reconciliation, and retained store writes.
 func (s *Service) Advance(ctx context.Context, now time.Time) {
-	s.advanceRealtime(now)
+	s.advanceRealtime(now, false)
 	s.advanceCommands(ctx, now)
 }
 

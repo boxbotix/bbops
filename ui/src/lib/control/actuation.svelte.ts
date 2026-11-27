@@ -671,7 +671,6 @@ export function createActuationController(
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const heldKeys = new Set<PadHoldKey>();
   let teleopTimer: ReturnType<typeof setInterval> | null = null;
-  let needsEngageFlagOnNextTick = false;
   let engageCounter = 0;
   let engagedEntityId: string | null = null;
   let engagedSession: string | null = null;
@@ -719,7 +718,6 @@ export function createActuationController(
     engagedEntityId = null;
     engagedSession = null;
     teleopSeq = 0;
-    needsEngageFlagOnNextTick = false;
     resetStickState();
   }
 
@@ -883,9 +881,7 @@ export function createActuationController(
       if (!verifyEngagedVehicleLive(sysid)) {
         return;
       }
-      const sendEngage = needsEngageFlagOnNextTick;
-      needsEngageFlagOnNextTick = false;
-      void dispatchTeleopNudge(sysid, sendEngage);
+      void dispatchTeleopNudge(sysid, false);
     }, teleopIntervalMs);
   }
 
@@ -1104,20 +1100,14 @@ export function createActuationController(
     engagedSession = session;
     teleopSeq = 0;
     resetStickState();
-    needsEngageFlagOnNextTick = false;
 
-    const dispatchedAt = now();
+    startTeleopTimer(vehicle.sysid);
     const ok = await dispatchTeleopNudge(vehicle.sysid, true);
     if (!ok || engagedSysId !== vehicle.sysid || engagedSession !== session) {
+      if (engagedSysId === vehicle.sysid && engagedSession === session) {
+        clearEngagedSessionLocal();
+      }
       return false;
-    }
-    startTeleopTimer(vehicle.sysid);
-    if (
-      now() - dispatchedAt >= teleopIntervalMs &&
-      !preemptBySysId.has(vehicle.sysid) &&
-      verifyEngagedVehicleLive(vehicle.sysid)
-    ) {
-      void dispatchTeleopNudge(vehicle.sysid, true);
     }
     return true;
   }

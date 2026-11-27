@@ -53,9 +53,14 @@ const (
 	PhaseCommitUnknown = "commit_unknown"
 	PhasePreempted     = "preempted"
 
-	// UnacknowledgedResult is stamped into uxs.command.ackresult while awaiting #77 COMMAND_ACK
-	// so TransitionWith emits an explicit triple delta when MAV_RESULT_ACCEPTED (0) arrives.
+	// UnacknowledgedResult is stamped into uxs.command.ackresult once a #76 COMMAND_LONG is
+	// persisted/sent without receiving a #77 COMMAND_ACK so TransitionWith emits an explicit
+	// triple delta when MAV_RESULT_ACCEPTED (0) arrives.
 	UnacknowledgedResult = -1
+
+	// UnsentAckResult marks a CommandEntity that was aborted or rejected prior to transmitting
+	// a #76 COMMAND_LONG datagram on UDP so restart recovery does not count an unreceived #77 ACK.
+	UnsentAckResult = -2
 
 	// CommitUnknownDetail is the canonical indeterminate status message surfaced when #77 COMMAND_ACK
 	// does not arrive within the command timeout (`ADR-111 Decision 3`, zero blind retries).

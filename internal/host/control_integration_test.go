@@ -550,4 +550,119 @@ func TestRuntimeControlRestartRetainedDataDir(t *testing.T) {
 	if cmdBoot2.CommandID == cmdDone.CommandID || cmdBoot2.CommandID == cmdIndeterminate.CommandID {
 		t.Fatalf("boot 2 reused pre-restart command entity ID: %s", cmdBoot2.CommandID)
 	}
+	// Resolve cmdBoot2 cleanly via its #77 ACCEPTED before shutting down Boot #2.
+	ackBoot2, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    4,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message: mavcodec.CommandAck{
+			Command: mavcodec.MAVCmdDoSetMode,
+			Result:  mavcodec.MAVResultAccepted,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame ackBoot2: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(ackBoot2, udpDst2); err != nil {
+		t.Fatalf("WriteToUDP ackBoot2: %v", err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt2, cmdBoot2.CommandID) != control.PhaseConfirmed {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Boot #3 on the SAME DataDir: cmdIndeterminate is now terminal (PhaseConfirmed via HEARTBEAT, AckResult=-1)
+	// in JetStream ENTITY_STATES! Verify LifecycleStore.ListCommands recovers its unacked status so a new
+	// Hold-Position command on Boot #3 treats a delayed #77 ACCEPTED as ambiguous (commit_unknown)!
+	stopCtx2Explicit, stopCancel2Explicit := context.WithTimeout(ctx, 10*time.Second)
+	stopErr2 := rt2.Stop(stopCtx2Explicit)
+	stopCancel2Explicit()
+	if stopErr2 != nil {
+		t.Fatalf("Stop boot 2: %v", stopErr2)
+	}
+
+	rt3, err := StartEphemeral(ctx, Options{
+		DataDir:   retainedDataDir,
+		Logger:    slog.New(slog.DiscardHandler),
+		Overrides: PortOverrides{MetricsPort: -1},
+		UIDir:     uiDir,
+		Version:   "test-m3.1-boot3",
+	}, 4)
+	if err != nil {
+		t.Fatalf("StartEphemeral boot 3: %v", err)
+	}
+	defer func() {
+		stopCtx3, stopCancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel3()
+		_ = rt3.Stop(stopCtx3)
+	}()
+	if err := rt3.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady boot 3: %v", err)
+	}
+
+	udpDst3, err := net.ResolveUDPAddr("udp4", rt3.Endpoints().MAVLinkUDPAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr boot 3: %v", err)
+	}
+	hbMsg3, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
+		Armed:        true,
+		SystemStatus: mavcodec.MAVStateActive,
+		Custom: mavcodec.CustomMode{
+			LinkTier:         mavcodec.LinkTierSITLLocal,
+			HealthFlags:      mavcodec.HealthFlags{CRSFLinkHealthy: true, CompanionTrunkHealthy: true},
+			Domain:           mavcodec.DomainQuadcopter,
+			CompanionMode:    mavcodec.ModeTeleopVelocity,
+			ControlAuthority: mavcodec.AuthorityCompanionTeleop,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeVehicleHeartbeat hb3: %v", err)
+	}
+	hb3, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    5,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message:     hbMsg3,
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame hb3: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(hb3, udpDst3); err != nil {
+		t.Fatalf("WriteToUDP hb3: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if target, ok := rt3.MAVLinkIngest().ActuationTarget(1); ok && target.Armed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	cmdBoot3 := postCommand(rt3.Endpoints().HTTPBaseURL, `{"sysid":1,"action":"hold-position"}`)
+	_ = readPeerFrames(2, 100*time.Millisecond)
+
+	// Send delayed #77 ACCEPTED for MAVCmdNavLoiterUnlim while vehicle is still in teleop-velocity mode:
+	// Boot #3 MUST transition cmdBoot3 to commit_unknown (not confirmed) because cmdIndeterminate was never ACKed!
+	staleLoiterAck, err := mavcodec.EncodeFrame(mavcodec.Frame{
+		Sequence:    6,
+		SystemID:    1,
+		ComponentID: mavcodec.CompIDAutopilot1,
+		Message: mavcodec.CommandAck{
+			Command: mavcodec.MAVCmdNavLoiterUnlim,
+			Result:  mavcodec.MAVResultAccepted,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeFrame staleLoiterAck: %v", err)
+	}
+	if _, err := peerConn.WriteToUDP(staleLoiterAck, udpDst3); err != nil {
+		t.Fatalf("WriteToUDP staleLoiterAck: %v", err)
+	}
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && readKVPhase(rt3, cmdBoot3.CommandID) != control.PhaseCommitUnknown {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readKVPhase(rt3, cmdBoot3.CommandID); got != control.PhaseCommitUnknown {
+		t.Fatalf("boot 3 failed to preserve terminal heartbeat-reconciled ACK ambiguity: phase=%q, want commit_unknown", got)
+	}
 }

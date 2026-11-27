@@ -1712,4 +1712,182 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       vi.useRealTimers();
     }
   });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("never emits a second engage=true on slow (>50ms) Engage Teleop responses and stays disengaged when P1 override intervenes before WS1 delivery", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-24T11:30:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      // Server-side state mirroring control.Service:
+      // 1) Initial engage (seq=1, engage=true) commits lease on server at t+10ms,
+      // 2) Brief P1 CRSF override + P2 recovery happens at t+40ms BEFORE the slow HTTP response
+      //    returns at t+75ms and BEFORE delayed WS1 transition delivery reaches the browser!
+      let serverLeaseSession: string | null = null;
+      let serverPreemptLatched = false;
+      const serverRevokedSessions = new Set<string>();
+      const sentTeleops: ControlTeleopRequest[] = [];
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push(req);
+            if (req.stop) {
+              if (req.session) {
+                serverRevokedSessions.add(req.session);
+              }
+              serverLeaseSession = null;
+              return {
+                ok: true,
+                result: { sysid: req.sysid, lease_active: false },
+              };
+            }
+            if (sentTeleops.length === 1 && req.engage) {
+              serverLeaseSession = req.session ?? null;
+              serverPreemptLatched = false;
+              // Simulate P1 override + P2 return on backend at t+30ms while HTTP response returns at t+75ms.
+              setTimeout(() => {
+                if (serverLeaseSession) {
+                  serverRevokedSessions.add(serverLeaseSession);
+                }
+                serverLeaseSession = null;
+                serverPreemptLatched = true;
+              }, 30);
+              await new Promise<void>((resolve) => {
+                setTimeout(resolve, 75);
+              });
+              return {
+                ok: true,
+                result: {
+                  sysid: req.sysid,
+                  lease_active: true,
+                  expires_ms: nowMs + 240,
+                },
+              };
+            }
+            if (
+              (req.session && serverRevokedSessions.has(req.session)) ||
+              (serverPreemptLatched && !req.engage)
+            ) {
+              return {
+                ok: false,
+                error: {
+                  code: "preemption_latched",
+                  message:
+                    "vehicle sysid 1 teleop was preempted — explicit re-engage required",
+                  status: 409,
+                },
+              };
+            }
+            if (req.engage) {
+              serverPreemptLatched = false;
+              serverLeaseSession = req.session ?? null;
+            }
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: true,
+                expires_ms: nowMs + 240,
+              },
+            };
+          },
+        },
+      });
+
+      const engagePromise = controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      nowMs += 30;
+      await vi.advanceTimersByTimeAsync(30);
+      nowMs += 20;
+      await vi.advanceTimersByTimeAsync(20);
+      nowMs += 25;
+      await vi.advanceTimersByTimeAsync(25);
+      const firstEngageResult = await engagePromise;
+      expect(firstEngageResult).toBe(false);
+
+      // Only the initial click request may carry engage=true; the 50ms renewal tick MUST omit engage!
+      expect(sentTeleops.filter((r) => r.engage === true)).toHaveLength(1);
+      expect(sentTeleops).toHaveLength(2);
+      expect(sentTeleops[0]?.engage).toBe(true);
+      expect(sentTeleops[1]?.engage).toBeUndefined();
+
+      // Because P1 override latched preemption on the server, the 50ms renewal failed with
+      // preemption_latched — disengaging and latching PREEMPTED without a second operator click!
+      expect(controller.engaged).toBe(false);
+      expect(controller.preemptionLatch).not.toBeNull();
+      expect(serverLeaseSession).toBeNull();
+
+      // Subsequent timer ticks emit zero teleop packets until the operator explicitly clicks Engage Teleop again.
+      const countAfterPreempt = sentTeleops.length;
+      nowMs += 200;
+      await vi.advanceTimersByTimeAsync(200);
+      expect(sentTeleops).toHaveLength(countAfterPreempt);
+
+      // Fresh explicit operator Engage Teleop click mints a brand-new session and succeeds cleanly.
+      const secondSessionEngage = await controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(secondSessionEngage).toBe(true);
+      expect(serverLeaseSession).not.toBeNull();
+      expect(serverLeaseSession).not.toBe(sentTeleops[0]?.session);
+
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
