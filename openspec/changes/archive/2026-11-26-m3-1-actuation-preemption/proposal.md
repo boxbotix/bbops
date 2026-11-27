@@ -1,5 +1,5 @@
 # Proposal: m3-1-actuation-preemption
-Approved-by:
+Approved-by: coby (2026-11-26) sha256:deb30a93e911
 Architect: gemini (gemini-4-carbon, default)
 
 ## Track

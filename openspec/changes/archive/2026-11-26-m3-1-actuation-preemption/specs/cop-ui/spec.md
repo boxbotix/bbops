@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
-`ControlPanel.svelte` and `PilotWorkspace.svelte` (`OQ3`) SHALL expose actuation only for commandable `VehicleEntityState`s, honor `#39` freshness and `#41` keyboard safety, collapse `10–30 Hz` teleop into `1 Hz` supervisory actions on `mesh-supervisory`, gate the `SITL Fault & Current Lab` to `sitl-local`, zero sticks and latch preemption on `direct-crsf-override`/`mcu-failsafe` until re-engaged, show non-retrying command states, and keep `#43` `Diagnostics` drafts offline.
+`ControlPanel.svelte` in `PilotWorkspace.svelte` (`Vehicle`) SHALL expose actuation only for commandable `VehicleEntityState`s behind an explicit `Engage Teleop` gate (pointer pad + focus-scoped pad-only hold keys, honoring `#39` freshness and `#41` hotkeys), collapse `10–30 Hz` teleop on `mesh-supervisory`, gate `SITL Fault & Current Lab` to `sitl-local`, zero sticks + latch preemption on `direct-crsf-override`/`mcu-failsafe`, and keep `#43` `Diagnostics` offline.
 
 #### Scenario: MeshSupervisory LinkTier collapses continuous velocity pad into discrete supervisory buttons
 - **WHEN** a selected commandable UXS vehicle reports `linkTier === "mesh-supervisory"` (or transitions from `"mesh-high-rate"` to `"mesh-supervisory"` mid-session)

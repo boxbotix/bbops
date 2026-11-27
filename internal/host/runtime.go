@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/boxbotix/bbops/internal/control"
+	"github.com/boxbotix/bbops/internal/mavcodec"
 	"github.com/boxbotix/bbops/internal/mavlink"
 	"github.com/boxbotix/bbops/internal/uxsvocab"
 	"github.com/c360studio/semengine/component"
@@ -22,6 +25,7 @@ import (
 	"github.com/c360studio/semengine/metric"
 	"github.com/c360studio/semengine/natsclient"
 	"github.com/c360studio/semengine/payloadregistry"
+	"github.com/c360studio/semengine/pkg/lifecycle"
 	"github.com/c360studio/semengine/pkg/projection"
 	"github.com/c360studio/semengine/service"
 	"github.com/c360studio/semengine/types"
@@ -54,7 +58,7 @@ type Options struct {
 }
 
 // Runtime owns a started bbops host instance (embedded NATS/JetStream,
-// ConfigManager, ServiceManager, MAVLink UDP ingest, and ADR-115 HTTP/WS surfaces).
+// ConfigManager, ServiceManager, MAVLink UDP ingest, UXS control service, and ADR-115 HTTP/WS surfaces).
 type Runtime struct {
 	endpoints      ResolvedEndpoints
 	natsURL        string
@@ -64,6 +68,7 @@ type Runtime struct {
 	configManager  *config.Manager
 	serviceManager atomic.Pointer[service.Manager]
 	mavlinkIngest  atomic.Pointer[mavlink.Component]
+	controlService *control.Service
 	serviceNames   []string
 	mutations      *projection.MutationClient
 
@@ -245,8 +250,28 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		return cleanup(fmt.Errorf("ensure catalog retention clean: %w", err))
 	}
 
+	lcMgr := lifecycle.NewManager(client, logger)
+	lcStore, err := control.NewLifecycleStore(lcMgr)
+	if err != nil {
+		return cleanup(fmt.Errorf("register uxs-command lifecycle workflow: %w", err))
+	}
+	mavBridge := runtimeMAVLinkBridge{comp: &rt.mavlinkIngest}
+	ctrlSvc, err := control.NewService(control.Options{
+		Org:      rt.platform.Org,
+		Platform: rt.platform.Platform,
+		Targets:  mavBridge,
+		Sender:   mavBridge,
+		Store:    lcStore,
+		Logger:   logger,
+	})
+	if err != nil {
+		return cleanup(fmt.Errorf("create control service: %w", err))
+	}
+	rt.controlService = ctrlSvc
+
 	compReg := component.NewRegistry()
 	if err := registerComponentsWithHook(compReg, func(c *mavlink.Component) {
+		c.SetActuationCallbacks(ctrlSvc.OnTransitionEvent, ctrlSvc.OnCommandAck)
 		rt.mavlinkIngest.Store(c)
 	}); err != nil {
 		return cleanup(err)
@@ -255,6 +280,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 	payloadReg := payloadregistry.New()
 	if err := uxsvocab.RegisterPayloads(payloadReg); err != nil {
 		return cleanup(fmt.Errorf("register uxs payloads: %w", err))
+	}
+	if err := lifecycle.RegisterPayloads(payloadReg); err != nil {
+		return cleanup(fmt.Errorf("register lifecycle payloads: %w", err))
 	}
 	if opts.RegisterPayloads != nil {
 		if err := opts.RegisterPayloads(payloadReg); err != nil {
@@ -280,6 +308,7 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 		TelemetryWS: endpoints.TelemetryWS,
 		GraphWS:     endpoints.GraphWS,
 		GraphSearch: client.RequestClassified,
+		Control:     ctrlSvc,
 		ShutdownCtx: wsProxyCtx,
 	})
 	if err != nil {
@@ -305,6 +334,9 @@ func Start(ctx context.Context, opts Options) (*Runtime, error) {
 
 	if err := svcMgr.StartAll(ctx); err != nil {
 		return cleanup(fmt.Errorf("start services: %w", err))
+	}
+	if err := ctrlSvc.Start(ctx); err != nil {
+		return cleanup(fmt.Errorf("start control service: %w", err))
 	}
 	rt.started.Store(true)
 	_ = rt.checkLiveReadiness()
@@ -413,6 +445,9 @@ func (rt *Runtime) Endpoints() ResolvedEndpoints { return rt.endpoints }
 // MAVLinkIngest returns the active mavlink-ingest Component instance, or nil when disabled/stopped.
 func (rt *Runtime) MAVLinkIngest() *mavlink.Component { return rt.mavlinkIngest.Load() }
 
+// ControlService returns the active UXS actuation/teleop control service.
+func (rt *Runtime) ControlService() *control.Service { return rt.controlService }
+
 // NATSURL returns the active NATS client URL with any credentials redacted.
 func (rt *Runtime) NATSURL() string { return rt.natsURL }
 
@@ -421,6 +456,32 @@ func (rt *Runtime) NATSClient() *natsclient.Client { return rt.natsClient }
 
 // Platform returns the effective authority identity minted by ConfigManager.
 func (rt *Runtime) Platform() types.PlatformMeta { return rt.platform }
+
+type runtimeMAVLinkBridge struct {
+	comp *atomic.Pointer[mavlink.Component]
+}
+
+func (b runtimeMAVLinkBridge) ActuationTarget(sysid uint8) (mavlink.ActuationTarget, bool) {
+	if b.comp == nil {
+		return mavlink.ActuationTarget{}, false
+	}
+	c := b.comp.Load()
+	if c == nil {
+		return mavlink.ActuationTarget{}, false
+	}
+	return c.ActuationTarget(sysid)
+}
+
+func (b runtimeMAVLinkBridge) SendFrame(frame mavcodec.Frame, peer netip.AddrPort) error {
+	if b.comp == nil {
+		return errors.New("mavlink-ingest component is unavailable")
+	}
+	c := b.comp.Load()
+	if c == nil {
+		return errors.New("mavlink-ingest component is unavailable")
+	}
+	return c.SendFrame(frame, peer)
+}
 
 // IsReady reports whether all composed SemEngine services and SKG/WebSocket
 // components currently satisfy ADR-109 readiness and shutdown has not begun.
@@ -503,8 +564,8 @@ func (rt *Runtime) checkLiveReadiness() bool {
 	return true
 }
 
-// Stop shuts down ServiceManager, ConfigManager, the NATS client, and any
-// embedded NATS server in reverse boot order. It is idempotent once nil is returned.
+// Stop shuts down ControlService, ServiceManager, ConfigManager, the NATS client,
+// and any embedded NATS server in reverse boot order. It is idempotent once nil is returned.
 func (rt *Runtime) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -522,6 +583,13 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 
 	var errs []error
+	if rt.controlService != nil {
+		if err := rt.controlService.Stop(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("stop control service: %w", err))
+		} else {
+			rt.controlService = nil
+		}
+	}
 	if svcMgr := rt.serviceManager.Load(); svcMgr != nil {
 		if err := svcMgr.StopAll(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("stop service manager: %w", err))

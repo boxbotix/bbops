@@ -103,6 +103,21 @@ type SnapshotBatchItem struct {
 	Payload []byte
 }
 
+// ActuationTarget captures the pinned UDP endpoint and safety state of an
+// admitted UXS vehicle atomically under the Tracker lock (`OQ1 Option A`).
+type ActuationTarget struct {
+	SysID                   uint8
+	EntityID                string
+	PeerAddr                netip.AddrPort
+	Domain                  string
+	Armed                   bool
+	Authority               string
+	CompanionMode           string
+	LinkTier                string
+	LinkLost                bool
+	HeartbeatObservedUnixNs int64
+}
+
 // IngestOutcome describes the deterministic side-effects produced by processing
 // one inbound UDP datagram in Tracker.IngestDatagram.
 type IngestOutcome struct {
@@ -111,6 +126,7 @@ type IngestOutcome struct {
 	SysID         uint8
 	Telemetry     *TelemetryFrame
 	Events        []TransitionEvent
+	CommandAck    *mavcodec.CommandAck
 	UrgentSKGSync bool
 }
 
@@ -129,6 +145,13 @@ type vehicleSession struct {
 	peerAddr     netip.AddrPort
 }
 
+func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
+	if !peer.IsValid() {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+}
+
 func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, monoSample time.Time) {
 	if s.lastPacketAt.IsZero() || !monoSample.Before(s.lastPacketAt) {
 		s.lastPacketAt = monoSample
@@ -136,8 +159,9 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 	s.lastSeq = seq
 	s.lastMsgID = msgID
 	s.linkLost = false
-	if peer.IsValid() {
-		s.peerAddr = peer
+	normPeer := normalizeAddrPort(peer)
+	if normPeer.IsValid() {
+		s.peerAddr = normPeer
 	}
 }
 
@@ -175,14 +199,15 @@ func newLinkTransitionEvent(snap uxsvocab.VehicleSnapshot, seq uint8, msgID uint
 	}
 }
 
-// Tracker maintains per-sysid (1..=254, compid == 1) vehicle state, peer UDP
-// endpoints (`D4 Option A`), link-loss freshness (`OQ1`–`OQ2 Option A`), packet
-// sanitization, and 3-lane split decisions.
+// Tracker maintains per-sysid (1..=254, compid == 1) vehicle state, pinned peer
+// UDP endpoints (`OQ1 Option A`), link-loss freshness, packet sanitization,
+// `#77 COMMAND_ACK` correlation, and 3-lane split decisions.
 type Tracker struct {
 	org                string
 	platform           string
 	linkTimeout        time.Duration
 	supervisoryTimeout time.Duration
+	allowedPeers       []netip.Prefix
 
 	mu       sync.RWMutex
 	sessions map[uint8]*vehicleSession
@@ -196,6 +221,16 @@ func NewTracker(org, platform string) (*Tracker, error) {
 // NewTrackerWithTimeouts constructs a per-sysid MAVLink v2 state tracker with explicit
 // bench/high-rate and mesh-supervisory silence thresholds.
 func NewTrackerWithTimeouts(org, platform string, linkTimeout, supervisoryTimeout time.Duration) (*Tracker, error) {
+	return NewTrackerWithOptions(org, platform, linkTimeout, supervisoryTimeout, nil)
+}
+
+// NewTrackerWithOptions constructs a per-sysid MAVLink v2 state tracker with explicit
+// silence thresholds and optional CIDR/IP allowed_peers admission filters.
+func NewTrackerWithOptions(
+	org, platform string,
+	linkTimeout, supervisoryTimeout time.Duration,
+	allowedPeers []netip.Prefix,
+) (*Tracker, error) {
 	if _, err := uxsvocab.VehicleEntityID(org, platform, 1); err != nil {
 		return nil, fmt.Errorf("mavlink: invalid platform identity (%q, %q): %w", org, platform, err)
 	}
@@ -205,13 +240,49 @@ func NewTrackerWithTimeouts(org, platform string, linkTimeout, supervisoryTimeou
 	if supervisoryTimeout < linkTimeout {
 		return nil, fmt.Errorf("mavlink: supervisoryTimeout (%v) must be >= linkTimeout (%v)", supervisoryTimeout, linkTimeout)
 	}
+	var prefixes []netip.Prefix
+	if len(allowedPeers) > 0 {
+		prefixes = make([]netip.Prefix, len(allowedPeers))
+		for i, pfx := range allowedPeers {
+			unmapped := pfx.Addr().Unmap()
+			bits := pfx.Bits()
+			if pfx.Addr().Is4In6() && bits >= 96 {
+				bits -= 96
+			}
+			prefixes[i] = netip.PrefixFrom(unmapped, bits).Masked()
+		}
+	}
 	return &Tracker{
 		org:                org,
 		platform:           platform,
 		linkTimeout:        linkTimeout,
 		supervisoryTimeout: supervisoryTimeout,
+		allowedPeers:       prefixes,
 		sessions:           make(map[uint8]*vehicleSession),
 	}, nil
+}
+
+func (t *Tracker) peerAllowed(peer netip.AddrPort) bool {
+	if len(t.allowedPeers) == 0 {
+		return true
+	}
+	if !peer.IsValid() {
+		return false
+	}
+	addr := peer.Addr().Unmap()
+	for _, pfx := range t.allowedPeers {
+		if pfx.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesPinnedPeer(sess *vehicleSession, normPeer netip.AddrPort) bool {
+	if !sess.peerAddr.IsValid() {
+		return true
+	}
+	return normPeer == sess.peerAddr
 }
 
 // IngestDatagram decodes a single MAVLink v2 (0xFD) UDP datagram, validates
@@ -267,15 +338,20 @@ func (t *Tracker) ingestFrameAt(frame mavcodec.Frame, peer netip.AddrPort, wallU
 		return t.applyLocalPositionNED(frame.SystemID, frame.Sequence, msg, peer, wallUTC, monoSample)
 	case mavcodec.GlobalPositionInt:
 		return t.applyGlobalPositionInt(frame.SystemID, frame.Sequence, msg, peer, wallUTC, monoSample)
+	case mavcodec.CommandAck:
+		return t.applyCommandAck(frame.SystemID, frame.Sequence, msg, peer, wallUTC, monoSample)
 	case mavcodec.StatusText:
 		return t.applyStatusText(frame.SystemID, frame.Sequence, msg, peer, wallUTC, monoSample)
 	default:
-		// Outbound/actuation messages (#76, #77, #84) are outside M1.2 telemetry ingest scope.
+		// Outbound GCS actuation messages (#76, #84) are ignored cleanly if echoed on shared UDP links.
 		return IngestOutcome{}
 	}
 }
 
 func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
 	domainStr, err := vh.Custom.Domain.VocabString()
 	if err != nil {
 		return IngestOutcome{CountedError: true}
@@ -292,6 +368,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	if err != nil {
 		return IngestOutcome{CountedError: true}
 	}
+	normPeer := normalizeAddrPort(peer)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -323,12 +400,16 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			snap: *snap,
 			rev:  1,
 		}
-		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, peer, monoSample)
+		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 		t.sessions[sysid] = newSess
 		return IngestOutcome{
 			Accepted: true,
 			SysID:    sysid,
 		}
+	}
+
+	if !sess.linkLost && !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -351,7 +432,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 
 	sess.snap = next
 	sess.rev++
-	sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, peer, monoSample)
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 
 	out := IngestOutcome{
 		Accepted: true,
@@ -412,12 +493,20 @@ func diffHeartbeatReasons(prev, next uxsvocab.VehicleSnapshot) []string {
 }
 
 func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
+	normPeer := normalizeAddrPort(peer)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	sess, exists := t.sessions[sysid]
 	if !exists {
 		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -473,6 +562,9 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 }
 
 func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.AttitudeQuaternion, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
 	rawQ := [4]float64{float64(msg.Q1), float64(msg.Q2), float64(msg.Q3), float64(msg.Q4)}
 	rates := [3]float64{float64(msg.Rollspeed), float64(msg.Pitchspeed), float64(msg.Yawspeed)}
 	for _, v := range rawQ {
@@ -497,6 +589,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 		rawQ[3] * invNorm,
 	}
 	hdgDeg := QuaternionYawDeg(unitQ)
+	normPeer := normalizeAddrPort(peer)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -504,6 +597,9 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 	sess, exists := t.sessions[sysid]
 	if !exists {
 		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -526,7 +622,7 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 	sess.hasAttitude = true
 	sess.hasHeading = true
 	sess.rev++
-	sess.recordAcceptedPacket(seq, mavcodec.MsgIDAttitudeQuaternion, peer, monoSample)
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDAttitudeQuaternion, normPeer, monoSample)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDAttitudeQuaternion, wallUTC)
 	out := IngestOutcome{
@@ -542,6 +638,9 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 }
 
 func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPositionNED, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
 	ned := [3]float64{float64(msg.X), float64(msg.Y), float64(msg.Z)}
 	vx, vy, vz := float64(msg.Vx), float64(msg.Vy), float64(msg.Vz)
 	for _, v := range [6]float64{ned[0], ned[1], ned[2], vx, vy, vz} {
@@ -549,6 +648,7 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 			return IngestOutcome{CountedError: true}
 		}
 	}
+	normPeer := normalizeAddrPort(peer)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -556,6 +656,9 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	sess, exists := t.sessions[sysid]
 	if !exists {
 		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -576,7 +679,7 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	sess.snap = next
 	sess.hasLocalPos = true
 	sess.rev++
-	sess.recordAcceptedPacket(seq, mavcodec.MsgIDLocalPositionNED, peer, monoSample)
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDLocalPositionNED, normPeer, monoSample)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDLocalPositionNED, wallUTC)
 	out := IngestOutcome{
@@ -592,6 +695,9 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 }
 
 func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPositionInt, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
 	if msg.Lat < minLatDegE7 || msg.Lat > maxLatDegE7 {
 		return IngestOutcome{CountedError: true}
 	}
@@ -605,6 +711,7 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	lat := float64(msg.Lat) / 1e7
 	lon := float64(msg.Lon) / 1e7
 	alt := float64(msg.Alt) / 1000.0
+	normPeer := normalizeAddrPort(peer)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -612,6 +719,9 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	sess, exists := t.sessions[sysid]
 	if !exists {
 		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -646,7 +756,7 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 		sess.hasHeading = hasFallbackHdg
 	}
 	sess.rev++
-	sess.recordAcceptedPacket(seq, mavcodec.MsgIDGlobalPositionInt, peer, monoSample)
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDGlobalPositionInt, normPeer, monoSample)
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDGlobalPositionInt, wallUTC)
 	out := IngestOutcome{
@@ -661,13 +771,66 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	return out
 }
 
-func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
+	if msg.TargetSystem != 0 && msg.TargetSystem != mavcodec.GCSSystemID {
+		return IngestOutcome{}
+	}
+	normPeer := normalizeAddrPort(peer)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	sess, exists := t.sessions[sysid]
 	if !exists {
 		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
+	}
+
+	wasLost := sess.linkLost
+	var events []TransitionEvent
+	urgent := false
+	if wasLost {
+		next := sess.snap
+		next.ObservedAt = wallUTC
+		if err := next.Validate(); err != nil {
+			return IngestOutcome{CountedError: true}
+		}
+		sess.snap = next
+		sess.rev++
+		urgent = true
+		events = append(events, newLinkTransitionEvent(next, seq, mavcodec.MsgIDCommandAck, EventKindLinkRestored, "link_restored", wallUTC))
+	}
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDCommandAck, normPeer, monoSample)
+	ackCopy := msg
+	return IngestOutcome{
+		Accepted:      true,
+		SysID:         sysid,
+		Events:        events,
+		CommandAck:    &ackCopy,
+		UrgentSKGSync: urgent,
+	}
+}
+
+func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
+	if !t.peerAllowed(peer) {
+		return IngestOutcome{CountedError: true}
+	}
+	normPeer := normalizeAddrPort(peer)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	sess, exists := t.sessions[sysid]
+	if !exists {
+		return IngestOutcome{}
+	}
+	if !matchesPinnedPeer(sess, normPeer) {
+		return IngestOutcome{CountedError: true}
 	}
 
 	wasLost := sess.linkLost
@@ -687,7 +850,7 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 		urgent = true
 		events = append(events, newLinkTransitionEvent(snap, seq, mavcodec.MsgIDStatusText, EventKindLinkRestored, "link_restored", wallUTC))
 	}
-	sess.recordAcceptedPacket(seq, mavcodec.MsgIDStatusText, peer, monoSample)
+	sess.recordAcceptedPacket(seq, mavcodec.MsgIDStatusText, normPeer, monoSample)
 
 	cleanText := strings.TrimRight(msg.Text, "\x00")
 	events = append(events, TransitionEvent{
@@ -879,6 +1042,29 @@ func (t *Tracker) Peers() map[uint8]netip.AddrPort {
 		}
 	}
 	return out
+}
+
+// ActuationTarget returns the pinned UDP endpoint and current safety snapshot
+// for sysid atomically under the Tracker lock (`OQ1 Option A`).
+func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	sess, ok := t.sessions[sysid]
+	if !ok || !sess.peerAddr.IsValid() {
+		return ActuationTarget{}, false
+	}
+	return ActuationTarget{
+		SysID:                   sysid,
+		EntityID:                sess.snap.EntityID(),
+		PeerAddr:                sess.peerAddr,
+		Domain:                  sess.snap.Domain,
+		Armed:                   sess.snap.Armed,
+		Authority:               sess.snap.Authority,
+		CompanionMode:           sess.snap.CompanionMode,
+		LinkTier:                sess.snap.LinkTier,
+		LinkLost:                sess.linkLost,
+		HeartbeatObservedUnixNs: sess.snap.HeartbeatObservedUnixNs,
+	}, true
 }
 
 // BuildPeriodicBatch marshals BaseMessage(VehicleSnapshot) items at flush time in ascending

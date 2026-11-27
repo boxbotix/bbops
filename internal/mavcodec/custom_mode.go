@@ -18,9 +18,31 @@ const (
 	AutopilotGeneric          uint8 = 0
 	ModeFlagCustomModeEnabled uint8 = 1
 	ModeFlagSafetyArmed       uint8 = 128
+	MAVStateActive            uint8 = 4
 	CompIDAutopilot1          uint8 = 1
+	CompIDMissionPlanner      uint8 = 190
+	GCSSystemID               uint8 = 255
 	MAVLinkVersionV2          uint8 = 3
 	MaxStatusTextBytes        int   = 50
+
+	// Standard MIT common.xml #84 SET_POSITION_TARGET_LOCAL_NED frame & velocity-only mask.
+	MAVFrameLocalNED                   uint8  = 1
+	MAVFrameBodyNED                    uint8  = 8
+	PositionTargetTypeMaskVelocityOnly uint16 = 0x07C7
+
+	// Standard MIT common.xml #76 COMMAND_LONG command IDs and #77 COMMAND_ACK results.
+	MAVCmdNavLoiterUnlim     uint16 = 17
+	MAVCmdDoSetMode          uint16 = 176
+	MAVCmdComponentArmDisarm uint16 = 400
+	MAVCmdUser1              uint16 = 31010
+
+	MAVResultAccepted            uint8 = 0
+	MAVResultTemporarilyRejected uint8 = 1
+	MAVResultDenied              uint8 = 2
+	MAVResultUnsupported         uint8 = 3
+	MAVResultFailed              uint8 = 4
+	MAVResultInProgress          uint8 = 5
+	MAVResultCancelled           uint8 = 6
 )
 
 const (

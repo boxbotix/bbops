@@ -20,6 +20,8 @@ type commandRequest struct {
 	SysID    uint8                           `json:"sysid,omitempty"`
 	Severity uint8                           `json:"severity,omitempty"`
 	Text     string                          `json:"text,omitempty"`
+	Tier     string                          `json:"tier,omitempty"`
+	Count    int                             `json:"count,omitempty"`
 	Contact  *e2eharness.ExternalContactSeed `json:"contact,omitempty"`
 }
 
@@ -75,6 +77,21 @@ func main() {
 			switch req.Action {
 			case "pulseCrsfOverride":
 				if actErr := stack.PulseCRSFOverride(req.SysID); actErr != nil {
+					reply.OK = false
+					reply.Error = actErr.Error()
+				}
+			case "restoreCompanionTeleop":
+				if actErr := stack.RestoreCompanionTeleop(req.SysID); actErr != nil {
+					reply.OK = false
+					reply.Error = actErr.Error()
+				}
+			case "setLinkTier":
+				if actErr := stack.SetVehicleLinkTier(req.SysID, req.Tier); actErr != nil {
+					reply.OK = false
+					reply.Error = actErr.Error()
+				}
+			case "setDropCommandAck":
+				if actErr := stack.SetDropCommandAck(req.SysID, req.Count); actErr != nil {
 					reply.OK = false
 					reply.Error = actErr.Error()
 				}

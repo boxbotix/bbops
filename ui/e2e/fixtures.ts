@@ -52,6 +52,9 @@ export interface CopStackFixture {
   readonly pageErrors: readonly string[];
   readonly consoleErrors: readonly string[];
   pulseCrsfOverride(sysid: number): Promise<void>;
+  restoreCompanionTeleop(sysid: number): Promise<void>;
+  setLinkTier(sysid: number, tier: string): Promise<void>;
+  setDropCommandAck(sysid: number, count: number): Promise<void>;
   emitStatusText(sysid: number, severity: number, text: string): Promise<void>;
   upsertExternalContact(contact: ExternalContactFixtureInput): Promise<void>;
 }
@@ -247,6 +250,12 @@ export const test = base.extend<{ copStack: CopStackFixture }>({
         consoleErrors,
         pulseCrsfOverride: (sysid) =>
           harness.sendCommand({ action: "pulseCrsfOverride", sysid }),
+        restoreCompanionTeleop: (sysid) =>
+          harness.sendCommand({ action: "restoreCompanionTeleop", sysid }),
+        setLinkTier: (sysid, tier) =>
+          harness.sendCommand({ action: "setLinkTier", sysid, tier }),
+        setDropCommandAck: (sysid, count) =>
+          harness.sendCommand({ action: "setDropCommandAck", sysid, count }),
         emitStatusText: (sysid, severity, text) =>
           harness.sendCommand({
             action: "emitStatusText",

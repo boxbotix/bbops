@@ -9,7 +9,7 @@ import {
   parseVehicleEntityId,
 } from "../uxs";
 
-// shortcut: tuning rack stages parameter diffs locally read-only in M2.4, wire ADR-111 non-retrying PARAM_SET commit in M3.1 (#11)
+// shortcut: tuning rack stages parameter diffs locally read-only until 0xB1 parameter protocol lands, wire non-retrying parameter commit in #47
 export type TuningControlWidget = "dial" | "slider";
 
 export type TuningBaselineSource = "domain-default" | "vehicle-reported";
