@@ -49,6 +49,8 @@ const (
 	PredicateCommandAckAccounted = "uxs.command.ackaccounted"
 	// PredicateCommandAckPoolMask records the cumulative bitmask of #77 COMMAND_ACK MAV_RESULT codes observed on `(sysid, cmd_id)`.
 	PredicateCommandAckPoolMask = "uxs.command.ackpoolmask"
+	// PredicateCommandDisplaced records (`1` vs `0`) whether target continuity broke across peer, domain, entity, incarnation, or SITL LinkTier.
+	PredicateCommandDisplaced = "uxs.command.displaced"
 	// PredicateCommandDetail records operator-facing status or refusal detail text.
 	PredicateCommandDetail = "uxs.command.detail"
 	// PredicateCommandIssuedMs records the UTC Unix-millisecond dispatch timestamp.
@@ -110,6 +112,7 @@ type CommandEntity struct {
 	AckResult    int    `lifecycle:"predicate=uxs.command.ackresult"`
 	AckAccounted int    `json:"ack_accounted,omitempty" lifecycle:"predicate=uxs.command.ackaccounted,operator_writable"`
 	AckPoolMask  int    `json:"ack_pool_mask,omitempty" lifecycle:"predicate=uxs.command.ackpoolmask,operator_writable"`
+	Displaced    int    `json:"displaced,omitempty" lifecycle:"predicate=uxs.command.displaced,operator_writable"`
 	Detail       string `lifecycle:"predicate=uxs.command.detail"`
 	IssuedMs     int64  `lifecycle:"predicate=uxs.command.issuedms"`
 	UpdatedMs    int64  `lifecycle:"predicate=uxs.command.updatedms"`
@@ -219,7 +222,12 @@ func ControlPackSpec() vocabulary.PackSpec {
 			},
 			{
 				Name:        PredicateCommandAckPoolMask,
-				Description: "Owner-neutral bitmask for the command pool: bits 0..26 record observed #77 COMMAND_ACK MAV_RESULT codes; bits 27..30 carry reserved continuity/accounting flags (bit 27 target-continuity displaced, bit 28 wrap-held receipt credit, bit 29 settled wrap credit, bit 30 v2 format marker)",
+				Description: "Owner-neutral bitmask for the (sysid, cmd_id) pool: bits 0..27 record observed #77 COMMAND_ACK MAV_RESULT codes; bits 28..30 carry reserved accounting flags (bit 28 wrap-held receipt credit, bit 29 settled wrap credit, bit 30 v2 format marker)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandDisplaced,
+				Description: "Durable target-continuity displacement marker (1 once pinned peer, target entity, domain, authority incarnation, or SITL LinkTier continuity broke)",
 				DataType:    "int",
 			},
 			{
@@ -255,7 +263,8 @@ var registerVocabMu sync.Mutex
 func RegisterVocab() error {
 	registerVocabMu.Lock()
 	defer registerVocabMu.Unlock()
-	if vocabulary.RequireDeclaredPredicate(PredicateCommandPhase) == nil {
+	if vocabulary.RequireDeclaredPredicate(PredicateCommandPhase) == nil &&
+		vocabulary.RequireDeclaredPredicate(PredicateCommandDisplaced) == nil {
 		return nil
 	}
 	pack := ControlPackSpec()
@@ -280,6 +289,7 @@ func Workflow() lifecycle.Workflow {
 		OperatorWritablePredicates: []string{
 			PredicateCommandAckAccounted,
 			PredicateCommandAckPoolMask,
+			PredicateCommandDisplaced,
 		},
 	}
 }

@@ -66,9 +66,11 @@ type CommandStore interface {
 }
 
 // RecoverableCommandStore extends CommandStore with authoritative reads, owner-neutral
-// consumed-ACK pool updates, and full-history enumeration for restart recovery and ambiguity preservation.
+// consumed-ACK and target-displacement updates, and full-history enumeration for restart recovery.
 type RecoverableCommandStore interface {
 	CommandStore
+	TransitionDisplaced(ctx context.Context, entityID, newPhase, note string, source lifecycle.TransitionSource, ackResult int, detail string, updatedMs int64) error
+	RecordDisplaced(ctx context.Context, entityID string) error
 	RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int) error
 	Get(ctx context.Context, entityID string) (*CommandEntity, error)
 	ListCommands(ctx context.Context) ([]CommandEntity, error)
@@ -108,6 +110,31 @@ func (s *LifecycleStore) Transition(
 	detail string,
 	updatedMs int64,
 ) error {
+	return s.transition(ctx, entityID, newPhase, note, source, ackResult, false, detail, updatedMs)
+}
+
+// TransitionDisplaced executes a revision-fenced CAS phase transition that atomically stamps
+// uxs.command.displaced = 1 alongside the phase change so no intermediate durable snapshot loses displacement.
+func (s *LifecycleStore) TransitionDisplaced(
+	ctx context.Context,
+	entityID, newPhase, note string,
+	source lifecycle.TransitionSource,
+	ackResult int,
+	detail string,
+	updatedMs int64,
+) error {
+	return s.transition(ctx, entityID, newPhase, note, source, ackResult, true, detail, updatedMs)
+}
+
+func (s *LifecycleStore) transition(
+	ctx context.Context,
+	entityID, newPhase, note string,
+	source lifecycle.TransitionSource,
+	ackResult int,
+	displaced bool,
+	detail string,
+	updatedMs int64,
+) error {
 	return s.mgr.TransitionWith(ctx, WorkflowName, entityID, newPhase, source, note, func(p lifecycle.Participant) error {
 		ce, ok := p.(*CommandEntity)
 		if !ok {
@@ -117,13 +144,24 @@ func (s *LifecycleStore) Transition(
 		if ackResult >= 0 {
 			ce.AckAccounted = 1
 			ce.AckPoolMask |= ackPoolFormatV2Bit
-			if ackResult < 27 {
+			if ackResult < 28 {
 				ce.AckPoolMask |= 1 << uint(ackResult)
 			}
+		}
+		if displaced {
+			ce.Displaced = 1
 		}
 		ce.Detail = detail
 		ce.UpdatedMs = updatedMs
 		return nil
+	})
+}
+
+// RecordDisplaced executes a revision-fenced CAS triple update marking uxs.command.displaced = 1
+// on an already-created CommandEntity without mutating its PhaseState or UpdatedMs transition timestamp.
+func (s *LifecycleStore) RecordDisplaced(ctx context.Context, entityID string) error {
+	return s.mgr.UpdateFromOperator(ctx, WorkflowName, entityID, map[string]any{
+		"displaced": 1,
 	})
 }
 
@@ -464,23 +502,19 @@ type commandInvokeSpec struct {
 }
 
 const (
-	ackPoolTargetDisplacedBit = 1 << 27
-	ackPoolWrapHeldBit        = 1 << 28
-	ackPoolWrapSettledBit     = 1 << 29
-	ackPoolFormatV2Bit        = 1 << 30
-	ackPoolResultMask         = (1 << 27) - 1
+	ackPoolWrapHeldBit    = 1 << 28
+	ackPoolWrapSettledBit = 1 << 29
+	ackPoolFormatV2Bit    = 1 << 30
+	ackPoolResultMask     = (1 << 28) - 1
 )
 
-func poolMaskForCmd(mask uint64, accounted, wrapHeld, displaced bool) int {
+func poolMaskForCmd(mask uint64, accounted, wrapHeld bool) int {
 	pm := int(mask) & ackPoolResultMask
-	if accounted || wrapHeld || displaced {
+	if accounted || wrapHeld {
 		pm |= ackPoolFormatV2Bit
 	}
 	if wrapHeld {
 		pm |= ackPoolWrapHeldBit
-	}
-	if displaced {
-		pm |= ackPoolTargetDisplacedBit
 	}
 	return pm
 }
@@ -488,6 +522,7 @@ func poolMaskForCmd(mask uint64, accounted, wrapHeld, displaced bool) int {
 type ackMetaState struct {
 	ackAccounted int
 	ackPoolMask  int
+	displaced    int
 }
 
 type inFlightCommand struct {
@@ -540,6 +575,7 @@ func (c *inFlightCommand) poolKey() cmdKey {
 type pendingCommandWrite struct {
 	entityID     string
 	ackOnly      bool
+	displaced    bool
 	phase        string
 	note         string
 	source       lifecycle.TransitionSource
@@ -1131,8 +1167,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			s.seenAckResultMask[key] |= mask
 			s.preResetAckResultMask[key] |= mask
 		}
-		isCurrentFormat := (ce.AckPoolMask & (ackPoolFormatV2Bit | ackPoolTargetDisplacedBit | ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0
-		wasDisplaced := (ce.AckPoolMask & ackPoolTargetDisplacedBit) != 0
+		isCurrentFormat := (ce.AckPoolMask & (ackPoolFormatV2Bit | ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0
+		wasDisplaced := ce.Displaced > 0
 		legacyWrapHeld := !isCurrentFormat &&
 			ce.AckResult < 0 &&
 			ce.AckAccounted > 0 &&
@@ -1146,6 +1182,15 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		s.persistedAckMeta[ce.ID] = ackMetaState{
 			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
 			ackPoolMask:  persistedMask,
+			displaced:    boolToInt(wasDisplaced),
+		}
+		if !recPeer.IsValid() && (ce.AckResult < 0 || isSITLOnlyAction(ce.Action)) {
+			s.surplusAckTainted[key] = true
+			for _, curCmd := range s.inFlight {
+				if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
+					curCmd.ackAmbiguous = true
+				}
+			}
 		}
 		if accounted && ce.AckResult < 0 {
 			s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], ce.ID)
@@ -1160,9 +1205,31 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 				}
 			}
 		}
+		recDomain := strings.TrimSpace(ce.Domain)
+		recLinkTier := strings.TrimSpace(ce.LinkTier)
+		sitlOnly := isSITLOnlyAction(ce.Action)
+		recTarget, recOK := s.targets.ActuationTarget(uint8(ce.SysID))
+		if !wasDisplaced && recPeer.IsValid() && !commandTransitions.IsTerminal(ce.PhaseState) && recOK {
+			probe := inFlightCommand{
+				issuedPeer:     recPeer,
+				issuedTargetID: ce.Target,
+				issuedDomain:   recDomain,
+				issuedLinkTier: recLinkTier,
+				fromRecovery:   true,
+				sitlOnly:       sitlOnly,
+			}
+			_ = observeCommandTargetContinuity(&probe, recTarget, true)
+			if probe.targetDisplaced {
+				wasDisplaced = true
+				if ce.PhaseState != PhasePending {
+					_ = s.enqueueDisplacedLocked(ce.ID)
+				}
+			}
+		}
 		if ce.PhaseState == PhasePending {
 			s.enqueueWriteLocked(pendingCommandWrite{
 				entityID:     ce.ID,
+				displaced:    wasDisplaced,
 				phase:        PhaseCommitUnknown,
 				note:         "recovered_indeterminate_after_restart",
 				source:       lifecycle.TransitionSourceComponent,
@@ -1206,9 +1273,6 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			unknownNs = ceUpdatedNs
 		}
 		var unknownHbSeq, unknownHbReceiptRev, unknownLinkEpoch, unknownPacketOrder uint64
-		recDomain := strings.TrimSpace(ce.Domain)
-		recLinkTier := strings.TrimSpace(ce.LinkTier)
-		recTarget, recOK := s.targets.ActuationTarget(uint8(ce.SysID))
 		if recOK {
 			if recTarget.HeartbeatObservedUnixNs > unknownNs {
 				unknownNs = recTarget.HeartbeatObservedUnixNs
@@ -1234,7 +1298,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			issuedLinkTier:      recLinkTier,
 			fromRecovery:        true,
 			priorUnackedAtIssue: true,
-			sitlOnly:            isSITLOnlyAction(ce.Action),
+			sitlOnly:            sitlOnly,
 			dispatch:            dispatchSent,
 			phase:               PhaseCommitUnknown,
 			detail:              CommitUnknownDetail,
@@ -1250,24 +1314,6 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		}
 		if recOK {
 			_ = observeCommandTargetContinuity(recCmd, recTarget, true)
-			if recCmd.targetDisplaced {
-				_ = s.persistDisplacedCommandLocked(recCmd)
-				if isUnacked {
-					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], ce.ID)
-				}
-				if wrapHeld {
-					recCmd.wrapReceiptHeld = false
-					s.wrapAckCredit[key]++
-					s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], ce.ID)
-					for _, curCmd := range s.inFlight {
-						if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID &&
-							(!key.peer.IsValid() || curCmd.issuedPeer == key.peer) {
-							curCmd.ackAmbiguous = true
-						}
-					}
-				}
-				continue
-			}
 		}
 		s.inFlight[ce.ID] = recCmd
 	}
@@ -1305,9 +1351,22 @@ func (s *Service) persistDisplacedCommandLocked(cmd *inFlightCommand) bool {
 	if cmd == nil || !cmd.targetDisplaced || cmd.dispatch != dispatchSent {
 		return false
 	}
-	key := cmd.poolKey()
-	mask := poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld, true)
-	return s.enqueueConsumedAckLocked(cmd.entityID, boolToInt(cmd.ackAccounted), mask)
+	return s.enqueueDisplacedLocked(cmd.entityID)
+}
+
+func (s *Service) enqueueDisplacedLocked(entityID string) bool {
+	if entityID == "" {
+		return false
+	}
+	if curMeta := s.persistedAckMeta[entityID]; curMeta.displaced > 0 {
+		return false
+	}
+	s.enqueueWriteLocked(pendingCommandWrite{
+		entityID:  entityID,
+		ackOnly:   true,
+		displaced: true,
+	})
+	return true
 }
 
 func (s *Service) enqueueConsumedAckLocked(entityID string, ackAccounted, ackPoolMask int) bool {
@@ -1333,6 +1392,9 @@ func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
 			w.ackAccounted = curMeta.ackAccounted
 		}
 		w.ackPoolMask |= curMeta.ackPoolMask
+		if curMeta.displaced > 0 {
+			w.displaced = true
+		}
 	}
 	if prev, exists := s.pendingWrites[w.entityID]; exists {
 		if w.ackOnly {
@@ -1340,6 +1402,9 @@ func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
 				prev.ackAccounted = w.ackAccounted
 			}
 			prev.ackPoolMask |= w.ackPoolMask
+			if w.displaced {
+				prev.displaced = true
+			}
 			s.pendingWrites[w.entityID] = prev
 			return
 		}
@@ -1350,6 +1415,9 @@ func (s *Service) enqueueWriteLocked(w pendingCommandWrite) {
 			w.ackAccounted = prev.ackAccounted
 		}
 		w.ackPoolMask |= prev.ackPoolMask
+		if prev.displaced {
+			w.displaced = true
+		}
 	}
 	s.pendingWrites[w.entityID] = w
 }
@@ -1386,21 +1454,57 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				if !hasReader {
 					s.mu.Lock()
 					if cur, exists := s.pendingWrites[w.entityID]; exists && cur.ackOnly &&
+						cur.displaced == w.displaced &&
 						cur.ackAccounted == w.ackAccounted && cur.ackPoolMask == w.ackPoolMask {
 						delete(s.pendingWrites, w.entityID)
 					}
 					s.mu.Unlock()
 					continue
 				}
-				err := recStore.RecordConsumedAck(ctx, w.entityID, w.ackAccounted, w.ackPoolMask)
-				verified := err == nil
-				if !verified && ctx.Err() == nil {
-					if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil &&
-						got.AckAccounted >= w.ackAccounted && (got.AckPoolMask&w.ackPoolMask) == w.ackPoolMask {
-						verified = true
+				s.mu.Lock()
+				curMeta := s.persistedAckMeta[w.entityID]
+				s.mu.Unlock()
+
+				if w.displaced && curMeta.displaced == 0 {
+					dispErr := recStore.RecordDisplaced(ctx, w.entityID)
+					dispVerified := dispErr == nil
+					if !dispVerified && ctx.Err() == nil {
+						if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil && got.Displaced > 0 {
+							dispVerified = true
+						}
 					}
+					if !dispVerified {
+						s.logger.Warn("control: transient command displacement write failed; retaining for retry",
+							slog.String("command_id", w.entityID),
+							slog.Any("error", dispErr),
+						)
+						continue
+					}
+					s.mu.Lock()
+					meta := s.persistedAckMeta[w.entityID]
+					meta.displaced = 1
+					s.persistedAckMeta[w.entityID] = meta
+					curMeta = meta
+					s.mu.Unlock()
 				}
-				if verified {
+
+				needAckPatch := w.ackAccounted > curMeta.ackAccounted || (w.ackPoolMask&^curMeta.ackPoolMask) != 0
+				if needAckPatch {
+					err := recStore.RecordConsumedAck(ctx, w.entityID, w.ackAccounted, w.ackPoolMask)
+					verified := err == nil
+					if !verified && ctx.Err() == nil {
+						if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil &&
+							got.AckAccounted >= w.ackAccounted && (got.AckPoolMask&w.ackPoolMask) == w.ackPoolMask {
+							verified = true
+						}
+					}
+					if !verified {
+						s.logger.Warn("control: transient consumed-ack write failed; retaining for retry",
+							slog.String("command_id", w.entityID),
+							slog.Any("error", err),
+						)
+						continue
+					}
 					s.mu.Lock()
 					meta := s.persistedAckMeta[w.entityID]
 					if w.ackAccounted > meta.ackAccounted {
@@ -1408,59 +1512,80 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 					}
 					meta.ackPoolMask |= w.ackPoolMask
 					s.persistedAckMeta[w.entityID] = meta
-					if cur, exists := s.pendingWrites[w.entityID]; exists && cur.ackOnly &&
-						cur.ackAccounted <= w.ackAccounted && (cur.ackPoolMask&^w.ackPoolMask) == 0 {
-						delete(s.pendingWrites, w.entityID)
-					}
 					s.mu.Unlock()
-					continue
 				}
-				s.logger.Warn("control: transient consumed-ack write failed; retaining for retry",
-					slog.String("command_id", w.entityID),
-					slog.Any("error", err),
-				)
+
+				s.mu.Lock()
+				meta := s.persistedAckMeta[w.entityID]
+				if cur, exists := s.pendingWrites[w.entityID]; exists && cur.ackOnly &&
+					(!cur.displaced || meta.displaced > 0) &&
+					cur.ackAccounted <= meta.ackAccounted && (cur.ackPoolMask&^meta.ackPoolMask) == 0 {
+					delete(s.pendingWrites, w.entityID)
+				}
+				s.mu.Unlock()
 				continue
 			}
 
-			err := s.store.Transition(
-				ctx,
-				w.entityID,
-				w.phase,
-				w.note,
-				w.source,
-				w.ackResult,
-				w.detail,
-				w.updatedMs,
-			)
+			var err error
+			if w.displaced && hasReader {
+				err = recStore.TransitionDisplaced(
+					ctx,
+					w.entityID,
+					w.phase,
+					w.note,
+					w.source,
+					w.ackResult,
+					w.detail,
+					w.updatedMs,
+				)
+			} else {
+				err = s.store.Transition(
+					ctx,
+					w.entityID,
+					w.phase,
+					w.note,
+					w.source,
+					w.ackResult,
+					w.detail,
+					w.updatedMs,
+				)
+			}
 			verified := err == nil
+			displacedVerified := verified && w.displaced && hasReader
 			if !verified && hasReader && ctx.Err() == nil {
 				if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil {
 					if got.PhaseState == w.phase || commandTransitions.IsTerminal(got.PhaseState) {
 						verified = true
+						displacedVerified = got.Displaced > 0
 					}
 				}
 			}
 			if verified {
 				s.mu.Lock()
+				meta := s.persistedAckMeta[w.entityID]
+				if displacedVerified {
+					meta.displaced = 1
+				}
 				if w.ackResult >= 0 {
-					meta := s.persistedAckMeta[w.entityID]
 					meta.ackAccounted = 1
 					meta.ackPoolMask |= ackPoolFormatV2Bit
-					if w.ackResult < 27 {
+					if w.ackResult < 28 {
 						meta.ackPoolMask |= 1 << uint(w.ackResult)
 					}
-					s.persistedAckMeta[w.entityID] = meta
 				}
+				s.persistedAckMeta[w.entityID] = meta
 				if cur, exists := s.pendingWrites[w.entityID]; exists && !cur.ackOnly && cur.phase == w.phase {
 					curMeta := s.persistedAckMeta[w.entityID]
+					needDisplacedPatch := hasReader && cur.displaced && curMeta.displaced == 0
 					needPoolPatch := hasReader && cur.ackResult < 0 &&
 						(cur.ackAccounted > curMeta.ackAccounted || (cur.ackPoolMask&^curMeta.ackPoolMask) != 0)
-					if !needPoolPatch {
+					if !needDisplacedPatch && !needPoolPatch {
 						delete(s.pendingWrites, w.entityID)
 					} else {
 						s.pendingWrites[w.entityID] = pendingCommandWrite{
 							entityID:     w.entityID,
 							ackOnly:      true,
+							displaced:    cur.displaced,
 							ackAccounted: cur.ackAccounted,
 							ackPoolMask:  cur.ackPoolMask,
 						}
@@ -2632,12 +2757,13 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			other.detail = CommitUnknownDetail
 			s.enqueueWriteLocked(pendingCommandWrite{
 				entityID:     other.entityID,
+				displaced:    other.targetDisplaced,
 				phase:        PhaseCommitUnknown,
 				note:         "superseded_by_emergency_disarm",
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(other.ackAccounted),
-				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[otherKey], other.ackAccounted, wasWrapHeld, other.targetDisplaced),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[otherKey], other.ackAccounted, wasWrapHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    dispatchNow.UnixMilli(),
 			})
@@ -3159,9 +3285,10 @@ func (s *Service) processDedupedCommandAck(sysid uint8, ackPeer netip.AddrPort, 
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
 				cmd.detail = CommitUnknownDetail
-				cmdMask := poolMaskForCmd(combinedSeenMask, cmd.ackAccounted, cmd.wrapReceiptHeld, cmd.targetDisplaced)
+				cmdMask := poolMaskForCmd(combinedSeenMask, cmd.ackAccounted, cmd.wrapReceiptHeld)
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,
+					displaced:    cmd.targetDisplaced,
 					phase:        PhaseCommitUnknown,
 					note:         "command_ack_ambiguous",
 					source:       lifecycle.TransitionSourceComponent,
@@ -3216,6 +3343,7 @@ func (s *Service) processDedupedCommandAck(sysid uint8, ackPeer netip.AddrPort, 
 	delete(s.inFlight, matched.entityID)
 	s.enqueueWriteLocked(pendingCommandWrite{
 		entityID:     matched.entityID,
+		displaced:    matched.targetDisplaced,
 		phase:        nextPhase,
 		note:         note,
 		source:       lifecycle.TransitionSourceComponent,
@@ -3367,12 +3495,13 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				cmd.detail = preemptDetail
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,
+					displaced:    cmd.targetDisplaced,
 					phase:        PhasePreempted,
 					note:         preemptNote,
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld, cmd.targetDisplaced),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 					detail:       preemptDetail,
 					updatedMs:    updatedMs,
 				})
@@ -3471,12 +3600,13 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					}
 					s.enqueueWriteLocked(pendingCommandWrite{
 						entityID:     cmd.entityID,
+						displaced:    cmd.targetDisplaced,
 						phase:        PhaseConfirmed,
 						note:         "reconciled_by_heartbeat",
 						source:       lifecycle.TransitionSourceComponent,
 						ackResult:    UnacknowledgedResult,
 						ackAccounted: boolToInt(cmd.ackAccounted),
-						ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld, cmd.targetDisplaced),
+						ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 						detail:       cmd.detail,
 						updatedMs:    updatedMs,
 					})
@@ -3664,12 +3794,13 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 			}
 			s.enqueueWriteLocked(pendingCommandWrite{
 				entityID:     cmd.entityID,
+				displaced:    cmd.targetDisplaced,
 				phase:        PhaseCommitUnknown,
 				note:         "command_ack_timeout",
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(cmd.ackAccounted),
-				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld, cmd.targetDisplaced),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    updatedMs,
 			})
@@ -3699,12 +3830,13 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 					}
 					s.enqueueWriteLocked(pendingCommandWrite{
 						entityID:     cmd.entityID,
+						displaced:    cmd.targetDisplaced,
 						phase:        PhaseConfirmed,
 						note:         "reconciled_by_heartbeat",
 						source:       lifecycle.TransitionSourceComponent,
 						ackResult:    UnacknowledgedResult,
 						ackAccounted: boolToInt(cmd.ackAccounted),
-						ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld, cmd.targetDisplaced),
+						ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 						detail:       cmd.detail,
 						updatedMs:    updatedMs,
 					})
