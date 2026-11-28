@@ -2569,14 +2569,45 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.keyboard.press("w");
     expect(teleopPosts).toHaveLength(0);
 
+    const settlePilotPaint = async (): Promise<void> => {
+      await page.waitForTimeout(250);
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
+    };
+
     // Let PilotWorkspace's DPR=2 SwiftShader canvases complete initial ResizeObserver allocation/paint/GC before starting the 240 ms teleop lease.
-    await page.waitForTimeout(250);
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-        ),
-    );
+    await settlePilotPaint();
+
+    // 2b. Held Space gesture on Quadcopter (#1) cancelled when workspace shortcut switches selection to SurfaceBoat (#3):
+    // releasing Space emits zero Engage requests until a fresh activation on #3.
+    await page.getByTestId("teleop-engage-btn").focus();
+    await page.keyboard.down(" ");
+    await page.keyboard.press("3");
+    await expect(panel).toHaveAttribute("data-sysid", "3");
+    await page.keyboard.up(" ");
+    await page.waitForTimeout(80);
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    expect(teleopPosts.filter((p) => p.engage === true)).toHaveLength(0);
+
+    await settlePilotPaint();
+    await page.getByTestId("teleop-engage-btn").focus();
+    await page.keyboard.press(" ");
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    expect(
+      teleopPosts.filter((p) => p.sysid === 3 && p.engage === true),
+    ).toHaveLength(1);
+    expect(
+      teleopPosts.filter((p) => p.sysid === 1 && p.engage === true),
+    ).toHaveLength(0);
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await page.keyboard.press("1");
+    await expect(panel).toHaveAttribute("data-sysid", "1");
+    await settlePilotPaint();
 
     // 3. Explicit Engage Teleop focuses velocity pad, streams 20 Hz #84 nudges on hold "w", updates live vehicle groundspeed, and zeroes on release.
     await page.getByTestId("teleop-engage-btn").click();

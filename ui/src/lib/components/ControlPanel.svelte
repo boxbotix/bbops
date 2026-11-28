@@ -63,7 +63,20 @@
     ),
   );
 
+  let trackedVehicleSysId: number | null = null;
   $effect(() => {
+    const nextSysId = vehicle.sysid;
+    if (trackedVehicleSysId !== null && trackedVehicleSysId !== nextSysId) {
+      if (pendingToggleIntent?.kind === "engage") {
+        pendingToggleIntent = {
+          kind: "cancelled",
+          sysid: pendingToggleIntent.sysid,
+          session: null,
+        };
+        suppressPadBlur = false;
+      }
+    }
+    trackedVehicleSysId = nextSysId;
     controller.reconcileVehicle(vehicle, freshnessContext);
   });
 
@@ -79,7 +92,7 @@
   let buttonKeyConsumed = false;
   let buttonKeyReleased = false;
   let pendingToggleIntent: {
-    readonly kind: "disengage" | "engage";
+    readonly kind: "disengage" | "engage" | "cancelled";
     readonly sysid: number;
     readonly session: string | null;
   } | null = null;
@@ -105,6 +118,14 @@
       }
       controller.handlePadKeyUp(ev);
     };
+    const clearReleasedPointerIntent = (): void => {
+      setTimeout(() => {
+        if (activeButtonKey === null) {
+          pendingToggleIntent = null;
+          suppressPadBlur = false;
+        }
+      }, 0);
+    };
     const onVisibilityChange = (): void => {
       if (
         typeof document !== "undefined" &&
@@ -115,10 +136,14 @@
     };
     window.addEventListener("blur", onWindowBlur);
     window.addEventListener("keyup", onWindowKeyUp);
+    window.addEventListener("pointerup", clearReleasedPointerIntent);
+    window.addEventListener("mouseup", clearReleasedPointerIntent);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.removeEventListener("blur", onWindowBlur);
       window.removeEventListener("keyup", onWindowKeyUp);
+      window.removeEventListener("pointerup", clearReleasedPointerIntent);
+      window.removeEventListener("mouseup", clearReleasedPointerIntent);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (!externalController && ownedController) {
         ownedController.dispose();
@@ -200,6 +225,8 @@
       activeButtonKey = null;
       buttonKeyConsumed = false;
       buttonKeyReleased = false;
+      pendingToggleIntent = null;
+      suppressPadBlur = false;
       return;
     }
     ev.preventDefault();
@@ -242,6 +269,12 @@
     suppressPadBlur = false;
     const intent = pendingToggleIntent;
     pendingToggleIntent = null;
+    if (
+      intent?.kind === "cancelled" ||
+      (intent?.kind === "engage" && intent.sysid !== vehicle.sysid)
+    ) {
+      return;
+    }
     if (intent?.kind === "disengage") {
       if (intent.session !== null) {
         await controller.disengageTeleop({

@@ -455,17 +455,16 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
 
       // 3. Inject P1 direct-crsf-override on WS1 -> sticks zero synchronously (<2ms), preemption banner latches,
       // and restoring P2 companion-teleop does NOT resume #84 nudges until explicit re-engage!
+      const preemptFrame = buildTransitionFrame(1, {
+        seq: 2,
+        kind: "heartbeat_edge",
+        authority: "direct-crsf-override",
+        companionMode: "hold-position",
+        linkTier: "sitl-local",
+        timestamp: nowMs + 100,
+      });
       const t0 = realPerfNow();
-      telemetryStore.ingestRawFrame(
-        buildTransitionFrame(1, {
-          seq: 2,
-          kind: "heartbeat_edge",
-          authority: "direct-crsf-override",
-          companionMode: "hold-position",
-          linkTier: "sitl-local",
-          timestamp: nowMs + 100,
-        }),
-      );
+      telemetryStore.ingestRawFrame(preemptFrame);
       const elapsedMs = realPerfNow() - t0;
       flushSync();
       expect(elapsedMs).toBeLessThan(2);
@@ -4031,6 +4030,229 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
         r();
       }
       await Promise.resolve();
+
+      unmount(panel);
+      host.remove();
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  it("cancels held Space or pointer Engage gestures when the selected vehicle changes before release", async () => {
+    vi.useFakeTimers();
+    try {
+      const nowMs = Date.parse("2026-11-28T04:00:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh1 = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      const veh3 = buildVehicleStoredPayload(
+        3,
+        {
+          "uxs.domain.kind": "surface-boat",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "direct-bench",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      for (const [idx, v] of [veh1, veh3].entries()) {
+        skgStore.ingestRawFrame(
+          JSON.stringify({
+            type: "put",
+            bucket: "ENTITY_STATES",
+            key: v.id,
+            revision: idx + 1,
+            payload: v,
+          }),
+        );
+      }
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 2,
+        }),
+      );
+
+      const sentTeleops: ControlTeleopRequest[] = [];
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        now: () => nowMs,
+        client: {
+          async submitCommand() {
+            throw new Error("unused");
+          },
+          async submitTeleop(req) {
+            sentTeleops.push({ ...req });
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: !req.stop,
+                expires_ms: nowMs + 240,
+              },
+            };
+          },
+        },
+      });
+
+      const viewportStore = createViewportStore();
+      viewportStore.selectEntity(veh1.id);
+
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const panel = mount(ControlPanel, {
+        target: host,
+        props: {
+          get vehicle() {
+            return skgStore.getVehicle(viewportStore.selectedEntityId!)!;
+          },
+          telemetryStore,
+          skgStore,
+          controller,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+
+      const btn = host.querySelector(
+        '[data-testid="teleop-engage-btn"]',
+      ) as HTMLButtonElement;
+      btn.focus();
+
+      // 1) Space held on #1 -> selection switches to #3 -> Space released: zero Engage requests!
+      btn.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      viewportStore.selectEntity(veh3.id);
+      flushSync();
+      expect(
+        host
+          .querySelector('[data-testid="control-panel"]')
+          ?.getAttribute("data-sysid"),
+      ).toBe("3");
+
+      btn.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops).toHaveLength(0);
+
+      // 2) Round-trip #3 -> #1 -> #3 while Space is held ALSO cancels Engage!
+      btn.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      viewportStore.selectEntity(veh1.id);
+      flushSync();
+      viewportStore.selectEntity(veh3.id);
+      flushSync();
+      btn.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops).toHaveLength(0);
+
+      // 3) Pointer press on #3 -> selection switches to #1 -> click release ALSO cancels Engage!
+      btn.dispatchEvent(
+        new MouseEvent("mousedown", {
+          button: 0,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      viewportStore.selectEntity(veh1.id);
+      flushSync();
+      btn.click();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops).toHaveLength(0);
+
+      // 4) Fresh Space press + release on #1 engages sysid=1 cleanly!
+      viewportStore.selectEntity(veh3.id);
+      flushSync();
+      btn.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      btn.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+      expect(controller.engaged).toBe(true);
+      expect(controller.engagedSysId).toBe(3);
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(1);
+      expect(sentTeleops[0]).toMatchObject({ sysid: 3, engage: true });
 
       unmount(panel);
       host.remove();

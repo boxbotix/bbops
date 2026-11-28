@@ -1489,10 +1489,10 @@ func validateCommandTarget(sysid uint8, actionSlug string, sitlOnly bool, target
 				Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
 			}
 		}
-		if target.TeleopUncertain &&
-			(target.TeleopUncertainReason == "supervisory_link_only" ||
-				target.TeleopUncertainReason == "supervisory_link_tier" ||
-				(target.UncertainLinkTier != "" && target.UncertainLinkTier != uxsvocab.LinkTierSITLLocal)) {
+		if (target.UncertainLinkTier != "" && target.UncertainLinkTier != uxsvocab.LinkTierSITLLocal) ||
+			(target.TeleopUncertain &&
+				(target.TeleopUncertainReason == "supervisory_link_only" ||
+					target.TeleopUncertainReason == "supervisory_link_tier")) {
 			effTier := target.UncertainLinkTier
 			if effTier == "" {
 				effTier = uxsvocab.LinkTierMeshSupervisory
