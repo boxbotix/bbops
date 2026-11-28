@@ -3489,3 +3489,158 @@ func TestTrackerRecoversAfterOver128LostPacketsAndHoldsWrappedDuplicateHeartbeat
 		}
 	})
 }
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerMultiWrapHistoryAndLossPreemption(t *testing.T) {
+	peer := netip.MustParseAddrPort("127.0.0.1:45212")
+	t0 := time.Date(2026, 11, 27, 23, 0, 0, 0, time.UTC)
+
+	hbTeleopArmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	hbTeleopDisarmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		false,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeDisarmed,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	hbOverrideArmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityDirectCRSFOverride,
+		mavcodec.ModeHoldPosition,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+
+	t.Run("two_wraps_preserve_prior_disarmed_history_at_seq1", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		// Cycle 0: seq=1 disarmed, seq=2 armed, telemetry seq=3..255, 0.
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopDisarmed}, peer, now)
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbTeleopArmed}, peer, now)
+		seq := uint8(2)
+		for i := 0; i < 254; i++ {
+			seq++
+			now = now.Add(2 * time.Millisecond)
+			_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+
+		// Cycle 1: seq=1 armed (overwrote single-state slot before fix!), telemetry seq=2..255, 0.
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopArmed}, peer, now)
+		seq = 1
+		for i := 0; i < 255; i++ {
+			seq++
+			now = now.Add(2 * time.Millisecond)
+			_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+
+		armedTarget, _ := tracker.ActuationTarget(1)
+
+		// Cycle 2: delayed copy of Cycle 0 (seq=1, Disarmed) arrives -> MUST still be held!
+		now = now.Add(10 * time.Millisecond)
+		outOld := tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopDisarmed}, peer, now)
+		if len(outOld.Events) != 0 || outOld.UrgentSKGSync {
+			t.Fatalf("two-wrap old (seq=1, Disarmed) emitted %+v, want held", outOld)
+		}
+		if snap, _ := tracker.Snapshot(1); !snap.Armed {
+			t.Fatal("Snapshot(1).Armed flipped false on two-wrap old (seq=1, Disarmed)")
+		}
+		if got, _ := tracker.ActuationTarget(1); !got.Armed || got.HeartbeatSeq != armedTarget.HeartbeatSeq || got.HeartbeatOrder != armedTarget.HeartbeatOrder {
+			t.Fatalf("ActuationTarget mutated on two-wrap old (seq=1, Disarmed): got %+v, want %+v", got, armedTarget)
+		}
+
+		// Corroborating disarmed HB at seq=2 confirms genuine disarmed transition!
+		now = now.Add(10 * time.Millisecond)
+		outCorr := tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbTeleopDisarmed}, peer, now)
+		if len(outCorr.Events) != 1 || outCorr.Events[0].Armed {
+			t.Fatalf("corroborated seq=2 disarmed outcome = %+v, want disarmed edge", outCorr)
+		}
+		if snap, _ := tracker.Snapshot(1); snap.Armed {
+			t.Fatal("Snapshot(1).Armed stayed true after corroborated seq=2 disarmed HB")
+		}
+	})
+
+	t.Run("override_after_199_lost_packets_and_post_wrap_seq1_preempts_immediately", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		// Packets 1..220 in companion-teleop.
+		for s := 1; s <= 220; s++ {
+			now = now.Add(2 * time.Millisecond)
+			var msg mavcodec.Message = mavcodec.AttitudeQuaternion{Q1: 1}
+			if s == 1 || s == 164 || s == 220 {
+				msg = hbTeleopArmed
+			}
+			_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: uint8(s), Message: msg}, peer, now)
+		}
+
+		// Lose 199 packets (221..255, 0..163); receive consecutive override heartbeats at seq=164 and seq=165.
+		now = now.Add(50 * time.Millisecond)
+		out164 := tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 164, Message: hbOverrideArmed}, peer, now)
+		if len(out164.Events) != 1 || out164.Events[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
+			t.Fatalf("seq=164 override after 199 lost packets events = %+v, want immediate direct-crsf-override edge", out164.Events)
+		}
+		target164, _ := tracker.ActuationTarget(1)
+		if target164.Authority != uxsvocab.AuthorityDirectCRSFOverride || target164.HeartbeatOrder != 0 {
+			t.Fatalf("target after unconfirmed seq=164 = %+v, want Authority=direct-crsf-override with uncertain HeartbeatOrder=0", target164)
+		}
+
+		now = now.Add(20 * time.Millisecond)
+		out165 := tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 165, Message: hbOverrideArmed}, peer, now)
+		if len(out165.Events) != 0 {
+			t.Fatalf("corroborating seq=165 override emitted duplicate events: %+v", out165.Events)
+		}
+		target165, _ := tracker.ActuationTarget(1)
+		if target165.Authority != uxsvocab.AuthorityDirectCRSFOverride || target165.HeartbeatOrder == 0 {
+			t.Fatalf("target after corroborated seq=165 = %+v, want confirmed HeartbeatOrder>0", target165)
+		}
+
+		// Subcase B: override at seq=1, companion at seq=2, telemetry through wrap, genuine override at seq=1.
+		trackerWrap, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker wrap: %v", err)
+		}
+		now = t0
+		_ = trackerWrap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbOverrideArmed}, peer, now)
+		now = now.Add(5 * time.Millisecond)
+		_ = trackerWrap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbTeleopArmed}, peer, now)
+		seq := uint8(2)
+		for i := 0; i < 254; i++ {
+			seq++
+			now = now.Add(2 * time.Millisecond)
+			_ = trackerWrap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+
+		now = now.Add(10 * time.Millisecond)
+		outWrapOv := trackerWrap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbOverrideArmed}, peer, now)
+		if len(outWrapOv.Events) != 1 || outWrapOv.Events[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
+			t.Fatalf("post-wrap seq=1 override events = %+v, want immediate direct-crsf-override edge", outWrapOv.Events)
+		}
+		wrapTarget1, _ := trackerWrap.ActuationTarget(1)
+		if wrapTarget1.Authority != uxsvocab.AuthorityDirectCRSFOverride || wrapTarget1.HeartbeatOrder != 0 {
+			t.Fatalf("post-wrap seq=1 target = %+v, want Authority=direct-crsf-override with uncertain HeartbeatOrder=0", wrapTarget1)
+		}
+
+		now = now.Add(10 * time.Millisecond)
+		_ = trackerWrap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbOverrideArmed}, peer, now)
+		wrapTarget2, _ := trackerWrap.ActuationTarget(1)
+		if wrapTarget2.Authority != uxsvocab.AuthorityDirectCRSFOverride || wrapTarget2.HeartbeatOrder == 0 {
+			t.Fatalf("post-wrap corroborated seq=2 target = %+v, want HeartbeatOrder>0", wrapTarget2)
+		}
+	})
+}

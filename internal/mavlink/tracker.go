@@ -185,11 +185,20 @@ func hbStateKeyOf(snap uxsvocab.VehicleSnapshot) hbStateKey {
 	}
 }
 
+type hbStateEntry struct {
+	state      hbStateKey
+	firstOrder uint64
+	lastOrder  uint64
+}
+
 type hbFrameSlot struct {
 	active      bool
+	overflowed  bool
 	packetOrder uint64
-	state       hbStateKey
+	entries     []hbStateEntry
 }
+
+const maxHbSlotStates = 16
 
 type authorityObsRecord struct {
 	rev   uint64
@@ -257,6 +266,64 @@ func isPreemptAuthority(auth string) bool {
 	return auth == uxsvocab.AuthorityDirectCRSFOverride || auth == uxsvocab.AuthorityMCUFailsafe
 }
 
+func (s *vehicleSession) recordHbSlot(seq uint8, hbOrder uint64, state hbStateKey) {
+	slot := &s.seenHbFrames[seq]
+	slot.active = true
+	if hbOrder > slot.packetOrder {
+		slot.packetOrder = hbOrder
+	}
+	for i := range slot.entries {
+		if slot.entries[i].state == state {
+			if hbOrder < slot.entries[i].firstOrder {
+				slot.entries[i].firstOrder = hbOrder
+			}
+			if hbOrder > slot.entries[i].lastOrder {
+				slot.entries[i].lastOrder = hbOrder
+			}
+			return
+		}
+	}
+	if len(slot.entries) >= maxHbSlotStates {
+		slot.overflowed = true
+		return
+	}
+	slot.entries = append(slot.entries, hbStateEntry{
+		state:      state,
+		firstOrder: hbOrder,
+		lastOrder:  hbOrder,
+	})
+}
+
+func (s *vehicleSession) wasHbStateSeenInPriorCycle(seq uint8, hbOrder uint64, state hbStateKey) bool {
+	slot := &s.seenHbFrames[seq]
+	if !slot.active {
+		return false
+	}
+	if slot.overflowed && hbOrder > 256 {
+		return true
+	}
+	for i := range slot.entries {
+		if slot.entries[i].state == state && hbOrder >= slot.entries[i].firstOrder+256 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *vehicleSession) hasHbStateAtOrder(seq uint8, order uint64, state hbStateKey) bool {
+	slot := &s.seenHbFrames[seq]
+	if !slot.active || order == 0 {
+		return false
+	}
+	for i := range slot.entries {
+		if slot.entries[i].state == state &&
+			(slot.entries[i].firstOrder == order || slot.entries[i].lastOrder == order) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *vehicleSession) clearPendingGap() {
 	s.hasPendingGap = false
 	s.pendingGapHasAck = false
@@ -275,16 +342,15 @@ func (s *vehicleSession) clearPendingWrapHb() {
 }
 
 func (s *vehicleSession) shouldHoldWrapHeartbeat(seq uint8, hbOrder uint64, prev, next uxsvocab.VehicleSnapshot) bool {
-	prevHb := s.seenHbFrames[seq]
 	curKey := hbStateKeyOf(prev)
 	nextKey := hbStateKeyOf(next)
-	if !prevHb.active || hbOrder < prevHb.packetOrder+256 || prevHb.state != nextKey || curKey == nextKey {
+	if !s.wasHbStateSeenInPriorCycle(seq, hbOrder, nextKey) || (curKey == nextKey && s.snapHbOrder > 0) {
 		return false
 	}
 	if s.hasPendingWrapHb &&
 		s.pendingWrapHbKey == nextKey &&
 		hbOrder > s.pendingWrapHbOrder &&
-		(seq != s.pendingWrapHbSeq || hbOrder >= s.pendingWrapHbOrder+256) {
+		seq != s.pendingWrapHbSeq {
 		return false
 	}
 	s.hasPendingWrapHb = true
@@ -301,13 +367,13 @@ func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 }
 
-func (s *vehicleSession) isUnconfirmedGapDelta(delta uint8) bool {
+func (s *vehicleSession) isUnconfirmedGapDelta(seq, delta uint8) bool {
 	if delta >= 65 && delta <= 191 {
 		return true
 	}
 	if delta >= 192 && delta <= 254 {
 		back := uint64(256 - uint16(delta))
-		return s.seqStreamPos <= back
+		return s.seqStreamPos <= back || s.seenSeqOrder[seq] == s.seqStreamPos-back
 	}
 	return false
 }
@@ -325,7 +391,7 @@ func (s *vehicleSession) evaluateHeartbeatSeq(seq uint8) (hbOrder uint64, confir
 			return 0, false, true
 		}
 		pos := s.seqStreamPos + uint64(s.pendingGapDelta)
-		if dupHbAt(pos) || (prevHb.active && s.seqStreamPos < prevHb.packetOrder+255) {
+		if dupHbAt(pos) {
 			return pos, false, true
 		}
 		return pos, false, false
@@ -345,9 +411,9 @@ func (s *vehicleSession) evaluateHeartbeatSeq(seq uint8) (hbOrder uint64, confir
 		}
 		return pos, true, false
 	}
-	if s.isUnconfirmedGapDelta(delta) {
+	if s.isUnconfirmedGapDelta(seq, delta) {
 		pos := s.seqStreamPos + uint64(delta)
-		if dupHbAt(pos) || (prevHb.active && s.seqStreamPos < prevHb.packetOrder+255) {
+		if dupHbAt(pos) {
 			return pos, false, true
 		}
 		return pos, false, false
@@ -388,7 +454,7 @@ func (s *vehicleSession) advanceTelemetrySeq(seq uint8) {
 		s.seenSeqOrder[seq] = s.seqStreamPos
 		return
 	}
-	if s.isUnconfirmedGapDelta(delta) {
+	if s.isUnconfirmedGapDelta(seq, delta) {
 		s.hasPendingGap = true
 		s.pendingGapSeq = seq
 		s.pendingGapDelta = delta
@@ -773,11 +839,7 @@ func (t *Tracker) commitConfirmedHeartbeatLocked(
 	}
 	sess.snapHbOrder = hbOrder
 	sess.seenSeqOrder[seq] = hbOrder
-	sess.seenHbFrames[seq] = hbFrameSlot{
-		active:      true,
-		packetOrder: hbOrder,
-		state:       hbStateKeyOf(next),
-	}
+	sess.recordHbSlot(seq, hbOrder, hbStateKeyOf(next))
 	sess.recordAuthorityObservation(wallUTC)
 
 	var events []TransitionEvent
@@ -814,6 +876,53 @@ func (t *Tracker) commitConfirmedHeartbeatLocked(
 		urgent = true
 	}
 	return events, urgent
+}
+
+func (t *Tracker) applyUncorroboratedPreemptLocked(
+	sess *vehicleSession,
+	sysid, seq uint8,
+	prev, next uxsvocab.VehicleSnapshot,
+	wallUTC, monoSample time.Time,
+) ([]TransitionEvent, bool) {
+	reasons := diffHeartbeatReasons(prev, next)
+	sess.snap = next
+	sess.rev++
+	sess.heartbeatSeq++
+	if prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier {
+		sess.authorityEpoch++
+	}
+	if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) {
+		sess.lastHbMonoAt = monoSample
+	}
+	sess.snapHbOrder = 0
+	sess.recordAuthorityObservation(wallUTC)
+	if len(reasons) == 0 {
+		return nil, false
+	}
+	prevAuth := ""
+	if prev.Authority != next.Authority {
+		prevAuth = prev.Authority
+	}
+	return []TransitionEvent{{
+		SysID:                sysid,
+		EntityID:             next.EntityID(),
+		Domain:               next.Domain,
+		Seq:                  seq,
+		MsgID:                mavcodec.MsgIDHeartbeat,
+		Kind:                 EventKindHeartbeatEdge,
+		Reasons:              reasons,
+		Armed:                next.Armed,
+		Authority:            next.Authority,
+		PrevAuthority:        prevAuth,
+		AuthorityIncarnation: t.incarnation,
+		AuthorityEpoch:       sess.authorityEpoch,
+		ObservationRev:       sess.obsRev,
+		CompanionMode:        next.CompanionMode,
+		LinkTier:             next.LinkTier,
+		Flags:                next.Flags,
+		Failsafes:            next.Failsafes,
+		Timestamp:            wallUTC.UnixMilli(),
+	}}, true
 }
 
 func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysid, seq uint8) ([]TransitionEvent, bool) {
@@ -853,23 +962,32 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 		sess.lastStreamSeq = gapSeq
 		if hadHb {
 			if hadHbApplied {
-				if gapOrder > sess.lastHbOrder {
-					sess.lastHbOrder = gapOrder
-				}
-				sess.snapHbOrder = gapOrder
 				if appliedNext, ok := applyHeartbeatFields(sess.snap, gapHbVh, gapHbWall); ok {
-					sess.seenHbFrames[gapSeq] = hbFrameSlot{
-						active:      true,
-						packetOrder: gapOrder,
-						state:       hbStateKeyOf(appliedNext),
+					appliedKey := hbStateKeyOf(appliedNext)
+					if sess.wasHbStateSeenInPriorCycle(gapSeq, gapOrder, appliedKey) {
+						sess.hasPendingWrapHb = true
+						sess.pendingWrapHbSeq = gapSeq
+						sess.pendingWrapHbOrder = gapOrder
+						sess.pendingWrapHbKey = appliedKey
+					} else {
+						if gapOrder > sess.lastHbOrder {
+							sess.lastHbOrder = gapOrder
+						}
+						sess.snapHbOrder = gapOrder
+						sess.recordHbSlot(gapSeq, gapOrder, appliedKey)
 					}
 				}
 				return nil, false
 			}
 			prev := sess.snap
 			next, ok := applyHeartbeatFields(prev, gapHbVh, gapHbWall)
-			if ok && !sess.shouldHoldWrapHeartbeat(gapSeq, gapOrder, prev, next) {
-				return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, prev, next, gapOrder, false, gapHbWall, gapHbMono)
+			if ok {
+				if !sess.shouldHoldWrapHeartbeat(gapSeq, gapOrder, prev, next) {
+					return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, prev, next, gapOrder, false, gapHbWall, gapHbMono)
+				}
+				if isPreemptAuthority(next.Authority) {
+					return t.applyUncorroboratedPreemptLocked(sess, sysid, gapSeq, prev, next, gapHbWall, gapHbMono)
+				}
 			}
 		}
 		return nil, false
@@ -936,11 +1054,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			snapHbOrder:    1,
 			linkEpoch:      1,
 		}
-		newSess.seenHbFrames[seq] = hbFrameSlot{
-			active:      true,
-			packetOrder: 1,
-			state:       hbStateKeyOf(*snap),
-		}
+		newSess.recordHbSlot(seq, 1, hbStateKeyOf(*snap))
 		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 		newSess.recordAuthorityObservation(wallUTC)
 		t.sessions[sysid] = newSess
@@ -980,53 +1094,23 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			}
 		}
 		if !confirmedOrder {
+			prevHb := sess.seenHbFrames[seq]
+			priorStreamPos := sess.seqStreamPos
 			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 			var preemptEvents []TransitionEvent
 			preemptUrgent := false
 			prev := sess.snap
 			next, ok := applyHeartbeatFields(prev, vh, wallUTC)
 			appliedPreempt := false
-			if ok && isPreemptAuthority(next.Authority) && !sess.shouldHoldWrapHeartbeat(seq, hbOrder, prev, next) {
-				sess.clearPendingWrapHb()
-				reasons := diffHeartbeatReasons(prev, next)
-				sess.snap = next
-				sess.rev++
-				sess.heartbeatSeq++
-				if prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier {
-					sess.authorityEpoch++
+			if ok && isPreemptAuthority(next.Authority) {
+				sameRecentDup := prevHb.active &&
+					priorStreamPos < prevHb.packetOrder+255 &&
+					sess.hasHbStateAtOrder(seq, prevHb.packetOrder, hbStateKeyOf(next))
+				if !sameRecentDup {
+					sess.clearPendingWrapHb()
+					preemptEvents, preemptUrgent = t.applyUncorroboratedPreemptLocked(sess, sysid, seq, prev, next, wallUTC, monoSample)
+					appliedPreempt = true
 				}
-				if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) {
-					sess.lastHbMonoAt = monoSample
-				}
-				sess.recordAuthorityObservation(wallUTC)
-				if len(reasons) > 0 {
-					prevAuth := ""
-					if prev.Authority != next.Authority {
-						prevAuth = prev.Authority
-					}
-					preemptEvents = append(preemptEvents, TransitionEvent{
-						SysID:                sysid,
-						EntityID:             next.EntityID(),
-						Domain:               next.Domain,
-						Seq:                  seq,
-						MsgID:                mavcodec.MsgIDHeartbeat,
-						Kind:                 EventKindHeartbeatEdge,
-						Reasons:              reasons,
-						Armed:                next.Armed,
-						Authority:            next.Authority,
-						PrevAuthority:        prevAuth,
-						AuthorityIncarnation: t.incarnation,
-						AuthorityEpoch:       sess.authorityEpoch,
-						ObservationRev:       sess.obsRev,
-						CompanionMode:        next.CompanionMode,
-						LinkTier:             next.LinkTier,
-						Flags:                next.Flags,
-						Failsafes:            next.Failsafes,
-						Timestamp:            wallUTC.UnixMilli(),
-					})
-					preemptUrgent = true
-				}
-				appliedPreempt = true
 			}
 			if sess.hasPendingGap && sess.pendingGapSeq == seq {
 				sess.pendingGapHasHb = true
@@ -1050,6 +1134,16 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		return IngestOutcome{CountedError: true}
 	}
 	if !wasLost && sess.shouldHoldWrapHeartbeat(seq, hbOrder, prev, next) {
+		if isPreemptAuthority(next.Authority) {
+			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+			preemptEvents, preemptUrgent := t.applyUncorroboratedPreemptLocked(sess, sysid, seq, prev, next, wallUTC, monoSample)
+			return IngestOutcome{
+				Accepted:      true,
+				SysID:         sysid,
+				Events:        append(gapEvents, preemptEvents...),
+				UrgentSKGSync: gapUrgent || preemptUrgent,
+			}
+		}
 		return IngestOutcome{
 			Accepted:      true,
 			SysID:         sysid,

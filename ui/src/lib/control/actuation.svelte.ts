@@ -213,6 +213,7 @@ export interface ActuationController {
   readonly activeSysId: number | null;
   readonly engaged: boolean;
   readonly engagedSysId: number | null;
+  readonly engagedSession: string | null;
   readonly leaseRenewalPending: boolean;
   readonly frame: TeleopFrame;
   readonly axes: TeleopAxes;
@@ -238,6 +239,7 @@ export interface ActuationController {
   disengageTeleop(options?: { sendZero?: boolean }): Promise<void>;
   setPadVector(normX: number, normY: number, dragging: boolean): void;
   releasePadPointer(): void;
+  clearHeldMovement(): void;
   handlePadKeyDown(event: PadKeyEventLike): boolean;
   handlePadKeyUp(event: PadKeyEventLike): boolean;
   handleFocusLoss(): void;
@@ -724,7 +726,7 @@ export function createActuationController(
   let timerGen = 0;
   let engageCounter = 0;
   let engagedEntityId: string | null = null;
-  let engagedSession: string | null = null;
+  let engagedSession = $state<string | null>(null);
   let teleopSeq = 0;
   let lastFreshnessContext: FleetFreshnessContext | undefined;
 
@@ -977,6 +979,7 @@ export function createActuationController(
       authorityIncarnation?: string;
       authorityEpoch?: number;
     },
+    onSettledBeforeFollowup?: () => void,
   ): Promise<boolean> {
     if (engagedSysId !== sysid || engagedSession === null) {
       return Promise.resolve(false);
@@ -1031,6 +1034,7 @@ export function createActuationController(
       })
       .then(
         (res) => {
+          onSettledBeforeFollowup?.();
           if (engagedSession === session && !engageFlag) {
             removeInFlightRenewal(seq);
           }
@@ -1115,6 +1119,7 @@ export function createActuationController(
           return true;
         },
         (err: unknown) => {
+          onSettledBeforeFollowup?.();
           if (engagedSession === session && !engageFlag) {
             removeInFlightRenewal(seq);
           }
@@ -1138,11 +1143,19 @@ export function createActuationController(
       return;
     }
     timerRenewalsInFlight += 1;
-    void dispatchTeleopNudge(sysid, false).finally(() => {
+    let released = false;
+    const releaseSlot = (): void => {
+      if (released) {
+        return;
+      }
+      released = true;
       if (timerGen === gen && timerRenewalsInFlight > 0) {
         timerRenewalsInFlight -= 1;
       }
-    });
+    };
+    void dispatchTeleopNudge(sysid, false, undefined, releaseSlot).finally(
+      releaseSlot,
+    );
   }
 
   function startTeleopTimer(sysid: number): void {
@@ -1509,6 +1522,26 @@ export function createActuationController(
     return true;
   }
 
+  function clearHeldMovement(): void {
+    const hadMovement =
+      heldKeys.size > 0 ||
+      pointerDragging ||
+      padNormX !== 0 ||
+      padNormY !== 0 ||
+      axes.vx !== 0 ||
+      axes.vy !== 0 ||
+      axes.vz !== 0 ||
+      axes.yawRate !== 0;
+    resetStickState();
+    if (hadMovement && engagedSysId !== null && leaseAccepted) {
+      if (hasConfirmedLeaseForDispatch()) {
+        void dispatchTeleopNudge(engagedSysId, false);
+      } else if (!hasPendingRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+      }
+    }
+  }
+
   function handleFocusLoss(): void {
     if (engagedSysId !== null) {
       void disengageTeleop({ sendZero: true });
@@ -1606,6 +1639,14 @@ export function createActuationController(
         ? engagedSysId
         : null;
     },
+    get engagedSession() {
+      return leaseAccepted &&
+        engagedSysId !== null &&
+        engagedSysId === activeSysId &&
+        hasSessionOrRenewalWindow()
+        ? engagedSession
+        : null;
+    },
     get leaseRenewalPending() {
       return (
         engagedSysId !== null &&
@@ -1665,6 +1706,7 @@ export function createActuationController(
     disengageTeleop,
     setPadVector,
     releasePadPointer,
+    clearHeldMovement,
     handlePadKeyDown,
     handlePadKeyUp,
     handleFocusLoss,

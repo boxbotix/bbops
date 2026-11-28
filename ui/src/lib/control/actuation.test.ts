@@ -3213,4 +3213,395 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       vi.useRealTimers();
     }
   });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  it("clears held movement keys when focus leaves the pad onto the toggle button and keyup occurs off-pad during renewal grace", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-27T21:15:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      let stallRenewals = false;
+      const sentTeleops: ControlTeleopRequest[] = [];
+      const stalledResolvers: Array<
+        (res: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void
+      > = [];
+
+      const client: ControlClient = {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          sentTeleops.push(req);
+          if (stallRenewals && !req.engage && !req.stop) {
+            return await new Promise((resolve) => {
+              stalledResolvers.push(resolve);
+            });
+          }
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: nowMs + 240,
+            },
+          };
+        },
+      };
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        client,
+        now: () => nowMs,
+      });
+
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const panel = mount(ControlPanel, {
+        target: host,
+        props: {
+          get vehicle() {
+            return skgStore.getVehicle(veh.id)!;
+          },
+          telemetryStore,
+          skgStore,
+          client,
+          controller,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+
+      const getPadEl = (): HTMLDivElement =>
+        host.querySelector('[data-testid="teleop-velocity-pad"]')!;
+      const getEngageBtn = (): HTMLButtonElement =>
+        host.querySelector('[data-testid="teleop-engage-btn"]')!;
+
+      let hbSeq = 0;
+      const stepHealthyMs = async (deltaMs: number): Promise<void> => {
+        nowMs += deltaMs;
+        hbSeq += 1;
+        telemetryStore.ingestRawFrame(
+          buildTransitionFrame(1, {
+            seq: hbSeq,
+            kind: "heartbeat_edge",
+            authority: "companion-teleop",
+            linkTier: "sitl-local",
+            timestamp: nowMs,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(deltaMs);
+        flushSync();
+      };
+
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      flushSync();
+      getPadEl().focus();
+      stallRenewals = true;
+
+      // Hold W on the velocity pad -> immediate forward velocity request (vx: 4).
+      getPadEl().dispatchEvent(
+        new KeyboardEvent("keydown", { key: "w", bubbles: true }),
+      );
+      flushSync();
+      expect(controller.axes.vx).toBe(4);
+      expect(sentTeleops.at(-1)?.vx).toBe(4);
+
+      // Advance into unconfirmed renewal grace (+250ms > +240ms initial deadline, < +340ms +100ms renewal bound).
+      await stepHealthyMs(50);
+      await stepHealthyMs(50);
+      await stepHealthyMs(150);
+      expect(controller.engaged).toBe(false);
+      expect(controller.leaseRenewalPending).toBe(true);
+      expect(controller.axes.vx).toBe(0);
+
+      // Move focus from the velocity pad onto the toggle button and release W on the toggle button.
+      getPadEl().dispatchEvent(
+        new FocusEvent("blur", { relatedTarget: getEngageBtn() }),
+      );
+      getEngageBtn().focus();
+      getEngageBtn().dispatchEvent(
+        new KeyboardEvent("keyup", { key: "w", bubbles: true }),
+      );
+      flushSync();
+
+      // Delayed +100ms renewal succeeds at +260ms; next teleop request MUST send vx: 0 (never stale vx: 4).
+      stallRenewals = false;
+      const countBeforeRecovery = sentTeleops.length;
+      await stepHealthyMs(10);
+      stalledResolvers.pop()?.({
+        ok: true,
+        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 80 },
+      });
+      stalledResolvers.length = 0;
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(true);
+      expect(controller.axes.vx).toBe(0);
+      expect(sentTeleops.length).toBeGreaterThan(countBeforeRecovery);
+      for (const pkt of sentTeleops.slice(countBeforeRecovery)) {
+        expect(pkt.vx).toBe(0);
+      }
+
+      unmount(panel);
+      host.remove();
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  // spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+  it("never opens a new teleop session when a click intended to disengage crosses lease expiry before release", async () => {
+    vi.useFakeTimers();
+    try {
+      let nowMs = Date.parse("2026-11-27T21:30:00.000Z");
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => nowMs,
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => nowMs,
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(nowMs - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      let mode: "drop-renewals" | "stall-renewals" = "drop-renewals";
+      const sentTeleops: ControlTeleopRequest[] = [];
+      const stalledResolvers: Array<
+        (res: Awaited<ReturnType<ControlClient["submitTeleop"]>>) => void
+      > = [];
+
+      const client: ControlClient = {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          sentTeleops.push(req);
+          if (!req.engage && !req.stop) {
+            if (mode === "drop-renewals") {
+              return {
+                ok: false,
+                error: {
+                  code: "teleop_seq_superseded",
+                  message: "simulated dropped renewal",
+                  status: 409,
+                },
+              };
+            }
+            return await new Promise((resolve) => {
+              stalledResolvers.push(resolve);
+            });
+          }
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: !req.stop,
+              expires_ms: nowMs + 240,
+            },
+          };
+        },
+      };
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        client,
+        now: () => nowMs,
+      });
+
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const panel = mount(ControlPanel, {
+        target: host,
+        props: {
+          get vehicle() {
+            return skgStore.getVehicle(veh.id)!;
+          },
+          telemetryStore,
+          skgStore,
+          client,
+          controller,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+
+      const getEngageBtn = (): HTMLButtonElement =>
+        host.querySelector('[data-testid="teleop-engage-btn"]')!;
+
+      let hbSeq = 0;
+      const stepHealthyMs = async (deltaMs: number): Promise<void> => {
+        nowMs += deltaMs;
+        hbSeq += 1;
+        telemetryStore.ingestRawFrame(
+          buildTransitionFrame(1, {
+            seq: hbSeq,
+            kind: "heartbeat_edge",
+            authority: "companion-teleop",
+            linkTier: "sitl-local",
+            timestamp: nowMs,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(deltaMs);
+        flushSync();
+      };
+
+      // Case A: Full lease expiry between pointerdown (239ms) and click release (241ms).
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      flushSync();
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(1);
+
+      await stepHealthyMs(239); // 239ms -> still engaged ("Disengage Teleop")
+      expect(controller.engaged).toBe(true);
+      expect(getEngageBtn().textContent?.trim()).toBe("Disengage Teleop");
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerdown", { button: 0, bubbles: true }),
+      );
+      await stepHealthyMs(2); // 241ms -> confirmed lease expired at 240ms
+      expect(controller.engaged).toBe(false);
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerup", { button: 0, bubbles: true }),
+      );
+      getEngageBtn().click();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(1);
+
+      // Case B: Confirmed lease crosses into pending renewal grace between pointerdown (239ms) and click (241ms):
+      // disengages the pending session (stop: true) and still sends zero new engage requests!
+      mode = "stall-renewals";
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      flushSync();
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(2);
+
+      await stepHealthyMs(50);
+      await stepHealthyMs(50);
+      await stepHealthyMs(139); // +239ms -> still engaged ("Disengage Teleop")
+      expect(controller.engaged).toBe(true);
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerdown", { button: 0, bubbles: true }),
+      );
+      await stepHealthyMs(2); // +241ms -> crossed into leaseRenewalPending
+      expect(controller.engaged).toBe(false);
+      expect(controller.leaseRenewalPending).toBe(true);
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerup", { button: 0, bubbles: true }),
+      );
+      getEngageBtn().click();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(controller.leaseRenewalPending).toBe(false);
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(2);
+      expect(sentTeleops.at(-1)?.stop).toBe(true);
+      stalledResolvers.length = 0;
+
+      unmount(panel);
+      host.remove();
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

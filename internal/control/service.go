@@ -1078,12 +1078,23 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		return -1
 	})
 
+	hasExplicitWrapFlags := make(map[cmdKey]bool)
+	for _, ce := range preRestartSent {
+		if (ce.AckPoolMask & (ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0 {
+			hasExplicitWrapFlags[cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}] = true
+		}
+	}
+	concreteResultMask := make(map[cmdKey]uint64)
+
 	s.mu.Lock()
 	for _, ce := range preRestartSent {
 		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}
+		priorConcreteMask := concreteResultMask[key]
 		var mask uint64
 		if ce.AckResult >= 0 && ce.AckResult < 64 {
-			mask |= uint64(1) << uint(ce.AckResult)
+			bit := uint64(1) << uint(ce.AckResult)
+			mask |= bit
+			concreteResultMask[key] |= bit
 		}
 		if ce.AckPoolMask > 0 {
 			mask |= uint64(ce.AckPoolMask & ackPoolResultMask)
@@ -1092,13 +1103,22 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			s.seenAckResultMask[key] |= mask
 			s.preResetAckResultMask[key] |= mask
 		}
+		legacyWrapHeld := !hasExplicitWrapFlags[key] &&
+			ce.AckResult < 0 &&
+			ce.AckAccounted > 0 &&
+			mask != 0 &&
+			(mask&^priorConcreteMask) == 0
 		wrapHeld := ce.AckResult < 0 &&
-			(ce.AckPoolMask&ackPoolWrapHeldBit) != 0 &&
-			(ce.AckPoolMask&ackPoolWrapSettledBit) == 0
+			(ce.AckPoolMask&ackPoolWrapSettledBit) == 0 &&
+			((ce.AckPoolMask&ackPoolWrapHeldBit) != 0 || legacyWrapHeld)
 		accounted := ce.AckAccounted > 0 || ce.AckResult >= 0
+		persistedMask := ce.AckPoolMask | poolMaskInt(mask)
+		if wrapHeld {
+			persistedMask |= ackPoolWrapHeldBit
+		}
 		s.persistedAckMeta[ce.ID] = ackMetaState{
 			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
-			ackPoolMask:  ce.AckPoolMask | poolMaskInt(mask),
+			ackPoolMask:  persistedMask,
 		}
 		if accounted && ce.AckResult < 0 {
 			s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], ce.ID)
@@ -2427,7 +2447,7 @@ func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, ba
 		if baselineHbSeq == 0 && target.HeartbeatObservedUnixNs <= baselineNs {
 			return false
 		}
-		if target.HeartbeatOrder > 0 || baselinePacketOrder > 0 {
+		if target.HeartbeatOrder > 0 || baselinePacketOrder > 0 || target.PacketOrder > 0 {
 			return target.HeartbeatOrder > baselinePacketOrder
 		}
 		return target.HeartbeatObservedUnixNs > baselineNs
@@ -2573,6 +2593,10 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	seenBeforeSeqReset := ack.Result < 64 && (s.preResetAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
 	seqMasks := s.seenAckResultMaskBySeq[key]
 	seenSameSeqResultBefore := hasSeq && seqMasks != nil && ack.Result < 64 && (seqMasks[seq]&(uint64(1)<<ack.Result)) != 0
+	couldBeAccountedDuplicate := seenBeforeSeqReset ||
+		ackOrderUncertain ||
+		(hasSeq && seenSameSeqResultBefore) ||
+		(!hasSeq && seenSameResultBefore)
 	if ack.Result < 64 {
 		s.seenAckResultMask[key] |= uint64(1) << ack.Result
 		if hasSeq {
@@ -2608,12 +2632,14 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
 				}
 			} else if s.wrapAckCredit[key] > 0 {
-				s.wrapAckCredit[key]--
-				if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
-					creditID := ids[0]
-					s.wrapCreditIDs[key] = ids[1:]
-					if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
-						wroteAck = true
+				if !couldBeAccountedDuplicate {
+					s.wrapAckCredit[key]--
+					if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+						creditID := ids[0]
+						s.wrapCreditIDs[key] = ids[1:]
+						if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
+							wroteAck = true
+						}
 					}
 				}
 			} else {
@@ -2671,18 +2697,22 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		wroteAny := false
 		markAllAmbiguous := nonWrapAmbiguous
 		if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
-			s.wrapAckCredit[key]--
-			if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
-				creditID := ids[0]
-				s.wrapCreditIDs[key] = ids[1:]
-				if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
-					wroteAny = true
+			if !couldBeAccountedDuplicate {
+				s.wrapAckCredit[key]--
+				if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+					creditID := ids[0]
+					s.wrapCreditIDs[key] = ids[1:]
+					if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
+						wroteAny = true
+					}
 				}
 			}
 			markAllAmbiguous = true
 		} else if s.recovered.Load() && priorUnacked > 0 {
 			s.unackedCount[key] = priorUnacked - 1
+			hadDetached := false
 			if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
+				hadDetached = true
 				detachedID := ids[0]
 				s.unackedDetachedIDs[key] = ids[1:]
 				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
@@ -2695,14 +2725,16 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 					}
 				}
 			}
-			if !nonWrapAmbiguous && len(matches) == 1 && !holdingWrapReceipt {
+			if !hadDetached && priorUnacked == 1 && len(matches) == 1 && !holdingWrapReceipt && couldBeAccountedDuplicate {
 				matches[0].wrapReceiptHeld = true
 			}
 		} else if s.recovered.Load() && priorUnacked == 0 {
 			if holdingWrapReceipt {
-				matches[0].wrapReceiptHeld = false
-				if s.enqueueConsumedAckLocked(matches[0].entityID, 1, settledWrapMask) {
-					wroteAny = true
+				if !couldBeAccountedDuplicate {
+					matches[0].wrapReceiptHeld = false
+					if s.enqueueConsumedAckLocked(matches[0].entityID, 1, settledWrapMask) {
+						wroteAny = true
+					}
 				}
 				markAllAmbiguous = true
 			} else {

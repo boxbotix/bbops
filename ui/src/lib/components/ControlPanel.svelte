@@ -75,6 +75,10 @@
   let currentEastMps = $state("1.2");
   let activePointerId: number | null = null;
   let suppressPadBlur = false;
+  let pendingToggleIntent: {
+    readonly kind: "disengage" | "engage";
+    readonly session: string | null;
+  } | null = null;
 
   $effect(() => {
     if (!safety.isSitlLocal && sitlLabOpen) {
@@ -86,6 +90,9 @@
     const onWindowBlur = (): void => {
       controller.handleFocusLoss();
     };
+    const onWindowKeyUp = (ev: KeyboardEvent): void => {
+      controller.handlePadKeyUp(ev);
+    };
     const onVisibilityChange = (): void => {
       if (
         typeof document !== "undefined" &&
@@ -95,9 +102,11 @@
       }
     };
     window.addEventListener("blur", onWindowBlur);
+    window.addEventListener("keyup", onWindowKeyUp);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.removeEventListener("blur", onWindowBlur);
+      window.removeEventListener("keyup", onWindowKeyUp);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (!externalController && ownedController) {
         ownedController.dispose();
@@ -126,8 +135,42 @@
     }
   }
 
+  function captureEngageToggleIntent(): void {
+    if (controller.engaged || controller.leaseRenewalPending) {
+      suppressPadBlur = true;
+    }
+    pendingToggleIntent = {
+      kind: controller.engaged ? "disengage" : "engage",
+      session: controller.engagedSession,
+    };
+  }
+
   async function toggleTeleopEngagement(): Promise<void> {
     suppressPadBlur = false;
+    const intent = pendingToggleIntent;
+    pendingToggleIntent = null;
+    if (intent?.kind === "disengage") {
+      if (
+        intent.session !== null &&
+        controller.engagedSession === intent.session
+      ) {
+        await controller.disengageTeleop({ sendZero: true });
+      }
+      return;
+    }
+    if (intent?.kind === "engage") {
+      if (controller.engaged) {
+        await tick();
+        padEl?.focus({ preventScroll: true });
+        return;
+      }
+      const ok = await controller.engageTeleop(vehicle, freshnessContext);
+      if (ok) {
+        await tick();
+        padEl?.focus({ preventScroll: true });
+      }
+      return;
+    }
     if (controller.engaged) {
       await controller.disengageTeleop({ sendZero: true });
       return;
@@ -220,6 +263,7 @@
         engageBtnEl.contains(ev.relatedTarget))
     ) {
       suppressPadBlur = false;
+      controller.clearHeldMovement();
       return;
     }
     controller.handleFocusLoss();
@@ -424,10 +468,27 @@
           data-testid="teleop-engage-btn"
           aria-pressed={controller.engaged}
           disabled={!controller.engaged && !safety.canEngageTeleop}
-          onpointerdown={() => {
-            if (controller.engaged || controller.leaseRenewalPending) {
-              suppressPadBlur = true;
+          onpointerdown={(ev) => {
+            if (ev.button === 0) {
+              captureEngageToggleIntent();
             }
+          }}
+          onmousedown={(ev) => {
+            if (ev.button === 0 && pendingToggleIntent === null) {
+              captureEngageToggleIntent();
+            }
+          }}
+          onkeydown={(ev) => {
+            if (
+              !ev.repeat &&
+              (ev.key === " " || ev.key === "Spacebar" || ev.key === "Enter")
+            ) {
+              captureEngageToggleIntent();
+            }
+          }}
+          onpointercancel={() => {
+            pendingToggleIntent = null;
+            suppressPadBlur = false;
           }}
           onclick={() => void toggleTeleopEngagement()}
         >
