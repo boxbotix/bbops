@@ -165,9 +165,30 @@ type ackFrameSlot struct {
 	packetOrder uint64
 }
 
+type hbStateKey struct {
+	domain        string
+	armed         bool
+	authority     string
+	companionMode string
+	linkTier      string
+	flags         uxsvocab.HealthFlags
+}
+
+func hbStateKeyOf(snap uxsvocab.VehicleSnapshot) hbStateKey {
+	return hbStateKey{
+		domain:        snap.Domain,
+		armed:         snap.Armed,
+		authority:     snap.Authority,
+		companionMode: snap.CompanionMode,
+		linkTier:      snap.LinkTier,
+		flags:         snap.Flags,
+	}
+}
+
 type hbFrameSlot struct {
 	active      bool
 	packetOrder uint64
+	state       hbStateKey
 }
 
 type authorityObsRecord struct {
@@ -182,45 +203,95 @@ const (
 )
 
 type vehicleSession struct {
-	snap             uxsvocab.VehicleSnapshot
-	rev              uint64
-	authorityEpoch   uint64
-	obsRev           uint64
-	heartbeatSeq     uint64
-	lastHbMonoAt     time.Time
-	lastHbOrder      uint64
-	obsHistory       [256]authorityObsRecord
-	obsIdx           int
-	obsMsEpoch       map[int64]uint64
-	obsMsOrder       [maxTrackedObsMs]int64
-	obsMsValid       [maxTrackedObsMs]bool
-	obsMsIdx         int
-	linkEpoch        uint64
-	hasSeqStream     bool
-	lastStreamSeq    uint8
-	seqStreamPos     uint64
-	hasPendingGap    bool
-	pendingGapSeq    uint8
-	pendingGapDelta  uint8
-	pendingGapHasAck bool
-	pendingGapAck    mavcodec.CommandAck
-	pendingGapHasHb  bool
-	lastAckOrder     uint64
-	lastAckSeq       uint64
-	lastAckUncertain bool
-	seenAckFrames    [256]ackFrameSlot
-	seenHbFrames     [256]hbFrameSlot
-	seenSeqOrder     [256]uint64
-	lastPacketAt     time.Time
-	lastSeq          uint8
-	lastMsgID        uint32
-	linkLost         bool
-	hasSysStatus     bool
-	hasAttitude      bool
-	hasLocalPos      bool
-	hasGlobalPos     bool
-	hasHeading       bool
-	peerAddr         netip.AddrPort
+	snap                uxsvocab.VehicleSnapshot
+	rev                 uint64
+	authorityEpoch      uint64
+	obsRev              uint64
+	heartbeatSeq        uint64
+	lastHbMonoAt        time.Time
+	lastHbOrder         uint64
+	snapHbOrder         uint64
+	hasPendingWrapHb    bool
+	pendingWrapHbSeq    uint8
+	pendingWrapHbOrder  uint64
+	pendingWrapHbKey    hbStateKey
+	obsHistory          [256]authorityObsRecord
+	obsIdx              int
+	obsMsEpoch          map[int64]uint64
+	obsMsOrder          [maxTrackedObsMs]int64
+	obsMsValid          [maxTrackedObsMs]bool
+	obsMsIdx            int
+	linkEpoch           uint64
+	hasSeqStream        bool
+	lastStreamSeq       uint8
+	seqStreamPos        uint64
+	hasPendingGap       bool
+	pendingGapSeq       uint8
+	pendingGapDelta     uint8
+	pendingGapHasAck    bool
+	pendingGapAck       mavcodec.CommandAck
+	pendingGapHasHb     bool
+	pendingGapHbApplied bool
+	pendingGapHbVh      mavcodec.VehicleHeartbeat
+	pendingGapHbWall    time.Time
+	pendingGapHbMono    time.Time
+	lastAckOrder        uint64
+	lastAckSeq          uint64
+	lastAckUncertain    bool
+	seenAckFrames       [256]ackFrameSlot
+	seenHbFrames        [256]hbFrameSlot
+	seenSeqOrder        [256]uint64
+	lastPacketAt        time.Time
+	lastSeq             uint8
+	lastMsgID           uint32
+	linkLost            bool
+	hasSysStatus        bool
+	hasAttitude         bool
+	hasLocalPos         bool
+	hasGlobalPos        bool
+	hasHeading          bool
+	peerAddr            netip.AddrPort
+}
+
+func isPreemptAuthority(auth string) bool {
+	return auth == uxsvocab.AuthorityDirectCRSFOverride || auth == uxsvocab.AuthorityMCUFailsafe
+}
+
+func (s *vehicleSession) clearPendingGap() {
+	s.hasPendingGap = false
+	s.pendingGapHasAck = false
+	s.pendingGapHasHb = false
+	s.pendingGapHbApplied = false
+	s.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
+	s.pendingGapHbWall = time.Time{}
+	s.pendingGapHbMono = time.Time{}
+}
+
+func (s *vehicleSession) clearPendingWrapHb() {
+	s.hasPendingWrapHb = false
+	s.pendingWrapHbSeq = 0
+	s.pendingWrapHbOrder = 0
+	s.pendingWrapHbKey = hbStateKey{}
+}
+
+func (s *vehicleSession) shouldHoldWrapHeartbeat(seq uint8, hbOrder uint64, prev, next uxsvocab.VehicleSnapshot) bool {
+	prevHb := s.seenHbFrames[seq]
+	curKey := hbStateKeyOf(prev)
+	nextKey := hbStateKeyOf(next)
+	if !prevHb.active || hbOrder < prevHb.packetOrder+256 || prevHb.state != nextKey || curKey == nextKey {
+		return false
+	}
+	if s.hasPendingWrapHb &&
+		s.pendingWrapHbKey == nextKey &&
+		hbOrder > s.pendingWrapHbOrder &&
+		(seq != s.pendingWrapHbSeq || hbOrder >= s.pendingWrapHbOrder+256) {
+		return false
+	}
+	s.hasPendingWrapHb = true
+	s.pendingWrapHbSeq = seq
+	s.pendingWrapHbOrder = hbOrder
+	s.pendingWrapHbKey = nextKey
+	return true
 }
 
 func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
@@ -228,6 +299,17 @@ func normalizeAddrPort(peer netip.AddrPort) netip.AddrPort {
 		return netip.AddrPort{}
 	}
 	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+}
+
+func (s *vehicleSession) isUnconfirmedGapDelta(delta uint8) bool {
+	if delta >= 65 && delta <= 191 {
+		return true
+	}
+	if delta >= 192 && delta <= 254 {
+		back := uint64(256 - uint16(delta))
+		return s.seqStreamPos <= back
+	}
+	return false
 }
 
 func (s *vehicleSession) evaluateHeartbeatSeq(seq uint8) (hbOrder uint64, confirmedOrder, staleOrDup bool) {
@@ -238,25 +320,15 @@ func (s *vehicleSession) evaluateHeartbeatSeq(seq uint8) (hbOrder uint64, confir
 	dupHbAt := func(pos uint64) bool {
 		return prevHb.active && (pos <= prevHb.packetOrder || pos-prevHb.packetOrder < 256)
 	}
-	if s.hasPendingGap {
-		gapStep := uint8(seq - s.pendingGapSeq)
-		if gapStep >= 1 && gapStep <= 64 {
-			pos := s.seqStreamPos + uint64(s.pendingGapDelta) + uint64(gapStep)
-			if dupHbAt(pos) || pos <= s.lastHbOrder {
-				return pos, false, true
-			}
-			return pos, true, false
+	if s.hasPendingGap && seq == s.pendingGapSeq {
+		if s.pendingGapHasHb {
+			return 0, false, true
 		}
-		if gapStep == 0 {
-			if s.pendingGapHasHb {
-				return 0, false, true
-			}
-			pos := s.seqStreamPos + uint64(s.pendingGapDelta)
-			if dupHbAt(pos) || (prevHb.active && s.seqStreamPos < prevHb.packetOrder+255) {
-				return pos, false, true
-			}
-			return pos, false, false
+		pos := s.seqStreamPos + uint64(s.pendingGapDelta)
+		if dupHbAt(pos) || (prevHb.active && s.seqStreamPos < prevHb.packetOrder+255) {
+			return pos, false, true
 		}
+		return pos, false, false
 	}
 	delta := uint8(seq - s.lastStreamSeq)
 	if delta == 0 {
@@ -273,7 +345,7 @@ func (s *vehicleSession) evaluateHeartbeatSeq(seq uint8) (hbOrder uint64, confir
 		}
 		return pos, true, false
 	}
-	if delta <= 128 {
+	if s.isUnconfirmedGapDelta(delta) {
 		pos := s.seqStreamPos + uint64(delta)
 		if dupHbAt(pos) || (prevHb.active && s.seqStreamPos < prevHb.packetOrder+255) {
 			return pos, false, true
@@ -297,46 +369,14 @@ func (s *vehicleSession) advanceTelemetrySeq(seq uint8) {
 		s.seqStreamPos = 1
 		s.lastStreamSeq = seq
 		s.seenSeqOrder[seq] = 1
-		s.hasPendingGap = false
-		s.pendingGapHasAck = false
-		s.pendingGapHasHb = false
+		s.clearPendingGap()
 		return
 	}
 	if s.hasPendingGap {
-		gapStep := uint8(seq - s.pendingGapSeq)
-		if gapStep >= 1 && gapStep <= 64 {
-			gapOrder := s.seqStreamPos + uint64(s.pendingGapDelta)
-			s.seenSeqOrder[s.pendingGapSeq] = gapOrder
-			if s.pendingGapHasAck {
-				s.seenAckFrames[s.pendingGapSeq] = ackFrameSlot{
-					active:      true,
-					ack:         s.pendingGapAck,
-					packetOrder: gapOrder,
-				}
-			}
-			if s.pendingGapHasHb {
-				s.seenHbFrames[s.pendingGapSeq] = hbFrameSlot{
-					active:      true,
-					packetOrder: gapOrder,
-				}
-				if gapOrder > s.lastHbOrder {
-					s.lastHbOrder = gapOrder
-				}
-			}
-			s.seqStreamPos = gapOrder + uint64(gapStep)
-			s.lastStreamSeq = seq
-			s.seenSeqOrder[seq] = s.seqStreamPos
-			s.hasPendingGap = false
-			s.pendingGapHasAck = false
-			s.pendingGapHasHb = false
+		if seq == s.pendingGapSeq {
 			return
 		}
-		if gapStep == 0 {
-			return
-		}
-		s.hasPendingGap = false
-		s.pendingGapHasAck = false
-		s.pendingGapHasHb = false
+		s.clearPendingGap()
 	}
 	delta := uint8(seq - s.lastStreamSeq)
 	if delta == 0 {
@@ -348,64 +388,59 @@ func (s *vehicleSession) advanceTelemetrySeq(seq uint8) {
 		s.seenSeqOrder[seq] = s.seqStreamPos
 		return
 	}
-	if delta <= 191 {
+	if s.isUnconfirmedGapDelta(delta) {
 		s.hasPendingGap = true
 		s.pendingGapSeq = seq
 		s.pendingGapDelta = delta
 		s.pendingGapHasAck = false
 		s.pendingGapHasHb = false
+		s.pendingGapHbApplied = false
+		s.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
+		s.pendingGapHbWall = time.Time{}
+		s.pendingGapHbMono = time.Time{}
 	}
 }
 
-func (s *vehicleSession) evaluateCommandAckSeq(seq uint8, msg mavcodec.CommandAck) (candPos uint64, advanceHead, clearGap, setGap, recordAckSlot, isDup, uncertain bool) {
+func (s *vehicleSession) evaluateCommandAckSeq(seq uint8, msg mavcodec.CommandAck) (candPos uint64, advanceHead, setGap, recordAckSlot, isDup, uncertain bool) {
 	prevSlot := s.seenAckFrames[seq]
 	if !s.hasSeqStream {
-		return 1, true, true, false, true, false, false
+		return 1, true, false, true, false, false
 	}
-	if s.hasPendingGap {
-		gapStep := uint8(seq - s.pendingGapSeq)
-		if gapStep >= 1 && gapStep <= 64 {
-			pos := s.seqStreamPos + uint64(s.pendingGapDelta) + uint64(gapStep)
-			dup := prevSlot.active && prevSlot.ack == msg &&
-				(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
-			return pos, true, true, false, true, dup, false
+	if s.hasPendingGap && seq == s.pendingGapSeq {
+		fwdPos := s.seqStreamPos + uint64(s.pendingGapDelta)
+		if s.pendingGapHasAck && s.pendingGapAck == msg {
+			return fwdPos, false, false, false, true, false
 		}
-		if gapStep == 0 {
-			fwdPos := s.seqStreamPos + uint64(s.pendingGapDelta)
-			if s.pendingGapHasAck && s.pendingGapAck == msg {
-				return fwdPos, false, false, false, false, true, false
+		if prevSlot.active && prevSlot.ack == msg {
+			if fwdPos <= prevSlot.packetOrder || fwdPos-prevSlot.packetOrder < 256 {
+				return fwdPos, false, false, false, true, false
 			}
-			if prevSlot.active && prevSlot.ack == msg {
-				if fwdPos <= prevSlot.packetOrder || fwdPos-prevSlot.packetOrder < 256 {
-					return fwdPos, false, false, false, false, true, false
-				}
-				return fwdPos, false, false, true, false, false, true
-			}
-			return fwdPos, false, false, true, false, false, false
+			return fwdPos, false, true, false, false, true
 		}
+		return fwdPos, false, true, false, false, false
 	}
 	delta := uint8(seq - s.lastStreamSeq)
 	if delta == 0 {
 		pos := s.seqStreamPos
 		dup := prevSlot.active && prevSlot.ack == msg &&
 			(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
-		return pos, false, false, false, true, dup, false
+		return pos, false, false, true, dup, false
 	}
 	if delta <= 64 {
 		pos := s.seqStreamPos + uint64(delta)
 		dup := prevSlot.active && prevSlot.ack == msg &&
 			(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
-		return pos, true, true, false, true, dup, false
+		return pos, true, false, true, dup, false
 	}
 	if delta <= 128 {
 		fwdPos := s.seqStreamPos + uint64(delta)
 		if prevSlot.active && prevSlot.ack == msg {
 			if fwdPos <= prevSlot.packetOrder || fwdPos-prevSlot.packetOrder < 256 {
-				return fwdPos, false, false, false, false, true, false
+				return fwdPos, false, false, false, true, false
 			}
-			return fwdPos, false, false, true, false, false, true
+			return fwdPos, false, true, false, false, true
 		}
-		return fwdPos, false, false, true, false, false, false
+		return fwdPos, false, true, false, false, false
 	}
 	back := uint64(uint8(s.lastStreamSeq - seq))
 	pos := uint64(1)
@@ -414,7 +449,7 @@ func (s *vehicleSession) evaluateCommandAckSeq(seq uint8, msg mavcodec.CommandAc
 	}
 	dup := prevSlot.active && prevSlot.ack == msg &&
 		(pos <= prevSlot.packetOrder || pos-prevSlot.packetOrder < 256)
-	return pos, false, false, false, true, dup, false
+	return pos, false, false, true, dup, false
 }
 
 func (s *vehicleSession) recordAuthorityObservation(wallUTC time.Time) {
@@ -451,11 +486,11 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 		s.linkEpoch++
 		s.lastHbMonoAt = time.Time{}
 		s.lastHbOrder = 0
+		s.snapHbOrder = 0
+		s.clearPendingWrapHb()
 		s.hasSeqStream = false
 		s.seqStreamPos = 0
-		s.hasPendingGap = false
-		s.pendingGapHasAck = false
-		s.pendingGapHasHb = false
+		s.clearPendingGap()
 		s.lastAckOrder = 0
 		s.lastAckSeq = 0
 		s.lastAckUncertain = false
@@ -677,6 +712,172 @@ func (t *Tracker) ingestFrameAt(frame mavcodec.Frame, peer netip.AddrPort, wallU
 	}
 }
 
+func applyHeartbeatFields(base uxsvocab.VehicleSnapshot, vh mavcodec.VehicleHeartbeat, wallUTC time.Time) (uxsvocab.VehicleSnapshot, bool) {
+	domainStr, err := vh.Custom.Domain.VocabString()
+	if err != nil {
+		return uxsvocab.VehicleSnapshot{}, false
+	}
+	authStr, err := vh.Custom.ControlAuthority.VocabString()
+	if err != nil {
+		return uxsvocab.VehicleSnapshot{}, false
+	}
+	modeStr, err := vh.Custom.CompanionMode.VocabString()
+	if err != nil {
+		return uxsvocab.VehicleSnapshot{}, false
+	}
+	tierStr, err := vh.Custom.LinkTier.VocabString()
+	if err != nil {
+		return uxsvocab.VehicleSnapshot{}, false
+	}
+	next := base
+	next.Domain = domainStr
+	next.Armed = vh.Armed
+	next.Authority = authStr
+	next.CompanionMode = modeStr
+	next.LinkTier = tierStr
+	next.Flags = vh.Custom.HealthFlags
+	next.HeartbeatObservedUnixNs = unixNanoOrZero(wallUTC)
+	next.ObservedAt = wallUTC
+	if err := next.Validate(); err != nil {
+		return uxsvocab.VehicleSnapshot{}, false
+	}
+	return next, true
+}
+
+func (t *Tracker) commitConfirmedHeartbeatLocked(
+	sess *vehicleSession,
+	sysid, seq uint8,
+	prev, next uxsvocab.VehicleSnapshot,
+	hbOrder uint64,
+	wasLost bool,
+	wallUTC, monoSample time.Time,
+) ([]TransitionEvent, bool) {
+	sess.clearPendingWrapHb()
+	// shortcut: edge transition alerts evaluated in internal/mavlink, migrate declarative alert rules to processor/rule when semengine alpha.9 lands
+	reasons := diffHeartbeatReasons(prev, next)
+
+	sess.snap = next
+	sess.rev++
+	sess.heartbeatSeq++
+	if !wasLost && (prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier) {
+		sess.authorityEpoch++
+	}
+	if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) || wasLost {
+		sess.lastHbMonoAt = monoSample
+	}
+	if wasLost {
+		hbOrder = 1
+		sess.lastHbOrder = 1
+	} else if hbOrder > sess.lastHbOrder {
+		sess.lastHbOrder = hbOrder
+	}
+	sess.snapHbOrder = hbOrder
+	sess.seenSeqOrder[seq] = hbOrder
+	sess.seenHbFrames[seq] = hbFrameSlot{
+		active:      true,
+		packetOrder: hbOrder,
+		state:       hbStateKeyOf(next),
+	}
+	sess.recordAuthorityObservation(wallUTC)
+
+	var events []TransitionEvent
+	urgent := false
+	if wasLost {
+		events = append(events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
+		urgent = true
+	}
+	if len(reasons) > 0 {
+		prevAuth := ""
+		if prev.Authority != next.Authority {
+			prevAuth = prev.Authority
+		}
+		events = append(events, TransitionEvent{
+			SysID:                sysid,
+			EntityID:             next.EntityID(),
+			Domain:               next.Domain,
+			Seq:                  seq,
+			MsgID:                mavcodec.MsgIDHeartbeat,
+			Kind:                 EventKindHeartbeatEdge,
+			Reasons:              reasons,
+			Armed:                next.Armed,
+			Authority:            next.Authority,
+			PrevAuthority:        prevAuth,
+			AuthorityIncarnation: t.incarnation,
+			AuthorityEpoch:       sess.authorityEpoch,
+			ObservationRev:       sess.obsRev,
+			CompanionMode:        next.CompanionMode,
+			LinkTier:             next.LinkTier,
+			Flags:                next.Flags,
+			Failsafes:            next.Failsafes,
+			Timestamp:            wallUTC.UnixMilli(),
+		})
+		urgent = true
+	}
+	return events, urgent
+}
+
+func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysid, seq uint8) ([]TransitionEvent, bool) {
+	if sess.linkLost || !sess.hasSeqStream || !sess.hasPendingGap {
+		return nil, false
+	}
+	if seq == sess.pendingGapSeq {
+		return nil, false
+	}
+	normalDelta := uint8(seq - sess.lastStreamSeq)
+	if normalDelta >= 1 && normalDelta <= 64 {
+		sess.clearPendingGap()
+		return nil, false
+	}
+	gapStep := uint8(seq - sess.pendingGapSeq)
+	if gapStep >= 1 && gapStep <= 64 {
+		gapSeq := sess.pendingGapSeq
+		gapOrder := sess.seqStreamPos + uint64(sess.pendingGapDelta)
+		hadAck := sess.pendingGapHasAck
+		gapAck := sess.pendingGapAck
+		hadHb := sess.pendingGapHasHb
+		hadHbApplied := sess.pendingGapHbApplied
+		gapHbVh := sess.pendingGapHbVh
+		gapHbWall := sess.pendingGapHbWall
+		gapHbMono := sess.pendingGapHbMono
+		sess.clearPendingGap()
+
+		sess.seenSeqOrder[gapSeq] = gapOrder
+		if hadAck {
+			sess.seenAckFrames[gapSeq] = ackFrameSlot{
+				active:      true,
+				ack:         gapAck,
+				packetOrder: gapOrder,
+			}
+		}
+		sess.seqStreamPos = gapOrder
+		sess.lastStreamSeq = gapSeq
+		if hadHb {
+			if hadHbApplied {
+				if gapOrder > sess.lastHbOrder {
+					sess.lastHbOrder = gapOrder
+				}
+				sess.snapHbOrder = gapOrder
+				if appliedNext, ok := applyHeartbeatFields(sess.snap, gapHbVh, gapHbWall); ok {
+					sess.seenHbFrames[gapSeq] = hbFrameSlot{
+						active:      true,
+						packetOrder: gapOrder,
+						state:       hbStateKeyOf(appliedNext),
+					}
+				}
+				return nil, false
+			}
+			prev := sess.snap
+			next, ok := applyHeartbeatFields(prev, gapHbVh, gapHbWall)
+			if ok && !sess.shouldHoldWrapHeartbeat(gapSeq, gapOrder, prev, next) {
+				return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, prev, next, gapOrder, false, gapHbWall, gapHbMono)
+			}
+		}
+		return nil, false
+	}
+	sess.clearPendingGap()
+	return nil, false
+}
+
 func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat, peer netip.AddrPort, wallUTC, monoSample time.Time) IngestOutcome {
 	if !t.peerAllowed(peer) {
 		return IngestOutcome{CountedError: true}
@@ -732,11 +933,13 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			heartbeatSeq:   1,
 			lastHbMonoAt:   monoSample,
 			lastHbOrder:    1,
+			snapHbOrder:    1,
 			linkEpoch:      1,
 		}
 		newSess.seenHbFrames[seq] = hbFrameSlot{
 			active:      true,
 			packetOrder: 1,
+			state:       hbStateKeyOf(*snap),
 		}
 		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 		newSess.recordAuthorityObservation(wallUTC)
@@ -750,24 +953,14 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	if !sess.linkLost && !matchesPinnedPeer(sess, normPeer) {
 		return IngestOutcome{CountedError: true}
 	}
-
-	wasLost := sess.linkLost
-	prev := sess.snap
-	next := prev
-	next.Domain = domainStr
-	next.Armed = vh.Armed
-	next.Authority = authStr
-	next.CompanionMode = modeStr
-	next.LinkTier = tierStr
-	next.Flags = vh.Custom.HealthFlags
-	next.HeartbeatObservedUnixNs = unixNanoOrZero(wallUTC)
-	next.ObservedAt = wallUTC
-	if err := next.Validate(); err != nil {
+	if _, ok := applyHeartbeatFields(sess.snap, vh, wallUTC); !ok {
 		return IngestOutcome{CountedError: true}
 	}
 
+	wasLost := sess.linkLost
+	var gapEvents []TransitionEvent
+	gapUrgent := false
 	var hbOrder uint64
-	confirmedOrder := true
 	if !wasLost {
 		if !sess.lastHbMonoAt.IsZero() && monoSample.Before(sess.lastHbMonoAt) {
 			return IngestOutcome{
@@ -775,88 +968,104 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 				SysID:    sysid,
 			}
 		}
-		var staleOrDup bool
+		gapEvents, gapUrgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+		var confirmedOrder, staleOrDup bool
 		hbOrder, confirmedOrder, staleOrDup = sess.evaluateHeartbeatSeq(seq)
 		if staleOrDup {
 			return IngestOutcome{
-				Accepted: true,
-				SysID:    sysid,
+				Accepted:      true,
+				SysID:         sysid,
+				Events:        gapEvents,
+				UrgentSKGSync: gapUrgent,
+			}
+		}
+		if !confirmedOrder {
+			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+			var preemptEvents []TransitionEvent
+			preemptUrgent := false
+			prev := sess.snap
+			next, ok := applyHeartbeatFields(prev, vh, wallUTC)
+			appliedPreempt := false
+			if ok && isPreemptAuthority(next.Authority) && !sess.shouldHoldWrapHeartbeat(seq, hbOrder, prev, next) {
+				sess.clearPendingWrapHb()
+				reasons := diffHeartbeatReasons(prev, next)
+				sess.snap = next
+				sess.rev++
+				sess.heartbeatSeq++
+				if prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier {
+					sess.authorityEpoch++
+				}
+				if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) {
+					sess.lastHbMonoAt = monoSample
+				}
+				sess.recordAuthorityObservation(wallUTC)
+				if len(reasons) > 0 {
+					prevAuth := ""
+					if prev.Authority != next.Authority {
+						prevAuth = prev.Authority
+					}
+					preemptEvents = append(preemptEvents, TransitionEvent{
+						SysID:                sysid,
+						EntityID:             next.EntityID(),
+						Domain:               next.Domain,
+						Seq:                  seq,
+						MsgID:                mavcodec.MsgIDHeartbeat,
+						Kind:                 EventKindHeartbeatEdge,
+						Reasons:              reasons,
+						Armed:                next.Armed,
+						Authority:            next.Authority,
+						PrevAuthority:        prevAuth,
+						AuthorityIncarnation: t.incarnation,
+						AuthorityEpoch:       sess.authorityEpoch,
+						ObservationRev:       sess.obsRev,
+						CompanionMode:        next.CompanionMode,
+						LinkTier:             next.LinkTier,
+						Flags:                next.Flags,
+						Failsafes:            next.Failsafes,
+						Timestamp:            wallUTC.UnixMilli(),
+					})
+					preemptUrgent = true
+				}
+				appliedPreempt = true
+			}
+			if sess.hasPendingGap && sess.pendingGapSeq == seq {
+				sess.pendingGapHasHb = true
+				sess.pendingGapHbApplied = appliedPreempt
+				sess.pendingGapHbVh = vh
+				sess.pendingGapHbWall = wallUTC
+				sess.pendingGapHbMono = monoSample
+			}
+			return IngestOutcome{
+				Accepted:      true,
+				SysID:         sysid,
+				Events:        append(gapEvents, preemptEvents...),
+				UrgentSKGSync: gapUrgent || preemptUrgent,
 			}
 		}
 	}
 
-	// shortcut: edge transition alerts evaluated in internal/mavlink, migrate declarative alert rules to processor/rule when semengine alpha.9 lands
-	reasons := diffHeartbeatReasons(prev, next)
-
-	sess.snap = next
-	sess.rev++
-	sess.heartbeatSeq++
-	if !wasLost && (prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier) {
-		sess.authorityEpoch++
+	prev := sess.snap
+	next, ok := applyHeartbeatFields(prev, vh, wallUTC)
+	if !ok {
+		return IngestOutcome{CountedError: true}
 	}
+	if !wasLost && sess.shouldHoldWrapHeartbeat(seq, hbOrder, prev, next) {
+		return IngestOutcome{
+			Accepted:      true,
+			SysID:         sysid,
+			Events:        gapEvents,
+			UrgentSKGSync: gapUrgent,
+		}
+	}
+
 	sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
-	if wasLost {
-		sess.lastHbMonoAt = monoSample
-		sess.lastHbOrder = 1
-		sess.seenHbFrames[seq] = hbFrameSlot{
-			active:      true,
-			packetOrder: 1,
-		}
-	} else {
-		if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) {
-			sess.lastHbMonoAt = monoSample
-		}
-		if confirmedOrder {
-			if hbOrder > sess.lastHbOrder {
-				sess.lastHbOrder = hbOrder
-			}
-			sess.seenSeqOrder[seq] = hbOrder
-			sess.seenHbFrames[seq] = hbFrameSlot{
-				active:      true,
-				packetOrder: hbOrder,
-			}
-		} else if sess.hasPendingGap && sess.pendingGapSeq == seq {
-			sess.pendingGapHasHb = true
-		}
+	hbEvents, hbUrgent := t.commitConfirmedHeartbeatLocked(sess, sysid, seq, prev, next, hbOrder, wasLost, wallUTC, monoSample)
+	return IngestOutcome{
+		Accepted:      true,
+		SysID:         sysid,
+		Events:        append(gapEvents, hbEvents...),
+		UrgentSKGSync: gapUrgent || hbUrgent,
 	}
-	sess.recordAuthorityObservation(wallUTC)
-
-	out := IngestOutcome{
-		Accepted: true,
-		SysID:    sysid,
-	}
-	if wasLost {
-		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDHeartbeat, EventKindLinkRestored, "link_restored", wallUTC))
-		out.UrgentSKGSync = true
-	}
-	if len(reasons) > 0 {
-		prevAuth := ""
-		if prev.Authority != next.Authority {
-			prevAuth = prev.Authority
-		}
-		out.Events = append(out.Events, TransitionEvent{
-			SysID:                sysid,
-			EntityID:             next.EntityID(),
-			Domain:               next.Domain,
-			Seq:                  seq,
-			MsgID:                mavcodec.MsgIDHeartbeat,
-			Kind:                 EventKindHeartbeatEdge,
-			Reasons:              reasons,
-			Armed:                next.Armed,
-			Authority:            next.Authority,
-			PrevAuthority:        prevAuth,
-			AuthorityIncarnation: t.incarnation,
-			AuthorityEpoch:       sess.authorityEpoch,
-			ObservationRev:       sess.obsRev,
-			CompanionMode:        next.CompanionMode,
-			LinkTier:             next.LinkTier,
-			Flags:                next.Flags,
-			Failsafes:            next.Failsafes,
-			Timestamp:            wallUTC.UnixMilli(),
-		})
-		out.UrgentSKGSync = true
-	}
-	return out
 }
 
 func diffHeartbeatReasons(prev, next uxsvocab.VehicleSnapshot) []string {
@@ -900,6 +1109,11 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	}
 
 	wasLost := sess.linkLost
+	var gapEvents []TransitionEvent
+	gapUrgent := false
+	if !wasLost {
+		gapEvents, gapUrgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+	}
 	hadSysStatus := sess.hasSysStatus
 	prevFailsafes := sess.snap.Failsafes
 	next := sess.snap
@@ -926,8 +1140,10 @@ func (t *Tracker) applySysStatus(sysid, seq uint8, msg mavcodec.SysStatus, peer 
 	}
 
 	out := IngestOutcome{
-		Accepted: true,
-		SysID:    sysid,
+		Accepted:      true,
+		SysID:         sysid,
+		Events:        gapEvents,
+		UrgentSKGSync: gapUrgent,
 	}
 	if wasLost {
 		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDSysStatus, EventKindLinkRestored, "link_restored", wallUTC))
@@ -1000,6 +1216,11 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 	}
 
 	wasLost := sess.linkLost
+	var gapEvents []TransitionEvent
+	gapUrgent := false
+	if !wasLost {
+		gapEvents, gapUrgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+	}
 	obsNs := unixNanoOrZero(wallUTC)
 	next := sess.snap
 	next.Quaternion = unitQ
@@ -1023,13 +1244,15 @@ func (t *Tracker) applyAttitudeQuaternion(sysid, seq uint8, msg mavcodec.Attitud
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDAttitudeQuaternion, wallUTC)
 	out := IngestOutcome{
-		Accepted:  true,
-		SysID:     sysid,
-		Telemetry: &tf,
+		Accepted:      true,
+		SysID:         sysid,
+		Telemetry:     &tf,
+		Events:        gapEvents,
+		UrgentSKGSync: gapUrgent,
 	}
 	if wasLost {
 		sess.recordAuthorityObservation(wallUTC)
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDAttitudeQuaternion, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -1060,6 +1283,11 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 	}
 
 	wasLost := sess.linkLost
+	var gapEvents []TransitionEvent
+	gapUrgent := false
+	if !wasLost {
+		gapEvents, gapUrgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+	}
 	obsNs := unixNanoOrZero(wallUTC)
 	next := sess.snap
 	next.NED = ned
@@ -1081,13 +1309,15 @@ func (t *Tracker) applyLocalPositionNED(sysid, seq uint8, msg mavcodec.LocalPosi
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDLocalPositionNED, wallUTC)
 	out := IngestOutcome{
-		Accepted:  true,
-		SysID:     sysid,
-		Telemetry: &tf,
+		Accepted:      true,
+		SysID:         sysid,
+		Telemetry:     &tf,
+		Events:        gapEvents,
+		UrgentSKGSync: gapUrgent,
 	}
 	if wasLost {
 		sess.recordAuthorityObservation(wallUTC)
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDLocalPositionNED, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -1124,6 +1354,11 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 	}
 
 	wasLost := sess.linkLost
+	var gapEvents []TransitionEvent
+	gapUrgent := false
+	if !wasLost {
+		gapEvents, gapUrgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+	}
 	obsNs := unixNanoOrZero(wallUTC)
 	next := sess.snap
 	next.Latitude = lat
@@ -1159,13 +1394,15 @@ func (t *Tracker) applyGlobalPositionInt(sysid, seq uint8, msg mavcodec.GlobalPo
 
 	tf := buildTelemetryFrame(sess, seq, mavcodec.MsgIDGlobalPositionInt, wallUTC)
 	out := IngestOutcome{
-		Accepted:  true,
-		SysID:     sysid,
-		Telemetry: &tf,
+		Accepted:      true,
+		SysID:         sysid,
+		Telemetry:     &tf,
+		Events:        gapEvents,
+		UrgentSKGSync: gapUrgent,
 	}
 	if wasLost {
 		sess.recordAuthorityObservation(wallUTC)
-		out.Events = []TransitionEvent{newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC)}
+		out.Events = append(out.Events, newLinkTransitionEvent(next, t.incarnation, sess.authorityEpoch, sess.obsRev, seq, mavcodec.MsgIDGlobalPositionInt, EventKindLinkRestored, "link_restored", wallUTC))
 		out.UrgentSKGSync = true
 	}
 	return out
@@ -1192,14 +1429,15 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	}
 
 	wasLost := sess.linkLost
-	var candPos uint64
-	var advanceHead, clearGap, setGap, recordAckSlot, isDupAck, ackUncertain bool
-	if !wasLost {
-		candPos, advanceHead, clearGap, setGap, recordAckSlot, isDupAck, ackUncertain = sess.evaluateCommandAckSeq(seq, msg)
-	}
-
 	var events []TransitionEvent
 	urgent := false
+	var candPos uint64
+	var advanceHead, setGap, recordAckSlot, isDupAck, ackUncertain bool
+	if !wasLost {
+		events, urgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+		candPos, advanceHead, setGap, recordAckSlot, isDupAck, ackUncertain = sess.evaluateCommandAckSeq(seq, msg)
+	}
+
 	next := sess.snap
 	if wasLost {
 		next.ObservedAt = wallUTC
@@ -1214,7 +1452,6 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 	if wasLost {
 		candPos = 1
 		advanceHead = true
-		clearGap = true
 		setGap = false
 		recordAckSlot = true
 		ackUncertain = false
@@ -1229,36 +1466,16 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 			UrgentSKGSync: urgent,
 		}
 	}
-	if clearGap {
-		if sess.hasPendingGap {
-			gapOrder := sess.seqStreamPos + uint64(sess.pendingGapDelta)
-			sess.seenSeqOrder[sess.pendingGapSeq] = gapOrder
-			if sess.pendingGapHasAck {
-				sess.seenAckFrames[sess.pendingGapSeq] = ackFrameSlot{
-					active:      true,
-					ack:         sess.pendingGapAck,
-					packetOrder: gapOrder,
-				}
-			}
-			if sess.pendingGapHasHb {
-				sess.seenHbFrames[sess.pendingGapSeq] = hbFrameSlot{
-					active:      true,
-					packetOrder: gapOrder,
-				}
-				if gapOrder > sess.lastHbOrder {
-					sess.lastHbOrder = gapOrder
-				}
-			}
-		}
-		sess.hasPendingGap = false
-		sess.pendingGapHasAck = false
-		sess.pendingGapHasHb = false
-	} else if setGap {
+	if setGap {
 		if !sess.hasPendingGap {
 			sess.hasPendingGap = true
 			sess.pendingGapSeq = seq
 			sess.pendingGapDelta = uint8(seq - sess.lastStreamSeq)
 			sess.pendingGapHasHb = false
+			sess.pendingGapHbApplied = false
+			sess.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
+			sess.pendingGapHbWall = time.Time{}
+			sess.pendingGapHbMono = time.Time{}
 		}
 		sess.pendingGapHasAck = true
 		sess.pendingGapAck = msg
@@ -1311,9 +1528,12 @@ func (t *Tracker) applyStatusText(sysid, seq uint8, msg mavcodec.StatusText, pee
 	}
 
 	wasLost := sess.linkLost
-	snap := sess.snap
 	var events []TransitionEvent
 	urgent := false
+	if !wasLost {
+		events, urgent = t.resolvePendingGapBeforePacketLocked(sess, sysid, seq)
+	}
+	snap := sess.snap
 
 	if wasLost {
 		next := sess.snap
@@ -1497,11 +1717,11 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	sess.linkEpoch++
 	sess.lastHbMonoAt = time.Time{}
 	sess.lastHbOrder = 0
+	sess.snapHbOrder = 0
+	sess.clearPendingWrapHb()
 	sess.hasSeqStream = false
 	sess.seqStreamPos = 0
-	sess.hasPendingGap = false
-	sess.pendingGapHasAck = false
-	sess.pendingGapHasHb = false
+	sess.clearPendingGap()
 	sess.lastAckOrder = 0
 	sess.lastAckSeq = 0
 	sess.lastAckUncertain = false
@@ -1566,7 +1786,7 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 		AuthorityEpoch:          sess.authorityEpoch,
 		ObservationRev:          sess.obsRev,
 		HeartbeatSeq:            sess.heartbeatSeq,
-		HeartbeatOrder:          sess.lastHbOrder,
+		HeartbeatOrder:          sess.snapHbOrder,
 		LinkEpoch:               sess.linkEpoch,
 		PacketOrder:             sess.seqStreamPos,
 		LastAckOrder:            sess.lastAckOrder,

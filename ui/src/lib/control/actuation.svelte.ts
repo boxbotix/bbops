@@ -213,6 +213,7 @@ export interface ActuationController {
   readonly activeSysId: number | null;
   readonly engaged: boolean;
   readonly engagedSysId: number | null;
+  readonly leaseRenewalPending: boolean;
   readonly frame: TeleopFrame;
   readonly axes: TeleopAxes;
   readonly padNormX: number;
@@ -698,6 +699,8 @@ export function createActuationController(
   let activeSysId = $state<number | null>(null);
   let engagedSysId = $state<number | null>(null);
   let leaseAccepted = $state(false);
+  let leaseConfirmed = $state(false);
+  let renewalGraceActive = $state(false);
   let frame = $state<TeleopFrame>("local-ned");
   let axes = $state<TeleopAxes>(ZERO_TELEOP_AXES);
   let padNormX = $state(0);
@@ -776,6 +779,8 @@ export function createActuationController(
     engagedEntityId = null;
     engagedSession = null;
     leaseAccepted = false;
+    leaseConfirmed = false;
+    renewalGraceActive = false;
     confirmedLeaseDeadlinePerf = null;
     inFlightRenewals = [];
     teleopSeq = 0;
@@ -790,23 +795,29 @@ export function createActuationController(
     );
   }
 
-  function getEffectiveLeaseDeadlinePerf(): number | null {
+  function getPendingRenewalDeadlinePerf(): number | null {
     if (!leaseAccepted || confirmedLeaseDeadlinePerf === null) {
       return null;
     }
-    let best = confirmedLeaseDeadlinePerf;
+    let best: number | null = null;
     for (const entry of inFlightRenewals) {
       const cand = entry.sentPerf + leaseTtlMs;
-      if (cand > best) {
+      if (best === null || cand > best) {
         best = cand;
       }
     }
     return best;
   }
 
-  function hasActiveConfirmedLease(nowPerf = perfNow()): boolean {
-    const deadline = getEffectiveLeaseDeadlinePerf();
+  function hasPendingRenewalWindow(nowPerf = perfNow()): boolean {
+    const deadline = getPendingRenewalDeadlinePerf();
     return deadline !== null && nowPerf < deadline;
+  }
+
+  function hasSessionOrRenewalWindow(nowPerf = perfNow()): boolean {
+    return (
+      hasConfirmedLeaseForDispatch(nowPerf) || hasPendingRenewalWindow(nowPerf)
+    );
   }
 
   function expireConfirmedLeaseLocal(sysid: number): void {
@@ -816,30 +827,39 @@ export function createActuationController(
 
   function scheduleLeaseExpiryTimer(sysid: number, session: string): void {
     clearLeaseExpiryTimer();
-    const deadline = getEffectiveLeaseDeadlinePerf();
-    if (deadline === null) {
+    if (
+      engagedSysId !== sysid ||
+      engagedSession !== session ||
+      !leaseAccepted ||
+      confirmedLeaseDeadlinePerf === null
+    ) {
       return;
     }
-    const delayMs = Math.max(0, deadline - perfNow());
-    leaseExpiryTimer = setTimeout(() => {
-      leaseExpiryTimer = null;
-      if (
-        engagedSysId !== sysid ||
-        engagedSession !== session ||
-        !leaseAccepted
-      ) {
-        return;
-      }
-      const nextDeadline = getEffectiveLeaseDeadlinePerf();
-      if (nextDeadline === null) {
-        return;
-      }
-      if (nextDeadline - perfNow() > 0) {
+    const nowPerf = perfNow();
+    if (nowPerf < confirmedLeaseDeadlinePerf) {
+      leaseConfirmed = true;
+      renewalGraceActive = false;
+      recomputeKeyboardAxes();
+      const delayMs = Math.max(0, confirmedLeaseDeadlinePerf - nowPerf);
+      leaseExpiryTimer = setTimeout(() => {
+        leaseExpiryTimer = null;
         scheduleLeaseExpiryTimer(sysid, session);
-        return;
-      }
-      expireConfirmedLeaseLocal(sysid);
-    }, delayMs);
+      }, delayMs);
+      return;
+    }
+    leaseConfirmed = false;
+    pointerDragging = false;
+    const pendingDeadline = getPendingRenewalDeadlinePerf();
+    if (pendingDeadline !== null && nowPerf < pendingDeadline) {
+      renewalGraceActive = true;
+      const delayMs = Math.max(0, pendingDeadline - nowPerf);
+      leaseExpiryTimer = setTimeout(() => {
+        leaseExpiryTimer = null;
+        scheduleLeaseExpiryTimer(sysid, session);
+      }, delayMs);
+      return;
+    }
+    expireConfirmedLeaseLocal(sysid);
   }
 
   function resetStickState(): void {
@@ -886,7 +906,7 @@ export function createActuationController(
     if (engagedSysId !== sysid) {
       return false;
     }
-    if (leaseAccepted && !hasActiveConfirmedLease()) {
+    if (leaseAccepted && !hasSessionOrRenewalWindow()) {
       expireConfirmedLeaseLocal(sysid);
       return false;
     }
@@ -1021,7 +1041,7 @@ export function createActuationController(
               res.error.code === "teleop_seq_superseded"
             ) {
               if (engagedSession === session && engagedSysId === sysid) {
-                if (!hasActiveConfirmedLease()) {
+                if (!hasSessionOrRenewalWindow()) {
                   expireConfirmedLeaseLocal(sysid);
                 } else {
                   scheduleLeaseExpiryTimer(sysid, session);
@@ -1059,7 +1079,7 @@ export function createActuationController(
             confirmedLeaseDeadlinePerf === null
               ? candidateDeadline
               : Math.max(confirmedLeaseDeadlinePerf, candidateDeadline);
-          if (perfNow() >= nextDeadline && !hasActiveConfirmedLease()) {
+          if (perfNow() >= nextDeadline && !hasPendingRenewalWindow()) {
             expireConfirmedLeaseLocal(sysid);
             return false;
           }
@@ -1075,12 +1095,22 @@ export function createActuationController(
             leaseAccepted = true;
             startTeleopTimer(sysid);
             scheduleLeaseExpiryTimer(sysid, session);
-            if (heldKeys.size > 0) {
-              void dispatchTeleopNudge(sysid, false);
+            if (
+              heldKeys.size > 0 ||
+              nextDeadline - perfNow() <= teleopIntervalMs * 2
+            ) {
+              triggerConfirmedTimerRenewal(sysid);
             }
           } else {
+            const wasUnconfirmed = !leaseConfirmed;
             confirmedLeaseDeadlinePerf = nextDeadline;
             scheduleLeaseExpiryTimer(sysid, session);
+            if (
+              wasUnconfirmed ||
+              nextDeadline - perfNow() <= teleopIntervalMs * 2
+            ) {
+              triggerConfirmedTimerRenewal(sysid);
+            }
           }
           return true;
         },
@@ -1093,26 +1123,33 @@ export function createActuationController(
       );
   }
 
+  function triggerConfirmedTimerRenewal(sysid: number, gen = timerGen): void {
+    if (engagedSysId !== sysid) {
+      stopTeleopTimer();
+      return;
+    }
+    if (!verifyEngagedVehicleLive(sysid)) {
+      return;
+    }
+    if (!hasConfirmedLeaseForDispatch()) {
+      return;
+    }
+    if (timerRenewalsInFlight >= 2) {
+      return;
+    }
+    timerRenewalsInFlight += 1;
+    void dispatchTeleopNudge(sysid, false).finally(() => {
+      if (timerGen === gen && timerRenewalsInFlight > 0) {
+        timerRenewalsInFlight -= 1;
+      }
+    });
+  }
+
   function startTeleopTimer(sysid: number): void {
     stopTeleopTimer();
     const gen = timerGen;
     teleopTimer = setIntervalFn(() => {
-      if (engagedSysId !== sysid) {
-        stopTeleopTimer();
-        return;
-      }
-      if (!verifyEngagedVehicleLive(sysid)) {
-        return;
-      }
-      if (timerRenewalsInFlight >= 2) {
-        return;
-      }
-      timerRenewalsInFlight += 1;
-      void dispatchTeleopNudge(sysid, false).finally(() => {
-        if (timerGen === gen && timerRenewalsInFlight > 0) {
-          timerRenewalsInFlight -= 1;
-        }
-      });
+      triggerConfirmedTimerRenewal(sysid, gen);
     }, teleopIntervalMs);
   }
 
@@ -1296,7 +1333,7 @@ export function createActuationController(
       } else if (
         engagedSysId === vehicle.sysid &&
         leaseAccepted &&
-        !hasActiveConfirmedLease()
+        !hasSessionOrRenewalWindow()
       ) {
         expireConfirmedLeaseLocal(vehicle.sysid);
       }
@@ -1337,7 +1374,10 @@ export function createActuationController(
     engagedEntityId = vehicle.id;
     engagedSession = session;
     leaseAccepted = false;
+    leaseConfirmed = false;
+    renewalGraceActive = false;
     confirmedLeaseDeadlinePerf = null;
+    inFlightRenewals = [];
     teleopSeq = 0;
     resetStickState();
 
@@ -1364,8 +1404,10 @@ export function createActuationController(
     ) {
       return;
     }
-    if (!hasActiveConfirmedLease()) {
-      expireConfirmedLeaseLocal(engagedSysId);
+    if (!hasConfirmedLeaseForDispatch()) {
+      if (!hasPendingRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+      }
       return;
     }
     const clampedX = clampUnit(normX);
@@ -1394,10 +1436,10 @@ export function createActuationController(
       axes = ZERO_TELEOP_AXES;
     }
     if (engagedSysId !== null && leaseAccepted) {
-      if (!hasActiveConfirmedLease()) {
-        expireConfirmedLeaseLocal(engagedSysId);
-      } else {
+      if (hasConfirmedLeaseForDispatch()) {
         void dispatchTeleopNudge(engagedSysId, false);
+      } else if (!hasPendingRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
       }
     }
   }
@@ -1413,21 +1455,29 @@ export function createActuationController(
     ) {
       return false;
     }
-    if (!hasActiveConfirmedLease()) {
-      expireConfirmedLeaseLocal(engagedSysId);
-      return false;
-    }
     const classified = classifyPadHoldKey(event);
     if (classified === null) {
+      return false;
+    }
+    if (classified === "stop") {
+      if (!hasSessionOrRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+        return false;
+      }
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      void disengageTeleop({ sendZero: true });
+      return true;
+    }
+    if (!hasConfirmedLeaseForDispatch()) {
+      if (!hasPendingRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
+      }
       return false;
     }
     event.preventDefault?.();
     event.stopPropagation?.();
 
-    if (classified === "stop") {
-      void disengageTeleop({ sendZero: true });
-      return true;
-    }
     if (event.repeat && heldKeys.has(classified)) {
       return true;
     }
@@ -1450,10 +1500,10 @@ export function createActuationController(
     heldKeys.delete(classified);
     recomputeKeyboardAxes();
     if (engagedSysId !== null && leaseAccepted) {
-      if (!hasActiveConfirmedLease()) {
-        expireConfirmedLeaseLocal(engagedSysId);
-      } else {
+      if (hasConfirmedLeaseForDispatch()) {
         void dispatchTeleopNudge(engagedSysId, false);
+      } else if (!hasPendingRenewalWindow()) {
+        expireConfirmedLeaseLocal(engagedSysId);
       }
     }
     return true;
@@ -1545,28 +1595,44 @@ export function createActuationController(
     },
     get engaged() {
       return (
+        leaseConfirmed &&
         engagedSysId !== null &&
         engagedSysId === activeSysId &&
-        hasActiveConfirmedLease()
+        hasConfirmedLeaseForDispatch()
       );
     },
     get engagedSysId() {
-      return hasActiveConfirmedLease() ? engagedSysId : null;
+      return leaseConfirmed && hasConfirmedLeaseForDispatch()
+        ? engagedSysId
+        : null;
+    },
+    get leaseRenewalPending() {
+      return (
+        engagedSysId !== null &&
+        engagedSysId === activeSysId &&
+        leaseAccepted &&
+        !hasConfirmedLeaseForDispatch() &&
+        (renewalGraceActive || hasPendingRenewalWindow())
+      );
     },
     get frame() {
       return frame;
     },
     get axes() {
-      return axes;
+      return leaseConfirmed && hasConfirmedLeaseForDispatch()
+        ? axes
+        : ZERO_TELEOP_AXES;
     },
     get padNormX() {
-      return padNormX;
+      return leaseConfirmed && hasConfirmedLeaseForDispatch() ? padNormX : 0;
     },
     get padNormY() {
-      return padNormY;
+      return leaseConfirmed && hasConfirmedLeaseForDispatch() ? padNormY : 0;
     },
     get pointerDragging() {
-      return pointerDragging;
+      return (
+        leaseConfirmed && hasConfirmedLeaseForDispatch() && pointerDragging
+      );
     },
     get submittingAction() {
       return submittingAction;

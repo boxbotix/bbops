@@ -425,7 +425,7 @@
           aria-pressed={controller.engaged}
           disabled={!controller.engaged && !safety.canEngageTeleop}
           onpointerdown={() => {
-            if (controller.engaged) {
+            if (controller.engaged || controller.leaseRenewalPending) {
               suppressPadBlur = true;
             }
           }}
@@ -442,7 +442,7 @@
         class:engaged={controller.engaged}
         data-testid="teleop-velocity-pad"
         data-actuation-pad="true"
-        tabindex={controller.engaged ? 0 : -1}
+        tabindex={controller.engaged || controller.leaseRenewalPending ? 0 : -1}
         role="application"
         aria-label="Spring-return 2D velocity teleop pad. Drag pointer or hold WASD/Arrows while engaged; Space or Escape disengages."
         onpointerdown={onPadPointerDown}
@@ -463,11 +463,13 @@
         ></div>
         {#if !controller.engaged}
           <span class="pad-overlay-hint">
-            {safety.canEngageTeleop
-              ? "Click Engage Teleop to unlock velocity pad"
-              : !safety.armed
-                ? "Arm vehicle to enable velocity teleop"
-                : `Teleop locked (${safety.authority})`}
+            {controller.leaseRenewalPending
+              ? "Awaiting teleop lease renewal confirmation…"
+              : safety.canEngageTeleop
+                ? "Click Engage Teleop to unlock velocity pad"
+                : !safety.armed
+                  ? "Arm vehicle to enable velocity teleop"
+                  : `Teleop locked (${safety.authority})`}
           </span>
         {/if}
       </div>

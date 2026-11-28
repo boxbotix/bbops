@@ -116,7 +116,7 @@ func (s *LifecycleStore) Transition(
 		ce.AckResult = ackResult
 		if ackResult >= 0 {
 			ce.AckAccounted = 1
-			if ackResult < 30 {
+			if ackResult < 28 {
 				ce.AckPoolMask |= 1 << uint(ackResult)
 			}
 		}
@@ -460,6 +460,20 @@ type commandInvokeSpec struct {
 	param3Bits uint32
 }
 
+const (
+	ackPoolWrapHeldBit    = 1 << 28
+	ackPoolWrapSettledBit = 1 << 29
+	ackPoolResultMask     = (1 << 28) - 1
+)
+
+func poolMaskForCmd(mask uint64, wrapHeld bool) int {
+	pm := int(mask) & ackPoolResultMask
+	if wrapHeld {
+		pm |= ackPoolWrapHeldBit
+	}
+	return pm
+}
+
 type ackMetaState struct {
 	ackAccounted int
 	ackPoolMask  int
@@ -548,6 +562,7 @@ type Service struct {
 	inFlight                map[string]*inFlightCommand
 	unackedCount            map[cmdKey]int
 	wrapAckCredit           map[cmdKey]int
+	wrapCreditIDs           map[cmdKey][]string
 	unackedDetachedIDs      map[cmdKey][]string
 	ambiguousSlotIDs        map[cmdKey][]string
 	persistedAckMeta        map[string]ackMetaState
@@ -664,6 +679,7 @@ func NewService(opts Options) (*Service, error) {
 		inFlight:                make(map[string]*inFlightCommand),
 		unackedCount:            make(map[cmdKey]int),
 		wrapAckCredit:           make(map[cmdKey]int),
+		wrapCreditIDs:           make(map[cmdKey][]string),
 		unackedDetachedIDs:      make(map[cmdKey][]string),
 		ambiguousSlotIDs:        make(map[cmdKey][]string),
 		persistedAckMeta:        make(map[string]ackMetaState),
@@ -1070,16 +1086,19 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			mask |= uint64(1) << uint(ce.AckResult)
 		}
 		if ce.AckPoolMask > 0 {
-			mask |= uint64(ce.AckPoolMask)
+			mask |= uint64(ce.AckPoolMask & ackPoolResultMask)
 		}
 		if mask != 0 {
 			s.seenAckResultMask[key] |= mask
 			s.preResetAckResultMask[key] |= mask
 		}
+		wrapHeld := ce.AckResult < 0 &&
+			(ce.AckPoolMask&ackPoolWrapHeldBit) != 0 &&
+			(ce.AckPoolMask&ackPoolWrapSettledBit) == 0
 		accounted := ce.AckAccounted > 0 || ce.AckResult >= 0
 		s.persistedAckMeta[ce.ID] = ackMetaState{
 			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
-			ackPoolMask:  max(ce.AckPoolMask, poolMaskInt(mask)),
+			ackPoolMask:  ce.AckPoolMask | poolMaskInt(mask),
 		}
 		if accounted && ce.AckResult < 0 {
 			s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], ce.ID)
@@ -1109,6 +1128,15 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		if s.dispatchedInBoot[key] || latestSentByKey[key].ID != ce.ID || commandTransitions.IsTerminal(ce.PhaseState) {
 			if isUnacked {
 				s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], ce.ID)
+			}
+			if wrapHeld {
+				s.wrapAckCredit[key]++
+				s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], ce.ID)
+				for _, curCmd := range s.inFlight {
+					if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
+						curCmd.ackAmbiguous = true
+					}
+				}
 			}
 			continue
 		}
@@ -1142,6 +1170,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			detail:              CommitUnknownDetail,
 			ackAccounted:        accounted,
 			ackAmbiguous:        true,
+			wrapReceiptHeld:     wrapHeld,
 			ackDeadline:         now,
 			unknownAtUnixNs:     unknownNs,
 			unknownHbSeq:        unknownHbSeq,
@@ -1158,7 +1187,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 }
 
 func poolMaskInt(mask uint64) int {
-	return int(mask & 0x3fffffff)
+	return int(mask) & ackPoolResultMask
 }
 
 func boolToInt(v bool) int {
@@ -1307,7 +1336,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				if w.ackResult >= 0 {
 					meta := s.persistedAckMeta[w.entityID]
 					meta.ackAccounted = 1
-					if w.ackResult < 30 {
+					if w.ackResult < 28 {
 						meta.ackPoolMask |= 1 << uint(w.ackResult)
 					}
 					s.persistedAckMeta[w.entityID] = meta
@@ -2296,9 +2325,11 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			continue
 		}
 		delete(s.inFlight, otherID)
-		if other.wrapReceiptHeld {
+		wasWrapHeld := other.wrapReceiptHeld
+		if wasWrapHeld {
 			other.wrapReceiptHeld = false
 			s.wrapAckCredit[key]++
+			s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], other.entityID)
 			supersededWrapHeld = true
 		}
 		if !other.ackAccounted {
@@ -2314,7 +2345,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(other.ackAccounted),
-				ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    dispatchNow.UnixMilli(),
 			})
@@ -2380,11 +2411,6 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 	for k := range s.seenAckResultMaskBySeq {
 		if k.sysid == sysid {
 			delete(s.seenAckResultMaskBySeq, k)
-		}
-	}
-	for k := range s.wrapAckCredit {
-		if k.sysid == sysid {
-			delete(s.wrapAckCredit, k)
 		}
 	}
 	delete(s.seenAckFrames, sysid)
@@ -2559,6 +2585,17 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	}
 	poolMask := poolMaskInt(s.seenAckResultMask[key])
 
+	slotPoolMask := func(accID string) int {
+		if slices.Contains(s.wrapCreditIDs[key], accID) {
+			return poolMask | ackPoolWrapHeldBit
+		}
+		if inflightCmd, ok := s.inFlight[accID]; ok && inflightCmd.wrapReceiptHeld {
+			return poolMask | ackPoolWrapHeldBit
+		}
+		return poolMask
+	}
+	settledWrapMask := poolMask | ackPoolWrapHeldBit | ackPoolWrapSettledBit
+
 	priorUnacked := s.unackedCount[key]
 	if len(matches) == 0 {
 		wroteAck := false
@@ -2572,11 +2609,18 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 				}
 			} else if s.wrapAckCredit[key] > 0 {
 				s.wrapAckCredit[key]--
+				if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+					creditID := ids[0]
+					s.wrapCreditIDs[key] = ids[1:]
+					if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
+						wroteAck = true
+					}
+				}
 			} else {
 				s.surplusAckTainted[key] = true
 			}
 			for _, accID := range s.ambiguousSlotIDs[key] {
-				if s.enqueueConsumedAckLocked(accID, 1, poolMask) {
+				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(accID)) {
 					wroteAck = true
 				}
 			}
@@ -2628,6 +2672,13 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		markAllAmbiguous := nonWrapAmbiguous
 		if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
 			s.wrapAckCredit[key]--
+			if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+				creditID := ids[0]
+				s.wrapCreditIDs[key] = ids[1:]
+				if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
+					wroteAny = true
+				}
+			}
 			markAllAmbiguous = true
 		} else if s.recovered.Load() && priorUnacked > 0 {
 			s.unackedCount[key] = priorUnacked - 1
@@ -2650,6 +2701,9 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		} else if s.recovered.Load() && priorUnacked == 0 {
 			if holdingWrapReceipt {
 				matches[0].wrapReceiptHeld = false
+				if s.enqueueConsumedAckLocked(matches[0].entityID, 1, settledWrapMask) {
+					wroteAny = true
+				}
 				markAllAmbiguous = true
 			} else {
 				s.surplusAckTainted[key] = true
@@ -2681,6 +2735,10 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
 				cmd.detail = CommitUnknownDetail
+				cmdMask := poolMask
+				if cmd.wrapReceiptHeld {
+					cmdMask |= ackPoolWrapHeldBit
+				}
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,
 					phase:        PhaseCommitUnknown,
@@ -2688,7 +2746,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMask,
+					ackPoolMask:  cmdMask,
 					detail:       CommitUnknownDetail,
 					updatedMs:    updatedMs,
 				})
@@ -2697,7 +2755,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		}
 		if s.recovered.Load() {
 			for _, accID := range s.ambiguousSlotIDs[key] {
-				if s.enqueueConsumedAckLocked(accID, 1, poolMask) {
+				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(accID)) {
 					wroteAny = true
 				}
 			}
@@ -2717,7 +2775,9 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	wasWrapHeld := matched.wrapReceiptHeld
 	matched.wrapReceiptHeld = false
 	matched.ackAccounted = true
+	finalPoolMask := poolMask
 	if wasWrapHeld {
+		finalPoolMask = settledWrapMask
 		s.ambiguousSlotIDs[key] = slices.DeleteFunc(s.ambiguousSlotIDs[key], func(id string) bool {
 			return id == matched.entityID
 		})
@@ -2739,7 +2799,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		source:       lifecycle.TransitionSourceComponent,
 		ackResult:    int(ack.Result),
 		ackAccounted: 1,
-		ackPoolMask:  poolMask,
+		ackPoolMask:  finalPoolMask,
 		detail:       detail,
 		updatedMs:    updatedMs,
 	})
@@ -2854,9 +2914,11 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					continue
 				}
 				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
-				if cmd.wrapReceiptHeld {
+				wasWrapHeld := cmd.wrapReceiptHeld
+				if wasWrapHeld {
 					cmd.wrapReceiptHeld = false
 					s.wrapAckCredit[key]++
+					s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], cmd.entityID)
 				}
 				if cmd.dispatch == dispatchSent && !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
@@ -2872,7 +2934,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
 					detail:       preemptDetail,
 					updatedMs:    updatedMs,
 				})
@@ -2952,9 +3014,11 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
 				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
-				if cmd.wrapReceiptHeld {
+				wasWrapHeld := cmd.wrapReceiptHeld
+				if wasWrapHeld {
 					cmd.wrapReceiptHeld = false
 					s.wrapAckCredit[key]++
+					s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], cmd.entityID)
 				}
 				if !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
@@ -2968,7 +3032,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
 					detail:       cmd.detail,
 					updatedMs:    updatedMs,
 				})
@@ -3151,7 +3215,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(cmd.ackAccounted),
-				ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.wrapReceiptHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    updatedMs,
 			})
@@ -3164,9 +3228,11 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
-				if cmd.wrapReceiptHeld {
+				wasWrapHeld := cmd.wrapReceiptHeld
+				if wasWrapHeld {
 					cmd.wrapReceiptHeld = false
 					s.wrapAckCredit[key]++
+					s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], cmd.entityID)
 				}
 				if !cmd.ackAccounted {
 					s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], cmd.entityID)
@@ -3180,7 +3246,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskInt(s.seenAckResultMask[key]),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
 					detail:       cmd.detail,
 					updatedMs:    updatedMs,
 				})

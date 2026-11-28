@@ -2596,17 +2596,20 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(page.getByTestId("teleop-axes-readout")).toContainText(
       "vx: 0.0 m/s",
     );
-    await expect
-      .poll(
-        () =>
-          teleopPosts.some(
-            (p) => p.sysid === 1 && p.vx === 0 && p.vy === 0 && p.vz === 0,
-          ),
-        { timeout: 3_000 },
-      )
-      .toBe(true);
+    await expect(page.getByTestId("hud-readout-gs").locator("dd")).toHaveText(
+      "0.0 m/s",
+      { timeout: 5_000 },
+    );
+
+    if ((await panel.getAttribute("data-engaged")) === "true") {
+      await page.getByTestId("teleop-engage-btn").click();
+      await expect(panel).toHaveAttribute("data-engaged", "false");
+    }
 
     // 4. Hardware P1 CRSF override while holding "w" zeroes sticks on the frame edge, latches PREEMPTED, and does NOT auto-resume when P2 returns.
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    await expect(page.getByTestId("teleop-velocity-pad")).toBeFocused();
     await page.keyboard.down("w");
     await expect(page.getByTestId("teleop-axes-readout")).toContainText(
       "vx: 4.0 m/s",

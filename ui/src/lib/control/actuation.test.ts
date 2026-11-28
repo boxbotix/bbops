@@ -4,6 +4,7 @@
 import { flushSync, mount, unmount } from "svelte";
 import { describe, expect, it, vi } from "vitest";
 import { createDiagnosticsDraftStore } from "../bench/tuning-rack";
+import ControlPanel from "../components/ControlPanel.svelte";
 import WorkspaceShell from "../components/WorkspaceShell.svelte";
 import { createSkgStore } from "../stores/skg.svelte";
 import { createTelemetryStore } from "../stores/telemetry.svelte";
@@ -2825,12 +2826,36 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
         },
       });
 
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const panel = mount(ControlPanel, {
+        target: host,
+        props: {
+          vehicle: skgStore.getVehicle(veh.id)!,
+          telemetryStore,
+          skgStore,
+          controller,
+          now: () => nowMs,
+        },
+      });
+      flushSync();
+      const getPanelEl = (): HTMLElement =>
+        host.querySelector('[data-testid="control-panel"]')!;
+      const getEngageBtn = (): HTMLButtonElement =>
+        host.querySelector('[data-testid="teleop-engage-btn"]')!;
+      const getPadEl = (): HTMLElement =>
+        host.querySelector('[data-testid="teleop-velocity-pad"]')!;
+
       // Case A: Engage confirmed at 0ms; periodic renewals at 50ms & 100ms stall under the 2-request cap.
       expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
         true,
       );
+      flushSync();
       expect(controller.engaged).toBe(true);
       expect(controller.engagedSysId).toBe(1);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("true");
+      expect(getEngageBtn().textContent?.trim()).toBe("Disengage Teleop");
+      expect(getPadEl().classList.contains("engaged")).toBe(true);
 
       let hbSeq = 1;
       const stepHealthyMs = async (deltaMs: number): Promise<void> => {
@@ -2846,6 +2871,7 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
           }),
         );
         await vi.advanceTimersByTimeAsync(deltaMs);
+        flushSync();
       };
 
       // Advance to 200ms (4 ticks: renewals sent at 50ms & 100ms, capped at 150ms & 200ms).
@@ -2854,17 +2880,48 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       }
       expect(sentTeleops).toHaveLength(3);
       expect(controller.engaged).toBe(true);
+      expect(controller.leaseRenewalPending).toBe(false);
 
-      // Past 240ms (confirmed deadline from 0ms engage), no new unconfirmed dispatches are allowed
-      // even on interactive keydown, and the 100ms in-flight renewal bounds expiry strictly at <= 340ms!
-      await stepHealthyMs(45); // 245ms
-      expect(controller.handlePadKeyDown({ key: "w" })).toBe(true);
-      expect(sentTeleops).toHaveLength(3);
-      await stepHealthyMs(94); // 339ms
+      await stepHealthyMs(39); // 239ms -> still within 240ms confirmed engage lease
       expect(controller.engaged).toBe(true);
-      await stepHealthyMs(1); // 340ms (100ms + 240ms server bound) -> expires!
+      expect(controller.engagedSysId).toBe(1);
+      expect(controller.leaseRenewalPending).toBe(false);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("true");
+
+      // At 240ms (confirmed deadline from 0ms engage when 50ms/100ms renewals are lost/unacknowledged,
+      // with zero intervening 1 Hz vehicle heartbeats), controller.engaged and ControlPanel DOM MUST drop
+      // to disengaged immediately via reactive leaseConfirmed while leaseRenewalPending tracks 340ms!
+      nowMs += 1;
+      await vi.advanceTimersByTimeAsync(1); // 240ms
+      flushSync();
       expect(controller.engaged).toBe(false);
       expect(controller.engagedSysId).toBeNull();
+      expect(controller.leaseRenewalPending).toBe(true);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
+      expect(getEngageBtn().textContent?.trim()).toBe("Engage Teleop");
+      expect(getPadEl().classList.contains("engaged")).toBe(false);
+      expect(getPadEl().textContent).toContain(
+        "Awaiting teleop lease renewal confirmation",
+      );
+      expect(controller.handlePadKeyDown({ key: "w" })).toBe(false);
+      expect(sentTeleops).toHaveLength(3);
+
+      await stepHealthyMs(10); // 250ms
+      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBeNull();
+      expect(controller.leaseRenewalPending).toBe(true);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
+      expect(sentTeleops).toHaveLength(3);
+
+      await stepHealthyMs(89); // 339ms -> still unconfirmed, pending renewal grace still open
+      expect(controller.engaged).toBe(false);
+      expect(controller.leaseRenewalPending).toBe(true);
+
+      await stepHealthyMs(1); // 340ms (100ms + 240ms server bound) -> pending session expires!
+      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBeNull();
+      expect(controller.leaseRenewalPending).toBe(false);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
       expect(controller.lastError).toMatch(/teleop lease expired/i);
       expect(controller.handlePadKeyDown({ key: "w" })).toBe(false);
 
@@ -2883,18 +2940,20 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
           result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
         });
       }
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
       expect(controller.engaged).toBe(false);
       await stepHealthyMs(100);
       expect(controller.engaged).toBe(false);
       expect(sentTeleops).toHaveLength(3);
 
       // Case B: Fresh explicit Engage Teleop resumes cleanly; confirm renewals at +50ms and +100ms
-      // (confirmed deadline +340ms), then stall renewals at +150ms and +200ms (server upper bound +440ms).
+      // (confirmed deadline +340ms), then stall renewals at +150ms and +200ms (grace bound +440ms).
       stallRenewals = false;
       expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
         true,
       );
+      flushSync();
       expect(controller.engaged).toBe(true);
       await stepHealthyMs(50); // +50ms renewal confirmed -> deadline +290ms
       await stepHealthyMs(50); // +100ms renewal confirmed -> deadline +340ms
@@ -2903,10 +2962,17 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       stallRenewals = true;
       await stepHealthyMs(50); // +150ms renewal stalls (#1)
       await stepHealthyMs(50); // +200ms renewal stalls (#2, capped)
-      await stepHealthyMs(239); // +439ms -> within +200ms + 240ms
+      await stepHealthyMs(139); // +339ms -> within +340ms confirmed lease
       expect(controller.engaged).toBe(true);
-      await stepHealthyMs(1); // +440ms -> server 240ms lease from +200ms expires!
+      expect(controller.leaseRenewalPending).toBe(false);
+      await stepHealthyMs(1); // +340ms -> confirmed lease expires immediately; grace runs until +440ms!
       expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBeNull();
+      expect(controller.leaseRenewalPending).toBe(true);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
+      await stepHealthyMs(100); // +440ms -> grace window from +200ms expires!
+      expect(controller.engaged).toBe(false);
+      expect(controller.leaseRenewalPending).toBe(false);
       await stepHealthyMs(360); // +800ms -> still disengaged!
       expect(controller.engaged).toBe(false);
 
@@ -2917,30 +2983,59 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
           result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
         });
       }
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
       expect(controller.engaged).toBe(false);
 
-      // Case C: If a renewal sent at +100ms resolves at +300ms (< 340ms) after a main-thread pause,
-      // engagement survives and extends confirmed deadline to +340ms without resetting held keys.
+      // Case C: If a renewal sent at +100ms was accepted by the server and its HTTP response arrives
+      // delayed at +260ms (> +240ms initial deadline, < +340ms renewal deadline), engaged and exposed axes
+      // drop to false / 0 during [+240ms, +260ms) and restore cleanly with held keys intact at +260ms!
       stallRenewals = false;
       expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
         true,
       );
+      flushSync();
       stallRenewals = true;
+      expect(controller.handlePadKeyDown({ key: "w" })).toBe(true);
+      expect(controller.axes.vx).toBe(4);
       await stepHealthyMs(50); // +50ms stalled (#1)
       await stepHealthyMs(50); // +100ms stalled (#2)
-      await stepHealthyMs(200); // +300ms (> +240ms initial, < +340ms in-flight bound)
-      expect(controller.engaged).toBe(true);
+      await stepHealthyMs(150); // +250ms (> +240ms initial, < +340ms in-flight bound)
+      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBeNull();
+      expect(controller.leaseRenewalPending).toBe(true);
+      expect(controller.axes.vx).toBe(0);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
+      expect(getEngageBtn().textContent?.trim()).toBe("Engage Teleop");
+      expect(getPadEl().classList.contains("engaged")).toBe(false);
+
+      await stepHealthyMs(10); // +260ms: server-accepted +100ms renewal response arrives!
       stalledResolvers.pop()?.({
         ok: true,
-        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 240 },
+        result: { sysid: 1, lease_active: true, expires_ms: nowMs + 80 },
       });
       stalledResolvers.length = 0;
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
       expect(controller.engaged).toBe(true);
-      await stepHealthyMs(40); // +340ms (no newer in-flight renewals remain) -> expires at +340ms sharp!
-      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSysId).toBe(1);
+      expect(controller.leaseRenewalPending).toBe(false);
+      expect(controller.axes.vx).toBe(4);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("true");
+      expect(getEngageBtn().textContent?.trim()).toBe("Disengage Teleop");
+      expect(getPadEl().classList.contains("engaged")).toBe(true);
 
+      await stepHealthyMs(79); // +339ms -> still confirmed under +100ms + 240ms = +340ms
+      expect(controller.engaged).toBe(true);
+      expect(controller.axes.vx).toBe(4);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("true");
+      await stepHealthyMs(1); // +340ms (new renewal stalled -> drops engaged & axes to false / 0 at +340ms sharp!)
+      expect(controller.engaged).toBe(false);
+      expect(controller.axes.vx).toBe(0);
+      expect(getPanelEl().getAttribute("data-engaged")).toBe("false");
+
+      unmount(panel);
+      host.remove();
       controller.dispose();
       telemetryStore.disconnect();
       skgStore.disconnect();
