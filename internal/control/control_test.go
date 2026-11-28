@@ -183,7 +183,7 @@ func (s *fakeCommandStore) Transition(
 	cur.AckResult = ackResult
 	if ackResult >= 0 {
 		cur.AckAccounted = 1
-		if ackResult < 28 {
+		if ackResult < 27 {
 			cur.AckPoolMask |= (1 << uint(ackResult)) | ackPoolFormatV2Bit
 		} else {
 			cur.AckPoolMask |= ackPoolFormatV2Bit
@@ -8826,7 +8826,9 @@ func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAn
 		for _, pred := range pack.Predicates {
 			if pred.Name == PredicateCommandAckPoolMask {
 				found = true
-				if !strings.Contains(pred.Description, "bits 0..27") || !strings.Contains(pred.Description, "bit 30") {
+				if !strings.Contains(pred.Description, "bits 0..26") ||
+					!strings.Contains(pred.Description, "bit 27") ||
+					!strings.Contains(pred.Description, "bit 30") {
 					t.Fatalf("PredicateCommandAckPoolMask description = %q, want result-bit range and reserved accounting bits", pred.Description)
 				}
 			}
@@ -10919,7 +10921,55 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 						secondPeer, secondDomain, admitBeforeRecovery, gotAfter.PhaseState, wantPhase, gotAfter)
 				}
 
-				// If replacement peerB displaced sysid=1, even if peerB later goes silent and peerA reconnects disarmed,
+				if wantPhase == PhaseCommitUnknown {
+					if (gotAfter.AckPoolMask & ackPoolTargetDisplacedBit) == 0 {
+						t.Fatalf("secondPeer=%s domain=%v admitBeforeRecovery=%v: expected durable ackPoolTargetDisplacedBit in AckPoolMask, got %+v",
+							secondPeer, secondDomain, admitBeforeRecovery, gotAfter)
+					}
+
+					// Restart #2 (svc3 / tr3) over the SAME store AFTER displacement and BEFORE Peer A returns:
+					// returning Peer A reporting Armed=false MUST NEVER confirm the displaced command in either svc3 recovery order!
+					for _, svc3AdmitBeforeRec := range []bool{true, false} {
+						tr3, err := mavlink.NewTracker("boxbotix", "bbops")
+						if err != nil {
+							t.Fatalf("NewTracker 3: %v", err)
+						}
+						now3 := now2.Add(500 * time.Millisecond)
+						svc3, err := NewService(Options{
+							Org:      "boxbotix",
+							Platform: "bbops",
+							Targets:  tr3,
+							Sender:   &fakeFrameSender{},
+							Store:    store,
+							Now:      func() time.Time { return now3 },
+						})
+						if err != nil {
+							t.Fatalf("NewService 3: %v", err)
+						}
+						if svc3AdmitBeforeRec {
+							deliverTrackerOutcome(svc3, tr3.IngestFrame(makeHBWithDomainAndTier(t, 1, 30, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now3), now3)
+							now3 = now3.Add(50 * time.Millisecond)
+							svc3.Advance(ctx, now3)
+							now3 = now3.Add(time.Second)
+							deliverTrackerOutcome(svc3, tr3.IngestFrame(makeHBWithDomainAndTier(t, 1, 31, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now3), now3)
+							svc3.Advance(ctx, now3)
+						} else {
+							svc3.Advance(ctx, now3)
+							now3 = now3.Add(50 * time.Millisecond)
+							deliverTrackerOutcome(svc3, tr3.IngestFrame(makeHBWithDomainAndTier(t, 1, 30, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now3), now3)
+							now3 = now3.Add(time.Second)
+							deliverTrackerOutcome(svc3, tr3.IngestFrame(makeHBWithDomainAndTier(t, 1, 31, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now3), now3)
+							svc3.Advance(ctx, now3)
+						}
+						gotSvc3 := lookupStoredEntity(t, store, disarmRes.CommandID)
+						if gotSvc3.PhaseState != PhaseCommitUnknown || gotSvc3.AckResult != UnacknowledgedResult {
+							t.Fatalf("secondPeer=%s domain=%v admitBeforeRec=%v svc3AdmitBeforeRec=%v: restart after displacement forgot displacement and confirmed Peer A command: %+v",
+								secondPeer, secondDomain, admitBeforeRecovery, svc3AdmitBeforeRec, gotSvc3)
+						}
+					}
+				}
+
+				// If replacement peerB displaced sysid=1, even if peerB later goes silent and peerA reconnects disarmed in svc2,
 				// targetDisplaced MUST remain latched and never confirm the displaced command!
 				if secondPeer != peerA {
 					now2 = now2.Add(3100 * time.Millisecond)
@@ -10936,7 +10986,7 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 				}
 			}
 
-			// Replacement Peer B (peerB != peerA) NEVER confirms Peer A's command in either admission order.
+			// Replacement Peer B (peerB != peerA) NEVER confirms Peer A's command in either admission order (nor after subsequent restarts).
 			runRestartDisarmCase(t, peerB, mavcodec.DomainQuadcopter, true, PhaseCommitUnknown)
 			runRestartDisarmCase(t, peerB, mavcodec.DomainQuadcopter, false, PhaseCommitUnknown)
 
@@ -10944,9 +10994,94 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 			runRestartDisarmCase(t, peerA, mavcodec.DomainQuadcopter, true, PhaseConfirmed)
 			runRestartDisarmCase(t, peerA, mavcodec.DomainQuadcopter, false, PhaseConfirmed)
 
-			// Same Peer A reporting a different domain (Rover != Quadcopter) NEVER confirms Peer A's command.
+			// Same Peer A reporting a different domain (Rover != Quadcopter) NEVER confirms Peer A's command (nor after subsequent restarts).
 			runRestartDisarmCase(t, peerA, mavcodec.DomainRover, true, PhaseCommitUnknown)
 			runRestartDisarmCase(t, peerA, mavcodec.DomainRover, false, PhaseCommitUnknown)
+
+			// Positive control across multiple restarts with NO displacing peer in svc2:
+			// Peer A issues Disarm in svc1 -> svc2 restarts and recovers while vehicle is still silent ->
+			// svc3 restarts and Peer A reconnects disarmed -> reconciles to PhaseConfirmed!
+			{
+				multiStore := newStore(t)
+				trM1, _ := mavlink.NewTracker("boxbotix", "bbops")
+				nowM := time.Date(2026, 11, 28, 9, 3, 0, 0, time.UTC)
+				svcM1, _ := NewService(Options{
+					Org: "boxbotix", Platform: "bbops", Targets: trM1, Sender: &fakeFrameSender{}, Store: multiStore,
+					Now: func() time.Time { return nowM },
+				})
+				deliverTrackerOutcome(svcM1, trM1.IngestFrame(makeHBWithDomainAndTier(t, 1, 1, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, nowM), nowM)
+				nowM = nowM.Add(10 * time.Millisecond)
+				disarmM, err := svcM1.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionDisarm})
+				if err != nil {
+					t.Fatalf("SubmitCommand multi-restart control: %v", err)
+				}
+				nowM = nowM.Add(2 * time.Second)
+				svcM1.Advance(ctx, nowM)
+
+				trM2, _ := mavlink.NewTracker("boxbotix", "bbops")
+				nowM = nowM.Add(500 * time.Millisecond)
+				svcM2, _ := NewService(Options{
+					Org: "boxbotix", Platform: "bbops", Targets: trM2, Sender: &fakeFrameSender{}, Store: multiStore,
+					Now: func() time.Time { return nowM },
+				})
+				svcM2.Advance(ctx, nowM) // recovers without any displacing peer
+
+				trM3, _ := mavlink.NewTracker("boxbotix", "bbops")
+				nowM = nowM.Add(500 * time.Millisecond)
+				svcM3, _ := NewService(Options{
+					Org: "boxbotix", Platform: "bbops", Targets: trM3, Sender: &fakeFrameSender{}, Store: multiStore,
+					Now: func() time.Time { return nowM },
+				})
+				svcM3.Advance(ctx, nowM)
+				nowM = nowM.Add(50 * time.Millisecond)
+				deliverTrackerOutcome(svcM3, trM3.IngestFrame(makeHBWithDomainAndTier(t, 1, 10, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, nowM), nowM)
+				nowM = nowM.Add(time.Second)
+				deliverTrackerOutcome(svcM3, trM3.IngestFrame(makeHBWithDomainAndTier(t, 1, 11, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, nowM), nowM)
+				svcM3.Advance(ctx, nowM)
+				if gotM := lookupStoredEntity(t, multiStore, disarmM.CommandID); gotM.PhaseState != PhaseConfirmed {
+					t.Fatalf("uninterrupted multi-restart same-peer control failed to confirm Disarm: %+v", gotM)
+				}
+			}
+
+			// Live displacement before restart: Peer A issues ActionSITLCRSFOverride in svc1 -> link_lost ->
+			// Peer B admitted in svc1 -> restart into svc2 -> Peer A returns reporting AuthorityDirectCRSFOverride -> stays PhaseCommitUnknown!
+			{
+				liveDispStore := newStore(t)
+				trLD1, _ := mavlink.NewTracker("boxbotix", "bbops")
+				nowLD := time.Date(2026, 11, 28, 9, 4, 0, 0, time.UTC)
+				svcLD1, _ := NewService(Options{
+					Org: "boxbotix", Platform: "bbops", Targets: trLD1, Sender: &fakeFrameSender{}, Store: liveDispStore,
+					Now: func() time.Time { return nowLD },
+				})
+				deliverTrackerOutcome(svcLD1, trLD1.IngestFrame(makeHBWithDomainAndTier(t, 1, 1, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, nowLD), nowLD)
+				nowLD = nowLD.Add(10 * time.Millisecond)
+				ldRes, err := svcLD1.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride})
+				if err != nil {
+					t.Fatalf("SubmitCommand live displacement: %v", err)
+				}
+				nowLD = nowLD.Add(2 * time.Second)
+				svcLD1.Advance(ctx, nowLD)
+				nowLD = nowLD.Add(3100 * time.Millisecond)
+				for _, ev := range trLD1.EvaluateSilence(nowLD) {
+					svcLD1.OnTransitionEvent(ev)
+				}
+				nowLD = nowLD.Add(20 * time.Millisecond)
+				deliverTrackerOutcome(svcLD1, trLD1.IngestFrame(makeHBWithDomainAndTier(t, 1, 5, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerB, nowLD), nowLD)
+
+				trLD2, _ := mavlink.NewTracker("boxbotix", "bbops")
+				nowLD = nowLD.Add(500 * time.Millisecond)
+				svcLD2, _ := NewService(Options{
+					Org: "boxbotix", Platform: "bbops", Targets: trLD2, Sender: &fakeFrameSender{}, Store: liveDispStore,
+					Now: func() time.Time { return nowLD },
+				})
+				deliverTrackerOutcome(svcLD2, trLD2.IngestFrame(makeHBWithDomainAndTier(t, 1, 10, mavcodec.DomainQuadcopter, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerA, nowLD), nowLD)
+				nowLD = nowLD.Add(time.Second)
+				deliverTrackerOutcome(svcLD2, trLD2.IngestFrame(makeHBWithDomainAndTier(t, 1, 11, mavcodec.DomainQuadcopter, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerA, nowLD), nowLD)
+				svcLD2.Advance(ctx, nowLD)
+				if gotLD := lookupStoredEntity(t, liveDispStore, ldRes.CommandID); gotLD.PhaseState != PhaseCommitUnknown {
+					t.Fatalf("live Peer B displacement before restart forgotten in svc2: %+v", gotLD)
+				}
+			}
 
 			// Legacy unpeered CommandEntity (Peer == "") recovered from older schema stays indeterminate (PhaseCommitUnknown)
 			// across both before-recovery and after-recovery peer admission + fresh post-recovery disarmed heartbeats.
@@ -10999,7 +11134,8 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 				}
 			}
 
-			// Same Peer A SITL-only command replaced by direct-bench hardware across restart stays PhaseCommitUnknown.
+			// Same Peer A SITL-only command replaced by direct-bench hardware across restart stays PhaseCommitUnknown
+			// even if svc3 restarts again and Peer A reports sitl-local + AuthorityDirectCRSFOverride!
 			sitlStore := newStore(t)
 			trSitl1, _ := mavlink.NewTracker("boxbotix", "bbops")
 			nowSitl := time.Date(2026, 11, 28, 9, 8, 0, 0, time.UTC)
@@ -11028,6 +11164,20 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 			svcSitl2.Advance(ctx, nowSitl2)
 			if gotSitl := lookupStoredEntity(t, sitlStore, sitlRes.CommandID); gotSitl.PhaseState != PhaseCommitUnknown {
 				t.Fatalf("post-restart direct-bench hardware on same peerA falsely confirmed SITL command: %+v", gotSitl)
+			}
+
+			trSitl3, _ := mavlink.NewTracker("boxbotix", "bbops")
+			nowSitl3 := nowSitl2.Add(500 * time.Millisecond)
+			svcSitl3, _ := NewService(Options{
+				Org: "boxbotix", Platform: "bbops", Targets: trSitl3, Sender: &fakeFrameSender{}, Store: sitlStore,
+				Now: func() time.Time { return nowSitl3 },
+			})
+			deliverTrackerOutcome(svcSitl3, trSitl3.IngestFrame(makeHBWithDomainAndTier(t, 1, 20, mavcodec.DomainQuadcopter, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerA, nowSitl3), nowSitl3)
+			nowSitl3 = nowSitl3.Add(time.Second)
+			deliverTrackerOutcome(svcSitl3, trSitl3.IngestFrame(makeHBWithDomainAndTier(t, 1, 21, mavcodec.DomainQuadcopter, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerA, nowSitl3), nowSitl3)
+			svcSitl3.Advance(ctx, nowSitl3)
+			if gotSitl3 := lookupStoredEntity(t, sitlStore, sitlRes.CommandID); gotSitl3.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("restart after direct-bench LinkTier displacement forgot displacement: %+v", gotSitl3)
 			}
 		}
 
@@ -11308,5 +11458,239 @@ func TestServicePostRestartPeerContinuityAndPeerScopedAckIsolation(t *testing.T)
 		if got := senderAged.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
 			t.Fatalf("aged seq=10 #76 count = %d, want 1", got)
 		}
+	})
+
+	// Legacy unpeered Arm (Peer == "") preserves endpoint uncertainty across peers:
+	// receipts on Peer B (matched or idle, live or across restart) NEVER allow a delayed MAV_RESULT_ACCEPTED
+	// from Peer A's old Arm to falsely confirm Peer A's subsequent Disarm while Peer A is still armed.
+	t.Run("legacy_unpeered_arm_preserves_ambiguity_for_other_peers_after_replacement_peer_ack", func(t *testing.T) {
+		runWithStoreFactory := func(t *testing.T, newStore func(*testing.T) testCommandStore) {
+			ctx := context.Background()
+			peerA := netip.MustParseAddrPort("127.0.0.1:20751")
+			peerB := netip.MustParseAddrPort("127.0.0.1:20752")
+
+			for _, legacyPhase := range []string{PhaseCommitUnknown, PhasePending} {
+				for _, restartAfterPeerB := range []bool{false, true} {
+					for _, withFrameSeq := range []bool{true, false} {
+						store := newStore(t)
+						tBase := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+						legacyArmID := "boxbotix.bbops.robotics.uxs.command.s10000000000000nlegacyarm000001"
+						if err := store.Create(ctx, &CommandEntity{
+							ID:           legacyArmID,
+							PhaseState:   legacyPhase,
+							Target:       "boxbotix.bbops.robotics.uxs.vehicle.1",
+							SysID:        1,
+							CmdID:        int(mavcodec.MAVCmdComponentArmDisarm),
+							Action:       ActionArm,
+							Peer:         "",
+							AckResult:    UnacknowledgedResult,
+							AckAccounted: 0,
+							IssuedMs:     tBase.UnixMilli(),
+							UpdatedMs:    tBase.UnixMilli(),
+						}); err != nil {
+							t.Fatalf("Create legacy Arm (%s): %v", legacyPhase, err)
+						}
+
+						tr1, err := mavlink.NewTracker("boxbotix", "bbops")
+						if err != nil {
+							t.Fatalf("NewTracker 1: %v", err)
+						}
+						now := tBase.Add(100 * time.Millisecond)
+						svc1, err := NewService(Options{
+							Org:      "boxbotix",
+							Platform: "bbops",
+							Targets:  tr1,
+							Sender:   &fakeFrameSender{},
+							Store:    store,
+							Now:      func() time.Time { return now },
+						})
+						if err != nil {
+							t.Fatalf("NewService 1: %v", err)
+						}
+
+						// Peer B is admitted (armed), issues Disarm, and returns MAV_RESULT_DENIED (plus an extra idle DENIED on Peer B).
+						deliverTrackerOutcome(svc1, tr1.IngestFrame(makeHBWithDomainAndTier(t, 1, 1, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerB, now), now)
+						now = now.Add(10 * time.Millisecond)
+						disarmB, err := svc1.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionDisarm})
+						if err != nil {
+							t.Fatalf("SubmitCommand Disarm Peer B: %v", err)
+						}
+						now = now.Add(10 * time.Millisecond)
+						deniedAck := mavcodec.CommandAck{
+							Command: mavcodec.MAVCmdComponentArmDisarm,
+							Result:  mavcodec.MAVResultDenied,
+						}
+						if withFrameSeq {
+							deliverTrackerOutcome(svc1, tr1.IngestFrame(mavcodec.Frame{
+								Sequence:    2,
+								SystemID:    1,
+								ComponentID: mavcodec.CompIDAutopilot1,
+								Message:     deniedAck,
+							}, peerB, now), now)
+							now = now.Add(10 * time.Millisecond)
+							deliverTrackerOutcome(svc1, tr1.IngestFrame(mavcodec.Frame{
+								Sequence:    3,
+								SystemID:    1,
+								ComponentID: mavcodec.CompIDAutopilot1,
+								Message: mavcodec.CommandAck{
+									Command: mavcodec.MAVCmdComponentArmDisarm,
+									Result:  mavcodec.MAVResultFailed,
+								},
+							}, peerB, now), now)
+						} else {
+							svc1.OnCommandAck(1, deniedAck, now)
+							now = now.Add(10 * time.Millisecond)
+							svc1.OnCommandAck(1, mavcodec.CommandAck{
+								Command: mavcodec.MAVCmdComponentArmDisarm,
+								Result:  mavcodec.MAVResultFailed,
+							}, now)
+						}
+						if gotB := lookupStoredEntity(t, store, disarmB.CommandID); gotB.PhaseState != PhaseCommitUnknown || gotB.AckResult != UnacknowledgedResult {
+							t.Fatalf("phase=%s restart=%v seq=%v Peer B Disarm = %+v, want PhaseCommitUnknown AckResult=-1",
+								legacyPhase, restartAfterPeerB, withFrameSeq, gotB)
+						}
+
+						// Peer B goes link_lost.
+						now = now.Add(3100 * time.Millisecond)
+						for _, ev := range tr1.EvaluateSilence(now) {
+							svc1.OnTransitionEvent(ev)
+						}
+
+						activeTr := tr1
+						activeSvc := svc1
+						if restartAfterPeerB {
+							tr2, err := mavlink.NewTracker("boxbotix", "bbops")
+							if err != nil {
+								t.Fatalf("NewTracker 2: %v", err)
+							}
+							now = now.Add(200 * time.Millisecond)
+							svc2, err := NewService(Options{
+								Org:      "boxbotix",
+								Platform: "bbops",
+								Targets:  tr2,
+								Sender:   &fakeFrameSender{},
+								Store:    store,
+								Now:      func() time.Time { return now },
+							})
+							if err != nil {
+								t.Fatalf("NewService 2: %v", err)
+							}
+							activeTr = tr2
+							activeSvc = svc2
+						}
+
+						// Peer A is admitted (still armed) and issues Disarm.
+						now = now.Add(20 * time.Millisecond)
+						deliverTrackerOutcome(activeSvc, activeTr.IngestFrame(makeHBWithDomainAndTier(t, 1, 10, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now), now)
+						now = now.Add(10 * time.Millisecond)
+						disarmA, err := activeSvc.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionDisarm})
+						if err != nil {
+							t.Fatalf("SubmitCommand Disarm Peer A: %v", err)
+						}
+
+						// Delayed MAV_RESULT_ACCEPTED from Peer A's old Arm arrives while Peer A is still armed:
+						// Peer A's Disarm MUST become PhaseCommitUnknown (AckResult=-1), NEVER PhaseConfirmed!
+						now = now.Add(10 * time.Millisecond)
+						acceptedAck := mavcodec.CommandAck{
+							Command: mavcodec.MAVCmdComponentArmDisarm,
+							Result:  mavcodec.MAVResultAccepted,
+						}
+						if withFrameSeq {
+							deliverTrackerOutcome(activeSvc, activeTr.IngestFrame(mavcodec.Frame{
+								Sequence:    11,
+								SystemID:    1,
+								ComponentID: mavcodec.CompIDAutopilot1,
+								Message:     acceptedAck,
+							}, peerA, now), now)
+						} else {
+							activeSvc.OnCommandAck(1, acceptedAck, now)
+						}
+						gotA := lookupStoredEntity(t, store, disarmA.CommandID)
+						if gotA.PhaseState != PhaseCommitUnknown || gotA.AckResult != UnacknowledgedResult {
+							t.Fatalf("phase=%s restart=%v seq=%v Peer A Disarm falsely confirmed by old Arm ACCEPTED while armed: %+v",
+								legacyPhase, restartAfterPeerB, withFrameSeq, gotA)
+						}
+
+						// Fresh disarmed #0 HEARTBEAT on Peer A then reconciles Peer A's Disarm to PhaseConfirmed (AckResult=-1).
+						now = now.Add(time.Second)
+						deliverTrackerOutcome(activeSvc, activeTr.IngestFrame(makeHBWithDomainAndTier(t, 1, 12, mavcodec.DomainQuadcopter, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, now), now)
+						activeSvc.Advance(ctx, now)
+						if gotARec := lookupStoredEntity(t, store, disarmA.CommandID); gotARec.PhaseState != PhaseConfirmed || gotARec.AckResult != UnacknowledgedResult {
+							t.Fatalf("phase=%s restart=%v seq=%v Peer A Disarm after disarmed HB = %+v, want PhaseConfirmed AckResult=-1",
+								legacyPhase, restartAfterPeerB, withFrameSeq, gotARec)
+						}
+					}
+				}
+			}
+
+			// Known-peer control: when the unanswered Arm explicitly recorded Peer == peerB.String(),
+			// Peer B's Disarm + DENIED stays PhaseCommitUnknown on Peer B, while Peer A's Disarm + ACCEPTED
+			// is isolated from Peer B and transitions directly to PhaseConfirmed (AckResult = 0).
+			peeredStore := newStore(t)
+			tCtrl := time.Date(2026, 11, 28, 10, 15, 0, 0, time.UTC)
+			if err := peeredStore.Create(ctx, &CommandEntity{
+				ID:           "boxbotix.bbops.robotics.uxs.command.s10000000000000npeeredarmb00001",
+				PhaseState:   PhaseCommitUnknown,
+				Target:       "boxbotix.bbops.robotics.uxs.vehicle.1",
+				SysID:        1,
+				CmdID:        int(mavcodec.MAVCmdComponentArmDisarm),
+				Action:       ActionArm,
+				Peer:         peerB.String(),
+				Domain:       uxsvocab.DomainQuadcopter,
+				LinkTier:     uxsvocab.LinkTierSITLLocal,
+				AckResult:    UnacknowledgedResult,
+				AckAccounted: 0,
+				IssuedMs:     tCtrl.UnixMilli(),
+				UpdatedMs:    tCtrl.UnixMilli(),
+			}); err != nil {
+				t.Fatalf("Create peered Arm control: %v", err)
+			}
+			trCtrl, _ := mavlink.NewTracker("boxbotix", "bbops")
+			nowCtrl := tCtrl.Add(100 * time.Millisecond)
+			svcCtrl, _ := NewService(Options{
+				Org: "boxbotix", Platform: "bbops", Targets: trCtrl, Sender: &fakeFrameSender{}, Store: peeredStore,
+				Now: func() time.Time { return nowCtrl },
+			})
+			deliverTrackerOutcome(svcCtrl, trCtrl.IngestFrame(makeHBWithDomainAndTier(t, 1, 1, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerB, nowCtrl), nowCtrl)
+			nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+			ctrlDisarmB, err := svcCtrl.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionDisarm})
+			if err != nil {
+				t.Fatalf("SubmitCommand ctrlDisarmB: %v", err)
+			}
+			nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcCtrl, trCtrl.IngestFrame(mavcodec.Frame{
+				Sequence: 2, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1,
+				Message: mavcodec.CommandAck{Command: mavcodec.MAVCmdComponentArmDisarm, Result: mavcodec.MAVResultDenied},
+			}, peerB, nowCtrl), nowCtrl)
+			if gotCtrlB := lookupStoredEntity(t, peeredStore, ctrlDisarmB.CommandID); gotCtrlB.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("known-peerB control Disarm B = %+v, want PhaseCommitUnknown", gotCtrlB)
+			}
+			nowCtrl = nowCtrl.Add(3100 * time.Millisecond)
+			for _, ev := range trCtrl.EvaluateSilence(nowCtrl) {
+				svcCtrl.OnTransitionEvent(ev)
+			}
+			nowCtrl = nowCtrl.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svcCtrl, trCtrl.IngestFrame(makeHBWithDomainAndTier(t, 1, 10, mavcodec.DomainQuadcopter, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerA, nowCtrl), nowCtrl)
+			nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+			ctrlDisarmA, err := svcCtrl.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionDisarm})
+			if err != nil {
+				t.Fatalf("SubmitCommand ctrlDisarmA: %v", err)
+			}
+			nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcCtrl, trCtrl.IngestFrame(mavcodec.Frame{
+				Sequence: 11, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1,
+				Message: mavcodec.CommandAck{Command: mavcodec.MAVCmdComponentArmDisarm, Result: mavcodec.MAVResultAccepted},
+			}, peerA, nowCtrl), nowCtrl)
+			if gotCtrlA := lookupStoredEntity(t, peeredStore, ctrlDisarmA.CommandID); gotCtrlA.PhaseState != PhaseConfirmed || gotCtrlA.AckResult != int(mavcodec.MAVResultAccepted) {
+				t.Fatalf("known-peerB control Disarm A = %+v, want PhaseConfirmed AckResult=0", gotCtrlA)
+			}
+		}
+
+		t.Run("fakeCommandStore", func(t *testing.T) {
+			runWithStoreFactory(t, func(*testing.T) testCommandStore { return newFakeCommandStore() })
+		})
+		t.Run("LifecycleStore_ENTITY_STATES_KV", func(t *testing.T) {
+			runWithStoreFactory(t, func(t *testing.T) testCommandStore { return newRealLifecycleStore(t) })
+		})
 	})
 }
