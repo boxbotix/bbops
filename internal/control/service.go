@@ -2603,21 +2603,27 @@ func hasFreshHeartbeatSince(
 	if target.CurrentLinkHbUnconfirmed {
 		return false
 	}
-	if (target.HeartbeatReceiptRev > 0 || baselineHbReceiptRev > 0) &&
-		target.HeartbeatReceiptRev <= baselineHbReceiptRev {
+	hasReceiptRev := target.HeartbeatReceiptRev > 0 || target.LatestHeartbeatReceiptRev > 0 || baselineHbReceiptRev > 0
+	if hasReceiptRev && target.HeartbeatReceiptRev <= baselineHbReceiptRev {
 		return false
 	}
 	if target.HeartbeatSeq > 0 {
 		if target.HeartbeatSeq <= baselineHbSeq {
 			return false
 		}
-		if baselineHbSeq == 0 && target.HeartbeatObservedUnixNs <= baselineNs {
+		if !hasReceiptRev && baselineHbSeq == 0 && target.HeartbeatObservedUnixNs <= baselineNs {
 			return false
 		}
 		if target.HeartbeatOrder > 0 || baselinePacketOrder > 0 || target.PacketOrder > 0 {
 			return target.HeartbeatOrder > baselinePacketOrder
 		}
+		if hasReceiptRev {
+			return target.HeartbeatReceiptRev > baselineHbReceiptRev
+		}
 		return target.HeartbeatObservedUnixNs > baselineNs
+	}
+	if hasReceiptRev {
+		return target.HeartbeatReceiptRev > baselineHbReceiptRev
 	}
 	return target.HeartbeatObservedUnixNs > baselineNs
 }

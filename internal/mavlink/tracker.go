@@ -258,6 +258,10 @@ type vehicleSession struct {
 	obsMsIdx                        int
 	linkEpoch                       uint64
 	lifetimePacketPos               uint64
+	hasLifeSeq                      bool
+	lastLifeSeq                     uint8
+	hasLifePendingGap               bool
+	lifePendingGapSeq               uint8
 	hasSeqStream                    bool
 	lastStreamSeq                   uint8
 	seqStreamPos                    uint64
@@ -365,6 +369,75 @@ func (s *vehicleSession) wasHbStateSeenInPriorCycle(seq uint8, hbOrder uint64, s
 	return false
 }
 
+func (s *vehicleSession) projectedLifetimePos(seq uint8) uint64 {
+	pos := s.lifetimePacketPos
+	if s.linkLost || !s.hasLifeSeq {
+		if pos == 0 || seq != s.lastSeq {
+			return pos + 1
+		}
+		return pos
+	}
+	if s.hasLifePendingGap {
+		if seq == s.lifePendingGapSeq {
+			if pos == 0 {
+				return 1
+			}
+			return pos
+		}
+		gapStep := uint8(seq - s.lifePendingGapSeq)
+		if gapStep >= 1 && gapStep <= 64 {
+			return pos + 2
+		}
+	}
+	delta := uint8(seq - s.lastLifeSeq)
+	if delta >= 1 && delta <= 64 {
+		return pos + 1
+	}
+	if pos == 0 {
+		return 1
+	}
+	return pos
+}
+
+func (s *vehicleSession) advanceLifetimeSeq(seq uint8) {
+	if !s.hasLifeSeq {
+		s.hasLifeSeq = true
+		s.lastLifeSeq = seq
+		s.hasLifePendingGap = false
+		if s.lifetimePacketPos == 0 || seq != s.lastSeq {
+			s.lifetimePacketPos++
+		}
+		return
+	}
+	if s.hasLifePendingGap {
+		if seq == s.lifePendingGapSeq {
+			return
+		}
+		gapStep := uint8(seq - s.lifePendingGapSeq)
+		if gapStep >= 1 && gapStep <= 64 {
+			s.hasLifePendingGap = false
+			s.lastLifeSeq = seq
+			s.lifetimePacketPos += 2
+			return
+		}
+		s.hasLifePendingGap = false
+	}
+	delta := uint8(seq - s.lastLifeSeq)
+	if delta == 0 {
+		return
+	}
+	if delta <= 64 {
+		s.lastLifeSeq = seq
+		s.lifetimePacketPos++
+		return
+	}
+	if delta <= 255-maxBackwardTelemetryReorder {
+		s.hasLifePendingGap = true
+		s.lifePendingGapSeq = seq
+		return
+	}
+}
+
 func (s *vehicleSession) recordLinkHbHistory(seq uint8, state hbStateKey) {
 	pos := s.lifetimePacketPos
 	if pos == 0 {
@@ -407,7 +480,24 @@ func (s *vehicleSession) recordLinkHbHistory(seq uint8, state hbStateKey) {
 	})
 }
 
-func (s *vehicleSession) wasHbStateSeenBeforeCurrentLink(seq uint8, peer netip.AddrPort, state hbStateKey) bool {
+func (s *vehicleSession) recordStaleLinkHbObservation(seq uint8, peer netip.AddrPort, state hbStateKey) {
+	candPos := s.lifetimePacketPos
+	if candPos == 0 {
+		candPos = 1
+	}
+	if s.wasHbStateSeenBeforeCurrentLinkAt(seq, peer, state, candPos) {
+		return
+	}
+	entries := s.seenLinkHbHistory[seq]
+	for i := range entries {
+		if entries[i].state == state && entries[i].curLinkEpoch == s.linkEpoch {
+			return
+		}
+	}
+	s.recordLinkHbHistory(seq, state)
+}
+
+func (s *vehicleSession) wasHbStateSeenBeforeCurrentLinkAt(seq uint8, peer netip.AddrPort, state hbStateKey, candPos uint64) bool {
 	normPeer := normalizeAddrPort(peer)
 	if !matchesPinnedPeer(s, normPeer) {
 		return false
@@ -424,18 +514,17 @@ func (s *vehicleSession) wasHbStateSeenBeforeCurrentLink(seq uint8, peer netip.A
 		if priorLife == 0 {
 			return false
 		}
-		pos := s.lifetimePacketPos
-		if pos == 0 {
-			pos = 1
+		if candPos == 0 {
+			candPos = 1
 		}
-		return pos <= priorLife+maxHistoricalHbReorderPackets
+		return candPos <= priorLife+maxHistoricalHbReorderPackets
 	}
 	return false
 }
 
-func (s *vehicleSession) shouldHoldPreLossHeartbeat(seq uint8, peer netip.AddrPort, prev, next uxsvocab.VehicleSnapshot) bool {
+func (s *vehicleSession) shouldHoldPreLossHeartbeatAt(seq uint8, peer netip.AddrPort, prev, next uxsvocab.VehicleSnapshot, candPos uint64) bool {
 	nextKey := hbStateKeyOf(next)
-	if !s.wasHbStateSeenBeforeCurrentLink(seq, peer, nextKey) {
+	if !s.wasHbStateSeenBeforeCurrentLinkAt(seq, peer, nextKey, candPos) {
 		return false
 	}
 	if s.currentLinkHbConfirmed &&
@@ -722,7 +811,8 @@ func (s *vehicleSession) recordAuthorityObservation(wallUTC time.Time) {
 
 func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer netip.AddrPort, monoSample time.Time) {
 	normPeer := normalizeAddrPort(peer)
-	if s.linkLost {
+	wasLost := s.linkLost
+	if wasLost {
 		if normPeer.IsValid() && s.peerAddr.IsValid() && normPeer != s.peerAddr {
 			s.seenLinkHbHistory = [256][]linkHbHistoryEntry{}
 		}
@@ -735,6 +825,8 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 		s.currentLinkHbConfirmed = false
 		s.clearTeleopUncertain()
 		s.clearPendingNonSITLLinkTier()
+		s.hasLifeSeq = false
+		s.hasLifePendingGap = false
 		s.hasSeqStream = false
 		s.seqStreamPos = 0
 		s.clearPendingGap()
@@ -745,9 +837,11 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 		s.seenHbFrames = [256]hbFrameSlot{}
 		s.seenSeqOrder = [256]uint64{}
 	}
-	s.lifetimePacketPos++
 	if msgID != mavcodec.MsgIDCommandAck {
+		s.advanceLifetimeSeq(seq)
 		s.advanceTelemetrySeq(seq, msgID == mavcodec.MsgIDHeartbeat)
+	} else if wasLost {
+		s.lifetimePacketPos++
 	}
 	if s.lastPacketAt.IsZero() || !monoSample.Before(s.lastPacketAt) {
 		s.lastPacketAt = monoSample
@@ -1175,6 +1269,7 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 		sess.seqStreamPos = gapOrder
 		sess.lastStreamSeq = gapSeq
 		if hadHb {
+			gapCandLife := sess.lifetimePacketPos + 1
 			gapRestricted := gapOrder <= sess.lastHbOrder ||
 				gapOrder <= priorRestrictionOrder ||
 				gapOrder < sess.activeRestrictionMinOrder()
@@ -1183,7 +1278,7 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 					if appliedNext, ok := applyHeartbeatFields(sess.snap, gapHbVh, gapHbWall); ok {
 						appliedKey := hbStateKeyOf(appliedNext)
 						if !sess.wasHbStateSeenInPriorCycle(gapSeq, gapOrder, appliedKey) &&
-							!sess.shouldHoldPreLossHeartbeat(gapSeq, sess.peerAddr, sess.snap, appliedNext) {
+							!sess.shouldHoldPreLossHeartbeatAt(gapSeq, sess.peerAddr, sess.snap, appliedNext, gapCandLife) {
 							if diff := diffHeartbeatReasons(sess.snap, appliedNext); len(diff) > 0 {
 								return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, sess.snap, appliedNext, gapOrder, gapHbReceiptSeq, false, gapHbWall, gapHbMono)
 							}
@@ -1218,7 +1313,7 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 					return nil, false
 				}
 				if !sess.shouldHoldWrapHeartbeat(gapSeq, gapOrder, prev, next) &&
-					!sess.shouldHoldPreLossHeartbeat(gapSeq, sess.peerAddr, prev, next) {
+					!sess.shouldHoldPreLossHeartbeatAt(gapSeq, sess.peerAddr, prev, next, gapCandLife) {
 					return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, prev, next, gapOrder, gapHbReceiptSeq, false, gapHbWall, gapHbMono)
 				}
 				if isPreemptAuthority(next.Authority) {
@@ -1314,9 +1409,11 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	if !sess.linkLost && !matchesPinnedPeer(sess, normPeer) {
 		return IngestOutcome{CountedError: true}
 	}
-	if _, ok := applyHeartbeatFields(sess.snap, vh, wallUTC); !ok {
+	candNext, ok := applyHeartbeatFields(sess.snap, vh, wallUTC)
+	if !ok {
 		return IngestOutcome{CountedError: true}
 	}
+	candKey := hbStateKeyOf(candNext)
 
 	wasLost := sess.linkLost
 	var gapEvents []TransitionEvent
@@ -1325,6 +1422,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	var receiptSeq uint64
 	if !wasLost {
 		if !sess.lastHbMonoAt.IsZero() && monoSample.Before(sess.lastHbMonoAt) {
+			sess.recordStaleLinkHbObservation(seq, normPeer, candKey)
 			return IngestOutcome{
 				Accepted: true,
 				SysID:    sysid,
@@ -1334,6 +1432,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		var confirmedOrder, staleOrDup bool
 		hbOrder, confirmedOrder, staleOrDup = sess.evaluateHeartbeatSeq(seq)
 		if staleOrDup {
+			sess.recordStaleLinkHbObservation(seq, normPeer, candKey)
 			return IngestOutcome{
 				Accepted:      true,
 				SysID:         sysid,
@@ -1345,6 +1444,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		receiptSeq = sess.hbReceiptSeq
 		if !confirmedOrder {
 			priorRestrictionOrder := sess.activeRestrictionMinOrder()
+			candLifePos := sess.projectedLifetimePos(seq)
 			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 			var preemptEvents []TransitionEvent
 			preemptUrgent := false
@@ -1353,7 +1453,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			appliedPreempt := false
 			if ok {
 				nextKey := hbStateKeyOf(next)
-				if !sess.wasHbStateSeenBeforeCurrentLink(seq, normPeer, nextKey) {
+				if !sess.wasHbStateSeenBeforeCurrentLinkAt(seq, normPeer, nextKey, candLifePos) {
 					sess.recordLinkHbHistory(seq, nextKey)
 				}
 				if isPreemptAuthority(next.Authority) {
@@ -1394,7 +1494,8 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	if !ok {
 		return IngestOutcome{CountedError: true}
 	}
-	if wasLost && sess.shouldHoldPreLossHeartbeat(seq, normPeer, prev, next) {
+	candLifePos := sess.projectedLifetimePos(seq)
+	if wasLost && sess.shouldHoldPreLossHeartbeatAt(seq, normPeer, prev, next, candLifePos) {
 		sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 		var holdEvents []TransitionEvent
 		if isPreemptAuthority(next.Authority) {
@@ -1435,11 +1536,11 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 		(sess.teleopUncertainReason != "" || sess.pendingNonSITLLinkTier != "") &&
 		hbOrder <= sess.activeRestrictionMinOrder() {
 		nextKey := hbStateKeyOf(next)
-		if !sess.wasHbStateSeenBeforeCurrentLink(seq, normPeer, nextKey) {
-			sess.recordLinkHbHistory(seq, nextKey)
-		}
 		if isPreemptAuthority(next.Authority) {
 			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+			if !sess.wasHbStateSeenBeforeCurrentLinkAt(seq, normPeer, nextKey, candLifePos) {
+				sess.recordLinkHbHistory(seq, nextKey)
+			}
 			preemptEvents, preemptUrgent := t.applyUncorroboratedPreemptLocked(sess, sysid, seq, prev, next, hbOrder, receiptSeq, false, wallUTC, monoSample)
 			return IngestOutcome{
 				Accepted:      true,
@@ -1447,6 +1548,10 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 				Events:        append(gapEvents, preemptEvents...),
 				UrgentSKGSync: gapUrgent || preemptUrgent,
 			}
+		}
+		sess.advanceLifetimeSeq(seq)
+		if !sess.wasHbStateSeenBeforeCurrentLinkAt(seq, normPeer, nextKey, candLifePos) {
+			sess.recordLinkHbHistory(seq, nextKey)
 		}
 		if monoSample.After(sess.lastPacketAt) {
 			sess.lastPacketAt = monoSample
@@ -1466,13 +1571,13 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 	}
 	if !wasLost &&
 		(sess.shouldHoldWrapHeartbeat(seq, hbOrder, prev, next) ||
-			sess.shouldHoldPreLossHeartbeat(seq, normPeer, prev, next)) {
+			sess.shouldHoldPreLossHeartbeatAt(seq, normPeer, prev, next, candLifePos)) {
 		nextKey := hbStateKeyOf(next)
-		if !sess.wasHbStateSeenBeforeCurrentLink(seq, normPeer, nextKey) {
-			sess.recordLinkHbHistory(seq, nextKey)
-		}
 		if isPreemptAuthority(next.Authority) {
 			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
+			if !sess.wasHbStateSeenBeforeCurrentLinkAt(seq, normPeer, nextKey, candLifePos) {
+				sess.recordLinkHbHistory(seq, nextKey)
+			}
 			preemptEvents, preemptUrgent := t.applyUncorroboratedPreemptLocked(sess, sysid, seq, prev, next, hbOrder, receiptSeq, false, wallUTC, monoSample)
 			return IngestOutcome{
 				Accepted:      true,
@@ -1480,6 +1585,14 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 				Events:        append(gapEvents, preemptEvents...),
 				UrgentSKGSync: gapUrgent || preemptUrgent,
 			}
+		}
+		sess.advanceLifetimeSeq(seq)
+		if !sess.currentLinkHbConfirmed &&
+			(!sess.hasSeqStream || (uint8(seq-sess.lastStreamSeq) >= 1 && uint8(seq-sess.lastStreamSeq) <= maxBackwardTelemetryReorder)) {
+			sess.advanceTelemetrySeq(seq, true)
+		}
+		if !sess.wasHbStateSeenBeforeCurrentLinkAt(seq, normPeer, nextKey, candLifePos) {
+			sess.recordLinkHbHistory(seq, nextKey)
 		}
 		if monoSample.After(sess.lastPacketAt) {
 			sess.lastPacketAt = monoSample
@@ -2164,6 +2277,8 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	sess.currentLinkHbConfirmed = false
 	sess.clearTeleopUncertain()
 	sess.clearPendingNonSITLLinkTier()
+	sess.hasLifeSeq = false
+	sess.hasLifePendingGap = false
 	sess.hasSeqStream = false
 	sess.seqStreamPos = 0
 	sess.clearPendingGap()

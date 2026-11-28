@@ -9665,4 +9665,388 @@ func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAn
 			t.Fatalf("ordered disarmed mcu-failsafe HB #76 count = %d, want 1", got)
 		}
 	})
+
+	t.Run("stale_out_of_order_sitl_heartbeat_before_loss_blocks_sitl_command_on_reconnect_copy", func(t *testing.T) {
+		for _, orderedPreLoss := range []bool{false, true} {
+			tracker, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker: %v", err)
+			}
+			sender := &fakeFrameSender{}
+			now := time.Date(2026, 11, 28, 4, 0, 0, 0, time.UTC)
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			peer := netip.MustParseAddrPort("127.0.0.1:20410")
+
+			if orderedPreLoss {
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+				now = now.Add(20 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 11, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, now), now)
+			} else {
+				// Out-of-order: seq=11 direct-bench arrives first, then older seq=10 sitl-local arrives stale!
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 11, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, now), now)
+				now = now.Add(20 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			}
+
+			now = now.Add(3100 * time.Millisecond)
+			for _, ev := range tracker.EvaluateSilence(now) {
+				svc.OnTransitionEvent(ev)
+			}
+
+			// Reconnect carries an identical copy of pre-loss (seq=10, sitl-local): MUST NOT grant ActionSITLCRSFOverride!
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+
+			var ce *ControlError
+			if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride}); !errors.As(err, &ce) || ce.Status != 403 || ce.Code != "sitl_only_action" {
+				t.Fatalf("orderedPreLoss=%v: ActionSITLCRSFOverride after stale seq=10 sitl-local replay = %v, want 403 sitl_only_action", orderedPreLoss, err)
+			}
+			if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+				t.Fatalf("orderedPreLoss=%v: emitted %d #76 frames on stale replay, want 0", orderedPreLoss, got)
+			}
+
+			// Positive control: fresh current-link sitl-local HB (seq=12) confirms sitl-local and allows ActionSITLCRSFOverride.
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 12, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride}); err != nil {
+				t.Fatalf("orderedPreLoss=%v: ActionSITLCRSFOverride after fresh seq=12 sitl-local: %v", orderedPreLoss, err)
+			}
+			if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+				t.Fatalf("orderedPreLoss=%v: fresh seq=12 #76 count = %d, want 1", orderedPreLoss, got)
+			}
+		}
+	})
+
+	t.Run("sustained_1hz_post_loss_heartbeats_restore_teleop_engage_before_769_packets_while_1024_single_copies_refuse_engage", func(t *testing.T) {
+		newBenchHarness := func(t *testing.T, preLossCount int) (*mavlink.Tracker, *Service, *fakeFrameSender, netip.AddrPort, *time.Time) {
+			t.Helper()
+			tracker, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker: %v", err)
+			}
+			sender := &fakeFrameSender{}
+			now := time.Date(2026, 11, 28, 4, 30, 0, 0, time.UTC)
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			peer := netip.MustParseAddrPort("127.0.0.1:20411")
+			for i := 0; i < preLossCount; i++ {
+				now = now.Add(time.Second)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, uint8(i), true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, now), now)
+			}
+			now = now.Add(3100 * time.Millisecond)
+			for _, ev := range tracker.EvaluateSilence(now) {
+				svc.OnTransitionEvent(ev)
+			}
+			return tracker, svc, sender, peer, &now
+		}
+
+		// Control A: Full 256-slot history -> 1 Hz consecutive heartbeats refuse engage at 512 and allow engage at 513 (well before 769).
+		trFull, svcFull, senderFull, peerFull, nowFull := newBenchHarness(t, 256)
+		for pkt := 1; pkt <= 513; pkt++ {
+			*nowFull = nowFull.Add(time.Second)
+			seq := uint8((pkt - 1) % 256)
+			deliverTrackerOutcome(svcFull, trFull.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, seq, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peerFull, *nowFull), *nowFull)
+			if pkt == 512 {
+				tgt512, _ := trFull.ActuationTarget(1)
+				var ce *ControlError
+				if _, err := svcFull.SubmitTeleop(context.Background(), TeleopRequest{
+					SysID:                1,
+					Session:              "s-full-512",
+					Seq:                  1,
+					Frame:                FrameLocalNED,
+					Vx:                   1.0,
+					Engage:               true,
+					ObservedMs:           tgt512.HeartbeatObservedUnixNs / int64(time.Millisecond),
+					ObservationRev:       tgt512.ObservationRev,
+					AuthorityIncarnation: tgt512.AuthorityIncarnation,
+					AuthorityEpoch:       tgt512.AuthorityEpoch,
+				}); !errors.As(err, &ce) || ce.Status != 409 || ce.Code != "authority_not_teleop" {
+					t.Fatalf("pkt 512 teleop engage = %v, want 409 authority_not_teleop", err)
+				}
+			}
+		}
+		tgt513, _ := trFull.ActuationTarget(1)
+		if _, err := svcFull.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "s-full-513",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.0,
+			Engage:               true,
+			ObservedMs:           tgt513.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt513.ObservationRev,
+			AuthorityIncarnation: tgt513.AuthorityIncarnation,
+			AuthorityEpoch:       tgt513.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("pkt 513 teleop engage after 1 Hz stream: %v", err)
+		}
+		if got := senderFull.countByMsgID(mavcodec.MsgIDSetPositionTargetLocalNED); got != 1 {
+			t.Fatalf("pkt 513 #84 count = %d, want 1", got)
+		}
+
+		// Control B: Partial 10-slot history -> refuses engage at packet 10 (seq=9) and allows engage at packet 11 (seq=10).
+		trPartial, svcPartial, senderPartial, peerPartial, nowPartial := newBenchHarness(t, 10)
+		for pkt := 1; pkt <= 11; pkt++ {
+			*nowPartial = nowPartial.Add(time.Second)
+			seq := uint8(pkt - 1)
+			deliverTrackerOutcome(svcPartial, trPartial.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, seq, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peerPartial, *nowPartial), *nowPartial)
+			if pkt == 10 {
+				tgt10, _ := trPartial.ActuationTarget(1)
+				var ce *ControlError
+				if _, err := svcPartial.SubmitTeleop(context.Background(), TeleopRequest{
+					SysID:                1,
+					Session:              "s-part-10",
+					Seq:                  1,
+					Frame:                FrameLocalNED,
+					Vx:                   1.0,
+					Engage:               true,
+					ObservedMs:           tgt10.HeartbeatObservedUnixNs / int64(time.Millisecond),
+					ObservationRev:       tgt10.ObservationRev,
+					AuthorityIncarnation: tgt10.AuthorityIncarnation,
+					AuthorityEpoch:       tgt10.AuthorityEpoch,
+				}); !errors.As(err, &ce) || ce.Status != 409 || ce.Code != "authority_not_teleop" {
+					t.Fatalf("partial pkt 10 teleop engage = %v, want 409 authority_not_teleop", err)
+				}
+			}
+		}
+		tgt11, _ := trPartial.ActuationTarget(1)
+		if _, err := svcPartial.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "s-part-11",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.0,
+			Engage:               true,
+			ObservedMs:           tgt11.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt11.ObservationRev,
+			AuthorityIncarnation: tgt11.AuthorityIncarnation,
+			AuthorityEpoch:       tgt11.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("partial pkt 11 teleop engage: %v", err)
+		}
+		if got := senderPartial.countByMsgID(mavcodec.MsgIDSetPositionTargetLocalNED); got != 1 {
+			t.Fatalf("partial pkt 11 #84 count = %d, want 1", got)
+		}
+
+		// Control C: 1,024 copies of a single old heartbeat (seq=5) still refuse teleop engage across both direct-bench and sitl-local.
+		for _, tier := range []mavcodec.LinkTier{mavcodec.LinkTierDirectBench, mavcodec.LinkTierSITLLocal} {
+			trDup, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker dup: %v", err)
+			}
+			senderDup := &fakeFrameSender{}
+			nowDup := time.Date(2026, 11, 28, 4, 40, 0, 0, time.UTC)
+			svcDup, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  trDup,
+				Sender:   senderDup,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return nowDup },
+			})
+			if err != nil {
+				t.Fatalf("NewService dup: %v", err)
+			}
+			peerDup := netip.MustParseAddrPort("127.0.0.1:20411")
+			for i := 0; i < 10; i++ {
+				nowDup = nowDup.Add(time.Second)
+				deliverTrackerOutcome(svcDup, trDup.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, uint8(i), true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, tier), peerDup, nowDup), nowDup)
+			}
+			nowDup = nowDup.Add(3100 * time.Millisecond)
+			for _, ev := range trDup.EvaluateSilence(nowDup) {
+				svcDup.OnTransitionEvent(ev)
+			}
+			for copyIdx := 1; copyIdx <= 1024; copyIdx++ {
+				nowDup = nowDup.Add(time.Second)
+				deliverTrackerOutcome(svcDup, trDup.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 5, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, tier), peerDup, nowDup), nowDup)
+			}
+			tgtDup, _ := trDup.ActuationTarget(1)
+			var ceDup *ControlError
+			if _, err := svcDup.SubmitTeleop(context.Background(), TeleopRequest{
+				SysID:                1,
+				Session:              "s-dup-1024",
+				Seq:                  1,
+				Frame:                FrameLocalNED,
+				Vx:                   1.0,
+				Engage:               true,
+				ObservedMs:           tgtDup.HeartbeatObservedUnixNs / int64(time.Millisecond),
+				ObservationRev:       tgtDup.ObservationRev,
+				AuthorityIncarnation: tgtDup.AuthorityIncarnation,
+				AuthorityEpoch:       tgtDup.AuthorityEpoch,
+			}); !errors.As(err, &ceDup) || ceDup.Status != 409 || ceDup.Code != "authority_not_teleop" {
+				t.Fatalf("tier=%v 1024 single-packet copies teleop engage = %v, want 409 authority_not_teleop", tier, err)
+			}
+			if got := senderDup.countByMsgID(mavcodec.MsgIDSetPositionTargetLocalNED); got != 0 {
+				t.Fatalf("tier=%v 1024 single-packet copies #84 count = %d, want 0", tier, got)
+			}
+		}
+	})
+
+	t.Run("backward_utc_clock_after_restart_with_empty_tracker_reconciles_disarm_via_receipt_revisions_while_preserving_timestamp_fallback", func(t *testing.T) {
+		peer := netip.MustParseAddrPort("127.0.0.1:20412")
+		t0 := time.Date(2026, 11, 28, 5, 0, 0, 0, time.UTC)
+
+		// Branch A (backward clock -1m on restart) and Branch B (forward clock +1m control):
+		for _, clockSkew := range []time.Duration{-1 * time.Minute, 1 * time.Minute} {
+			tr1, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker 1: %v", err)
+			}
+			store := newFakeCommandStore()
+			now1 := t0
+			svc1, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tr1,
+				Sender:   &fakeFrameSender{},
+				Store:    store,
+				Now:      func() time.Time { return now1 },
+			})
+			if err != nil {
+				t.Fatalf("NewService 1: %v", err)
+			}
+			deliverTrackerOutcome(svc1, tr1.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now1), now1)
+			now1 = now1.Add(10 * time.Millisecond)
+			disarmRes, err := svc1.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+			if err != nil {
+				t.Fatalf("SubmitCommand Disarm: %v", err)
+			}
+
+			// Simulate process restart with empty Tracker and UTC clock skewed by clockSkew.
+			tr2, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker 2: %v", err)
+			}
+			now2 := t0.Add(clockSkew)
+			svc2, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tr2,
+				Sender:   &fakeFrameSender{},
+				Store:    store,
+				Now:      func() time.Time { return now2 },
+			})
+			if err != nil {
+				t.Fatalf("NewService 2: %v", err)
+			}
+			svc2.Advance(context.Background(), now2)
+			if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("skew=%v: recovered Disarm phase before heartbeats = %q, want %q", clockSkew, ent.PhaseState, PhaseCommitUnknown)
+			}
+
+			// Current boot receives 3 disarmed heartbeats while UTC clock is still behind t0 (when clockSkew < 0).
+			for seq := uint8(1); seq <= 3; seq++ {
+				now2 = now2.Add(time.Second)
+				deliverTrackerOutcome(svc2, tr2.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, seq, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, now2), now2)
+			}
+			svc2.Advance(context.Background(), now2)
+			entAfter, ok := store.get(disarmRes.CommandID)
+			if !ok || entAfter.PhaseState != PhaseConfirmed || entAfter.AckResult != -1 {
+				t.Fatalf("skew=%v: Disarm after 3 current-boot disarmed heartbeats = %+v (ok=%v), want PhaseConfirmed AckResult=-1",
+					clockSkew, entAfter, ok)
+			}
+		}
+
+		// Branch C: TargetSource without receipt revisions (fakeTargetSource, HeartbeatReceiptRev == 0)
+		// preserves the HeartbeatObservedUnixNs > unknownAtUnixNs timestamp fallback!
+		fake1 := newFakeTargetSource()
+		nowC1 := t0
+		fake1.set(mavlink.ActuationTarget{
+			SysID:                   1,
+			Domain:                  uxsvocab.DomainQuadcopter,
+			Armed:                   true,
+			CompanionMode:           uxsvocab.ModeTeleopVelocity,
+			Authority:               uxsvocab.AuthorityCompanionTeleop,
+			LinkTier:                uxsvocab.LinkTierSITLLocal,
+			PeerAddr:                peer,
+			HeartbeatObservedUnixNs: nowC1.UnixNano(),
+			HeartbeatSeq:            1,
+		})
+		storeC := newFakeCommandStore()
+		svcC1, err := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  fake1,
+			Sender:   &fakeFrameSender{},
+			Store:    storeC,
+			Now:      func() time.Time { return nowC1 },
+		})
+		if err != nil {
+			t.Fatalf("NewService C1: %v", err)
+		}
+		nowC1 = nowC1.Add(10 * time.Millisecond)
+		disarmC, err := svcC1.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+		if err != nil {
+			t.Fatalf("SubmitCommand Disarm C: %v", err)
+		}
+
+		fake2 := newFakeTargetSource()
+		nowC2 := t0.Add(10 * time.Second)
+		svcC2, err := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  fake2,
+			Sender:   &fakeFrameSender{},
+			Store:    storeC,
+			Now:      func() time.Time { return nowC2 },
+		})
+		if err != nil {
+			t.Fatalf("NewService C2: %v", err)
+		}
+		svcC2.Advance(context.Background(), nowC2)
+
+		// Without receipt revisions, a disarmed snapshot whose HeartbeatObservedUnixNs <= nowC2 stays PhaseCommitUnknown.
+		fake2.set(mavlink.ActuationTarget{
+			SysID:                   1,
+			Domain:                  uxsvocab.DomainQuadcopter,
+			Armed:                   false,
+			CompanionMode:           uxsvocab.ModeDisarmed,
+			Authority:               uxsvocab.AuthorityCompanionTeleop,
+			LinkTier:                uxsvocab.LinkTierSITLLocal,
+			PeerAddr:                peer,
+			HeartbeatObservedUnixNs: t0.UnixNano(),
+			HeartbeatSeq:            1,
+		})
+		svcC2.Advance(context.Background(), nowC2)
+		if entStale, _ := storeC.get(disarmC.CommandID); entStale.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("provider without receipt revisions falsely confirmed on stale timestamp: %+v", entStale)
+		}
+
+		// Once HeartbeatObservedUnixNs > nowC2, timestamp fallback reconciles Disarm to PhaseConfirmed.
+		nowC2 = nowC2.Add(time.Second)
+		fake2.set(mavlink.ActuationTarget{
+			SysID:                   1,
+			Domain:                  uxsvocab.DomainQuadcopter,
+			Armed:                   false,
+			CompanionMode:           uxsvocab.ModeDisarmed,
+			Authority:               uxsvocab.AuthorityCompanionTeleop,
+			LinkTier:                uxsvocab.LinkTierSITLLocal,
+			PeerAddr:                peer,
+			HeartbeatObservedUnixNs: nowC2.UnixNano(),
+			HeartbeatSeq:            2,
+		})
+		svcC2.Advance(context.Background(), nowC2)
+		if entFresh, _ := storeC.get(disarmC.CommandID); entFresh.PhaseState != PhaseConfirmed {
+			t.Fatalf("provider without receipt revisions after fresh timestamp = %+v, want PhaseConfirmed", entFresh)
+		}
+	})
 }

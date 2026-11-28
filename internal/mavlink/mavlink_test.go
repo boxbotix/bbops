@@ -4385,4 +4385,172 @@ func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *test
 			t.Fatalf("corroborated disarmed mcu-failsafe target = %+v (ok=%v), want Armed=false HeartbeatOrder>0", tgtCorroborated, ok)
 		}
 	})
+
+	t.Run("out_of_order_stale_sitl_heartbeat_before_loss_is_remembered_across_reconnect", func(t *testing.T) {
+		hbBench := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityCompanionTeleop,
+			mavcodec.ModeTeleopVelocity,
+			mavcodec.LinkTierDirectBench,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+
+		// Subcase A: Out-of-order sequence staleOrDup (seq=10 sitl-local arriving after seq=11 direct-bench).
+		for _, restoreViaAttitude := range []bool{false, true} {
+			tr, err := NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker: %v", err)
+			}
+			now := t0
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: hbBench}, peer, now)
+			now = now.Add(20 * time.Millisecond)
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, now)
+			if tgtPre, ok := tr.ActuationTarget(1); !ok || tgtPre.LinkTier != uxsvocab.LinkTierDirectBench || tgtPre.CurrentLinkHbUnconfirmed {
+				t.Fatalf("pre-loss target after stale seq=10 sitl-local = %+v (ok=%v), want confirmed direct-bench", tgtPre, ok)
+			}
+
+			now = now.Add(3100 * time.Millisecond)
+			if lost := tr.EvaluateSilence(now); len(lost) != 1 || lost[0].Kind != EventKindLinkLost {
+				t.Fatalf("EvaluateSilence = %+v, want single link_lost", lost)
+			}
+
+			if restoreViaAttitude {
+				now = now.Add(20 * time.Millisecond)
+				_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 9, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			}
+			now = now.Add(20 * time.Millisecond)
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, now)
+			tgtPost, ok := tr.ActuationTarget(1)
+			if !ok || !tgtPost.CurrentLinkHbUnconfirmed || tgtPost.LinkTier != uxsvocab.LinkTierDirectBench {
+				t.Fatalf("restoreViaAttitude=%v: target after replaying stale pre-loss seq=10 sitl-local = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench",
+					restoreViaAttitude, tgtPost, ok)
+			}
+
+			// Positive control: fresh current-link sitl-local heartbeat at seq=12 confirms sitl-local.
+			now = now.Add(20 * time.Millisecond)
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbTeleopArmed}, peer, now)
+			if tgtFresh, _ := tr.ActuationTarget(1); tgtFresh.CurrentLinkHbUnconfirmed || tgtFresh.LinkTier != uxsvocab.LinkTierSITLLocal {
+				t.Fatalf("restoreViaAttitude=%v: target after fresh seq=12 sitl-local = %+v, want confirmed sitl-local", restoreViaAttitude, tgtFresh)
+			}
+		}
+
+		// Subcase B: Monotonic-sample stale heartbeat (monoSample < lastHbMonoAt) before loss is also remembered across reconnect.
+		trMono, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker mono: %v", err)
+		}
+		nowMono := t0.Add(50 * time.Millisecond)
+		_ = trMono.IngestFrameWithClock(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: hbBench}, peer, nowMono, nowMono)
+		staleMono := t0.Add(10 * time.Millisecond)
+		_ = trMono.IngestFrameWithClock(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbTeleopArmed}, peer, nowMono.Add(5*time.Millisecond), staleMono)
+
+		nowMono = nowMono.Add(3100 * time.Millisecond)
+		if lost := trMono.EvaluateSilence(nowMono); len(lost) != 1 || lost[0].Kind != EventKindLinkLost {
+			t.Fatalf("EvaluateSilence mono = %+v, want single link_lost", lost)
+		}
+		nowMono = nowMono.Add(20 * time.Millisecond)
+		_ = trMono.IngestFrameWithClock(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbTeleopArmed}, peer, nowMono, nowMono)
+		if tgtMono, ok := trMono.ActuationTarget(1); !ok || !tgtMono.CurrentLinkHbUnconfirmed || tgtMono.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("target after replaying mono-stale seq=12 sitl-local = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtMono, ok)
+		}
+		nowMono = nowMono.Add(20 * time.Millisecond)
+		_ = trMono.IngestFrameWithClock(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 13, Message: hbTeleopArmed}, peer, nowMono, nowMono)
+		if tgtMonoFresh, _ := trMono.ActuationTarget(1); tgtMonoFresh.CurrentLinkHbUnconfirmed || tgtMonoFresh.LinkTier != uxsvocab.LinkTierSITLLocal {
+			t.Fatalf("target after fresh seq=13 sitl-local = %+v, want confirmed sitl-local", tgtMonoFresh)
+		}
+	})
+
+	t.Run("sustained_1hz_heartbeat_stream_after_full_256_slot_history_confirms_within_513_packets_while_1024_single_packet_copies_stay_unconfirmed", func(t *testing.T) {
+		hbBench := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityCompanionTeleop,
+			mavcodec.ModeTeleopVelocity,
+			mavcodec.LinkTierDirectBench,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+
+		// Control A: Full 256-slot history (seq=0..255) before link_lost -> 1 Hz consecutive heartbeats
+		// stay unconfirmed through packet 512, confirm at packet 513 (well before 769), and stay confirmed through 769.
+		trFull, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker full: %v", err)
+		}
+		nowFull := t0
+		for i := 0; i < 256; i++ {
+			nowFull = nowFull.Add(time.Second)
+			_ = trFull.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: uint8(i), Message: hbBench}, peer, nowFull)
+		}
+		nowFull = nowFull.Add(3100 * time.Millisecond)
+		if lost := trFull.EvaluateSilence(nowFull); len(lost) != 1 || lost[0].Kind != EventKindLinkLost {
+			t.Fatalf("EvaluateSilence full = %+v, want single link_lost", lost)
+		}
+		for pkt := 1; pkt <= 769; pkt++ {
+			nowFull = nowFull.Add(time.Second)
+			seq := uint8((pkt - 1) % 256)
+			_ = trFull.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: hbBench}, peer, nowFull)
+			tgt, ok := trFull.ActuationTarget(1)
+			if !ok {
+				t.Fatalf("pkt %d: ActuationTarget missing", pkt)
+			}
+			if pkt <= 512 && !tgt.CurrentLinkHbUnconfirmed {
+				t.Fatalf("pkt %d (seq=%d): confirmed prematurely inside 512-packet hold window: %+v", pkt, seq, tgt)
+			}
+			if pkt >= 513 && tgt.CurrentLinkHbUnconfirmed {
+				t.Fatalf("pkt %d (seq=%d): still CurrentLinkHbUnconfirmed after 512-packet aging window: %+v", pkt, seq, tgt)
+			}
+		}
+
+		// Control B: Partial 10-slot history (seq=0..9) before link_lost -> confirms on packet 11 (seq=10).
+		trPartial, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker partial: %v", err)
+		}
+		nowPartial := t0
+		for i := 0; i < 10; i++ {
+			nowPartial = nowPartial.Add(time.Second)
+			_ = trPartial.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: uint8(i), Message: hbBench}, peer, nowPartial)
+		}
+		nowPartial = nowPartial.Add(3100 * time.Millisecond)
+		_ = trPartial.EvaluateSilence(nowPartial)
+		for pkt := 1; pkt <= 11; pkt++ {
+			nowPartial = nowPartial.Add(time.Second)
+			seq := uint8(pkt - 1)
+			_ = trPartial.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: hbBench}, peer, nowPartial)
+			tgt, _ := trPartial.ActuationTarget(1)
+			if pkt <= 10 && !tgt.CurrentLinkHbUnconfirmed {
+				t.Fatalf("partial pkt %d (seq=%d): confirmed prematurely on seen slot: %+v", pkt, seq, tgt)
+			}
+			if pkt == 11 && tgt.CurrentLinkHbUnconfirmed {
+				t.Fatalf("partial pkt 11 (seq=10): remained unconfirmed on unseen slot: %+v", tgt)
+			}
+		}
+
+		// Control C: 1,024 copies of a single pre-loss heartbeat (seq=5) never advance history aging to confirm.
+		for _, withSilenceBetweenCopies := range []bool{false, true} {
+			trDup, err := NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker dup: %v", err)
+			}
+			nowDup := t0
+			for i := 0; i < 10; i++ {
+				nowDup = nowDup.Add(time.Second)
+				_ = trDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: uint8(i), Message: hbTeleopArmed}, peer, nowDup)
+			}
+			nowDup = nowDup.Add(3100 * time.Millisecond)
+			_ = trDup.EvaluateSilence(nowDup)
+			for copyIdx := 1; copyIdx <= 1024; copyIdx++ {
+				if withSilenceBetweenCopies && copyIdx > 1 {
+					nowDup = nowDup.Add(3100 * time.Millisecond)
+					_ = trDup.EvaluateSilence(nowDup)
+				}
+				nowDup = nowDup.Add(time.Second)
+				_ = trDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 5, Message: hbTeleopArmed}, peer, nowDup)
+				if tgt, _ := trDup.ActuationTarget(1); !tgt.CurrentLinkHbUnconfirmed {
+					t.Fatalf("withSilence=%v copy #%d: repeated pre-loss seq=5 falsely confirmed link: %+v", withSilenceBetweenCopies, copyIdx, tgt)
+				}
+			}
+		}
+	})
 }
