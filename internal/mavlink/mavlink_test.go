@@ -4256,4 +4256,133 @@ func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *test
 			t.Fatalf("target after current-link SITL heartbeat = %+v (ok=%v), want CurrentLinkHbUnconfirmed=false LinkTier=sitl-local", tgtConfirmed, ok)
 		}
 	})
+
+	t.Run("deferred_gap_promotion_preserves_original_heartbeat_receipt_revision", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopArmed}, peer, now)
+
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 80, Message: hbTeleopDisarmed}, peer, now)
+		tgtHeld, ok := tracker.ActuationTarget(1)
+		if !ok || tgtHeld.HeartbeatReceiptRev != 1 || tgtHeld.LatestHeartbeatReceiptRev != 2 {
+			t.Fatalf("target while gap HB held = %+v (ok=%v), want HeartbeatReceiptRev=1 LatestHeartbeatReceiptRev=2", tgtHeld, ok)
+		}
+
+		// Corroborate seq=80 via AttitudeQuaternion(seq=81) -> promoted HeartbeatReceiptRev equals original receipt rev 2.
+		now = now.Add(2020 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 81, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		tgtPromoted, ok := tracker.ActuationTarget(1)
+		if !ok || tgtPromoted.Armed || tgtPromoted.HeartbeatReceiptRev != 2 || tgtPromoted.LatestHeartbeatReceiptRev != 2 {
+			t.Fatalf("target after deferred gap promotion = %+v (ok=%v), want Armed=false HeartbeatReceiptRev=2 LatestHeartbeatReceiptRev=2", tgtPromoted, ok)
+		}
+	})
+
+	t.Run("pre_loss_sitl_heartbeat_copy_cannot_promote_link_tier_or_confirm_restored_link", func(t *testing.T) {
+		hbBench := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityCompanionTeleop,
+			mavcodec.ModeTeleopVelocity,
+			mavcodec.LinkTierDirectBench,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+		newLostTracker := func(t *testing.T) (*Tracker, time.Time) {
+			t.Helper()
+			tr, err := NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+			if err != nil {
+				t.Fatalf("NewTrackerWithTimeouts: %v", err)
+			}
+			now := t0
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, now)
+			now = now.Add(20 * time.Millisecond)
+			_ = tr.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: hbBench}, peer, now)
+			now = now.Add(3100 * time.Millisecond)
+			if evs := tr.EvaluateSilence(now); len(evs) != 1 || evs[0].Kind != EventKindLinkLost {
+				t.Fatalf("EvaluateSilence = %+v, want single link_lost", evs)
+			}
+			return tr, now
+		}
+
+		// Path A: Direct reconnect with exact copy of pre-loss (seq=10, sitl-local) on same endpoint.
+		trDirect, nowDirect := newLostTracker(t)
+		nowDirect = nowDirect.Add(20 * time.Millisecond)
+		outDirect := trDirect.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowDirect)
+		if len(outDirect.Events) != 1 || outDirect.Events[0].Kind != EventKindLinkRestored {
+			t.Fatalf("direct replay restore events = %+v, want [link_restored]", outDirect.Events)
+		}
+		tgtDirect, ok := trDirect.ActuationTarget(1)
+		if !ok || tgtDirect.LinkLost || !tgtDirect.CurrentLinkHbUnconfirmed || tgtDirect.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("target after pre-loss SITL replay = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtDirect, ok)
+		}
+
+		// Path B: AttitudeQuaternion restores link first, then pre-loss (seq=10, sitl-local) + (seq=11, AttitudeQuaternion) arrive.
+		trAfterAtt, nowAtt := newLostTracker(t)
+		nowAtt = nowAtt.Add(20 * time.Millisecond)
+		_ = trAfterAtt.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 9, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowAtt)
+		nowAtt = nowAtt.Add(10 * time.Millisecond)
+		_ = trAfterAtt.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowAtt)
+		tgtAfterAtt, ok := trAfterAtt.ActuationTarget(1)
+		if !ok || !tgtAfterAtt.CurrentLinkHbUnconfirmed || tgtAfterAtt.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("target after post-attitude pre-loss SITL replay = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtAfterAtt, ok)
+		}
+
+		// Positive controls: fresh direct-bench HB confirms direct-bench, and fresh sitl-local HB confirms sitl-local.
+		nowDirect = nowDirect.Add(20 * time.Millisecond)
+		_ = trDirect.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbBench}, peer, nowDirect)
+		if tgtBench, _ := trDirect.ActuationTarget(1); tgtBench.CurrentLinkHbUnconfirmed || tgtBench.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("target after fresh direct-bench HB = %+v, want confirmed direct-bench", tgtBench)
+		}
+
+		nowAtt = nowAtt.Add(20 * time.Millisecond)
+		_ = trAfterAtt.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbTeleopArmed}, peer, nowAtt)
+		if tgtSITL, _ := trAfterAtt.ActuationTarget(1); tgtSITL.CurrentLinkHbUnconfirmed || tgtSITL.LinkTier != uxsvocab.LinkTierSITLLocal {
+			t.Fatalf("target after fresh sitl-local HB = %+v, want confirmed sitl-local", tgtSITL)
+		}
+	})
+
+	t.Run("uncorroborated_disarmed_mcu_failsafe_heartbeat_retains_confirmed_armed_restriction_until_corroborated", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		hbFailsafeArmed := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityMCUFailsafe,
+			mavcodec.ModeHoldPosition,
+			mavcodec.LinkTierSITLLocal,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+		hbFailsafeDisarmed := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			false,
+			mavcodec.AuthorityMCUFailsafe,
+			mavcodec.ModeDisarmed,
+			mavcodec.LinkTierSITLLocal,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+
+		now := t0
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbFailsafeArmed}, peer, now)
+
+		// Unconfirmed gap disarmed mcu-failsafe heartbeat (seq=80) MUST NOT clear Armed=true before corroboration.
+		now = now.Add(20 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 80, Message: hbFailsafeDisarmed}, peer, now)
+		tgtUncorroborated, ok := tracker.ActuationTarget(1)
+		if !ok || !tgtUncorroborated.Armed || tgtUncorroborated.HeartbeatOrder != 0 || tgtUncorroborated.Authority != uxsvocab.AuthorityMCUFailsafe {
+			t.Fatalf("uncorroborated disarmed mcu-failsafe target = %+v (ok=%v), want Armed=true HeartbeatOrder=0 Authority=mcu-failsafe", tgtUncorroborated, ok)
+		}
+
+		// Corroborating packet (seq=81) commits Armed=false.
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 81, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		tgtCorroborated, ok := tracker.ActuationTarget(1)
+		if !ok || tgtCorroborated.Armed || tgtCorroborated.HeartbeatOrder == 0 {
+			t.Fatalf("corroborated disarmed mcu-failsafe target = %+v (ok=%v), want Armed=false HeartbeatOrder>0", tgtCorroborated, ok)
+		}
+	})
 }

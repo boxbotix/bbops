@@ -505,9 +505,11 @@ type inFlightCommand struct {
 	ackDeadline         time.Time
 	issuedHbObsNs       int64
 	issuedHbSeq         uint64
+	issuedHbReceiptRev  uint64
 	issuedPacketOrder   uint64
 	unknownAtUnixNs     int64
 	unknownHbSeq        uint64
+	unknownHbReceiptRev uint64
 	unknownPacketOrder  uint64
 	earlyAcks           []earlyCommandAck
 }
@@ -1164,12 +1166,13 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		if ceUpdatedNs := ce.UpdatedMs * int64(time.Millisecond); ceUpdatedNs > unknownNs {
 			unknownNs = ceUpdatedNs
 		}
-		var unknownHbSeq, unknownPacketOrder uint64
+		var unknownHbSeq, unknownHbReceiptRev, unknownPacketOrder uint64
 		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok {
 			if target.HeartbeatObservedUnixNs > unknownNs {
 				unknownNs = target.HeartbeatObservedUnixNs
 			}
 			unknownHbSeq = target.HeartbeatSeq
+			unknownHbReceiptRev = latestTargetHbReceiptRev(target)
 			unknownPacketOrder = target.PacketOrder
 		}
 		seq := s.cmdCounter.Add(1)
@@ -1191,6 +1194,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			ackDeadline:         now,
 			unknownAtUnixNs:     unknownNs,
 			unknownHbSeq:        unknownHbSeq,
+			unknownHbReceiptRev: unknownHbReceiptRev,
 			unknownPacketOrder:  unknownPacketOrder,
 		}
 	}
@@ -2427,6 +2431,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.signalPersistWake()
 		return CommandResult{}, retErr
 	}
+	preSendHbReceiptRev := latestTargetHbReceiptRev(sendTarget)
 	inflight.issuedAuthority = sendTarget.Authority
 	inflight.dispatch = dispatchSending
 	s.mu.Unlock()
@@ -2468,12 +2473,16 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	hasSupersededWrite := false
 	s.mu.Lock()
 	hbBaselineNs := dispatchNow.UnixNano()
+	hbBaselineReceiptRev := preSendHbReceiptRev
 	var hbBaselineSeq, packetOrderBaseline uint64
 	if curT, ok := s.targets.ActuationTarget(req.SysID); ok {
 		if curT.HeartbeatObservedUnixNs > hbBaselineNs {
 			hbBaselineNs = curT.HeartbeatObservedUnixNs
 		}
 		hbBaselineSeq = curT.HeartbeatSeq
+		if curRev := latestTargetHbReceiptRev(curT); curRev > hbBaselineReceiptRev {
+			hbBaselineReceiptRev = curRev
+		}
 		packetOrderBaseline = curT.PacketOrder
 	}
 	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
@@ -2519,9 +2528,11 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	inflight.ackDeadline = dispatchNow.Add(ackWait)
 	inflight.issuedHbObsNs = hbBaselineNs
 	inflight.issuedHbSeq = hbBaselineSeq
+	inflight.issuedHbReceiptRev = hbBaselineReceiptRev
 	inflight.issuedPacketOrder = packetOrderBaseline
 	inflight.unknownAtUnixNs = hbBaselineNs
 	inflight.unknownHbSeq = hbBaselineSeq
+	inflight.unknownHbReceiptRev = hbBaselineReceiptRev
 	inflight.unknownPacketOrder = packetOrderBaseline
 	earlyAcks := inflight.earlyAcks
 	inflight.earlyAcks = nil
@@ -2577,7 +2588,25 @@ func (s *Service) snapshotPreResetAckHistoryLocked(sysid uint8) {
 	delete(s.lastSeenTrackerAckSeq, sysid)
 }
 
-func hasFreshHeartbeatSince(target mavlink.ActuationTarget, baselineNs int64, baselineHbSeq, baselinePacketOrder uint64) bool {
+func latestTargetHbReceiptRev(target mavlink.ActuationTarget) uint64 {
+	if target.LatestHeartbeatReceiptRev > target.HeartbeatReceiptRev {
+		return target.LatestHeartbeatReceiptRev
+	}
+	return target.HeartbeatReceiptRev
+}
+
+func hasFreshHeartbeatSince(
+	target mavlink.ActuationTarget,
+	baselineNs int64,
+	baselineHbSeq, baselineHbReceiptRev, baselinePacketOrder uint64,
+) bool {
+	if target.CurrentLinkHbUnconfirmed {
+		return false
+	}
+	if (target.HeartbeatReceiptRev > 0 || baselineHbReceiptRev > 0) &&
+		target.HeartbeatReceiptRev <= baselineHbReceiptRev {
+		return false
+	}
 	if target.HeartbeatSeq > 0 {
 		if target.HeartbeatSeq <= baselineHbSeq {
 			return false
@@ -2811,7 +2840,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		hasPostDispatchMatchingHB := targetOK &&
 			!target.LinkLost &&
 			!ackOrderUncertain &&
-			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq, matches[0].issuedPacketOrder) &&
+			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq, matches[0].issuedHbReceiptRev, matches[0].issuedPacketOrder) &&
 			matchesExpectedCommandState(matches[0], target)
 		if ackOrderUncertain {
 			wrapAmbiguous = true
@@ -2899,12 +2928,13 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			}
 		}
 		hbFloor := obsNs
-		var hbFloorSeq, packetOrderFloor uint64
+		var hbFloorSeq, hbFloorReceiptRev, packetOrderFloor uint64
 		if targetOK {
 			if target.HeartbeatObservedUnixNs > hbFloor {
 				hbFloor = target.HeartbeatObservedUnixNs
 			}
 			hbFloorSeq = target.HeartbeatSeq
+			hbFloorReceiptRev = latestTargetHbReceiptRev(target)
 			packetOrderFloor = target.PacketOrder
 		}
 		for _, cmd := range matches {
@@ -2916,6 +2946,9 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			}
 			if hbFloorSeq > cmd.unknownHbSeq {
 				cmd.unknownHbSeq = hbFloorSeq
+			}
+			if hbFloorReceiptRev > cmd.unknownHbReceiptRev {
+				cmd.unknownHbReceiptRev = hbFloorReceiptRev
 			}
 			if packetOrderFloor > cmd.unknownPacketOrder {
 				cmd.unknownPacketOrder = packetOrderFloor
@@ -3194,7 +3227,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 			if cmd.dispatch == dispatchSent &&
 				cmd.sysid == ev.SysID &&
 				cmd.phase == PhaseCommitUnknown &&
-				hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownPacketOrder) &&
+				hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownHbReceiptRev, cmd.unknownPacketOrder) &&
 				matchesExpectedCommandState(cmd, targetForObs) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
@@ -3389,6 +3422,9 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				if target.HeartbeatSeq > cmd.unknownHbSeq {
 					cmd.unknownHbSeq = target.HeartbeatSeq
 				}
+				if curRev := latestTargetHbReceiptRev(target); curRev > cmd.unknownHbReceiptRev {
+					cmd.unknownHbReceiptRev = curRev
+				}
 				if target.PacketOrder > cmd.unknownPacketOrder {
 					cmd.unknownPacketOrder = target.PacketOrder
 				}
@@ -3411,7 +3447,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		}
 		if cmd.phase == PhaseCommitUnknown {
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
-				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownPacketOrder) &&
+				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownHbReceiptRev, cmd.unknownPacketOrder) &&
 				matchesExpectedCommandState(cmd, target) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"

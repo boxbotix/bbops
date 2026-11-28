@@ -9427,4 +9427,242 @@ func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAn
 			t.Fatalf("fresh sitl-local heartbeat #76 count = %d, want 1", got)
 		}
 	})
+
+	t.Run("pre_command_held_disarmed_heartbeat_promoted_after_timeout_cannot_confirm_disarm", func(t *testing.T) {
+		newTimedOutDisarmWithPreCmdGapHB := func(t *testing.T, withPreCmdGapHB bool) (*mavlink.Tracker, *Service, *fakeCommandStore, netip.AddrPort, string, *time.Time) {
+			t.Helper()
+			now := time.Date(2026, 11, 28, 5, 0, 0, 0, time.UTC)
+			tracker, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker: %v", err)
+			}
+			store := newFakeCommandStore()
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   &fakeFrameSender{},
+				Store:    store,
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			peer := netip.MustParseAddrPort("127.0.0.1:20401")
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+
+			if withPreCmdGapHB {
+				// Disarmed gap HB arrives 10ms BEFORE Disarm is submitted and stays held in pendingGap.
+				now = now.Add(10 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 80, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+			}
+
+			now = now.Add(10 * time.Millisecond)
+			disarmRes, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+			if err != nil {
+				t.Fatalf("SubmitCommand Disarm: %v", err)
+			}
+			now = now.Add(2 * time.Second)
+			svc.Advance(context.Background(), now)
+			if ent, _ := store.get(disarmRes.CommandID); ent.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("Disarm at timeout = %+v, want PhaseCommitUnknown", ent)
+			}
+			return tracker, svc, store, peer, disarmRes.CommandID, &now
+		}
+
+		// Branch A: AttitudeQuaternion after timeout promotes the pre-command held disarmed HB (seq=80),
+		// which MUST NOT reconcile Disarm to PhaseConfirmed.
+		trPre, svcPre, storePre, peerPre, cmdPre, nowPre := newTimedOutDisarmWithPreCmdGapHB(t, true)
+		*nowPre = nowPre.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcPre, trPre.IngestFrame(mavcodec.Frame{
+			Sequence:    81,
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Message:     mavcodec.AttitudeQuaternion{Q1: 1},
+		}, peerPre, *nowPre), *nowPre)
+		svcPre.Advance(context.Background(), *nowPre)
+		if ent, _ := storePre.get(cmdPre); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("Disarm after deferred promotion of pre-command disarmed HB = %+v, want PhaseCommitUnknown", ent)
+		}
+
+		// Branch B: Attitude-only control without any post-timeout heartbeat also stays PhaseCommitUnknown.
+		trAtt, svcAtt, storeAtt, peerAtt, cmdAtt, nowAtt := newTimedOutDisarmWithPreCmdGapHB(t, false)
+		*nowAtt = nowAtt.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcAtt, trAtt.IngestFrame(mavcodec.Frame{
+			Sequence:    2,
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Message:     mavcodec.AttitudeQuaternion{Q1: 1},
+		}, peerAtt, *nowAtt), *nowAtt)
+		svcAtt.Advance(context.Background(), *nowAtt)
+		if ent, _ := storeAtt.get(cmdAtt); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("Disarm after attitude-only frame = %+v, want PhaseCommitUnknown", ent)
+		}
+
+		// Branch C: Genuinely new disarmed heartbeat received AFTER timeout reconciles Disarm to PhaseConfirmed.
+		*nowPre = nowPre.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcPre, trPre.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 82, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peerPre, *nowPre), *nowPre)
+		svcPre.Advance(context.Background(), *nowPre)
+		if ent, _ := storePre.get(cmdPre); ent.PhaseState != PhaseConfirmed || ent.AckResult != UnacknowledgedResult {
+			t.Fatalf("Disarm after post-timeout disarmed HB = %+v, want PhaseConfirmed AckResult=-1", ent)
+		}
+	})
+
+	t.Run("pre_loss_sitl_heartbeat_copy_after_reconnect_cannot_grant_sitl_only_command_permission", func(t *testing.T) {
+		newLostBenchHarness := func(t *testing.T) (*mavlink.Tracker, *Service, *fakeFrameSender, netip.AddrPort, *time.Time) {
+			t.Helper()
+			now := time.Date(2026, 11, 28, 5, 10, 0, 0, time.UTC)
+			tracker, err := mavlink.NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+			if err != nil {
+				t.Fatalf("NewTrackerWithTimeouts: %v", err)
+			}
+			sender := &fakeFrameSender{}
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			peer := netip.MustParseAddrPort("127.0.0.1:20402")
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 11, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, now), now)
+
+			now = now.Add(3100 * time.Millisecond)
+			for _, ev := range tracker.EvaluateSilence(now) {
+				svc.OnTransitionEvent(ev)
+			}
+			return tracker, svc, sender, peer, &now
+		}
+
+		// Branch A: Direct reconnect with exact copy of pre-loss (seq=10, sitl-local) on same endpoint.
+		trDirect, svcDirect, senderDirect, peerDirect, nowDirect := newLostBenchHarness(t)
+		*nowDirect = nowDirect.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcDirect, trDirect.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerDirect, *nowDirect), *nowDirect)
+		var ce *ControlError
+		if _, err := svcDirect.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action after direct pre-loss SITL HB replay = %v, want 403 sitl_only_action", err)
+		}
+		if got := senderDirect.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("direct pre-loss SITL HB replay emitted %d #76 frames, want 0", got)
+		}
+
+		// Branch B: AttitudeQuaternion restores link first, then exact copy of pre-loss (seq=10, sitl-local) arrives.
+		trAtt, svcAtt, senderAtt, peerAtt, nowAtt := newLostBenchHarness(t)
+		*nowAtt = nowAtt.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcAtt, trAtt.IngestFrame(mavcodec.Frame{Sequence: 9, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peerAtt, *nowAtt), *nowAtt)
+		*nowAtt = nowAtt.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcAtt, trAtt.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerAtt, *nowAtt), *nowAtt)
+		ce = nil
+		if _, err := svcAtt.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action after post-attitude pre-loss SITL HB replay = %v, want 403 sitl_only_action", err)
+		}
+		if got := senderAtt.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("post-attitude pre-loss SITL HB replay emitted %d #76 frames, want 0", got)
+		}
+
+		// Branch C: Fresh direct-bench heartbeat (seq=12) confirms direct-bench and keeps SITL action blocked.
+		*nowDirect = nowDirect.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcDirect, trDirect.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 12, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peerDirect, *nowDirect), *nowDirect)
+		ce = nil
+		if _, err := svcDirect.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action after fresh direct-bench HB = %v, want 403 sitl_only_action", err)
+		}
+
+		// Branch D: Fresh sitl-local heartbeat (seq=12) confirms sitl-local on restored link and permits SITL action.
+		*nowAtt = nowAtt.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcAtt, trAtt.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 12, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerAtt, *nowAtt), *nowAtt)
+		if _, err := svcAtt.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); err != nil {
+			t.Fatalf("SubmitCommand SITL action after fresh sitl-local HB: %v", err)
+		}
+		if got := senderAtt.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+			t.Fatalf("fresh sitl-local HB #76 count = %d, want 1", got)
+		}
+	})
+
+	t.Run("unconfirmed_disarmed_mcu_failsafe_heartbeat_retains_hold_restriction_until_corroborated", func(t *testing.T) {
+		newArmedFailsafeHarness := func(t *testing.T) (*mavlink.Tracker, *Service, *fakeFrameSender, netip.AddrPort, *time.Time) {
+			t.Helper()
+			now := time.Date(2026, 11, 28, 5, 20, 0, 0, time.UTC)
+			tracker, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker: %v", err)
+			}
+			sender := &fakeFrameSender{}
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			peer := netip.MustParseAddrPort("127.0.0.1:20403")
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityMCUFailsafe), peer, now), now)
+			return tracker, svc, sender, peer, &now
+		}
+
+		// Branch A: Confirmed armed mcu-failsafe refuses Hold -> unconfirmed gap disarmed mcu-failsafe (seq=80)
+		// STILL refuses Hold while retaining emergency Disarm eligibility, until seq=81 corroborates disarm.
+		trGap, svcGap, senderGap, peerGap, nowGap := newArmedFailsafeHarness(t)
+		var ce *ControlError
+		if _, err := svcGap.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition}); !errors.As(err, &ce) || ce.Code != "authority_preempted" {
+			t.Fatalf("Hold on confirmed armed mcu-failsafe = %v, want 409 authority_preempted", err)
+		}
+
+		*nowGap = nowGap.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcGap, trGap.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 80, false, mavcodec.ModeDisarmed, mavcodec.AuthorityMCUFailsafe), peerGap, *nowGap), *nowGap)
+		tgtUncorroborated, ok := trGap.ActuationTarget(1)
+		if !ok || tgtUncorroborated.HeartbeatOrder != 0 {
+			t.Fatalf("target after unconfirmed disarmed mcu-failsafe HB = %+v (ok=%v), want HeartbeatOrder=0", tgtUncorroborated, ok)
+		}
+		ce = nil
+		if _, err := svcGap.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition}); !errors.As(err, &ce) || ce.Code != "authority_preempted" {
+			t.Fatalf("Hold after unconfirmed disarmed mcu-failsafe HB = %v, want 409 authority_preempted", err)
+		}
+		if vErr := validateCommandTarget(1, ActionDisarm, false, tgtUncorroborated, ok); vErr != nil {
+			t.Fatalf("emergency Disarm eligibility after unconfirmed disarmed mcu-failsafe HB = %v, want nil", vErr)
+		}
+		if got := senderGap.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("unconfirmed disarmed mcu-failsafe HB emitted %d #76 frames, want 0", got)
+		}
+
+		// Corroborate seq=80 with AttitudeQuaternion(seq=81) -> Armed=false confirmed, Hold now eligible.
+		*nowGap = nowGap.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcGap, trGap.IngestFrame(mavcodec.Frame{Sequence: 81, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peerGap, *nowGap), *nowGap)
+		if _, err := svcGap.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition}); err != nil {
+			t.Fatalf("Hold after corroborated disarmed mcu-failsafe HB: %v", err)
+		}
+		if got := senderGap.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+			t.Fatalf("corroborated disarmed mcu-failsafe HB #76 count = %d, want 1", got)
+		}
+
+		// Branch B: Uncertain mcu-failsafe HB still reporting Armed=true keeps Hold blocked.
+		trArmedGap, svcArmedGap, _, peerArmedGap, nowArmedGap := newArmedFailsafeHarness(t)
+		*nowArmedGap = nowArmedGap.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcArmedGap, trArmedGap.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 80, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityMCUFailsafe), peerArmedGap, *nowArmedGap), *nowArmedGap)
+		ce = nil
+		if _, err := svcArmedGap.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition}); !errors.As(err, &ce) || ce.Code != "authority_preempted" {
+			t.Fatalf("Hold on uncertain armed mcu-failsafe HB = %v, want 409 authority_preempted", err)
+		}
+
+		// Branch C: Ordered disarmed mcu-failsafe HB (seq=2 after seq=1) commits immediately and allows Hold.
+		trOrdered, svcOrdered, senderOrdered, peerOrdered, nowOrdered := newArmedFailsafeHarness(t)
+		*nowOrdered = nowOrdered.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcOrdered, trOrdered.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 2, false, mavcodec.ModeDisarmed, mavcodec.AuthorityMCUFailsafe), peerOrdered, *nowOrdered), *nowOrdered)
+		if _, err := svcOrdered.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition}); err != nil {
+			t.Fatalf("Hold after ordered disarmed mcu-failsafe HB: %v", err)
+		}
+		if got := senderOrdered.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+			t.Fatalf("ordered disarmed mcu-failsafe HB #76 count = %d, want 1", got)
+		}
+	})
 }
