@@ -1481,15 +1481,32 @@ func validateCommandTarget(sysid uint8, actionSlug string, sitlOnly bool, target
 			Message: fmt.Sprintf("vehicle sysid %d link is silent (LINK LOST)", sysid),
 		}
 	}
-	if sitlOnly && target.LinkTier != uxsvocab.LinkTierSITLLocal {
-		return &ControlError{
-			Status:  http.StatusForbidden,
-			Code:    "sitl_only_action",
-			Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
+	if sitlOnly {
+		if target.LinkTier != uxsvocab.LinkTierSITLLocal {
+			return &ControlError{
+				Status:  http.StatusForbidden,
+				Code:    "sitl_only_action",
+				Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
+			}
+		}
+		if target.TeleopUncertain &&
+			(target.TeleopUncertainReason == "supervisory_link_only" ||
+				target.TeleopUncertainReason == "supervisory_link_tier" ||
+				(target.UncertainLinkTier != "" && target.UncertainLinkTier != uxsvocab.LinkTierSITLLocal)) {
+			effTier := target.UncertainLinkTier
+			if effTier == "" {
+				effTier = uxsvocab.LinkTierMeshSupervisory
+			}
+			return &ControlError{
+				Status:  http.StatusForbidden,
+				Code:    "sitl_only_action",
+				Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (uncertain link_tier=%q)", actionSlug, effTier),
+			}
 		}
 	}
 	if !sitlOnly {
-		if target.Authority == uxsvocab.AuthorityDirectCRSFOverride {
+		if target.Authority == uxsvocab.AuthorityDirectCRSFOverride ||
+			(target.TeleopUncertain && target.UncertainAuthority == uxsvocab.AuthorityDirectCRSFOverride) {
 			return &ControlError{
 				Status:  http.StatusConflict,
 				Code:    "authority_preempted",
@@ -1501,6 +1518,22 @@ func validateCommandTarget(sysid uint8, actionSlug string, sitlOnly bool, target
 				Status:  http.StatusConflict,
 				Code:    "authority_preempted",
 				Message: "MCU hardware failsafe (mcu-failsafe) holds actuator authority",
+			}
+		}
+		if target.TeleopUncertain && target.UncertainAuthority == uxsvocab.AuthorityMCUFailsafe &&
+			(target.Armed || target.UncertainArmed) && actionSlug != ActionDisarm {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "authority_preempted",
+				Message: "MCU hardware failsafe (mcu-failsafe) holds actuator authority",
+			}
+		}
+		if target.TeleopUncertain && target.UncertainAuthority == "" &&
+			target.TeleopUncertainReason == "authority_preempted" && actionSlug != ActionDisarm {
+			return &ControlError{
+				Status:  http.StatusConflict,
+				Code:    "authority_preempted",
+				Message: "actuator authority is uncertain (authority_preempted)",
 			}
 		}
 	}
@@ -1823,22 +1856,29 @@ func (s *Service) revokeUncertainLease(sysid uint8, session string, engage bool,
 	var zeroFrame uint8
 	var shouldZero bool
 	s.mu.Lock()
+	liveTarget, liveOK := s.targets.ActuationTarget(sysid)
+	liveErr := validateTeleopTarget(sysid, liveTarget, liveOK)
 	if prev, had := s.leases[sysid]; had {
-		zeroPeer = prev.peer
-		zeroFrame = prev.coordFrame
-		s.recordStoppedSessionLocked(sysid, prev.session)
-		delete(s.leases, sysid)
-		s.authEpoch[sysid]++
-		shouldZero = true
+		sameSession := (session != "" && prev.session == session) || (session == "" && prev.session == "")
+		newerObs := (fallbackTarget.ObservationRev > 0 && prev.engagedObsRev > fallbackTarget.ObservationRev) ||
+			(fallbackTarget.HeartbeatObservedUnixNs > 0 && prev.engagedObsMs > fallbackTarget.HeartbeatObservedUnixNs/int64(time.Millisecond))
+		if liveErr != nil || (!engage && sameSession && !newerObs) {
+			zeroPeer = prev.peer
+			zeroFrame = prev.coordFrame
+			s.recordStoppedSessionLocked(sysid, prev.session)
+			delete(s.leases, sysid)
+			s.authEpoch[sysid]++
+			shouldZero = true
+		}
 	}
-	if engage && session != "" {
+	if session != "" {
 		s.recordStoppedSessionLocked(sysid, session)
 	}
 	s.mu.Unlock()
 
 	if shouldZero {
-		target, ok := s.targets.ActuationTarget(sysid)
-		if !ok {
+		target := liveTarget
+		if !liveOK {
 			target = fallbackTarget
 		}
 		if !target.LinkLost && target.PeerAddr.IsValid() &&

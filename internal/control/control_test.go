@@ -4048,12 +4048,16 @@ func TestServiceDelayedPreOverrideEngageRejectedAfterRecovery(t *testing.T) {
 }
 
 func makeTestVehicleHeartbeatFrame(t *testing.T, sysid, seq uint8, armed bool, mode mavcodec.CompanionMode, auth mavcodec.ControlAuthority) mavcodec.Frame {
+	return makeTestVehicleHeartbeatFrameWithTier(t, sysid, seq, armed, mode, auth, mavcodec.LinkTierSITLLocal)
+}
+
+func makeTestVehicleHeartbeatFrameWithTier(t *testing.T, sysid, seq uint8, armed bool, mode mavcodec.CompanionMode, auth mavcodec.ControlAuthority, tier mavcodec.LinkTier) mavcodec.Frame {
 	t.Helper()
 	hb, err := mavcodec.EncodeVehicleHeartbeat(mavcodec.VehicleHeartbeat{
 		Armed:        armed,
 		SystemStatus: mavcodec.MAVStateActive,
 		Custom: mavcodec.CustomMode{
-			LinkTier:         mavcodec.LinkTierSITLLocal,
+			LinkTier:         tier,
 			Domain:           mavcodec.DomainQuadcopter,
 			CompanionMode:    mode,
 			ControlAuthority: auth,
@@ -8370,6 +8374,465 @@ func TestServiceWrapHeldTeleopHoleLossRepeatHeartbeatIdleDupAckFormatV2AndSessio
 			Vx:      1.2,
 		}); err != nil || !renewNext.LeaseActive {
 			t.Fatalf("s-next renewal after late s-orig Stop = (%+v, %v), want LeaseActive=true", renewNext, err)
+		}
+	})
+}
+
+type barrierTargetSource struct {
+	inner     *mavlink.Tracker
+	mu        sync.Mutex
+	armPause  bool
+	pausedCh  chan struct{}
+	releaseCh chan struct{}
+}
+
+func (b *barrierTargetSource) ActuationTarget(sysid uint8) (mavlink.ActuationTarget, bool) {
+	tgt, ok := b.inner.ActuationTarget(sysid)
+	b.mu.Lock()
+	shouldPause := b.armPause && ok && tgt.TeleopUncertain
+	if shouldPause {
+		b.armPause = false
+	}
+	pausedCh := b.pausedCh
+	releaseCh := b.releaseCh
+	b.mu.Unlock()
+	if shouldPause {
+		close(pausedCh)
+		<-releaseCh
+	}
+	return tgt, ok
+}
+
+func (b *barrierTargetSource) ResolveObservation(sysid uint8, obsRev, authorityEpoch uint64, observedMs int64) (uint64, bool) {
+	return b.inner.ResolveObservation(sysid, obsRev, authorityEpoch, observedMs)
+}
+
+// spec: uxs-control / ADR-111 non-retrying #76 COMMAND_LONG execution, #77 COMMAND_ACK correlation, and preemption
+// spec: uxs-control / Lease-bound at-most-once #84 velocity teleop with LinkTier and authority safety gates
+func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAndReplacementLease(t *testing.T) {
+	t.Run("finding1_motion_suspension_survives_delayed_attitude_and_copied_armed_heartbeat_before_renewal", func(t *testing.T) {
+		peer := netip.MustParseAddrPort("127.0.0.1:20201")
+		now := time.Date(2026, 11, 28, 3, 0, 0, 0, time.UTC)
+
+		// Subcase A: unconfirmed-gap disarmed HB -> delayed attitude arrives BEFORE next renewal -> renewal refused!
+		trackerA, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderA := &fakeFrameSender{}
+		svcA, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerA,
+			Sender:   senderA,
+			Store:    newFakeCommandStore(),
+			Now:      func() time.Time { return now },
+		})
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+		for seq := uint8(2); seq <= 10; seq++ {
+			now = now.Add(5 * time.Millisecond)
+			_ = trackerA.IngestFrame(mavcodec.Frame{Sequence: seq, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+		tgtA, _ := trackerA.ActuationTarget(1)
+		if _, err := svcA.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "s-gap-attitude",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   2.0,
+			Engage:               true,
+			ObservedMs:           tgtA.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgtA.ObservationRev,
+			AuthorityIncarnation: tgtA.AuthorityIncarnation,
+			AuthorityEpoch:       tgtA.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("svcA engage: %v", err)
+		}
+
+		// Disarmed heartbeat opens gap (seq=91), then delayed attitude (seq=11) arrives BEFORE renewal.
+		now = now.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 91, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+		now = now.Add(5 * time.Millisecond)
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(mavcodec.Frame{Sequence: 11, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+
+		var ce *ControlError
+		if _, err := svcA.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:   1,
+			Session: "s-gap-attitude",
+			Seq:     2,
+			Frame:   FrameLocalNED,
+			Vx:      2.0,
+		}); !errors.As(err, &ce) || ce.Code != "vehicle_disarmed" {
+			t.Fatalf("svcA renewal after delayed attitude got err=%v, want 409 vehicle_disarmed", err)
+		}
+
+		// Subcase B: post-wrap disarmed HB -> copied earlier armed HB arrives BEFORE next renewal -> renewal refused!
+		trackerB, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderB := &fakeFrameSender{}
+		svcB, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerB,
+			Sender:   senderB,
+			Store:    newFakeCommandStore(),
+			Now:      func() time.Time { return now },
+		})
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+		now = now.Add(5 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 2, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+		seq := uint8(2)
+		for i := 0; i < 254; i++ {
+			seq++
+			now = now.Add(2 * time.Millisecond)
+			_ = trackerB.IngestFrame(mavcodec.Frame{Sequence: seq, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+		tgtB, _ := trackerB.ActuationTarget(1)
+		if _, err := svcB.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "s-wrap-copied-armed",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   2.0,
+			Engage:               true,
+			ObservedMs:           tgtB.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgtB.ObservationRev,
+			AuthorityIncarnation: tgtB.AuthorityIncarnation,
+			AuthorityEpoch:       tgtB.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("svcB engage: %v", err)
+		}
+
+		// Genuine disarmed HB at seq=1 suspends motion; copied Cycle 0 armed HB at seq=2 arrives BEFORE renewal.
+		now = now.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+		now = now.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 2, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+
+		ce = nil
+		if _, err := svcB.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:   1,
+			Session: "s-wrap-copied-armed",
+			Seq:     2,
+			Frame:   FrameLocalNED,
+			Vx:      2.0,
+		}); !errors.As(err, &ce) || ce.Code != "vehicle_disarmed" {
+			t.Fatalf("svcB renewal after copied Cycle 0 armed HB got err=%v, want 409 vehicle_disarmed", err)
+		}
+	})
+
+	t.Run("finding2_regular_1hz_hb_31hz_kinematics_reconciles_timed_out_disarm_while_holding_delayed_copies", func(t *testing.T) {
+		tracker, _ := mavlink.NewTracker("boxbotix", "bbops")
+		store := newFakeCommandStore()
+		now := time.Date(2026, 11, 28, 3, 10, 0, 0, time.UTC)
+		svc, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  tracker,
+			Sender:   &fakeFrameSender{},
+			Store:    store,
+			Now:      func() time.Time { return now },
+		})
+		peer := netip.MustParseAddrPort("127.0.0.1:20202")
+
+		var seq uint8
+		emitSecond := func(armed bool, mode mavcodec.CompanionMode) {
+			seq++
+			now = now.Add(31 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, seq, armed, mode, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+			for k := 0; k < 31; k++ {
+				seq++
+				now = now.Add(31 * time.Millisecond)
+				_ = tracker.IngestFrame(mavcodec.Frame{Sequence: seq, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			}
+			svc.Advance(context.Background(), now)
+		}
+
+		for i := 0; i < 8; i++ {
+			emitSecond(false, mavcodec.ModeDisarmed)
+		}
+		for i := 0; i < 8; i++ {
+			emitSecond(true, mavcodec.ModeTeleopVelocity)
+		}
+
+		now = now.Add(5 * time.Millisecond)
+		disarmCmd, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm})
+		if err != nil {
+			t.Fatalf("SubmitCommand Disarm: %v", err)
+		}
+		// Advance 2 seconds of kinematics so Disarm times out to commit_unknown while staying on cadence.
+		for sec := 0; sec < 2; sec++ {
+			emitSecond(true, mavcodec.ModeTeleopVelocity)
+		}
+		now = now.Add(100 * time.Millisecond)
+		svc.Advance(context.Background(), now)
+		if ent, _ := store.get(disarmCmd.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("Disarm after timeout = %+v, want PhaseCommitUnknown", ent)
+		}
+
+		// Deliver 64 consecutive genuine disarmed heartbeats + 31 kinematics/sec:
+		// delayed copy count 1..2 stays held (commit_unknown), and sustained stream reconciles well before 64s!
+		for sec := 1; sec <= 64; sec++ {
+			emitSecond(false, mavcodec.ModeDisarmed)
+			ent, _ := store.get(disarmCmd.CommandID)
+			if sec <= 2 && ent.PhaseState != PhaseCommitUnknown {
+				t.Fatalf("Disarm confirmed too early on held heartbeat #%d: %+v", sec, ent)
+			}
+		}
+		snap, _ := tracker.Snapshot(1)
+		ent, _ := store.get(disarmCmd.CommandID)
+		if snap.Armed || ent.PhaseState != PhaseConfirmed {
+			t.Fatalf("after 64s genuine disarmed cadence: Armed=%v cmd=%+v, want Armed=false PhaseConfirmed", snap.Armed, ent)
+		}
+	})
+
+	t.Run("finding3_repeated_override_preempts_pending_hold_blocks_arm_preserves_emergency_disarm_and_blocks_sitl_on_uncertain_supervisory", func(t *testing.T) {
+		peer := netip.MustParseAddrPort("127.0.0.1:20203")
+		now := time.Date(2026, 11, 28, 3, 20, 0, 0, time.UTC)
+
+		// 3A) Repeated DirectCRSFOverride slot (seq=164 -> seq=220 teleop -> lose 199 -> seq=164 override):
+		// pending Hold MUST transition to PhasePreempted and subsequent Arm MUST be rejected with zero outbound #76!
+		trackerCRSF, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderCRSF := &fakeFrameSender{}
+		storeCRSF := newFakeCommandStore()
+		svcCRSF, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerCRSF,
+			Sender:   senderCRSF,
+			Store:    storeCRSF,
+			Now:      func() time.Time { return now },
+		})
+		for s := 1; s <= 220; s++ {
+			now = now.Add(2 * time.Millisecond)
+			switch s {
+			case 1, 220:
+				deliverTrackerOutcome(svcCRSF, trackerCRSF.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, uint8(s), true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+			case 164:
+				deliverTrackerOutcome(svcCRSF, trackerCRSF.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 164, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride), peer, now), now)
+			default:
+				_ = trackerCRSF.IngestFrame(mavcodec.Frame{Sequence: uint8(s), SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			}
+		}
+
+		now = now.Add(5 * time.Millisecond)
+		holdCmd, err := svcCRSF.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition})
+		if err != nil {
+			t.Fatalf("SubmitCommand Hold: %v", err)
+		}
+		cmdLongBeforeOverride := senderCRSF.countByMsgID(mavcodec.MsgIDCommandLong)
+
+		now = now.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcCRSF, trackerCRSF.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 164, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride), peer, now), now)
+
+		if holdEnt, _ := storeCRSF.get(holdCmd.CommandID); holdEnt.PhaseState != PhasePreempted {
+			t.Fatalf("pending Hold after repeated-slot DirectCRSFOverride = %+v, want PhasePreempted", holdEnt)
+		}
+		var ce *ControlError
+		if _, err := svcCRSF.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionArm}); !errors.As(err, &ce) || ce.Code != "authority_preempted" {
+			t.Fatalf("SubmitCommand Arm during repeated-slot DirectCRSFOverride got err=%v, want 409 authority_preempted", err)
+		}
+		if got := senderCRSF.countByMsgID(mavcodec.MsgIDCommandLong); got != cmdLongBeforeOverride {
+			t.Fatalf("CommandLong count after rejected Arm = %d, want %d (zero new #76 frames)", got, cmdLongBeforeOverride)
+		}
+
+		// 3B) Repeated MCUFailsafe slot preempts pending Hold and rejects Hold/Arm while preserving emergency Disarm!
+		trackerMCU, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderMCU := &fakeFrameSender{}
+		storeMCU := newFakeCommandStore()
+		svcMCU, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerMCU,
+			Sender:   senderMCU,
+			Store:    storeMCU,
+			Now:      func() time.Time { return now },
+		})
+		for s := 1; s <= 220; s++ {
+			now = now.Add(2 * time.Millisecond)
+			switch s {
+			case 1, 220:
+				deliverTrackerOutcome(svcMCU, trackerMCU.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, uint8(s), true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, now), now)
+			case 164:
+				deliverTrackerOutcome(svcMCU, trackerMCU.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 164, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityMCUFailsafe), peer, now), now)
+			default:
+				_ = trackerMCU.IngestFrame(mavcodec.Frame{Sequence: uint8(s), SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			}
+		}
+		holdMCU, err := svcMCU.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionHoldPosition})
+		if err != nil {
+			t.Fatalf("svcMCU Hold: %v", err)
+		}
+		now = now.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcMCU, trackerMCU.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 164, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityMCUFailsafe), peer, now), now)
+		if holdEnt, _ := storeMCU.get(holdMCU.CommandID); holdEnt.PhaseState != PhasePreempted {
+			t.Fatalf("pending Hold after repeated-slot MCUFailsafe = %+v, want PhasePreempted", holdEnt)
+		}
+		beforeMCUReject := senderMCU.countByMsgID(mavcodec.MsgIDCommandLong)
+		ce = nil
+		if _, err := svcMCU.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionArm}); !errors.As(err, &ce) || ce.Code != "authority_preempted" {
+			t.Fatalf("svcMCU Arm got err=%v, want authority_preempted", err)
+		}
+		if got := senderMCU.countByMsgID(mavcodec.MsgIDCommandLong); got != beforeMCUReject {
+			t.Fatalf("svcMCU CommandLong count after rejected Arm = %d, want %d", got, beforeMCUReject)
+		}
+		if _, err := svcMCU.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionDisarm}); err != nil {
+			t.Fatalf("emergency Disarm under repeated-slot MCUFailsafe failed: %v", err)
+		}
+		if got := senderMCU.countByMsgID(mavcodec.MsgIDCommandLong); got != beforeMCUReject+1 {
+			t.Fatalf("emergency Disarm CommandLong count = %d, want %d", got, beforeMCUReject+1)
+		}
+
+		// 3C) SITL-local heartbeat followed by supervisory-link heartbeat of uncertain order:
+		// direct validateCommandTarget AND SubmitCommand reject SITL-only actions with 403 sitl_only_action!
+		trackerSup, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderSup := &fakeFrameSender{}
+		svcSup, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerSup,
+			Sender:   senderSup,
+			Store:    newFakeCommandStore(),
+			Now:      func() time.Time { return now },
+		})
+		deliverTrackerOutcome(svcSup, trackerSup.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+		now = now.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcSup, trackerSup.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 90, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierMeshSupervisory), peer, now), now)
+
+		supTarget, supOK := trackerSup.ActuationTarget(1)
+		ce = nil
+		if vErr := validateCommandTarget(1, ActionSITLCRSFOverride, true, supTarget, supOK); !errors.As(vErr, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("validateCommandTarget on uncertain supervisory link = %v, want 403 sitl_only_action", vErr)
+		}
+		ce = nil
+		if _, err := svcSup.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action on uncertain supervisory link = %v, want 403 sitl_only_action", err)
+		}
+		if got := senderSup.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("SITL action on uncertain supervisory link emitted %d #76 frames, want 0", got)
+		}
+	})
+
+	t.Run("finding4_delayed_uncertain_renewal_never_stops_newer_healthy_replacement_session", func(t *testing.T) {
+		tracker, _ := mavlink.NewTracker("boxbotix", "bbops")
+		barrier := &barrierTargetSource{
+			inner:     tracker,
+			pausedCh:  make(chan struct{}),
+			releaseCh: make(chan struct{}),
+		}
+		sender := &fakeFrameSender{}
+		var muNow sync.Mutex
+		curNow := time.Date(2026, 11, 28, 3, 30, 0, 0, time.UTC)
+		getNow := func() time.Time {
+			muNow.Lock()
+			defer muNow.Unlock()
+			return curNow
+		}
+		addNow := func(d time.Duration) time.Time {
+			muNow.Lock()
+			curNow = curNow.Add(d)
+			out := curNow
+			muNow.Unlock()
+			return out
+		}
+
+		svc, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  barrier,
+			Sender:   sender,
+			Store:    newFakeCommandStore(),
+			Now:      getNow,
+		})
+		peer := netip.MustParseAddrPort("127.0.0.1:20204")
+		t0 := getNow()
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, t0), t0)
+
+		tgt1, _ := tracker.ActuationTarget(1)
+		if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "session-old",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.5,
+			Engage:               true,
+			ObservedMs:           tgt1.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt1.ObservationRev,
+			AuthorityIncarnation: tgt1.AuthorityIncarnation,
+			AuthorityEpoch:       tgt1.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("engage session-old: %v", err)
+		}
+
+		// Uncertain disarmed heartbeat arrives at seq=90; arm barrier so old renewal pauses right after sampling uncertain target.
+		tUncertain := addNow(20 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 90, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop), peer, tUncertain), tUncertain)
+		barrier.mu.Lock()
+		barrier.armPause = true
+		barrier.mu.Unlock()
+
+		oldErrCh := make(chan error, 1)
+		go func() {
+			_, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+				SysID:   1,
+				Session: "session-old",
+				Seq:     2,
+				Frame:   FrameLocalNED,
+				Vx:      1.5,
+			})
+			oldErrCh <- err
+		}()
+		<-barrier.pausedCh
+
+		// Healthy armed heartbeat arrives at seq=2 and replacement session-new engages before session-old resumes.
+		tHealthy := addNow(15 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrame(t, 1, 2, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop), peer, tHealthy), tHealthy)
+		tgt2, _ := tracker.ActuationTarget(1)
+		if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "session-new",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   2.2,
+			Engage:               true,
+			ObservedMs:           tgt2.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt2.ObservationRev,
+			AuthorityIncarnation: tgt2.AuthorityIncarnation,
+			AuthorityEpoch:       tgt2.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("engage session-new: %v", err)
+		}
+
+		// Resume delayed session-old renewal: it MUST remain refused while session-new stays active and can renew!
+		close(barrier.releaseCh)
+		var ce *ControlError
+		if oldErr := <-oldErrCh; !errors.As(oldErr, &ce) || ce.Code != "vehicle_disarmed" {
+			t.Fatalf("resumed stale renewal err = %v, want 409 vehicle_disarmed", oldErr)
+		}
+		if !svc.HasActiveLease(1) {
+			t.Fatal("delayed uncertain renewal deleted active replacement lease")
+		}
+		_ = addNow(20 * time.Millisecond)
+		if renewRes, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:   1,
+			Session: "session-new",
+			Seq:     2,
+			Frame:   FrameLocalNED,
+			Vx:      2.2,
+		}); err != nil || !renewRes.LeaseActive {
+			t.Fatalf("replacement session-new renewal after delayed old renewal = (%+v, %v), want LeaseActive=true", renewRes, err)
+		}
+	})
+
+	t.Run("ackpoolmask_vocab_documents_result_range_and_reserved_accounting_bits", func(t *testing.T) {
+		pack := ControlPackSpec()
+		found := false
+		for _, pred := range pack.Predicates {
+			if pred.Name == PredicateCommandAckPoolMask {
+				found = true
+				if !strings.Contains(pred.Description, "bits 0..27") || !strings.Contains(pred.Description, "bit 30") {
+					t.Fatalf("PredicateCommandAckPoolMask description = %q, want result-bit range and reserved accounting bits", pred.Description)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("PredicateCommandAckPoolMask missing from ControlPackSpec")
 		}
 	})
 }

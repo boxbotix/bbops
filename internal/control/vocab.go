@@ -195,7 +195,7 @@ func ControlPackSpec() vocabulary.PackSpec {
 			},
 			{
 				Name:        PredicateCommandAckPoolMask,
-				Description: "Owner-neutral bitmask of #77 COMMAND_ACK MAV_RESULT codes observed across the (sysid, cmd_id) pool",
+				Description: "Owner-neutral bitmask for the (sysid, cmd_id) pool: bits 0..27 record observed #77 COMMAND_ACK MAV_RESULT codes; bits 28..30 carry reserved accounting flags (bit 28 wrap-held receipt credit, bit 29 settled wrap credit, bit 30 v2 format marker)",
 				DataType:    "int",
 			},
 			{

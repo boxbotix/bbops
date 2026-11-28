@@ -2569,7 +2569,8 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.keyboard.press("w");
     expect(teleopPosts).toHaveLength(0);
 
-    // Let PilotWorkspace's DPR=2 SwiftShader canvases complete initial ResizeObserver allocation/paint before starting the 240 ms teleop lease.
+    // Let PilotWorkspace's DPR=2 SwiftShader canvases complete initial ResizeObserver allocation/paint/GC before starting the 240 ms teleop lease.
+    await page.waitForTimeout(250);
     await page.evaluate(
       () =>
         new Promise<void>((resolve) =>
@@ -2673,6 +2674,75 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     expect(
       teleopPosts.filter((p) => p.sysid === 1 && p.engage === true).length,
     ).toBe(engagesBeforeHoldEnter);
+
+    // Holding Space on Disengage Teleop until the confirmed lease expires locally (with no successful renewal)
+    // and then releasing Space in Chromium MUST send a scoped Stop for the captured session and zero new Engages.
+    await engageBtn.click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    const spaceEngagedSession = teleopPosts
+      .filter((p) => p.sysid === 1 && p.engage === true)
+      .at(-1)?.session;
+    expect(typeof spaceEngagedSession).toBe("string");
+
+    let failSpaceRenewals = true;
+    const stalledRenewals: Array<() => void> = [];
+    const spaceRenewalRoute = async (
+      route: Parameters<Parameters<typeof page.route>[1]>[0],
+    ): Promise<void> => {
+      const raw = route.request().postData();
+      const parsed = raw
+        ? (JSON.parse(raw) as { engage?: boolean; stop?: boolean })
+        : {};
+      if (failSpaceRenewals && !parsed.engage && !parsed.stop) {
+        await new Promise<void>((resolve) => {
+          stalledRenewals.push(resolve);
+        });
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: "lease_expired",
+            message: "simulated renewal stall",
+          }),
+        });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/control/teleop", spaceRenewalRoute);
+    try {
+      await engageBtn.focus();
+      const engagesBeforeHoldSpace = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.engage === true,
+      ).length;
+      const stopsBeforeHoldSpace = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.stop === true,
+      ).length;
+
+      await page.keyboard.down(" ");
+      await expect(panel).toHaveAttribute("data-engaged", "false", {
+        timeout: 2_000,
+      });
+      await page.keyboard.up(" ");
+      await page.waitForTimeout(80);
+
+      await expect(panel).toHaveAttribute("data-engaged", "false");
+      expect(
+        teleopPosts.filter((p) => p.sysid === 1 && p.engage === true).length,
+      ).toBe(engagesBeforeHoldSpace);
+      const spaceStops = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.stop === true,
+      );
+      expect(spaceStops.length).toBe(stopsBeforeHoldSpace + 1);
+      expect(spaceStops.at(-1)?.session).toBe(spaceEngagedSession);
+    } finally {
+      failSpaceRenewals = false;
+      while (stalledRenewals.length > 0) {
+        stalledRenewals.shift()?.();
+      }
+      await page.waitForTimeout(20);
+      await page.unroute("**/control/teleop", spaceRenewalRoute);
+    }
 
     // 5. ADR-111 Decision 3: dropped #77 COMMAND_ACK transitions pending -> commit_unknown with zero retries, then reconciles to confirmed on next #0 HEARTBEAT.
     await copStack.setDropCommandAck(1, 1);

@@ -3781,15 +3781,18 @@ func TestTrackerWrapHeldTeleopSuspensionHoleLossAndHistoricalRepeatGuard(t *test
 			_ = trackerDupSlot.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: uint8(s), Message: msg}, peer, now)
 		}
 		now = now.Add(40 * time.Millisecond)
-		_ = trackerDupSlot.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 164, Message: hbOverrideArmed}, peer, now)
+		outDup164 := trackerDupSlot.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 164, Message: hbOverrideArmed}, peer, now)
+		if len(outDup164.Events) != 1 || outDup164.Events[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
+			t.Fatalf("seq=164 override matching prior override slot events = %+v, want immediate direct-crsf-override edge", outDup164.Events)
+		}
 		tgtDup164, _ := trackerDupSlot.ActuationTarget(1)
-		if !tgtDup164.TeleopUncertain || tgtDup164.TeleopUncertainReason != "authority_preempted" {
-			t.Fatalf("target after seq=164 matching prior override slot = %+v, want TeleopUncertain=true reason=authority_preempted", tgtDup164)
+		if tgtDup164.Authority != uxsvocab.AuthorityDirectCRSFOverride || tgtDup164.HeartbeatOrder != 0 {
+			t.Fatalf("target after seq=164 matching prior override slot = %+v, want Authority=direct-crsf-override HeartbeatOrder=0", tgtDup164)
 		}
 		now = now.Add(20 * time.Millisecond)
 		outDup165 := trackerDupSlot.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 165, Message: hbOverrideArmed}, peer, now)
-		if len(outDup165.Events) != 1 || outDup165.Events[0].Authority != uxsvocab.AuthorityDirectCRSFOverride {
-			t.Fatalf("corroborating seq=165 override events = %+v, want direct-crsf-override edge", outDup165.Events)
+		if len(outDup165.Events) != 0 {
+			t.Fatalf("corroborating seq=165 override emitted duplicate events = %+v", outDup165.Events)
 		}
 		tgtDup165, _ := trackerDupSlot.ActuationTarget(1)
 		if tgtDup165.Authority != uxsvocab.AuthorityDirectCRSFOverride || tgtDup165.TeleopUncertain || tgtDup165.HeartbeatOrder == 0 {
@@ -3842,6 +3845,193 @@ func TestTrackerWrapHeldTeleopSuspensionHoleLossAndHistoricalRepeatGuard(t *test
 		if confirmed.Armed || confirmed.TeleopUncertain || confirmed.HeartbeatOrder <= armedBase.HeartbeatOrder {
 			t.Fatalf("target after fresh seq=3 disarmed = %+v, want Armed=false TeleopUncertain=false HeartbeatOrder>%d",
 				confirmed, armedBase.HeartbeatOrder)
+		}
+	})
+}
+
+// spec: mavlink-ingest / Three-lane hybrid MAVLink v2 UDP telemetry and SKG ingest component
+func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *testing.T) {
+	peer := netip.MustParseAddrPort("127.0.0.1:45214")
+	t0 := time.Date(2026, 11, 28, 2, 0, 0, 0, time.UTC)
+
+	hbTeleopArmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	hbTeleopDisarmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		false,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeDisarmed,
+		mavcodec.LinkTierSITLLocal,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+	hbSupervisoryArmed := makeVehicleHB(
+		mavcodec.DomainQuadcopter,
+		true,
+		mavcodec.AuthorityCompanionTeleop,
+		mavcodec.ModeTeleopVelocity,
+		mavcodec.LinkTierMeshSupervisory,
+		uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+	)
+
+	t.Run("gap_disarmed_suspension_survives_delayed_attitude_until_fresh_heartbeat", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopArmed}, peer, now)
+		for seq := uint8(2); seq <= 10; seq++ {
+			now = now.Add(5 * time.Millisecond)
+			_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+
+		// Genuine disarmed heartbeat opens a sequence gap (seq=91, delta=81) and suspends motion.
+		now = now.Add(20 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 91, Message: hbTeleopDisarmed}, peer, now)
+		if tgt, _ := tracker.ActuationTarget(1); !tgt.TeleopUncertain || tgt.TeleopUncertainReason != "vehicle_disarmed" {
+			t.Fatalf("gap disarmed target = %+v, want TeleopUncertain=true reason=vehicle_disarmed", tgt)
+		}
+
+		// Delayed attitude packet at seq=11 (normalDelta=1) MUST NOT clear motion suspension.
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		if tgt, _ := tracker.ActuationTarget(1); !tgt.TeleopUncertain || tgt.TeleopUncertainReason != "vehicle_disarmed" {
+			t.Fatalf("delayed attitude seq=11 cleared motion suspension: %+v", tgt)
+		}
+
+		// Backward-reordered heartbeat from before seq=10 (seq=9) MUST NOT clear motion suspension either.
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 9, Message: hbTeleopArmed}, peer, now)
+		if tgt, _ := tracker.ActuationTarget(1); !tgt.TeleopUncertain || tgt.TeleopUncertainReason != "vehicle_disarmed" {
+			t.Fatalf("backward-reordered armed heartbeat seq=9 cleared motion suspension: %+v", tgt)
+		}
+
+		// Genuinely fresh unseen armed heartbeat at seq=12 clears suspension.
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbTeleopArmed}, peer, now)
+		if tgt, _ := tracker.ActuationTarget(1); tgt.TeleopUncertain || !tgt.Armed {
+			t.Fatalf("fresh unseen armed heartbeat seq=12 did not clear suspension: %+v", tgt)
+		}
+	})
+
+	t.Run("wrap_disarmed_suspension_survives_copied_earlier_armed_heartbeat", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		// Cycle 0: seq=1 disarmed, seq=2 armed, seq=3 armed, telemetry through wrap.
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopDisarmed}, peer, now)
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbTeleopArmed}, peer, now)
+		now = now.Add(5 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 3, Message: hbTeleopArmed}, peer, now)
+		seq := uint8(3)
+		for i := 0; i < 253; i++ {
+			seq++
+			now = now.Add(2 * time.Millisecond)
+			_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+		}
+		armedBase, _ := tracker.ActuationTarget(1)
+
+		// Post-wrap genuine disarmed heartbeat at seq=1 suspends motion.
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopDisarmed}, peer, now)
+		if tgt, _ := tracker.ActuationTarget(1); !tgt.TeleopUncertain || tgt.TeleopUncertainReason != "vehicle_disarmed" {
+			t.Fatalf("post-wrap seq=1 disarmed target = %+v, want TeleopUncertain=true", tgt)
+		}
+
+		// Copy of earlier armed heartbeat at seq=2 MUST NOT clear TeleopUncertain or advance HeartbeatOrder.
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 2, Message: hbTeleopArmed}, peer, now)
+		afterCopiedArmed, _ := tracker.ActuationTarget(1)
+		if !afterCopiedArmed.TeleopUncertain || afterCopiedArmed.TeleopUncertainReason != "vehicle_disarmed" ||
+			afterCopiedArmed.HeartbeatOrder != armedBase.HeartbeatOrder {
+			t.Fatalf("copied Cycle 0 armed heartbeat cleared suspension or advanced order: got %+v, base %+v",
+				afterCopiedArmed, armedBase)
+		}
+
+		// Fresh unseen armed heartbeat at seq=1 (never armed in Cycle 0) clears suspension.
+		now = now.Add(10 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopArmed}, peer, now)
+		if cleared, _ := tracker.ActuationTarget(1); cleared.TeleopUncertain || cleared.HeartbeatOrder <= armedBase.HeartbeatOrder {
+			t.Fatalf("fresh unseen armed heartbeat seq=1 did not clear suspension: %+v", cleared)
+		}
+	})
+
+	t.Run("regular_1hz_heartbeat_31hz_kinematics_cadence_recovers_from_populated_slots", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		var seq uint8
+		emitSecond := func(hb mavcodec.Heartbeat) IngestOutcome {
+			seq++
+			now = now.Add(31 * time.Millisecond)
+			out := tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: hb}, peer, now)
+			for k := 0; k < 31; k++ {
+				seq++
+				now = now.Add(31 * time.Millisecond)
+				_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			}
+			return out
+		}
+
+		// 8 disarmed heartbeats + 8 armed heartbeats populate all 8 fixed cadence slots.
+		for i := 0; i < 8; i++ {
+			_ = emitSecond(hbTeleopDisarmed)
+		}
+		for i := 0; i < 8; i++ {
+			_ = emitSecond(hbTeleopArmed)
+		}
+		if snap, _ := tracker.Snapshot(1); !snap.Armed {
+			t.Fatal("expected Snapshot(1).Armed == true after 8 armed seconds")
+		}
+
+		// Delayed historical copies (1st and 2nd disarmed heartbeats) remain held, while sustained genuine
+		// disarmed telemetry confirms Disarmed on the 4th consecutive heartbeat (well under 64 seconds).
+		confirmedSecond := -1
+		for sec := 1; sec <= 64; sec++ {
+			out := emitSecond(hbTeleopDisarmed)
+			snap, _ := tracker.Snapshot(1)
+			if sec <= 2 && snap.Armed == false {
+				t.Fatalf("delayed historical copy count=%d confirmed Disarmed too early", sec)
+			}
+			if !snap.Armed && confirmedSecond < 0 {
+				confirmedSecond = sec
+				if len(out.Events) == 0 || out.Events[0].Armed {
+					t.Fatalf("confirming second %d did not emit disarmed TransitionEvent: %+v", sec, out.Events)
+				}
+			}
+		}
+		if confirmedSecond != maxConsecutiveHeldHeartbeats {
+			t.Fatalf("confirmedSecond = %d, want %d consecutive heartbeats on regular 32 pkt/s cadence",
+				confirmedSecond, maxConsecutiveHeldHeartbeats)
+		}
+		if snap, _ := tracker.Snapshot(1); snap.Armed {
+			t.Fatal("Snapshot(1).Armed remained true after sustained genuine disarmed heartbeats")
+		}
+	})
+
+	t.Run("uncertain_supervisory_heartbeat_propagates_uncertain_link_tier", func(t *testing.T) {
+		tracker, err := NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker: %v", err)
+		}
+		now := t0
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 1, Message: hbTeleopArmed}, peer, now)
+		now = now.Add(20 * time.Millisecond)
+		_ = tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 90, Message: hbSupervisoryArmed}, peer, now)
+		tgt, ok := tracker.ActuationTarget(1)
+		if !ok || !tgt.TeleopUncertain || tgt.TeleopUncertainReason != "supervisory_link_only" || tgt.UncertainLinkTier != uxsvocab.LinkTierMeshSupervisory {
+			t.Fatalf("uncertain supervisory target = %+v (ok=%v), want TeleopUncertain=true UncertainLinkTier=mesh-supervisory", tgt, ok)
 		}
 	})
 }

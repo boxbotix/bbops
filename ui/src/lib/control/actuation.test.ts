@@ -3969,6 +3969,69 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
         engagesBeforeHoldSpace,
       );
 
+      // 4) Finding 5: Holding Space on Disengage Teleop until the confirmed lease expires locally
+      // and then releasing Space (including post-keyup microtask drain before any native click)
+      // MUST send Stop for the captured session and zero new Engage requests!
+      delayRenewals = true;
+      const spaceExpOk = await controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(spaceExpOk).toBe(true);
+      const spaceExpSession = controller.engagedSession!;
+      flushSync();
+      const engagesBeforeExpiredSpace = sentTeleops.filter(
+        (r) => r.engage,
+      ).length;
+      const stopsBeforeExpiredSpace = sentTeleops.filter((r) => r.stop).length;
+
+      btn.focus();
+      expect(btn.textContent?.trim()).toBe("Disengage Teleop");
+      btn.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: " ",
+          code: "Space",
+          repeat: false,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+
+      // Advance past confirmed lease TTL + pending renewal grace with stalled renewals so local engaged becomes false while Space stays held.
+      await stepMs(250);
+      await stepMs(250);
+      expect(controller.engaged).toBe(false);
+      expect(btn.textContent?.trim()).toBe("Engage Teleop");
+
+      const spaceUpAfterExpiry = new KeyboardEvent("keyup", {
+        key: " ",
+        code: "Space",
+        bubbles: true,
+        cancelable: true,
+      });
+      btn.dispatchEvent(spaceUpAfterExpiry);
+      expect(spaceUpAfterExpiry.defaultPrevented).toBe(true);
+      // Drain microtasks first (matching Chromium's post-keyup microtask checkpoint) before advancing macrotasks:
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(
+        engagesBeforeExpiredSpace,
+      );
+      expect(sentTeleops.filter((r) => r.stop)).toHaveLength(
+        stopsBeforeExpiredSpace + 1,
+      );
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: spaceExpSession,
+        stop: true,
+      });
+      for (const r of pendingRenewalResolvers.splice(0)) {
+        r();
+      }
+      await Promise.resolve();
+
       unmount(panel);
       host.remove();
       controller.dispose();

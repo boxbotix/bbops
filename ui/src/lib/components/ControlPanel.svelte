@@ -95,6 +95,14 @@
       controller.handleFocusLoss();
     };
     const onWindowKeyUp = (ev: KeyboardEvent): void => {
+      if (
+        activeButtonKey !== null &&
+        !buttonKeyReleased &&
+        !buttonKeyConsumed &&
+        isSameEngageButtonKey(ev.key, activeButtonKey)
+      ) {
+        onEngageButtonKeyUp(ev);
+      }
       controller.handlePadKeyUp(ev);
     };
     const onVisibilityChange = (): void => {
@@ -172,13 +180,7 @@
       pendingToggleIntent = null;
     }
     if (ev.repeat || activeButtonKey !== null) {
-      if (
-        ev.key === "Enter" ||
-        activeButtonKey === "Enter" ||
-        buttonKeyConsumed
-      ) {
-        ev.preventDefault();
-      }
+      ev.preventDefault();
       return;
     }
     activeButtonKey = ev.key;
@@ -200,8 +202,10 @@
       buttonKeyReleased = false;
       return;
     }
+    ev.preventDefault();
+    void toggleTeleopEngagement();
     buttonKeyReleased = true;
-    queueMicrotask(() => {
+    setTimeout(() => {
       if (buttonKeyReleased) {
         activeButtonKey = null;
         buttonKeyConsumed = false;
@@ -209,7 +213,7 @@
         pendingToggleIntent = null;
         suppressPadBlur = false;
       }
-    });
+    }, 0);
   }
 
   function onEngageButtonBlur(): void {
