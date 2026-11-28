@@ -37,6 +37,12 @@ const (
 	PredicateCommandCmdID = "uxs.command.cmdid"
 	// PredicateCommandAction records the canonical bbops discrete command action slug.
 	PredicateCommandAction = "uxs.command.action"
+	// PredicateCommandPeer records the normalized UDP peer endpoint (`ip:port`) to which #76 COMMAND_LONG was dispatched.
+	PredicateCommandPeer = "uxs.command.peer"
+	// PredicateCommandDomain records the admitted UXS vehicle domain at dispatch (`quadcopter`, `rover`, `surface-boat`).
+	PredicateCommandDomain = "uxs.command.domain"
+	// PredicateCommandLinkTier records the admitted UXS LinkTier at dispatch (`sitl-local`, `direct-bench`, `mesh-supervisory`).
+	PredicateCommandLinkTier = "uxs.command.linktier"
 	// PredicateCommandAckResult records the #77 COMMAND_ACK MAV_RESULT (`-1` while unacknowledged or ambiguous).
 	PredicateCommandAckResult = "uxs.command.ackresult"
 	// PredicateCommandAckAccounted records (`1` vs `0`) whether an unattributed/ambiguous or idle #77 COMMAND_ACK slot was accounted for.
@@ -98,6 +104,9 @@ type CommandEntity struct {
 	SysID        int    `lifecycle:"predicate=uxs.command.sysid"`
 	CmdID        int    `lifecycle:"predicate=uxs.command.cmdid"`
 	Action       string `lifecycle:"predicate=uxs.command.action"`
+	Peer         string `json:"peer,omitempty" lifecycle:"predicate=uxs.command.peer"`
+	Domain       string `json:"domain,omitempty" lifecycle:"predicate=uxs.command.domain"`
+	LinkTier     string `json:"link_tier,omitempty" lifecycle:"predicate=uxs.command.linktier"`
 	AckResult    int    `lifecycle:"predicate=uxs.command.ackresult"`
 	AckAccounted int    `json:"ack_accounted,omitempty" lifecycle:"predicate=uxs.command.ackaccounted,operator_writable"`
 	AckPoolMask  int    `json:"ack_pool_mask,omitempty" lifecycle:"predicate=uxs.command.ackpoolmask,operator_writable"`
@@ -181,6 +190,21 @@ func ControlPackSpec() vocabulary.PackSpec {
 			{
 				Name:        PredicateCommandAction,
 				Description: "Canonical bbops discrete command action identifier",
+				DataType:    "string",
+			},
+			{
+				Name:        PredicateCommandPeer,
+				Description: "Normalized UDP peer endpoint (ip:port) to which COMMAND_LONG was dispatched",
+				DataType:    "string",
+			},
+			{
+				Name:        PredicateCommandDomain,
+				Description: "Admitted UXS vehicle domain at command dispatch",
+				DataType:    "string",
+			},
+			{
+				Name:        PredicateCommandLinkTier,
+				Description: "Admitted UXS LinkTier at command dispatch",
 				DataType:    "string",
 			},
 			{

@@ -4766,7 +4766,8 @@ func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *test
 			}
 		}
 
-		// Subcase B: 140-packet-late same-cycle duplicate (back=140 > 128 > 64) does NOT advance curLinkLife past pos=1.
+		// Subcase B: olderMono=true (capture timestamp before lastHbMonoAt) does NOT advance curLinkLife past pos=1,
+		// whereas olderMono=false (delta=116 plausible forward gap after packet loss) refreshes curLinkLife fail-closed.
 		for _, olderMono := range []bool{false, true} {
 			trLateDup, err := NewTracker("boxbotix", "bbops")
 			if err != nil {
@@ -4798,9 +4799,115 @@ func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *test
 			_ = trLateDup.EvaluateSilence(nowLD)
 			nowLD = nowLD.Add(20 * time.Millisecond)
 			_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowLD)
-			if tgtAged, _ := trLateDup.ActuationTarget(1); tgtAged.CurrentLinkHbUnconfirmed || tgtAged.LinkTier != uxsvocab.LinkTierSITLLocal {
-				t.Fatalf("olderMono=%v: 140-packet-late same-cycle duplicate falsely advanced history position: %+v", olderMono, tgtAged)
+			tgtPost, _ := trLateDup.ActuationTarget(1)
+			if olderMono {
+				if tgtPost.CurrentLinkHbUnconfirmed || tgtPost.LinkTier != uxsvocab.LinkTierSITLLocal {
+					t.Fatalf("olderMono=true: stale-timestamp duplicate falsely advanced history position: %+v", tgtPost)
+				}
+			} else {
+				if !tgtPost.CurrentLinkHbUnconfirmed || tgtPost.LinkTier != uxsvocab.LinkTierDirectBench {
+					t.Fatalf("olderMono=false: delta=116 forward-gap observation failed to refresh history and hold reconnect copy: %+v", tgtPost)
+				}
 			}
+		}
+	})
+
+	t.Run("forward_gap_unconfirmed_sitl_heartbeat_after_packet_drop_refreshes_history_and_holds_reconnect_copy", func(t *testing.T) {
+		hbBench := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityCompanionTeleop,
+			mavcodec.ModeTeleopVelocity,
+			mavcodec.LinkTierDirectBench,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+
+		runDroppedGapTrace := func(extraPacketsAfter266 int, cancelWithPreDropAttitude bool) *Tracker {
+			trGap, err := NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker gap: %v", err)
+			}
+			nowG := t0
+			// Active link receives seq=1..150 (pos=1..150): seq=10 is sitl-local, seq=20 transitions to confirmed direct-bench.
+			for s := uint8(1); s <= 150; s++ {
+				nowG = nowG.Add(5 * time.Millisecond)
+				var msg mavcodec.Message = mavcodec.AttitudeQuaternion{Q1: 1}
+				switch s {
+				case 1, 10:
+					msg = hbTeleopArmed
+				case 20:
+					msg = hbBench
+				}
+				_ = trGap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: s, Message: msg}, peer, nowG)
+			}
+			if tgtInit, _ := trGap.ActuationTarget(1); tgtInit.LinkTier != uxsvocab.LinkTierDirectBench || tgtInit.CurrentLinkHbUnconfirmed {
+				t.Fatalf("initial target at pos=150 = %+v, want confirmed direct-bench", tgtInit)
+			}
+
+			// Transmitted positions 151..265 (seq=151..255, 0..9) are dropped; transmitted position 266 emits (seq=10, sitl-local), delta=116.
+			nowG = nowG.Add(5 * time.Millisecond)
+			_ = trGap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowG)
+
+			if cancelWithPreDropAttitude {
+				// Slightly delayed pre-drop attitude packet (seq=149) cancels pending-gap corroboration.
+				nowG = nowG.Add(2 * time.Millisecond)
+				_ = trGap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 149, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowG)
+			}
+
+			// Link continues on direct-bench from transmitted position 267 (seq=11) for extraPacketsAfter266 packets.
+			curSeq := uint8(10)
+			for i := 0; i < extraPacketsAfter266; i++ {
+				curSeq++
+				nowG = nowG.Add(5 * time.Millisecond)
+				var msg mavcodec.Message = mavcodec.AttitudeQuaternion{Q1: 1}
+				if i == 0 || i == 1 {
+					msg = hbBench
+				}
+				_ = trGap.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: msg}, peer, nowG)
+			}
+			if tgtMid, _ := trGap.ActuationTarget(1); tgtMid.LinkTier != uxsvocab.LinkTierDirectBench || tgtMid.CurrentLinkHbUnconfirmed {
+				t.Fatalf("mid-stream target after %d packets = %+v, want confirmed direct-bench", extraPacketsAfter266, tgtMid)
+			}
+
+			nowG = nowG.Add(3100 * time.Millisecond)
+			if lost := trGap.EvaluateSilence(nowG); len(lost) != 1 || lost[0].Kind != EventKindLinkLost {
+				t.Fatalf("EvaluateSilence = %+v, want single link_lost", lost)
+			}
+			return trGap
+		}
+
+		// Primary regression: 384 packets after transmitted position 266 (transmitted position 650, inside 512-packet window).
+		tr384 := runDroppedGapTrace(384, true)
+		reconnectTs := t0.Add(10 * time.Second)
+		_ = tr384.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, reconnectTs)
+		if tgtHeld, ok := tr384.ActuationTarget(1); !ok || !tgtHeld.CurrentLinkHbUnconfirmed || tgtHeld.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("post-reconnect target after delayed (seq=10, sitl-local) at pos 650 = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtHeld, ok)
+		}
+		// Control 1: genuinely new SITL observation on unused slot (seq=25) establishes sitl-local immediately.
+		_ = tr384.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 25, Message: hbTeleopArmed}, peer, reconnectTs.Add(20*time.Millisecond))
+		if tgtNew, _ := tr384.ActuationTarget(1); tgtNew.CurrentLinkHbUnconfirmed || tgtNew.LinkTier != uxsvocab.LinkTierSITLLocal {
+			t.Fatalf("target after fresh (seq=25, sitl-local) = %+v, want confirmed sitl-local", tgtNew)
+		}
+
+		// Control 2: in-order corroboration without pre-drop attitude cancellation also holds reconnect copy at pos 650.
+		trInOrder := runDroppedGapTrace(384, false)
+		_ = trInOrder.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, reconnectTs)
+		if tgtInOrder, _ := trInOrder.ActuationTarget(1); !tgtInOrder.CurrentLinkHbUnconfirmed || tgtInOrder.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("in-order control target = %+v, want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtInOrder)
+		}
+
+		// Control 3: earlier link loss (100 packets after position 266) also holds reconnect copy.
+		trEarly := runDroppedGapTrace(100, true)
+		_ = trEarly.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, reconnectTs)
+		if tgtEarly, _ := trEarly.ActuationTarget(1); !tgtEarly.CurrentLinkHbUnconfirmed || tgtEarly.LinkTier != uxsvocab.LinkTierDirectBench {
+			t.Fatalf("earlier link-loss control target = %+v, want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", tgtEarly)
+		}
+
+		// Control 4: aging past >512 received packets after position 266 allows (seq=10, sitl-local) to confirm again.
+		trAged := runDroppedGapTrace(520, true)
+		_ = trAged.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, reconnectTs)
+		if tgtAged, _ := trAged.ActuationTarget(1); tgtAged.CurrentLinkHbUnconfirmed || tgtAged.LinkTier != uxsvocab.LinkTierSITLLocal {
+			t.Fatalf("aged (>512 received packets) control target = %+v, want confirmed sitl-local", tgtAged)
 		}
 	})
 }

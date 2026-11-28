@@ -317,6 +317,7 @@ func (r *stoppedSessionRing) contains(session string) bool {
 type cmdKey struct {
 	sysid uint8
 	cmdID uint16
+	peer  netip.AddrPort
 }
 
 type cmdDispatchState uint8
@@ -328,6 +329,7 @@ const (
 )
 
 type earlyCommandAck struct {
+	peer       netip.AddrPort
 	seq        uint8
 	hasSeq     bool
 	uncertain  bool
@@ -497,6 +499,7 @@ type inFlightCommand struct {
 	issuedIncarnation   string
 	issuedLinkTier      string
 	issuedAuthority     string
+	fromRecovery        bool
 	priorUnackedAtIssue bool
 	sitlOnly            bool
 	targetDisplaced     bool
@@ -520,6 +523,14 @@ type inFlightCommand struct {
 	unknownLinkEpoch    uint64
 	unknownPacketOrder  uint64
 	earlyAcks           []earlyCommandAck
+}
+
+func (c *inFlightCommand) poolKey() cmdKey {
+	return cmdKey{
+		sysid: c.sysid,
+		cmdID: c.cmdID,
+		peer:  c.issuedPeer,
+	}
 }
 
 type pendingCommandWrite struct {
@@ -587,6 +598,7 @@ type Service struct {
 	lastSeenTrackerAckSeq   map[uint8]uint64
 	lastAckIncarnation      map[uint8]string
 	lastAckLinkEpoch        map[uint8]uint64
+	lastAckPeer             map[uint8]netip.AddrPort
 	seenAckResultMask       map[cmdKey]uint64
 	seenAckResultMaskBySeq  map[cmdKey]*[256]uint64
 	preResetAckResultMask   map[cmdKey]uint64
@@ -704,6 +716,7 @@ func NewService(opts Options) (*Service, error) {
 		lastSeenTrackerAckSeq:   make(map[uint8]uint64),
 		lastAckIncarnation:      make(map[uint8]string),
 		lastAckLinkEpoch:        make(map[uint8]uint64),
+		lastAckPeer:             make(map[uint8]netip.AddrPort),
 		seenAckResultMask:       make(map[cmdKey]uint64),
 		seenAckResultMaskBySeq:  make(map[cmdKey]*[256]uint64),
 		preResetAckResultMask:   make(map[cmdKey]uint64),
@@ -1078,7 +1091,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			continue
 		}
 		preRestartSent = append(preRestartSent, ce)
-		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}
+		cePeer := parseEntityPeer(ce.Peer)
+		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID), peer: cePeer}
 		if cur, exists := latestSentByKey[key]; !exists || isNewerRecoveredEntity(ce, cur) {
 			latestSentByKey[key] = ce
 		}
@@ -1097,7 +1111,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 
 	s.mu.Lock()
 	for _, ce := range preRestartSent {
-		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}
+		recPeer := parseEntityPeer(ce.Peer)
+		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID), peer: recPeer}
 		priorConcreteMask := concreteResultMask[key]
 		var mask uint64
 		if ce.AckResult >= 0 && ce.AckResult < 64 {
@@ -1134,7 +1149,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		if isUnacked {
 			s.unackedCount[key]++
 			for _, curCmd := range s.inFlight {
-				if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
+				if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID &&
+					(!key.peer.IsValid() || curCmd.issuedPeer == key.peer) {
 					curCmd.ackAmbiguous = true
 				}
 			}
@@ -1152,7 +1168,16 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 				updatedMs:    updatedMs,
 			})
 		}
-		if s.dispatchedInBoot[key] || latestSentByKey[key].ID != ce.ID || commandTransitions.IsTerminal(ce.PhaseState) {
+		dispatchedForPool := s.dispatchedInBoot[key]
+		if !recPeer.IsValid() {
+			for k, v := range s.dispatchedInBoot {
+				if v && k.sysid == key.sysid && k.cmdID == key.cmdID {
+					dispatchedForPool = true
+					break
+				}
+			}
+		}
+		if !recPeer.IsValid() || dispatchedForPool || latestSentByKey[key].ID != ce.ID || commandTransitions.IsTerminal(ce.PhaseState) {
 			if isUnacked {
 				s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], ce.ID)
 			}
@@ -1160,7 +1185,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 				s.wrapAckCredit[key]++
 				s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], ce.ID)
 				for _, curCmd := range s.inFlight {
-					if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
+					if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID &&
+						(!key.peer.IsValid() || curCmd.issuedPeer == key.peer) {
 						curCmd.ackAmbiguous = true
 					}
 				}
@@ -1175,8 +1201,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			unknownNs = ceUpdatedNs
 		}
 		var unknownHbSeq, unknownHbReceiptRev, unknownLinkEpoch, unknownPacketOrder uint64
-		var recPeer netip.AddrPort
-		var recDomain, recIncarnation, recLinkTier string
+		recDomain := strings.TrimSpace(ce.Domain)
+		recLinkTier := strings.TrimSpace(ce.LinkTier)
 		recTarget, recOK := s.targets.ActuationTarget(uint8(ce.SysID))
 		if recOK {
 			if recTarget.HeartbeatObservedUnixNs > unknownNs {
@@ -1184,12 +1210,10 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			}
 			unknownHbSeq = recTarget.HeartbeatSeq
 			unknownHbReceiptRev = latestTargetHbReceiptRev(recTarget)
-			unknownLinkEpoch = recTarget.LinkEpoch
-			unknownPacketOrder = recTarget.PacketOrder
-			recPeer = normalizeControlPeer(recTarget.PeerAddr)
-			recDomain = recTarget.Domain
-			recIncarnation = recTarget.AuthorityIncarnation
-			recLinkTier = recTarget.LinkTier
+			if normalizeControlPeer(recTarget.PeerAddr) == recPeer {
+				unknownLinkEpoch = recTarget.LinkEpoch
+				unknownPacketOrder = recTarget.PacketOrder
+			}
 		}
 		seq := s.cmdCounter.Add(1)
 		recCmd := &inFlightCommand{
@@ -1202,8 +1226,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			issuedPeer:          recPeer,
 			issuedTargetID:      ce.Target,
 			issuedDomain:        recDomain,
-			issuedIncarnation:   recIncarnation,
 			issuedLinkTier:      recLinkTier,
+			fromRecovery:        true,
 			priorUnackedAtIssue: true,
 			sitlOnly:            isSITLOnlyAction(ce.Action),
 			dispatch:            dispatchSent,
@@ -2292,7 +2316,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.mu.Unlock()
 		return CommandResult{}, err
 	}
-	if curTarget.PeerAddr != initialTarget.PeerAddr {
+	if normalizeControlPeer(curTarget.PeerAddr) != normalizeControlPeer(initialTarget.PeerAddr) {
 		s.mu.Unlock()
 		return CommandResult{}, &ControlError{
 			Status:  http.StatusConflict,
@@ -2300,9 +2324,13 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			Message: fmt.Sprintf("vehicle sysid %d pinned peer changed prior to command registration", req.SysID),
 		}
 	}
+	normPeer := normalizeControlPeer(curTarget.PeerAddr)
 
 	for existingID, existing := range s.inFlight {
 		if existing.sysid != req.SysID || existing.cmdID != spec.msg.Command {
+			continue
+		}
+		if existing.targetDisplaced || (existing.issuedPeer.IsValid() && existing.issuedPeer != normPeer) {
 			continue
 		}
 		if existing.dispatch == dispatchReserved || existing.phase == PhasePending {
@@ -2338,7 +2366,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			param2Bits: math.Float32bits(spec.msg.Param2),
 			param3Bits: math.Float32bits(spec.msg.Param3),
 		},
-		issuedPeer:        normalizeControlPeer(pinnedPeer),
+		issuedPeer:        normPeer,
 		issuedTargetID:    curTarget.EntityID,
 		issuedDomain:      curTarget.Domain,
 		issuedIncarnation: curTarget.AuthorityIncarnation,
@@ -2358,6 +2386,9 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		SysID:      int(req.SysID),
 		CmdID:      int(spec.msg.Command),
 		Action:     actionSlug,
+		Peer:       normPeer.String(),
+		Domain:     curTarget.Domain,
+		LinkTier:   curTarget.LinkTier,
 		AckResult:  UnacknowledgedResult,
 		Detail:     "Awaiting COMMAND_ACK",
 		IssuedMs:   now.UnixMilli(),
@@ -2380,13 +2411,18 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 	s.mu.Lock()
 	sendTarget, sendOK := s.targets.ActuationTarget(req.SysID)
 	targetErr := validateCommandTarget(req.SysID, actionSlug, spec.sitlOnly, sendTarget, sendOK)
-	peerChanged := targetErr == nil && sendTarget.PeerAddr != pinnedPeer
+	peerChanged := targetErr == nil && (normalizeControlPeer(sendTarget.PeerAddr) != normPeer ||
+		(entity.Target != "" && sendTarget.EntityID != entity.Target) ||
+		(entity.Domain != "" && sendTarget.Domain != entity.Domain))
 	epochRevoked := !spec.sitlOnly && s.authEpoch[req.SysID] != startEpoch &&
 		(s.isPreemptLatchedLocked(req.SysID) || inflight.abortedNote != "")
 
 	if inflight.abortedNote == "" && targetErr == nil && !peerChanged && !epochRevoked {
 		for _, other := range s.inFlight {
 			if other.entityID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command {
+				continue
+			}
+			if other.targetDisplaced || (other.issuedPeer.IsValid() && other.issuedPeer != normPeer) {
 				continue
 			}
 			if other.dispatch != dispatchReserved && other.phase == PhasePending && (actionSlug != ActionDisarm || other.action == ActionDisarm) {
@@ -2463,7 +2499,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		return CommandResult{}, retErr
 	}
 	preSendHbReceiptRev := latestTargetHbReceiptRev(sendTarget)
-	inflight.issuedPeer = normalizeControlPeer(pinnedPeer)
+	inflight.issuedPeer = normPeer
 	inflight.issuedTargetID = sendTarget.EntityID
 	inflight.issuedDomain = sendTarget.Domain
 	inflight.issuedIncarnation = sendTarget.AuthorityIncarnation
@@ -2496,7 +2532,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.flushPendingWrites(ctx)
 		s.signalPersistWake()
 		for _, ea := range earlyAcks {
-			s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
+			s.processDedupedCommandAck(req.SysID, ea.peer, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
 		}
 		return CommandResult{}, &ControlError{
 			Status:  http.StatusServiceUnavailable,
@@ -2524,22 +2560,27 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		linkEpochBaseline = curT.LinkEpoch
 		packetOrderBaseline = curT.PacketOrder
 	}
-	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
+	key := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command, peer: normPeer}
+	legacyKey := cmdKey{sysid: req.SysID, cmdID: spec.msg.Command}
 	supersededWrapHeld := false
 	for otherID, other := range s.inFlight {
 		if otherID == entityID || other.sysid != req.SysID || other.cmdID != spec.msg.Command || other.dispatch != dispatchSent {
+			continue
+		}
+		otherKey := other.poolKey()
+		if otherKey != key {
 			continue
 		}
 		delete(s.inFlight, otherID)
 		wasWrapHeld := other.wrapReceiptHeld
 		if wasWrapHeld {
 			other.wrapReceiptHeld = false
-			s.wrapAckCredit[key]++
-			s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], other.entityID)
+			s.wrapAckCredit[otherKey]++
+			s.wrapCreditIDs[otherKey] = append(s.wrapCreditIDs[otherKey], other.entityID)
 			supersededWrapHeld = true
 		}
 		if !other.ackAccounted {
-			s.unackedDetachedIDs[key] = append(s.unackedDetachedIDs[key], other.entityID)
+			s.unackedDetachedIDs[otherKey] = append(s.unackedDetachedIDs[otherKey], other.entityID)
 		}
 		if other.phase == PhasePending {
 			other.phase = PhaseCommitUnknown
@@ -2551,19 +2592,21 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(other.ackAccounted),
-				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], other.ackAccounted, wasWrapHeld),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[otherKey], other.ackAccounted, wasWrapHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    dispatchNow.UnixMilli(),
 			})
 			hasSupersededWrite = true
 		}
 	}
-	priorUnacked := s.unackedCount[key] > 0 || s.wrapAckCredit[key] > 0 || supersededWrapHeld
+	priorUnacked := s.unackedCount[key] > 0 || s.wrapAckCredit[key] > 0 || supersededWrapHeld ||
+		s.unackedCount[legacyKey] > 0 || s.wrapAckCredit[legacyKey] > 0
 	s.unackedCount[key]++
 	s.dispatchedInBoot[key] = true
+	tainted := s.surplusAckTainted[key] || s.surplusAckTainted[legacyKey]
 	inflight.dispatch = dispatchSent
-	inflight.priorUnackedAtIssue = !s.recovered.Load() || priorUnacked || s.surplusAckTainted[key]
-	inflight.ackAmbiguous = !s.recovered.Load() || priorUnacked || s.surplusAckTainted[key]
+	inflight.priorUnackedAtIssue = !s.recovered.Load() || priorUnacked || tainted
+	inflight.ackAmbiguous = !s.recovered.Load() || priorUnacked || tainted
 	inflight.ackDeadline = dispatchNow.Add(ackWait)
 	inflight.issuedHbObsNs = hbBaselineNs
 	inflight.issuedHbSeq = hbBaselineSeq
@@ -2588,7 +2631,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		s.signalPersistWake()
 	}
 	for _, ea := range earlyAcks {
-		s.processDedupedCommandAck(req.SysID, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
+		s.processDedupedCommandAck(req.SysID, ea.peer, ea.seq, ea.hasSeq, ea.uncertain, ea.ack, ea.observedAt)
 	}
 	s.signalLeaseWake()
 
@@ -2697,13 +2740,19 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 	obsUTC := observedAt.UTC()
 
 	target, targetOK := s.targets.ActuationTarget(sysid)
+	var ackPeer netip.AddrPort
+	if targetOK && target.PeerAddr.IsValid() {
+		ackPeer = normalizeControlPeer(target.PeerAddr)
+	}
 	var ackOrderUncertain bool
 	s.mu.Lock()
 	if targetOK {
 		prevInc := s.lastAckIncarnation[sysid]
 		prevLinkEpoch := s.lastAckLinkEpoch[sysid]
+		prevAckPeer := s.lastAckPeer[sysid]
 		if (prevInc != "" && target.AuthorityIncarnation != "" && prevInc != target.AuthorityIncarnation) ||
-			(prevLinkEpoch != 0 && target.LinkEpoch != 0 && prevLinkEpoch != target.LinkEpoch) {
+			(prevLinkEpoch != 0 && target.LinkEpoch != 0 && prevLinkEpoch != target.LinkEpoch) ||
+			(prevAckPeer.IsValid() && ackPeer.IsValid() && prevAckPeer != ackPeer) {
 			s.snapshotPreResetAckHistoryLocked(sysid)
 		}
 		if target.AuthorityIncarnation != "" {
@@ -2711,6 +2760,9 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 		}
 		if target.LinkEpoch != 0 {
 			s.lastAckLinkEpoch[sysid] = target.LinkEpoch
+		}
+		if ackPeer.IsValid() {
+			s.lastAckPeer[sysid] = ackPeer
 		}
 	}
 	if hasSeq {
@@ -2764,18 +2816,27 @@ func (s *Service) handleCommandAck(sysid, seq uint8, hasSeq bool, ack mavcodec.C
 	}
 	s.mu.Unlock()
 
-	s.processDedupedCommandAck(sysid, seq, hasSeq, ackOrderUncertain, ack, obsUTC)
+	s.processDedupedCommandAck(sysid, ackPeer, seq, hasSeq, ackOrderUncertain, ack, obsUTC)
 }
 
-func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUncertain bool, ack mavcodec.CommandAck, obsUTC time.Time) {
+func (s *Service) processDedupedCommandAck(sysid uint8, ackPeer netip.AddrPort, seq uint8, hasSeq, ackOrderUncertain bool, ack mavcodec.CommandAck, obsUTC time.Time) {
 	updatedMs := obsUTC.UnixMilli()
 	obsNs := obsUTC.UnixNano()
-	key := cmdKey{sysid: sysid, cmdID: ack.Command}
 
 	s.mu.Lock()
+	target, targetOK := s.targets.ActuationTarget(sysid)
+	if !ackPeer.IsValid() && targetOK && target.PeerAddr.IsValid() {
+		ackPeer = normalizeControlPeer(target.PeerAddr)
+	}
+	key := cmdKey{sysid: sysid, cmdID: ack.Command, peer: ackPeer}
+	legacyKey := cmdKey{sysid: sysid, cmdID: ack.Command}
+	hasLegacyPool := ackPeer.IsValid()
+
 	for _, cmd := range s.inFlight {
-		if cmd.dispatch == dispatchSending && cmd.sysid == sysid && cmd.cmdID == ack.Command {
+		if cmd.dispatch == dispatchSending && cmd.sysid == sysid && cmd.cmdID == ack.Command &&
+			(!ackPeer.IsValid() || cmd.issuedPeer == ackPeer) {
 			cmd.earlyAcks = append(cmd.earlyAcks, earlyCommandAck{
+				peer:       ackPeer,
 				seq:        seq,
 				hasSeq:     hasSeq,
 				uncertain:  ackOrderUncertain,
@@ -2789,10 +2850,22 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 
 	var matches []*inFlightCommand
 	for _, cmd := range s.inFlight {
-		if cmd.dispatch == dispatchSent && cmd.sysid == sysid && cmd.cmdID == ack.Command &&
-			(cmd.phase == PhasePending || cmd.phase == PhaseCommitUnknown) {
-			matches = append(matches, cmd)
+		if cmd.dispatch != dispatchSent || cmd.sysid != sysid || cmd.cmdID != ack.Command {
+			continue
 		}
+		if cmd.phase != PhasePending && cmd.phase != PhaseCommitUnknown {
+			continue
+		}
+		if targetOK && target.PeerAddr.IsValid() {
+			_ = observeCommandTargetContinuity(cmd, target, true)
+		}
+		if cmd.targetDisplaced {
+			continue
+		}
+		if ackPeer.IsValid() && cmd.issuedPeer != ackPeer {
+			continue
+		}
+		matches = append(matches, cmd)
 	}
 	if len(matches) > 1 {
 		slices.SortFunc(matches, func(a, b *inFlightCommand) int {
@@ -2806,8 +2879,20 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		})
 	}
 
-	seenSameResultBefore := ack.Result < 64 && (s.seenAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
-	seenBeforeSeqReset := ack.Result < 64 && (s.preResetAckResultMask[key]&(uint64(1)<<ack.Result)) != 0
+	combinedSeenMask := s.seenAckResultMask[key]
+	combinedPreResetMask := s.preResetAckResultMask[key]
+	var legacyUnacked, legacyWrapCredit int
+	var legacyTainted bool
+	if hasLegacyPool {
+		combinedSeenMask |= s.seenAckResultMask[legacyKey]
+		combinedPreResetMask |= s.preResetAckResultMask[legacyKey]
+		legacyUnacked = s.unackedCount[legacyKey]
+		legacyWrapCredit = s.wrapAckCredit[legacyKey]
+		legacyTainted = s.surplusAckTainted[legacyKey]
+	}
+
+	seenSameResultBefore := ack.Result < 64 && (combinedSeenMask&(uint64(1)<<ack.Result)) != 0
+	seenBeforeSeqReset := ack.Result < 64 && (combinedPreResetMask&(uint64(1)<<ack.Result)) != 0
 	seqMasks := s.seenAckResultMaskBySeq[key]
 	seenSameSeqResultBefore := hasSeq && seqMasks != nil && ack.Result < 64 && (seqMasks[seq]&(uint64(1)<<ack.Result)) != 0
 	couldBeAccountedDuplicate := seenBeforeSeqReset ||
@@ -2815,19 +2900,24 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		(hasSeq && seenSameSeqResultBefore) ||
 		(!hasSeq && seenSameResultBefore)
 	if ack.Result < 64 {
-		s.seenAckResultMask[key] |= uint64(1) << ack.Result
+		bit := uint64(1) << ack.Result
+		s.seenAckResultMask[key] |= bit
+		combinedSeenMask |= bit
+		if hasLegacyPool && (legacyUnacked > 0 || legacyWrapCredit > 0 || len(s.ambiguousSlotIDs[legacyKey]) > 0) {
+			s.seenAckResultMask[legacyKey] |= bit
+		}
 		if hasSeq {
 			if seqMasks == nil {
 				seqMasks = &[256]uint64{}
 				s.seenAckResultMaskBySeq[key] = seqMasks
 			}
-			seqMasks[seq] |= uint64(1) << ack.Result
+			seqMasks[seq] |= bit
 		}
 	}
-	poolMask := poolMaskInt(s.seenAckResultMask[key])
+	poolMask := poolMaskInt(combinedSeenMask)
 
-	slotPoolMask := func(accID string) int {
-		if slices.Contains(s.wrapCreditIDs[key], accID) {
+	slotPoolMask := func(pool cmdKey, accID string) int {
+		if slices.Contains(s.wrapCreditIDs[pool], accID) {
 			return poolMask | ackPoolWrapHeldBit
 		}
 		if inflightCmd, ok := s.inFlight[accID]; ok && inflightCmd.wrapReceiptHeld {
@@ -2838,28 +2928,38 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	settledWrapMask := poolMask | ackPoolWrapHeldBit | ackPoolWrapSettledBit
 
 	priorUnacked := s.unackedCount[key]
+	effPriorUnacked := priorUnacked + legacyUnacked
+	effWrapCredit := s.wrapAckCredit[key] + legacyWrapCredit
 	if len(matches) == 0 {
 		wroteAck := false
 		if s.recovered.Load() {
-			if priorUnacked > 0 {
-				s.unackedCount[key] = priorUnacked - 1
+			targetPool := key
+			if legacyUnacked > 0 {
+				targetPool = legacyKey
+			}
+			if s.unackedCount[targetPool] > 0 {
+				s.unackedCount[targetPool]--
 				if couldBeAccountedDuplicate {
-					s.wrapAckCredit[key]++
+					s.wrapAckCredit[targetPool]++
 				}
-				if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
+				if ids := s.unackedDetachedIDs[targetPool]; len(ids) > 0 {
 					detachedID := ids[0]
-					s.unackedDetachedIDs[key] = ids[1:]
+					s.unackedDetachedIDs[targetPool] = ids[1:]
 					if couldBeAccountedDuplicate {
-						s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], detachedID)
+						s.wrapCreditIDs[targetPool] = append(s.wrapCreditIDs[targetPool], detachedID)
 					}
-					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
+					s.ambiguousSlotIDs[targetPool] = appendBoundedIDs(s.ambiguousSlotIDs[targetPool], detachedID)
 				}
-			} else if s.wrapAckCredit[key] > 0 {
+			} else if effWrapCredit > 0 {
+				creditPool := key
+				if legacyWrapCredit > 0 {
+					creditPool = legacyKey
+				}
 				if !couldBeAccountedDuplicate {
-					s.wrapAckCredit[key]--
-					if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+					s.wrapAckCredit[creditPool]--
+					if ids := s.wrapCreditIDs[creditPool]; len(ids) > 0 {
 						creditID := ids[0]
-						s.wrapCreditIDs[key] = ids[1:]
+						s.wrapCreditIDs[creditPool] = ids[1:]
 						if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
 							wroteAck = true
 						}
@@ -2869,8 +2969,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 				s.surplusAckTainted[key] = true
 			}
 			for _, accID := range s.ambiguousSlotIDs[key] {
-				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(accID)) {
+				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(key, accID)) {
 					wroteAck = true
+				}
+			}
+			if hasLegacyPool {
+				for _, accID := range s.ambiguousSlotIDs[legacyKey] {
+					if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(legacyKey, accID)) {
+						wroteAck = true
+					}
 				}
 			}
 		}
@@ -2884,7 +2991,6 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		return
 	}
 
-	target, targetOK := s.targets.ActuationTarget(sysid)
 	anyTargetDisplaced := false
 	for _, cmd := range matches {
 		if targetOK && !canReconcileCommandOnTarget(cmd, target, true) {
@@ -2917,11 +3023,12 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	holdingWrapReceipt := len(matches) == 1 && matches[0].wrapReceiptHeld
 	nonWrapAmbiguous := !s.recovered.Load() ||
 		anyTargetDisplaced ||
-		priorUnacked > 1 ||
-		s.wrapAckCredit[key] > 0 ||
+		effPriorUnacked > 1 ||
+		effWrapCredit > 0 ||
 		len(matches) > 1 ||
 		matches[0].ackAmbiguous ||
 		s.surplusAckTainted[key] ||
+		legacyTainted ||
 		seenBeforeSeqReset ||
 		(!hasSeq && seenSameResultBefore)
 	ambiguous := nonWrapAmbiguous || wrapAmbiguous
@@ -2931,25 +3038,33 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		markAllAmbiguous := nonWrapAmbiguous
 		if anyTargetDisplaced {
 			markAllAmbiguous = true
-		} else if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
+		} else if s.recovered.Load() && effWrapCredit > 0 && !holdingWrapReceipt {
+			creditPool := key
+			if legacyWrapCredit > 0 {
+				creditPool = legacyKey
+			}
 			if !couldBeAccountedDuplicate {
-				s.wrapAckCredit[key]--
-				if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
+				s.wrapAckCredit[creditPool]--
+				if ids := s.wrapCreditIDs[creditPool]; len(ids) > 0 {
 					creditID := ids[0]
-					s.wrapCreditIDs[key] = ids[1:]
+					s.wrapCreditIDs[creditPool] = ids[1:]
 					if s.enqueueConsumedAckLocked(creditID, 1, settledWrapMask) {
 						wroteAny = true
 					}
 				}
 			}
 			markAllAmbiguous = true
-		} else if s.recovered.Load() && priorUnacked > 0 {
+		} else if s.recovered.Load() && effPriorUnacked > 0 {
+			targetPool := key
+			if legacyUnacked > 0 {
+				targetPool = legacyKey
+			}
 			if !couldBeAccountedDuplicate {
-				s.unackedCount[key] = priorUnacked - 1
-				if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
+				s.unackedCount[targetPool]--
+				if ids := s.unackedDetachedIDs[targetPool]; len(ids) > 0 {
 					detachedID := ids[0]
-					s.unackedDetachedIDs[key] = ids[1:]
-					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
+					s.unackedDetachedIDs[targetPool] = ids[1:]
+					s.ambiguousSlotIDs[targetPool] = appendBoundedIDs(s.ambiguousSlotIDs[targetPool], detachedID)
 				} else {
 					for _, cmd := range matches {
 						if !cmd.ackAccounted {
@@ -2959,15 +3074,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 						}
 					}
 				}
-			} else if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
-				s.unackedCount[key] = priorUnacked - 1
-				s.wrapAckCredit[key]++
+			} else if ids := s.unackedDetachedIDs[targetPool]; len(ids) > 0 {
+				s.unackedCount[targetPool]--
+				s.wrapAckCredit[targetPool]++
 				detachedID := ids[0]
-				s.unackedDetachedIDs[key] = ids[1:]
-				s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], detachedID)
-				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
+				s.unackedDetachedIDs[targetPool] = ids[1:]
+				s.wrapCreditIDs[targetPool] = append(s.wrapCreditIDs[targetPool], detachedID)
+				s.ambiguousSlotIDs[targetPool] = appendBoundedIDs(s.ambiguousSlotIDs[targetPool], detachedID)
 				markAllAmbiguous = true
-			} else if priorUnacked == 1 && len(matches) == 1 && !holdingWrapReceipt && !matches[0].ackAccounted {
+			} else if effPriorUnacked == 1 && len(matches) == 1 && !holdingWrapReceipt && !matches[0].ackAccounted {
 				s.unackedCount[key] = 0
 				matches[0].ackAccounted = true
 				matches[0].wrapReceiptHeld = true
@@ -2975,7 +3090,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			} else {
 				markAllAmbiguous = true
 			}
-		} else if s.recovered.Load() && priorUnacked == 0 {
+		} else if s.recovered.Load() && effPriorUnacked == 0 {
 			if holdingWrapReceipt {
 				if !couldBeAccountedDuplicate {
 					matches[0].wrapReceiptHeld = false
@@ -3023,7 +3138,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
 				cmd.detail = CommitUnknownDetail
-				cmdMask := poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld)
+				cmdMask := poolMaskForCmd(combinedSeenMask, cmd.ackAccounted, cmd.wrapReceiptHeld)
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,
 					phase:        PhaseCommitUnknown,
@@ -3040,8 +3155,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		}
 		if s.recovered.Load() {
 			for _, accID := range s.ambiguousSlotIDs[key] {
-				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(accID)) {
+				if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(key, accID)) {
 					wroteAny = true
+				}
+			}
+			if hasLegacyPool {
+				for _, accID := range s.ambiguousSlotIDs[legacyKey] {
+					if s.enqueueConsumedAckLocked(accID, 1, slotPoolMask(legacyKey, accID)) {
+						wroteAny = true
+					}
 				}
 			}
 		}
@@ -3138,8 +3260,11 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 	}
 
 	if ev.Kind == mavlink.EventKindLinkLost || ev.Kind == mavlink.EventKindLinkRestored {
+		normObsPeer := normalizeControlPeer(targetForObs.PeerAddr)
+		prevAckPeer := s.lastAckPeer[ev.SysID]
 		alreadySnapshotted := ev.Kind == mavlink.EventKindLinkRestored && targetForObsOK &&
-			targetForObs.LinkEpoch != 0 && s.lastAckLinkEpoch[ev.SysID] == targetForObs.LinkEpoch
+			targetForObs.LinkEpoch != 0 && s.lastAckLinkEpoch[ev.SysID] == targetForObs.LinkEpoch &&
+			(!prevAckPeer.IsValid() || !normObsPeer.IsValid() || prevAckPeer == normObsPeer)
 		if !alreadySnapshotted {
 			s.snapshotPreResetAckHistoryLocked(ev.SysID)
 		}
@@ -3149,6 +3274,9 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 			}
 			if targetForObs.LinkEpoch != 0 {
 				s.lastAckLinkEpoch[ev.SysID] = targetForObs.LinkEpoch
+			}
+			if normObsPeer.IsValid() {
+				s.lastAckPeer[ev.SysID] = normObsPeer
 			}
 		}
 	}
@@ -3198,14 +3326,14 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 			preemptDetail = "Preempted by vehicle link loss"
 		}
 		for id, cmd := range s.inFlight {
-			if cmd.sysid == ev.SysID && !cmd.sitlOnly {
+			if cmd.sysid == ev.SysID && !cmd.sitlOnly && !cmd.targetDisplaced {
 				delete(s.inFlight, id)
 				if cmd.dispatch == dispatchReserved {
 					cmd.abortedNote = preemptNote
 					cmd.abortedDetail = preemptDetail
 					continue
 				}
-				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
+				key := cmd.poolKey()
 				wasWrapHeld := cmd.wrapReceiptHeld
 				if wasWrapHeld {
 					cmd.wrapReceiptHeld = false
@@ -3307,7 +3435,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				cmd.phase = PhaseConfirmed
 				cmd.detail = "Confirmed via vehicle HEARTBEAT state reconciliation"
 				delete(s.inFlight, id)
-				key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
+				key := cmd.poolKey()
 				wasWrapHeld := cmd.wrapReceiptHeld
 				if wasWrapHeld {
 					cmd.wrapReceiptHeld = false
@@ -3485,7 +3613,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		if cmd.dispatch != dispatchSent {
 			continue
 		}
-		key := cmdKey{sysid: cmd.sysid, cmdID: cmd.cmdID}
+		key := cmd.poolKey()
 		if cmd.phase == PhasePending && !now.Before(cmd.ackDeadline) {
 			cmd.phase = PhaseCommitUnknown
 			cmd.detail = CommitUnknownDetail
@@ -3623,6 +3751,18 @@ func normalizeControlPeer(peer netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 }
 
+func parseEntityPeer(raw string) netip.AddrPort {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return netip.AddrPort{}
+	}
+	parsed, err := netip.ParseAddrPort(trimmed)
+	if err != nil || !parsed.IsValid() {
+		return netip.AddrPort{}
+	}
+	return normalizeControlPeer(parsed)
+}
+
 func isApplicableCommandLinkTier(cmd *inFlightCommand, target mavlink.ActuationTarget) bool {
 	if cmd == nil || !uxsvocab.IsValidLinkTier(target.LinkTier) {
 		return false
@@ -3647,8 +3787,10 @@ func observeCommandTargetContinuity(cmd *inFlightCommand, target mavlink.Actuati
 	}
 	curPeer := normalizeControlPeer(target.PeerAddr)
 	if !cmd.issuedPeer.IsValid() {
-		cmd.issuedPeer = curPeer
-	} else if curPeer != cmd.issuedPeer {
+		cmd.targetDisplaced = true
+		return false
+	}
+	if curPeer != cmd.issuedPeer {
 		cmd.targetDisplaced = true
 	}
 	if cmd.issuedTargetID != "" && target.EntityID != "" && target.EntityID != cmd.issuedTargetID {
@@ -3656,17 +3798,22 @@ func observeCommandTargetContinuity(cmd *inFlightCommand, target mavlink.Actuati
 	}
 	if cmd.issuedDomain != "" && target.Domain != "" && target.Domain != cmd.issuedDomain {
 		cmd.targetDisplaced = true
-	} else if cmd.issuedDomain == "" && target.Domain != "" {
+	} else if !cmd.fromRecovery && cmd.issuedDomain == "" && target.Domain != "" {
 		cmd.issuedDomain = target.Domain
 	}
 	if cmd.issuedIncarnation != "" && target.AuthorityIncarnation != "" && target.AuthorityIncarnation != cmd.issuedIncarnation {
 		cmd.targetDisplaced = true
-	} else if cmd.issuedIncarnation == "" && target.AuthorityIncarnation != "" {
-		cmd.issuedIncarnation = target.AuthorityIncarnation
+	}
+	if cmd.sitlOnly && cmd.fromRecovery &&
+		cmd.issuedLinkTier != "" && cmd.issuedLinkTier != uxsvocab.LinkTierSITLLocal {
+		cmd.targetDisplaced = true
 	}
 	if cmd.sitlOnly && !target.LinkLost && !target.CurrentLinkHbUnconfirmed &&
 		target.LinkTier != "" && target.LinkTier != uxsvocab.LinkTierSITLLocal {
 		cmd.targetDisplaced = true
+	}
+	if !cmd.targetDisplaced && cmd.issuedIncarnation == "" && target.AuthorityIncarnation != "" {
+		cmd.issuedIncarnation = target.AuthorityIncarnation
 	}
 	return !cmd.targetDisplaced
 }
