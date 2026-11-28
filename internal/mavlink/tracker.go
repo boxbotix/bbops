@@ -124,31 +124,32 @@ type SnapshotBatchItem struct {
 // ActuationTarget captures the pinned UDP endpoint and safety state of an
 // admitted UXS vehicle atomically under the Tracker lock (`OQ1 Option A`).
 type ActuationTarget struct {
-	SysID                   uint8
-	EntityID                string
-	PeerAddr                netip.AddrPort
-	Domain                  string
-	Armed                   bool
-	Authority               string
-	AuthorityIncarnation    string
-	AuthorityEpoch          uint64
-	ObservationRev          uint64
-	HeartbeatSeq            uint64
-	HeartbeatOrder          uint64
-	LinkEpoch               uint64
-	PacketOrder             uint64
-	LastAckOrder            uint64
-	LastAckSeq              uint64
-	LastAckUncertain        bool
-	CompanionMode           string
-	LinkTier                string
-	LinkLost                bool
-	TeleopUncertain         bool
-	TeleopUncertainReason   string
-	UncertainAuthority      string
-	UncertainLinkTier       string
-	UncertainArmed          bool
-	HeartbeatObservedUnixNs int64
+	SysID                    uint8
+	EntityID                 string
+	PeerAddr                 netip.AddrPort
+	Domain                   string
+	Armed                    bool
+	Authority                string
+	AuthorityIncarnation     string
+	AuthorityEpoch           uint64
+	ObservationRev           uint64
+	HeartbeatSeq             uint64
+	HeartbeatOrder           uint64
+	LinkEpoch                uint64
+	PacketOrder              uint64
+	LastAckOrder             uint64
+	LastAckSeq               uint64
+	LastAckUncertain         bool
+	CompanionMode            string
+	LinkTier                 string
+	LinkLost                 bool
+	CurrentLinkHbUnconfirmed bool
+	TeleopUncertain          bool
+	TeleopUncertainReason    string
+	UncertainAuthority       string
+	UncertainLinkTier        string
+	UncertainArmed           bool
+	HeartbeatObservedUnixNs  int64
 }
 
 // IngestOutcome describes the deterministic side-effects produced by processing
@@ -222,57 +223,59 @@ const (
 )
 
 type vehicleSession struct {
-	snap                   uxsvocab.VehicleSnapshot
-	rev                    uint64
-	authorityEpoch         uint64
-	obsRev                 uint64
-	heartbeatSeq           uint64
-	lastHbMonoAt           time.Time
-	lastHbOrder            uint64
-	snapHbOrder            uint64
-	teleopUncertainReason  string
-	uncertainAuthority     string
-	uncertainLinkTier      string
-	uncertainArmed         bool
-	uncertainMinOrder      uint64
-	pendingNonSITLLinkTier string
-	pendingNonSITLMinOrder uint64
-	obsHistory             [256]authorityObsRecord
-	obsIdx                 int
-	obsMsEpoch             map[int64]uint64
-	obsMsOrder             [maxTrackedObsMs]int64
-	obsMsValid             [maxTrackedObsMs]bool
-	obsMsIdx               int
-	linkEpoch              uint64
-	hasSeqStream           bool
-	lastStreamSeq          uint8
-	seqStreamPos           uint64
-	hasPendingGap          bool
-	pendingGapSeq          uint8
-	pendingGapOrder        uint64
-	pendingGapHasAck       bool
-	pendingGapAck          mavcodec.CommandAck
-	pendingGapHasHb        bool
-	pendingGapHbApplied    bool
-	pendingGapHbVh         mavcodec.VehicleHeartbeat
-	pendingGapHbWall       time.Time
-	pendingGapHbMono       time.Time
-	lastAckOrder           uint64
-	lastAckSeq             uint64
-	lastAckUncertain       bool
-	seenAckFrames          [256]ackFrameSlot
-	seenHbFrames           [256]hbFrameSlot
-	seenSeqOrder           [256]uint64
-	lastPacketAt           time.Time
-	lastSeq                uint8
-	lastMsgID              uint32
-	linkLost               bool
-	hasSysStatus           bool
-	hasAttitude            bool
-	hasLocalPos            bool
-	hasGlobalPos           bool
-	hasHeading             bool
-	peerAddr               netip.AddrPort
+	snap                            uxsvocab.VehicleSnapshot
+	rev                             uint64
+	authorityEpoch                  uint64
+	obsRev                          uint64
+	heartbeatSeq                    uint64
+	lastHbMonoAt                    time.Time
+	lastHbOrder                     uint64
+	snapHbOrder                     uint64
+	currentLinkHbConfirmed          bool
+	teleopUncertainReason           string
+	uncertainAuthority              string
+	uncertainLinkTier               string
+	uncertainArmed                  bool
+	uncertainMinOrder               uint64
+	pendingNonSITLLinkTier          string
+	pendingNonSITLMinOrder          uint64
+	obsHistory                      [256]authorityObsRecord
+	obsIdx                          int
+	obsMsEpoch                      map[int64]uint64
+	obsMsOrder                      [maxTrackedObsMs]int64
+	obsMsValid                      [maxTrackedObsMs]bool
+	obsMsIdx                        int
+	linkEpoch                       uint64
+	hasSeqStream                    bool
+	lastStreamSeq                   uint8
+	seqStreamPos                    uint64
+	hasPendingGap                   bool
+	pendingGapSeq                   uint8
+	pendingGapOrder                 uint64
+	pendingGapHasAck                bool
+	pendingGapAck                   mavcodec.CommandAck
+	pendingGapHasHb                 bool
+	pendingGapHbApplied             bool
+	pendingGapPriorRestrictionOrder uint64
+	pendingGapHbVh                  mavcodec.VehicleHeartbeat
+	pendingGapHbWall                time.Time
+	pendingGapHbMono                time.Time
+	lastAckOrder                    uint64
+	lastAckSeq                      uint64
+	lastAckUncertain                bool
+	seenAckFrames                   [256]ackFrameSlot
+	seenHbFrames                    [256]hbFrameSlot
+	seenSeqOrder                    [256]uint64
+	lastPacketAt                    time.Time
+	lastSeq                         uint8
+	lastMsgID                       uint32
+	linkLost                        bool
+	hasSysStatus                    bool
+	hasAttitude                     bool
+	hasLocalPos                     bool
+	hasGlobalPos                    bool
+	hasHeading                      bool
+	peerAddr                        netip.AddrPort
 }
 
 func isPreemptAuthority(auth string) bool {
@@ -354,18 +357,21 @@ func (s *vehicleSession) clearPendingGap() {
 	s.pendingGapHasAck = false
 	s.pendingGapHasHb = false
 	s.pendingGapHbApplied = false
+	s.pendingGapPriorRestrictionOrder = 0
 	s.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
 	s.pendingGapHbWall = time.Time{}
 	s.pendingGapHbMono = time.Time{}
 }
 
 func (s *vehicleSession) setTeleopUncertain(reason string, next uxsvocab.VehicleSnapshot, minOrder uint64) {
-	s.teleopUncertainReason = reason
-	s.uncertainAuthority = next.Authority
-	s.uncertainLinkTier = next.LinkTier
-	s.uncertainArmed = next.Armed
-	if minOrder < s.seqStreamPos {
+	if minOrder == 0 {
 		minOrder = s.seqStreamPos
+	}
+	if s.teleopUncertainReason == "" || minOrder >= s.uncertainMinOrder {
+		s.teleopUncertainReason = reason
+		s.uncertainAuthority = next.Authority
+		s.uncertainLinkTier = next.LinkTier
+		s.uncertainArmed = next.Armed
 	}
 	if minOrder > s.uncertainMinOrder {
 		s.uncertainMinOrder = minOrder
@@ -384,9 +390,11 @@ func (s *vehicleSession) setPendingNonSITLLinkTier(linkTier string, minOrder uin
 	if linkTier == "" || linkTier == uxsvocab.LinkTierSITLLocal {
 		return
 	}
-	s.pendingNonSITLLinkTier = linkTier
-	if minOrder < s.seqStreamPos {
+	if minOrder == 0 {
 		minOrder = s.seqStreamPos
+	}
+	if s.pendingNonSITLLinkTier == "" || minOrder >= s.pendingNonSITLMinOrder {
+		s.pendingNonSITLLinkTier = linkTier
 	}
 	if minOrder > s.pendingNonSITLMinOrder {
 		s.pendingNonSITLMinOrder = minOrder
@@ -522,6 +530,7 @@ func (s *vehicleSession) advanceTelemetrySeq(seq uint8, isHeartbeat bool) {
 		s.pendingGapHasAck = false
 		s.pendingGapHasHb = false
 		s.pendingGapHbApplied = false
+		s.pendingGapPriorRestrictionOrder = 0
 		s.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
 		s.pendingGapHbWall = time.Time{}
 		s.pendingGapHbMono = time.Time{}
@@ -619,6 +628,7 @@ func (s *vehicleSession) recordAcceptedPacket(seq uint8, msgID uint32, peer neti
 		s.lastHbMonoAt = time.Time{}
 		s.lastHbOrder = 0
 		s.snapHbOrder = 0
+		s.currentLinkHbConfirmed = false
 		s.clearTeleopUncertain()
 		s.clearPendingNonSITLLinkTier()
 		s.hasSeqStream = false
@@ -885,6 +895,7 @@ func (t *Tracker) commitConfirmedHeartbeatLocked(
 	wasLost bool,
 	wallUTC, monoSample time.Time,
 ) ([]TransitionEvent, bool) {
+	sess.currentLinkHbConfirmed = true
 	sess.clearTeleopUncertain()
 	sess.clearPendingNonSITLLinkTier()
 	// shortcut: edge transition alerts evaluated in internal/mavlink, migrate declarative alert rules to processor/rule when semengine alpha.9 lands
@@ -953,17 +964,26 @@ func (t *Tracker) applyUncorroboratedPreemptLocked(
 	hbOrder uint64,
 	wallUTC, monoSample time.Time,
 ) ([]TransitionEvent, bool) {
-	sess.clearTeleopUncertain()
-	if next.LinkTier != uxsvocab.LinkTierSITLLocal {
-		sess.clearPendingNonSITLLinkTier()
-	} else if hbOrder > sess.pendingNonSITLMinOrder {
-		sess.clearPendingNonSITLLinkTier()
+	if isPreemptAuthority(prev.Authority) &&
+		(sess.teleopUncertainReason != "" || sess.pendingNonSITLLinkTier != "") &&
+		hbOrder < sess.activeRestrictionMinOrder() {
+		if next.LinkTier != uxsvocab.LinkTierSITLLocal {
+			sess.setPendingNonSITLLinkTier(next.LinkTier, hbOrder)
+		}
+		return nil, false
 	}
-	reasons := diffHeartbeatReasons(prev, next)
-	sess.snap = next
+	effectiveNext := next
+	effectiveNext.LinkTier = prev.LinkTier
+	if next.LinkTier != uxsvocab.LinkTierSITLLocal {
+		sess.setPendingNonSITLLinkTier(next.LinkTier, hbOrder)
+	}
+	sess.setTeleopUncertain("authority_preempted", effectiveNext, hbOrder)
+
+	reasons := diffHeartbeatReasons(prev, effectiveNext)
+	sess.snap = effectiveNext
 	sess.rev++
 	sess.heartbeatSeq++
-	if prev.Authority != next.Authority || prev.Armed != next.Armed || prev.LinkTier != next.LinkTier {
+	if prev.Authority != effectiveNext.Authority || prev.Armed != effectiveNext.Armed || prev.LinkTier != effectiveNext.LinkTier {
 		sess.authorityEpoch++
 	}
 	if sess.lastHbMonoAt.IsZero() || !monoSample.Before(sess.lastHbMonoAt) {
@@ -975,27 +995,27 @@ func (t *Tracker) applyUncorroboratedPreemptLocked(
 		return nil, false
 	}
 	prevAuth := ""
-	if prev.Authority != next.Authority {
+	if prev.Authority != effectiveNext.Authority {
 		prevAuth = prev.Authority
 	}
 	return []TransitionEvent{{
 		SysID:                sysid,
-		EntityID:             next.EntityID(),
-		Domain:               next.Domain,
+		EntityID:             effectiveNext.EntityID(),
+		Domain:               effectiveNext.Domain,
 		Seq:                  seq,
 		MsgID:                mavcodec.MsgIDHeartbeat,
 		Kind:                 EventKindHeartbeatEdge,
 		Reasons:              reasons,
-		Armed:                next.Armed,
-		Authority:            next.Authority,
+		Armed:                effectiveNext.Armed,
+		Authority:            effectiveNext.Authority,
 		PrevAuthority:        prevAuth,
 		AuthorityIncarnation: t.incarnation,
 		AuthorityEpoch:       sess.authorityEpoch,
 		ObservationRev:       sess.obsRev,
-		CompanionMode:        next.CompanionMode,
-		LinkTier:             next.LinkTier,
-		Flags:                next.Flags,
-		Failsafes:            next.Failsafes,
+		CompanionMode:        effectiveNext.CompanionMode,
+		LinkTier:             effectiveNext.LinkTier,
+		Flags:                effectiveNext.Flags,
+		Failsafes:            effectiveNext.Failsafes,
 		Timestamp:            wallUTC.UnixMilli(),
 	}}, true
 }
@@ -1020,6 +1040,7 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 		gapAck := sess.pendingGapAck
 		hadHb := sess.pendingGapHasHb
 		hadHbApplied := sess.pendingGapHbApplied
+		priorRestrictionOrder := sess.pendingGapPriorRestrictionOrder
 		gapHbVh := sess.pendingGapHbVh
 		gapHbWall := sess.pendingGapHbWall
 		gapHbMono := sess.pendingGapHbMono
@@ -1036,17 +1057,26 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 		sess.seqStreamPos = gapOrder
 		sess.lastStreamSeq = gapSeq
 		if hadHb {
+			gapRestricted := gapOrder <= sess.lastHbOrder ||
+				gapOrder <= priorRestrictionOrder ||
+				gapOrder < sess.activeRestrictionMinOrder()
 			if hadHbApplied {
-				if appliedNext, ok := applyHeartbeatFields(sess.snap, gapHbVh, gapHbWall); ok {
-					appliedKey := hbStateKeyOf(appliedNext)
-					if !sess.wasHbStateSeenInPriorCycle(gapSeq, gapOrder, appliedKey) {
-						if gapOrder > sess.lastHbOrder {
-							sess.lastHbOrder = gapOrder
+				if !gapRestricted {
+					if appliedNext, ok := applyHeartbeatFields(sess.snap, gapHbVh, gapHbWall); ok {
+						appliedKey := hbStateKeyOf(appliedNext)
+						if !sess.wasHbStateSeenInPriorCycle(gapSeq, gapOrder, appliedKey) {
+							if diff := diffHeartbeatReasons(sess.snap, appliedNext); len(diff) > 0 {
+								return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, sess.snap, appliedNext, gapOrder, false, gapHbWall, gapHbMono)
+							}
+							sess.currentLinkHbConfirmed = true
+							if gapOrder > sess.lastHbOrder {
+								sess.lastHbOrder = gapOrder
+							}
+							sess.snapHbOrder = gapOrder
+							sess.recordHbSlot(gapSeq, gapOrder, appliedKey)
+							sess.clearTeleopUncertain()
+							sess.clearPendingNonSITLLinkTier()
 						}
-						sess.snapHbOrder = gapOrder
-						sess.recordHbSlot(gapSeq, gapOrder, appliedKey)
-						sess.clearTeleopUncertain()
-						sess.clearPendingNonSITLLinkTier()
 					}
 				}
 				return nil, false
@@ -1054,6 +1084,18 @@ func (t *Tracker) resolvePendingGapBeforePacketLocked(sess *vehicleSession, sysi
 			prev := sess.snap
 			next, ok := applyHeartbeatFields(prev, gapHbVh, gapHbWall)
 			if ok {
+				if gapRestricted {
+					if isPreemptAuthority(next.Authority) {
+						return t.applyUncorroboratedPreemptLocked(sess, sysid, gapSeq, prev, next, gapOrder, gapHbWall, gapHbMono)
+					}
+					if next.LinkTier != uxsvocab.LinkTierSITLLocal {
+						sess.setPendingNonSITLLinkTier(next.LinkTier, gapOrder)
+					}
+					if reason := nonTeleopUncertainReason(next); reason != "" {
+						sess.setTeleopUncertain(reason, next, gapOrder)
+					}
+					return nil, false
+				}
 				if !sess.shouldHoldWrapHeartbeat(gapSeq, gapOrder, prev, next) {
 					return t.commitConfirmedHeartbeatLocked(sess, sysid, gapSeq, prev, next, gapOrder, false, gapHbWall, gapHbMono)
 				}
@@ -1123,14 +1165,15 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			return IngestOutcome{CountedError: true}
 		}
 		newSess := &vehicleSession{
-			snap:           *snap,
-			rev:            1,
-			authorityEpoch: 1,
-			heartbeatSeq:   1,
-			lastHbMonoAt:   monoSample,
-			lastHbOrder:    1,
-			snapHbOrder:    1,
-			linkEpoch:      1,
+			snap:                   *snap,
+			rev:                    1,
+			authorityEpoch:         1,
+			heartbeatSeq:           1,
+			lastHbMonoAt:           monoSample,
+			lastHbOrder:            1,
+			snapHbOrder:            1,
+			currentLinkHbConfirmed: true,
+			linkEpoch:              1,
 		}
 		newSess.recordHbSlot(seq, 1, hbStateKeyOf(*snap))
 		newSess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
@@ -1172,6 +1215,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			}
 		}
 		if !confirmedOrder {
+			priorRestrictionOrder := sess.activeRestrictionMinOrder()
 			sess.recordAcceptedPacket(seq, mavcodec.MsgIDHeartbeat, normPeer, monoSample)
 			var preemptEvents []TransitionEvent
 			preemptUrgent := false
@@ -1194,6 +1238,7 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 			if sess.hasPendingGap && sess.pendingGapSeq == seq {
 				sess.pendingGapHasHb = true
 				sess.pendingGapHbApplied = appliedPreempt
+				sess.pendingGapPriorRestrictionOrder = priorRestrictionOrder
 				sess.pendingGapHbVh = vh
 				sess.pendingGapHbWall = wallUTC
 				sess.pendingGapHbMono = monoSample
@@ -1224,6 +1269,9 @@ func (t *Tracker) applyHeartbeat(sysid, seq uint8, vh mavcodec.VehicleHeartbeat,
 				Events:        append(gapEvents, preemptEvents...),
 				UrgentSKGSync: gapUrgent || preemptUrgent,
 			}
+		}
+		if monoSample.After(sess.lastPacketAt) {
+			sess.lastPacketAt = monoSample
 		}
 		if next.LinkTier != uxsvocab.LinkTierSITLLocal {
 			sess.setPendingNonSITLLinkTier(next.LinkTier, hbOrder)
@@ -1681,6 +1729,7 @@ func (t *Tracker) applyCommandAck(sysid, seq uint8, msg mavcodec.CommandAck, pee
 			sess.pendingGapOrder = sess.seqStreamPos + uint64(uint8(seq-sess.lastStreamSeq))
 			sess.pendingGapHasHb = false
 			sess.pendingGapHbApplied = false
+			sess.pendingGapPriorRestrictionOrder = 0
 			sess.pendingGapHbVh = mavcodec.VehicleHeartbeat{}
 			sess.pendingGapHbWall = time.Time{}
 			sess.pendingGapHbMono = time.Time{}
@@ -1926,6 +1975,7 @@ func (t *Tracker) evaluateSessionSilence(sess *vehicleSession, wallUTC, monoSamp
 	sess.lastHbMonoAt = time.Time{}
 	sess.lastHbOrder = 0
 	sess.snapHbOrder = 0
+	sess.currentLinkHbConfirmed = false
 	sess.clearTeleopUncertain()
 	sess.clearPendingNonSITLLinkTier()
 	sess.hasSeqStream = false
@@ -1989,31 +2039,32 @@ func (t *Tracker) ActuationTarget(sysid uint8) (ActuationTarget, bool) {
 		uncertainTier = sess.uncertainLinkTier
 	}
 	return ActuationTarget{
-		SysID:                   sysid,
-		EntityID:                sess.snap.EntityID(),
-		Domain:                  sess.snap.Domain,
-		PeerAddr:                sess.peerAddr,
-		Armed:                   sess.snap.Armed,
-		Authority:               sess.snap.Authority,
-		AuthorityIncarnation:    t.incarnation,
-		AuthorityEpoch:          sess.authorityEpoch,
-		ObservationRev:          sess.obsRev,
-		HeartbeatSeq:            sess.heartbeatSeq,
-		HeartbeatOrder:          sess.snapHbOrder,
-		LinkEpoch:               sess.linkEpoch,
-		PacketOrder:             sess.seqStreamPos,
-		LastAckOrder:            sess.lastAckOrder,
-		LastAckSeq:              sess.lastAckSeq,
-		LastAckUncertain:        sess.lastAckUncertain,
-		CompanionMode:           sess.snap.CompanionMode,
-		LinkTier:                sess.snap.LinkTier,
-		LinkLost:                sess.linkLost,
-		TeleopUncertain:         sess.teleopUncertainReason != "",
-		TeleopUncertainReason:   sess.teleopUncertainReason,
-		UncertainAuthority:      sess.uncertainAuthority,
-		UncertainLinkTier:       uncertainTier,
-		UncertainArmed:          sess.uncertainArmed,
-		HeartbeatObservedUnixNs: sess.snap.HeartbeatObservedUnixNs,
+		SysID:                    sysid,
+		EntityID:                 sess.snap.EntityID(),
+		Domain:                   sess.snap.Domain,
+		PeerAddr:                 sess.peerAddr,
+		Armed:                    sess.snap.Armed,
+		Authority:                sess.snap.Authority,
+		AuthorityIncarnation:     t.incarnation,
+		AuthorityEpoch:           sess.authorityEpoch,
+		ObservationRev:           sess.obsRev,
+		HeartbeatSeq:             sess.heartbeatSeq,
+		HeartbeatOrder:           sess.snapHbOrder,
+		LinkEpoch:                sess.linkEpoch,
+		PacketOrder:              sess.seqStreamPos,
+		LastAckOrder:             sess.lastAckOrder,
+		LastAckSeq:               sess.lastAckSeq,
+		LastAckUncertain:         sess.lastAckUncertain,
+		CompanionMode:            sess.snap.CompanionMode,
+		LinkTier:                 sess.snap.LinkTier,
+		LinkLost:                 sess.linkLost,
+		CurrentLinkHbUnconfirmed: !sess.currentLinkHbConfirmed,
+		TeleopUncertain:          sess.teleopUncertainReason != "",
+		TeleopUncertainReason:    sess.teleopUncertainReason,
+		UncertainAuthority:       sess.uncertainAuthority,
+		UncertainLinkTier:        uncertainTier,
+		UncertainArmed:           sess.uncertainArmed,
+		HeartbeatObservedUnixNs:  sess.snap.HeartbeatObservedUnixNs,
 	}, true
 }
 

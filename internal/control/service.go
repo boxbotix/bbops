@@ -1446,6 +1446,13 @@ func validateTeleopTarget(sysid uint8, target mavlink.ActuationTarget, ok bool) 
 			Message: fmt.Sprintf("vehicle sysid %d authority is %q (companion-teleop required)", sysid, target.Authority),
 		}
 	}
+	if target.CurrentLinkHbUnconfirmed {
+		return &ControlError{
+			Status:  http.StatusConflict,
+			Code:    "authority_not_teleop",
+			Message: fmt.Sprintf("vehicle sysid %d velocity teleop suspended pending current-link vehicle heartbeat", sysid),
+		}
+	}
 	if target.TeleopUncertain {
 		code := target.TeleopUncertainReason
 		status := http.StatusConflict
@@ -1487,6 +1494,13 @@ func validateCommandTarget(sysid uint8, actionSlug string, sitlOnly bool, target
 				Status:  http.StatusForbidden,
 				Code:    "sitl_only_action",
 				Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current link_tier=%q)", actionSlug, target.LinkTier),
+			}
+		}
+		if target.CurrentLinkHbUnconfirmed {
+			return &ControlError{
+				Status:  http.StatusForbidden,
+				Code:    "sitl_only_action",
+				Message: fmt.Sprintf("action %q is restricted to sitl-local vehicles (current-link heartbeat required)", actionSlug),
 			}
 		}
 		if (target.UncertainLinkTier != "" && target.UncertainLinkTier != uxsvocab.LinkTierSITLLocal) ||
@@ -1576,7 +1590,7 @@ func (s *Service) syncObsIncarnationLocked(sysid uint8, inc string) {
 
 func (s *Service) ensurePreemptRecoveryObservedLocked(sysid uint8, target mavlink.ActuationTarget, ok bool) {
 	st := s.preemptState[sysid]
-	if st == nil || !ok || target.LinkLost ||
+	if st == nil || !ok || target.LinkLost || target.CurrentLinkHbUnconfirmed || target.TeleopUncertain ||
 		target.LinkTier == uxsvocab.LinkTierMeshSupervisory ||
 		!target.Armed || target.Authority != uxsvocab.AuthorityCompanionTeleop {
 		return
@@ -3132,7 +3146,8 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 				st.recoveryEpoch = 0
 				st.recoveryIncarnation = ""
 			}
-		} else if st != nil {
+		} else if st != nil && isHeartbeatEvidence &&
+			(!targetForObsOK || (!targetForObs.CurrentLinkHbUnconfirmed && !targetForObs.TeleopUncertain)) {
 			if !st.recoveryReady {
 				recMs := updatedMs
 				recEpoch := ev.AuthorityEpoch

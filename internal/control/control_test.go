@@ -9069,4 +9069,362 @@ func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAn
 			})
 		}
 	})
+
+	t.Run("older_second_gap_pair_keeps_teleop_and_sitl_only_commands_blocked_until_newer_corroboration", func(t *testing.T) {
+		countNonZero := func(s *fakeFrameSender) int {
+			n := 0
+			for _, rec := range s.snapshot() {
+				if sp, ok := rec.frame.Message.(mavcodec.SetPositionTargetLocalNED); ok &&
+					(sp.Vx != 0 || sp.Vy != 0 || sp.Vz != 0 || sp.YawRate != 0) {
+					n++
+				}
+			}
+			return n
+		}
+
+		// Case A (teleop): Active lease at seq=10 -> disarmed HB at seq=160 -> delayed attitude at seq=11 ->
+		// older armed+SITL gap pair at seq=80/81 MUST keep existing session renewal AND fresh engage blocked.
+		now := time.Date(2026, 11, 28, 4, 10, 0, 0, time.UTC)
+		tracker, _ := mavlink.NewTracker("boxbotix", "bbops")
+		sender := &fakeFrameSender{}
+		svc, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  tracker,
+			Sender:   sender,
+			Store:    newFakeCommandStore(),
+			Now:      func() time.Time { return now },
+		})
+		peer := netip.MustParseAddrPort("127.0.0.1:20310")
+
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+		tgt10, _ := tracker.ActuationTarget(1)
+		if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "sess-gap-active",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.3,
+			Engage:               true,
+			ObservedMs:           tgt10.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt10.ObservationRev,
+			AuthorityIncarnation: tgt10.AuthorityIncarnation,
+			AuthorityEpoch:       tgt10.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("initial engage at seq=10: %v", err)
+		}
+
+		now = now.Add(15 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 160, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+		now = now.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{Sequence: 11, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+		now = now.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 80, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+		now = now.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{Sequence: 81, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+
+		beforeNonZero := countNonZero(sender)
+		var ce *ControlError
+		if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:   1,
+			Session: "sess-gap-active",
+			Seq:     2,
+			Frame:   FrameLocalNED,
+			Vx:      1.3,
+		}); !errors.As(err, &ce) || ce.Code != "vehicle_disarmed" {
+			t.Fatalf("renewal after older gap pair 80/81 = %v, want 409 vehicle_disarmed", err)
+		}
+		tgt81, _ := tracker.ActuationTarget(1)
+		ce = nil
+		if _, err := svc.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "sess-gap-fresh-81",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.1,
+			Engage:               true,
+			ObservedMs:           tgt81.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgt81.ObservationRev,
+			AuthorityIncarnation: tgt81.AuthorityIncarnation,
+			AuthorityEpoch:       tgt81.AuthorityEpoch,
+		}); !errors.As(err, &ce) || ce.Code != "vehicle_disarmed" {
+			t.Fatalf("fresh engage after older gap pair 80/81 = %v, want 409 vehicle_disarmed", err)
+		}
+		if got := countNonZero(sender); got != beforeNonZero {
+			t.Fatalf("older gap pair 80/81 emitted nonzero #84 frames: got %d, want %d", got, beforeNonZero)
+		}
+
+		// Positive control (teleop): identical packet history 10 -> 160 -> 11 -> 80 -> 81 followed by genuinely
+		// newer armed+SITL pair 161/162 restores motion eligibility for both an active session and fresh engage.
+		nowCtrl := time.Date(2026, 11, 28, 4, 11, 0, 0, time.UTC)
+		trackerCtrl, _ := mavlink.NewTracker("boxbotix", "bbops")
+		senderCtrl := &fakeFrameSender{}
+		svcCtrl, _ := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerCtrl,
+			Sender:   senderCtrl,
+			Store:    newFakeCommandStore(),
+			Now:      func() time.Time { return nowCtrl },
+		})
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowCtrl), nowCtrl)
+		tgtCtrl10, _ := trackerCtrl.ActuationTarget(1)
+		if _, err := svcCtrl.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "sess-gap-ctrl",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.3,
+			Engage:               true,
+			ObservedMs:           tgtCtrl10.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgtCtrl10.ObservationRev,
+			AuthorityIncarnation: tgtCtrl10.AuthorityIncarnation,
+			AuthorityEpoch:       tgtCtrl10.AuthorityEpoch,
+		}); err != nil {
+			t.Fatalf("ctrl engage at seq=10: %v", err)
+		}
+		nowCtrl = nowCtrl.Add(15 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 160, false, mavcodec.ModeDisarmed, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowCtrl), nowCtrl)
+		nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(mavcodec.Frame{Sequence: 11, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowCtrl), nowCtrl)
+		nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 80, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowCtrl), nowCtrl)
+		nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(mavcodec.Frame{Sequence: 81, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowCtrl), nowCtrl)
+		nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 161, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowCtrl), nowCtrl)
+		nowCtrl = nowCtrl.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcCtrl, trackerCtrl.IngestFrame(mavcodec.Frame{Sequence: 162, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowCtrl), nowCtrl)
+
+		beforeCtrlRenew := countNonZero(senderCtrl)
+		if res, err := svcCtrl.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:   1,
+			Session: "sess-gap-ctrl",
+			Seq:     2,
+			Frame:   FrameLocalNED,
+			Vx:      1.6,
+		}); err != nil || !res.LeaseActive || countNonZero(senderCtrl) != beforeCtrlRenew+1 {
+			t.Fatalf("ctrl renewal after newer gap pair 161/162 = (%+v, %v), nonzero=%d want %d",
+				res, err, countNonZero(senderCtrl), beforeCtrlRenew+1)
+		}
+
+		// Case B (tier restriction): Confirmed sitl-local at seq=10 -> pending non-SITL tier at seq=160 ->
+		// delayed attitude at seq=11 -> older sitl-local pair at seq=80/81 MUST keep SITL-only actions blocked;
+		// genuinely newer sitl-local pair at seq=161/162 restores SITL-only eligibility.
+		for _, tierByte := range []mavcodec.LinkTier{
+			mavcodec.LinkTierDirectBench,
+			mavcodec.LinkTierMeshHighRate,
+			mavcodec.LinkTierMeshSupervisory,
+		} {
+			nowTier := time.Date(2026, 11, 28, 4, 12, 0, 0, time.UTC)
+			trackerTier, _ := mavlink.NewTracker("boxbotix", "bbops")
+			senderTier := &fakeFrameSender{}
+			svcTier, _ := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  trackerTier,
+				Sender:   senderTier,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return nowTier },
+			})
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowTier), nowTier)
+			nowTier = nowTier.Add(15 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 160, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, tierByte), peer, nowTier), nowTier)
+			nowTier = nowTier.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(mavcodec.Frame{Sequence: 11, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowTier), nowTier)
+			nowTier = nowTier.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 80, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowTier), nowTier)
+			nowTier = nowTier.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(mavcodec.Frame{Sequence: 81, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowTier), nowTier)
+
+			tgtTier81, okTier81 := trackerTier.ActuationTarget(1)
+			ce = nil
+			if vErr := validateCommandTarget(1, ActionSITLCRSFOverride, true, tgtTier81, okTier81); !errors.As(vErr, &ce) || ce.Code != "sitl_only_action" {
+				t.Fatalf("tier=%d validateCommandTarget after older 80/81 = %v, want 403 sitl_only_action (target=%+v)", tierByte, vErr, tgtTier81)
+			}
+			ce = nil
+			if _, err := svcTier.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+				t.Fatalf("tier=%d SubmitCommand after older 80/81 = %v, want 403 sitl_only_action", tierByte, err)
+			}
+			if got := senderTier.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+				t.Fatalf("tier=%d older 80/81 allowed %d #76 frames, want 0", tierByte, got)
+			}
+
+			nowTier = nowTier.Add(15 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 161, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, nowTier), nowTier)
+			nowTier = nowTier.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcTier, trackerTier.IngestFrame(mavcodec.Frame{Sequence: 162, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowTier), nowTier)
+			if _, err := svcTier.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); err != nil {
+				t.Fatalf("tier=%d SubmitCommand after newer 161/162: %v", tierByte, err)
+			}
+			if got := senderTier.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+				t.Fatalf("tier=%d newer 161/162 #76 count = %d, want 1", tierByte, got)
+			}
+		}
+	})
+
+	t.Run("uncorroborated_preempt_heartbeat_across_non_sitl_tiers_blocks_sitl_only_commands_until_corroborated", func(t *testing.T) {
+		tiers := []struct {
+			name     string
+			tierByte mavcodec.LinkTier
+		}{
+			{name: "direct_bench", tierByte: mavcodec.LinkTierDirectBench},
+			{name: "mesh_high_rate", tierByte: mavcodec.LinkTierMeshHighRate},
+			{name: "mesh_supervisory", tierByte: mavcodec.LinkTierMeshSupervisory},
+		}
+		authorities := []struct {
+			name string
+			auth mavcodec.ControlAuthority
+		}{
+			{name: "crsf_override", auth: mavcodec.AuthorityDirectCRSFOverride},
+			{name: "mcu_failsafe", auth: mavcodec.AuthorityMCUFailsafe},
+		}
+		for _, tc := range tiers {
+			for _, ac := range authorities {
+				t.Run(tc.name+"_"+ac.name, func(t *testing.T) {
+					now := time.Date(2026, 11, 28, 4, 15, 0, 0, time.UTC)
+					tracker, _ := mavlink.NewTracker("boxbotix", "bbops")
+					sender := &fakeFrameSender{}
+					svc, _ := NewService(Options{
+						Org:      "boxbotix",
+						Platform: "bbops",
+						Targets:  tracker,
+						Sender:   sender,
+						Store:    newFakeCommandStore(),
+						Now:      func() time.Time { return now },
+					})
+					peer := netip.MustParseAddrPort("127.0.0.1:20311")
+
+					deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, tc.tierByte), peer, now), now)
+					now = now.Add(20 * time.Millisecond)
+					deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 90, true, mavcodec.ModeHoldPosition, ac.auth, mavcodec.LinkTierSITLLocal), peer, now), now)
+
+					tgt, ok := tracker.ActuationTarget(1)
+					if !ok || tgt.HeartbeatOrder != 0 {
+						t.Fatalf("expected uncorroborated HeartbeatOrder=0, got %+v (ok=%v)", tgt, ok)
+					}
+					var ce *ControlError
+					if vErr := validateCommandTarget(1, ActionHoldPosition, false, tgt, ok); !errors.As(vErr, &ce) || ce.Code != "authority_preempted" {
+						t.Fatalf("validateCommandTarget regular action = %v, want 409 authority_preempted", vErr)
+					}
+					ce = nil
+					if vErr := validateCommandTarget(1, ActionSITLCRSFOverride, true, tgt, ok); !errors.As(vErr, &ce) || ce.Code != "sitl_only_action" {
+						t.Fatalf("validateCommandTarget SITL action = %v, want 403 sitl_only_action (target=%+v)", vErr, tgt)
+					}
+					ce = nil
+					if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+						t.Fatalf("SubmitCommand SITL action during uncorroborated preempt = %v, want 403 sitl_only_action", err)
+					}
+					if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+						t.Fatalf("uncorroborated preempt emitted %d #76 frames, want 0", got)
+					}
+
+					// Corroborate seq=90 with consecutive packet seq=91 -> SITL-only action now permitted.
+					now = now.Add(15 * time.Millisecond)
+					deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{Sequence: 91, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+					if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); err != nil {
+						t.Fatalf("SubmitCommand SITL action after corroboration at seq=91: %v", err)
+					}
+					if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+						t.Fatalf("corroborated SITL action #76 count = %d, want 1", got)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("non_heartbeat_link_restore_blocks_sitl_only_commands_and_teleop_until_current_link_heartbeat", func(t *testing.T) {
+		runRestoredHistory := func(t *testing.T) (*mavlink.Tracker, *Service, *fakeFrameSender, netip.AddrPort, *time.Time) {
+			t.Helper()
+			now := time.Date(2026, 11, 28, 4, 20, 0, 0, time.UTC)
+			tracker, err := mavlink.NewTrackerWithTimeouts("boxbotix", "bbops", 3*time.Second, 10*time.Second)
+			if err != nil {
+				t.Fatalf("NewTrackerWithTimeouts: %v", err)
+			}
+			sender := &fakeFrameSender{}
+			svc, _ := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			peer := netip.MustParseAddrPort("127.0.0.1:20312")
+
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 80, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, now), now)
+
+			now = now.Add(3100 * time.Millisecond)
+			lostEvents := tracker.EvaluateSilence(now)
+			if len(lostEvents) != 1 || lostEvents[0].Kind != mavlink.EventKindLinkLost {
+				t.Fatalf("EvaluateSilence events = %+v, want single link_lost", lostEvents)
+			}
+			for _, ev := range lostEvents {
+				svc.OnTransitionEvent(ev)
+			}
+
+			now = now.Add(20 * time.Millisecond)
+			restoreOut := tracker.IngestFrame(mavcodec.Frame{Sequence: 81, SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now)
+			if len(restoreOut.Events) != 1 || restoreOut.Events[0].Kind != mavlink.EventKindLinkRestored {
+				t.Fatalf("attitude restore events = %+v, want single link_restored", restoreOut.Events)
+			}
+			deliverTrackerOutcome(svc, restoreOut, now)
+			return tracker, svc, sender, peer, &now
+		}
+
+		// Branch A: Non-heartbeat link restoration rejects SITL-only command and teleop engage, and
+		// a subsequent direct-bench current-link heartbeat continues to reject SITL-only commands.
+		trackerBench, svcBench, senderBench, peerBench, nowBench := runRestoredHistory(t)
+		tgtRestored, okRestored := trackerBench.ActuationTarget(1)
+		var ce *ControlError
+		if vErr := validateCommandTarget(1, ActionSITLCRSFOverride, true, tgtRestored, okRestored); !errors.As(vErr, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("validateCommandTarget after attitude link_restored = %v, want 403 sitl_only_action (target=%+v)", vErr, tgtRestored)
+		}
+		ce = nil
+		if _, err := svcBench.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action after attitude link_restored = %v, want 403 sitl_only_action", err)
+		}
+		ce = nil
+		if _, err := svcBench.SubmitTeleop(context.Background(), TeleopRequest{
+			SysID:                1,
+			Session:              "sess-after-att-restore",
+			Seq:                  1,
+			Frame:                FrameLocalNED,
+			Vx:                   1.2,
+			Engage:               true,
+			ObservedMs:           tgtRestored.HeartbeatObservedUnixNs / int64(time.Millisecond),
+			ObservationRev:       tgtRestored.ObservationRev,
+			AuthorityIncarnation: tgtRestored.AuthorityIncarnation,
+			AuthorityEpoch:       tgtRestored.AuthorityEpoch,
+		}); !errors.As(err, &ce) {
+			t.Fatal("expected SubmitTeleop Engage after attitude-only link_restored to be rejected until current-link heartbeat")
+		}
+		if got := senderBench.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("attitude-only link_restored emitted %d #76 frames, want 0", got)
+		}
+
+		*nowBench = nowBench.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcBench, trackerBench.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 82, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peerBench, *nowBench), *nowBench)
+		ce = nil
+		if _, err := svcBench.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); !errors.As(err, &ce) || ce.Code != "sitl_only_action" {
+			t.Fatalf("SubmitCommand SITL action after fresh direct-bench heartbeat = %v, want 403 sitl_only_action", err)
+		}
+		if got := senderBench.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+			t.Fatalf("fresh direct-bench heartbeat emitted %d #76 frames, want 0", got)
+		}
+
+		// Branch B: Same pre-heartbeat restoration history, followed by a fresh sitl-local heartbeat,
+		// confirms sitl-local on the restored link and permits the SITL-only command.
+		trackerSITL, svcSITL, senderSITL, peerSITL, nowSITL := runRestoredHistory(t)
+		*nowSITL = nowSITL.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcSITL, trackerSITL.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 82, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSITL, *nowSITL), *nowSITL)
+		if _, err := svcSITL.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride, Param1: 1}); err != nil {
+			t.Fatalf("SubmitCommand SITL action after fresh sitl-local heartbeat: %v", err)
+		}
+		if got := senderSITL.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+			t.Fatalf("fresh sitl-local heartbeat #76 count = %d, want 1", got)
+		}
+	})
 }
