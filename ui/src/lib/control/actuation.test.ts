@@ -3604,4 +3604,378 @@ describe("M3.1 Actuation Client, Controller & ControlPanel (OQ2 + OQ3 Option A)"
       vi.useRealTimers();
     }
   });
+
+  // spec: cop-ui / Guarded Vehicle ControlPanel, LinkTier supervisory collapse, sub-2ms hardware preemption release, and SITL fault lab
+  it("sends session-bound Stop when Disengage completes at 484ms after local expiry while server lease is still alive (preserving any replacement lease) and suppresses held Enter/Space repeat re-engagement", async () => {
+    vi.useFakeTimers();
+    try {
+      const baseMs = Date.parse("2026-11-28T01:40:00.000Z");
+      vi.setSystemTime(baseMs);
+      const ws1Rig = new MockWebSocketRig();
+      const ws2Rig = new MockWebSocketRig();
+      const skgStore = createSkgStore({
+        url: "ws://127.0.0.1:8082/ws",
+        createSocket: ws2Rig.createSocket,
+        now: () => Date.now(),
+      });
+      const telemetryStore = createTelemetryStore({
+        url: "ws://127.0.0.1:8081/ws",
+        createSocket: ws1Rig.createSocket,
+        now: () => Date.now(),
+      });
+      telemetryStore.connect();
+      skgStore.connect();
+      ws1Rig.latest.serverOpen();
+      ws2Rig.latest.serverOpen();
+
+      const veh = buildVehicleStoredPayload(
+        1,
+        {
+          "uxs.domain.kind": "quadcopter",
+          "uxs.authority.state": "companion-teleop",
+          "uxs.mode.companion": "teleop-velocity",
+          "uxs.link.tier": "sitl-local",
+          "uxs.health.armed": true,
+        },
+        { observedAt: new Date(Date.now() - 20).toISOString() },
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "put",
+          bucket: "ENTITY_STATES",
+          key: veh.id,
+          revision: 1,
+          payload: veh,
+        }),
+      );
+      skgStore.ingestRawFrame(
+        JSON.stringify({
+          type: "synced",
+          bucket: "ENTITY_STATES",
+          revision: 1,
+        }),
+      );
+
+      let serverLease = null as {
+        session: string;
+        expiresMs: number;
+        vx: number;
+      } | null;
+      let delayRenewals = true;
+      const sentTeleops: ControlTeleopRequest[] = [];
+      const pendingRenewalResolvers: Array<() => void> = [];
+
+      const client: ControlClient = {
+        async submitCommand() {
+          throw new Error("unused");
+        },
+        async submitTeleop(req) {
+          sentTeleops.push(req);
+          const reqSentOffsetMs = Date.now() - baseMs;
+          if (req.stop) {
+            if (
+              serverLease !== null &&
+              (!req.session || serverLease.session === req.session)
+            ) {
+              serverLease = null;
+            }
+            return {
+              ok: true,
+              result: { sysid: req.sysid, lease_active: false },
+            };
+          }
+          if (req.engage) {
+            serverLease = {
+              session: req.session ?? "",
+              expiresMs: Date.now() + 240,
+              vx: req.vx,
+            };
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: true,
+                expires_ms: Date.now() + 240,
+              },
+            };
+          }
+          if (delayRenewals) {
+            // Exact timeline:
+            // - 0ms nonzero nudge lands on server at 230ms (extending serverLease to 470ms)
+            // - 50ms nonzero timer renewal lands on server at 455ms (extending serverLease to 695ms)
+            // while both HTTP responses stay pending past 484ms so client deadlines expire first!
+            const serverArrivalDelayMs =
+              reqSentOffsetMs === 0 ? 230 : reqSentOffsetMs === 50 ? 405 : 230;
+            setTimeout(() => {
+              const nowAtServer = Date.now();
+              if (
+                serverLease !== null &&
+                serverLease.session === req.session &&
+                nowAtServer < serverLease.expiresMs
+              ) {
+                serverLease = {
+                  session: serverLease.session,
+                  expiresMs: nowAtServer + 240,
+                  vx: req.vx,
+                };
+              }
+            }, serverArrivalDelayMs);
+            await new Promise<void>((resolve) => {
+              pendingRenewalResolvers.push(resolve);
+            });
+            return {
+              ok: true,
+              result: {
+                sysid: req.sysid,
+                lease_active: serverLease?.session === req.session,
+                expires_ms: serverLease?.expiresMs ?? Date.now(),
+              },
+            };
+          }
+          if (serverLease !== null && serverLease.session === req.session) {
+            serverLease = {
+              session: serverLease.session,
+              expiresMs: Date.now() + 240,
+              vx: req.vx,
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              sysid: req.sysid,
+              lease_active: true,
+              expires_ms: Date.now() + 240,
+            },
+          };
+        },
+      };
+
+      const controller = createActuationController({
+        telemetryStore,
+        skgStore,
+        client,
+        now: () => Date.now(),
+      });
+
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const panel = mount(ControlPanel, {
+        target: host,
+        props: {
+          get vehicle() {
+            return skgStore.getVehicle(veh.id)!;
+          },
+          telemetryStore,
+          skgStore,
+          client,
+          controller,
+          now: () => Date.now(),
+        },
+      });
+      flushSync();
+
+      const getEngageBtn = (): HTMLButtonElement =>
+        host.querySelector('[data-testid="teleop-engage-btn"]')!;
+
+      let hbSeq = 0;
+      const stepMs = async (deltaMs: number): Promise<void> => {
+        await vi.advanceTimersByTimeAsync(deltaMs);
+        hbSeq += 1;
+        telemetryStore.ingestRawFrame(
+          buildTransitionFrame(1, {
+            seq: hbSeq,
+            kind: "heartbeat_edge",
+            authority: "companion-teleop",
+            linkTier: "sitl-local",
+            timestamp: Date.now(),
+          }),
+        );
+        flushSync();
+      };
+
+      // 1) Finding 7: Engage at 0ms, hold forward ('w'), nonzero renewals land on server at 230ms and 455ms
+      // (extending serverLease to 695ms), press Disengage at 239ms, advance to 484ms (both local deadlines
+      // expired -> controller.engaged === false), release Disengage at 484ms -> sends Stop for session1!
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      const session1 = controller.engagedSession!;
+      expect(session1).toBeTruthy();
+      controller.handlePadKeyDown({ key: "w" });
+      await Promise.resolve();
+
+      await stepMs(239); // 230ms server renewal already landed; at 239ms client is still engaged!
+      expect(controller.engaged).toBe(true);
+      expect(getEngageBtn().textContent?.trim()).toBe("Disengage Teleop");
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerdown", { button: 0, bubbles: true }),
+      );
+
+      // Advance to 484ms: 455ms server renewal extended serverLease to 695ms, while local client deadlines
+      // expired at 240ms/340ms so controller.engaged & engagedSession are now false/null!
+      await stepMs(245); // 239 + 245 = 484ms
+      expect(controller.engaged).toBe(false);
+      expect(controller.engagedSession).toBeNull();
+      expect(serverLease?.session).toBe(session1);
+      expect(serverLease!.expiresMs).toBe(baseMs + 695);
+      expect(serverLease!.expiresMs).toBeGreaterThan(Date.now());
+
+      getEngageBtn().dispatchEvent(
+        new PointerEvent("pointerup", { button: 0, bubbles: true }),
+      );
+      getEngageBtn().click();
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: session1,
+        stop: true,
+        vx: 0,
+      });
+      expect(serverLease).toBeNull();
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(1);
+      for (const r of pendingRenewalResolvers.splice(0)) {
+        r();
+      }
+      await Promise.resolve();
+
+      // Also verify replacement-session safety: stopping old session1 while session2 is engaged leaves session2 active!
+      delayRenewals = false;
+      expect(await controller.engageTeleop(skgStore.getVehicle(veh.id))).toBe(
+        true,
+      );
+      const session2 = controller.engagedSession!;
+      expect(session2).not.toBe(session1);
+      await controller.disengageTeleop({
+        sendZero: true,
+        sysid: 1,
+        session: session1,
+      });
+      expect(controller.engaged).toBe(true);
+      expect(controller.engagedSession).toBe(session2);
+      expect(serverLease?.session).toBe(session2);
+
+      // 2) Finding 6A: Holding Enter on Disengage Teleop disengages once and suppresses auto-repeat re-engagement!
+      const engagesBeforeHoldEnter = sentTeleops.filter((r) => r.engage).length;
+      const stopsBeforeHoldEnter = sentTeleops.filter((r) => r.stop).length;
+      const btn = getEngageBtn();
+      btn.focus();
+      expect(btn.textContent?.trim()).toBe("Disengage Teleop");
+
+      const enterDown1 = new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        repeat: false,
+        bubbles: true,
+        cancelable: true,
+      });
+      btn.dispatchEvent(enterDown1);
+      btn.click(); // Native <button> click on initial Enter keydown
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(btn.textContent?.trim()).toBe("Engage Teleop");
+      expect(sentTeleops.filter((r) => r.stop)).toHaveLength(
+        stopsBeforeHoldEnter + 1,
+      );
+
+      // Simulate held Enter auto-repeats while button now reads "Engage Teleop":
+      for (let i = 0; i < 3; i += 1) {
+        const repeatEv = new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          repeat: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        btn.dispatchEvent(repeatEv);
+        expect(repeatEv.defaultPrevented).toBe(true);
+        // Even if an environment dispatches a click during held Enter before keyup, buttonKeyConsumed blocks it:
+        btn.click();
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(
+        engagesBeforeHoldEnter,
+      );
+
+      btn.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: "Enter",
+          code: "Enter",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+
+      // 3) Finding 6B: Fresh Enter press engages, then holding Space across repeat keydowns disengages once on keyup without re-engaging!
+      const spaceSessionOk = await controller.engageTeleop(
+        skgStore.getVehicle(veh.id),
+      );
+      expect(spaceSessionOk).toBe(true);
+      const spaceSession = controller.engagedSession!;
+      flushSync();
+      const engagesBeforeHoldSpace = sentTeleops.filter((r) => r.engage).length;
+      const stopsBeforeHoldSpace = sentTeleops.filter((r) => r.stop).length;
+
+      btn.focus();
+      btn.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: " ",
+          code: "Space",
+          repeat: false,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      for (let i = 0; i < 3; i += 1) {
+        btn.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: " ",
+            code: "Space",
+            repeat: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+      btn.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: " ",
+          code: "Space",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      btn.click(); // Native <button> click on Space keyup
+      await vi.advanceTimersByTimeAsync(0);
+      flushSync();
+
+      expect(controller.engaged).toBe(false);
+      expect(sentTeleops.filter((r) => r.stop)).toHaveLength(
+        stopsBeforeHoldSpace + 1,
+      );
+      expect(sentTeleops.at(-1)).toMatchObject({
+        sysid: 1,
+        session: spaceSession,
+        stop: true,
+      });
+      expect(sentTeleops.filter((r) => r.engage)).toHaveLength(
+        engagesBeforeHoldSpace,
+      );
+
+      unmount(panel);
+      host.remove();
+      controller.dispose();
+      telemetryStore.disconnect();
+      skgStore.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

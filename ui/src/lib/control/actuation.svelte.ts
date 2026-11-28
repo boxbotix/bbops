@@ -209,6 +209,12 @@ export interface CreateActuationControllerOptions {
   readonly clearIntervalFn?: (handle: ReturnType<typeof setInterval>) => void;
 }
 
+export interface DisengageTeleopOptions {
+  readonly sendZero?: boolean;
+  readonly sysid?: number;
+  readonly session?: string | null;
+}
+
 export interface ActuationController {
   readonly activeSysId: number | null;
   readonly engaged: boolean;
@@ -236,7 +242,7 @@ export interface ActuationController {
     vehicle: VehicleEntityState | null,
     freshnessContext?: FleetFreshnessContext,
   ): Promise<boolean>;
-  disengageTeleop(options?: { sendZero?: boolean }): Promise<void>;
+  disengageTeleop(options?: DisengageTeleopOptions): Promise<void>;
   setPadVector(normX: number, normY: number, dragging: boolean): void;
   releasePadPointer(): void;
   clearHeldMovement(): void;
@@ -1266,13 +1272,36 @@ export function createActuationController(
   }
 
   async function disengageTeleop(
-    opts: { sendZero?: boolean } = {},
+    opts: DisengageTeleopOptions = {},
   ): Promise<void> {
+    const sendZero = opts.sendZero ?? true;
+    if (opts.session !== undefined) {
+      const targetSession = opts.session;
+      if (targetSession === null) {
+        return;
+      }
+      const targetSysId = opts.sysid ?? engagedSysId ?? activeSysId;
+      if (
+        engagedSession === targetSession &&
+        (opts.sysid === undefined || engagedSysId === opts.sysid)
+      ) {
+        const stopSeq = teleopSeq + 1;
+        clearEngagedSessionLocal();
+        if (targetSysId !== null && sendZero) {
+          await sendStopRelease(targetSysId, targetSession, stopSeq);
+        }
+        return;
+      }
+      if (targetSysId !== null && sendZero) {
+        await sendStopRelease(targetSysId, targetSession);
+      }
+      return;
+    }
     const prevSysId = engagedSysId;
     const prevSession = engagedSession ?? undefined;
     const stopSeq = prevSession !== undefined ? teleopSeq + 1 : undefined;
     clearEngagedSessionLocal();
-    if (prevSysId !== null && (opts.sendZero ?? true)) {
+    if (prevSysId !== null && sendZero) {
       await sendStopRelease(prevSysId, prevSession, stopSeq);
     }
   }

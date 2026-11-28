@@ -2569,6 +2569,14 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.keyboard.press("w");
     expect(teleopPosts).toHaveLength(0);
 
+    // Let PilotWorkspace's DPR=2 SwiftShader canvases complete initial ResizeObserver allocation/paint before starting the 240 ms teleop lease.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+
     // 3. Explicit Engage Teleop focuses velocity pad, streams 20 Hz #84 nudges on hold "w", updates live vehicle groundspeed, and zeroes on release.
     await page.getByTestId("teleop-engage-btn").click();
     await expect(panel).toHaveAttribute("data-engaged", "true");
@@ -2639,15 +2647,32 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.waitForTimeout(250);
     expect(teleopPosts.length).toBe(teleopCountBeforeRestore);
 
-    // Explicit re-engagement clears preemption latch; Disengage Teleop sends explicit stop zero frame.
-    await page.getByTestId("teleop-engage-btn").click();
+    // Explicit re-engagement clears preemption latch; holding Enter across auto-repeats on Disengage Teleop sends one stop and zero re-engages.
+    const engageBtn = page.getByTestId("teleop-engage-btn");
+    await engageBtn.click();
     await expect(panel).toHaveAttribute("data-engaged", "true");
     await expect(preemptBanner).toHaveCount(0);
-    await page.getByTestId("teleop-engage-btn").click();
+    await engageBtn.focus();
+    const engagesBeforeHoldEnter = teleopPosts.filter(
+      (p) => p.sysid === 1 && p.engage === true,
+    ).length;
+    const stopsBeforeHoldEnter = teleopPosts.filter(
+      (p) => p.sysid === 1 && p.stop === true,
+    ).length;
+    await page.keyboard.down("Enter");
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await page.keyboard.down("Enter");
+    await page.keyboard.down("Enter");
+    await page.keyboard.up("Enter");
+    await page.waitForTimeout(80);
     await expect(panel).toHaveAttribute("data-engaged", "false");
     expect(
-      teleopPosts.some((p) => p.sysid === 1 && p.stop === true && p.vx === 0),
-    ).toBe(true);
+      teleopPosts.filter((p) => p.sysid === 1 && p.stop === true && p.vx === 0)
+        .length,
+    ).toBe(stopsBeforeHoldEnter + 1);
+    expect(
+      teleopPosts.filter((p) => p.sysid === 1 && p.engage === true).length,
+    ).toBe(engagesBeforeHoldEnter);
 
     // 5. ADR-111 Decision 3: dropped #77 COMMAND_ACK transitions pending -> commit_unknown with zero retries, then reconciles to confirmed on next #0 HEARTBEAT.
     await copStack.setDropCommandAck(1, 1);

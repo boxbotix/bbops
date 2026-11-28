@@ -75,8 +75,12 @@
   let currentEastMps = $state("1.2");
   let activePointerId: number | null = null;
   let suppressPadBlur = false;
+  let activeButtonKey: string | null = null;
+  let buttonKeyConsumed = false;
+  let buttonKeyReleased = false;
   let pendingToggleIntent: {
     readonly kind: "disengage" | "engage";
+    readonly sysid: number;
     readonly session: string | null;
   } | null = null;
 
@@ -135,26 +139,112 @@
     }
   }
 
+  function isEngageButtonKey(key: string): boolean {
+    return key === " " || key === "Spacebar" || key === "Enter";
+  }
+
+  function isSameEngageButtonKey(a: string, b: string): boolean {
+    if (a === b) {
+      return true;
+    }
+    return (a === " " || a === "Spacebar") && (b === " " || b === "Spacebar");
+  }
+
   function captureEngageToggleIntent(): void {
     if (controller.engaged || controller.leaseRenewalPending) {
       suppressPadBlur = true;
     }
     pendingToggleIntent = {
       kind: controller.engaged ? "disengage" : "engage",
+      sysid: controller.engagedSysId ?? vehicle.sysid,
       session: controller.engagedSession,
     };
   }
 
+  function onEngageButtonKeyDown(ev: KeyboardEvent): void {
+    if (!isEngageButtonKey(ev.key)) {
+      return;
+    }
+    if (!ev.repeat && buttonKeyReleased) {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      pendingToggleIntent = null;
+    }
+    if (ev.repeat || activeButtonKey !== null) {
+      if (
+        ev.key === "Enter" ||
+        activeButtonKey === "Enter" ||
+        buttonKeyConsumed
+      ) {
+        ev.preventDefault();
+      }
+      return;
+    }
+    activeButtonKey = ev.key;
+    buttonKeyConsumed = false;
+    buttonKeyReleased = false;
+    captureEngageToggleIntent();
+  }
+
+  function onEngageButtonKeyUp(ev: KeyboardEvent): void {
+    if (
+      activeButtonKey === null ||
+      !isSameEngageButtonKey(ev.key, activeButtonKey)
+    ) {
+      return;
+    }
+    if (buttonKeyConsumed || ev.key === "Enter") {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      return;
+    }
+    buttonKeyReleased = true;
+    queueMicrotask(() => {
+      if (buttonKeyReleased) {
+        activeButtonKey = null;
+        buttonKeyConsumed = false;
+        buttonKeyReleased = false;
+        pendingToggleIntent = null;
+        suppressPadBlur = false;
+      }
+    });
+  }
+
+  function onEngageButtonBlur(): void {
+    if (activeButtonKey !== null) {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      pendingToggleIntent = null;
+      suppressPadBlur = false;
+    }
+  }
+
   async function toggleTeleopEngagement(): Promise<void> {
+    if (activeButtonKey !== null) {
+      if (buttonKeyConsumed) {
+        return;
+      }
+      if (buttonKeyReleased) {
+        activeButtonKey = null;
+        buttonKeyConsumed = false;
+        buttonKeyReleased = false;
+      } else {
+        buttonKeyConsumed = true;
+      }
+    }
     suppressPadBlur = false;
     const intent = pendingToggleIntent;
     pendingToggleIntent = null;
     if (intent?.kind === "disengage") {
-      if (
-        intent.session !== null &&
-        controller.engagedSession === intent.session
-      ) {
-        await controller.disengageTeleop({ sendZero: true });
+      if (intent.session !== null) {
+        await controller.disengageTeleop({
+          sendZero: true,
+          sysid: intent.sysid,
+          session: intent.session,
+        });
       }
       return;
     }
@@ -470,22 +560,23 @@
           disabled={!controller.engaged && !safety.canEngageTeleop}
           onpointerdown={(ev) => {
             if (ev.button === 0) {
+              activeButtonKey = null;
+              buttonKeyConsumed = false;
+              buttonKeyReleased = false;
               captureEngageToggleIntent();
             }
           }}
           onmousedown={(ev) => {
             if (ev.button === 0 && pendingToggleIntent === null) {
+              activeButtonKey = null;
+              buttonKeyConsumed = false;
+              buttonKeyReleased = false;
               captureEngageToggleIntent();
             }
           }}
-          onkeydown={(ev) => {
-            if (
-              !ev.repeat &&
-              (ev.key === " " || ev.key === "Spacebar" || ev.key === "Enter")
-            ) {
-              captureEngageToggleIntent();
-            }
-          }}
+          onkeydown={onEngageButtonKeyDown}
+          onkeyup={onEngageButtonKeyUp}
+          onblur={onEngageButtonBlur}
           onpointercancel={() => {
             pendingToggleIntent = null;
             suppressPadBlur = false;

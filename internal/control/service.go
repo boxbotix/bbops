@@ -116,6 +116,7 @@ func (s *LifecycleStore) Transition(
 		ce.AckResult = ackResult
 		if ackResult >= 0 {
 			ce.AckAccounted = 1
+			ce.AckPoolMask |= ackPoolFormatV2Bit
 			if ackResult < 28 {
 				ce.AckPoolMask |= 1 << uint(ackResult)
 			}
@@ -463,11 +464,15 @@ type commandInvokeSpec struct {
 const (
 	ackPoolWrapHeldBit    = 1 << 28
 	ackPoolWrapSettledBit = 1 << 29
+	ackPoolFormatV2Bit    = 1 << 30
 	ackPoolResultMask     = (1 << 28) - 1
 )
 
-func poolMaskForCmd(mask uint64, wrapHeld bool) int {
+func poolMaskForCmd(mask uint64, accounted, wrapHeld bool) int {
 	pm := int(mask) & ackPoolResultMask
+	if accounted || wrapHeld {
+		pm |= ackPoolFormatV2Bit
+	}
 	if wrapHeld {
 		pm |= ackPoolWrapHeldBit
 	}
@@ -1078,12 +1083,6 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 		return -1
 	})
 
-	hasExplicitWrapFlags := make(map[cmdKey]bool)
-	for _, ce := range preRestartSent {
-		if (ce.AckPoolMask & (ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0 {
-			hasExplicitWrapFlags[cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID)}] = true
-		}
-	}
 	concreteResultMask := make(map[cmdKey]uint64)
 
 	s.mu.Lock()
@@ -1103,7 +1102,8 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			s.seenAckResultMask[key] |= mask
 			s.preResetAckResultMask[key] |= mask
 		}
-		legacyWrapHeld := !hasExplicitWrapFlags[key] &&
+		isCurrentFormat := (ce.AckPoolMask & (ackPoolFormatV2Bit | ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0
+		legacyWrapHeld := !isCurrentFormat &&
 			ce.AckResult < 0 &&
 			ce.AckAccounted > 0 &&
 			mask != 0 &&
@@ -1112,10 +1112,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			(ce.AckPoolMask&ackPoolWrapSettledBit) == 0 &&
 			((ce.AckPoolMask&ackPoolWrapHeldBit) != 0 || legacyWrapHeld)
 		accounted := ce.AckAccounted > 0 || ce.AckResult >= 0
-		persistedMask := ce.AckPoolMask | poolMaskInt(mask)
-		if wrapHeld {
-			persistedMask |= ackPoolWrapHeldBit
-		}
+		persistedMask := ce.AckPoolMask | (int(mask) & ackPoolResultMask)
 		s.persistedAckMeta[ce.ID] = ackMetaState{
 			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
 			ackPoolMask:  persistedMask,
@@ -1207,7 +1204,7 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 }
 
 func poolMaskInt(mask uint64) int {
-	return int(mask) & ackPoolResultMask
+	return (int(mask) & ackPoolResultMask) | ackPoolFormatV2Bit
 }
 
 func boolToInt(v bool) int {
@@ -1356,6 +1353,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				if w.ackResult >= 0 {
 					meta := s.persistedAckMeta[w.entityID]
 					meta.ackAccounted = 1
+					meta.ackPoolMask |= ackPoolFormatV2Bit
 					if w.ackResult < 28 {
 						meta.ackPoolMask |= 1 << uint(w.ackResult)
 					}
@@ -1446,6 +1444,23 @@ func validateTeleopTarget(sysid uint8, target mavlink.ActuationTarget, ok bool) 
 			Status:  http.StatusConflict,
 			Code:    "authority_not_teleop",
 			Message: fmt.Sprintf("vehicle sysid %d authority is %q (companion-teleop required)", sysid, target.Authority),
+		}
+	}
+	if target.TeleopUncertain {
+		code := target.TeleopUncertainReason
+		status := http.StatusConflict
+		switch code {
+		case "supervisory_link_only", "supervisory_link_tier":
+			code = "supervisory_link_tier"
+			status = http.StatusForbidden
+		case "vehicle_disarmed", "authority_preempted":
+		default:
+			code = "authority_not_teleop"
+		}
+		return &ControlError{
+			Status:  status,
+			Code:    code,
+			Message: fmt.Sprintf("vehicle sysid %d velocity teleop suspended pending corroborated vehicle heartbeat (%s)", sysid, code),
 		}
 	}
 	return nil
@@ -1800,6 +1815,43 @@ func (s *Service) checkTeleopSessionLocked(sysid uint8, session string, seq uint
 	return nil
 }
 
+func (s *Service) revokeUncertainLease(sysid uint8, session string, engage bool, fallbackTarget mavlink.ActuationTarget) {
+	s.egressMu[sysid].Lock()
+	defer s.egressMu[sysid].Unlock()
+
+	var zeroPeer netip.AddrPort
+	var zeroFrame uint8
+	var shouldZero bool
+	s.mu.Lock()
+	if prev, had := s.leases[sysid]; had {
+		zeroPeer = prev.peer
+		zeroFrame = prev.coordFrame
+		s.recordStoppedSessionLocked(sysid, prev.session)
+		delete(s.leases, sysid)
+		s.authEpoch[sysid]++
+		shouldZero = true
+	}
+	if engage && session != "" {
+		s.recordStoppedSessionLocked(sysid, session)
+	}
+	s.mu.Unlock()
+
+	if shouldZero {
+		target, ok := s.targets.ActuationTarget(sysid)
+		if !ok {
+			target = fallbackTarget
+		}
+		if !target.LinkLost && target.PeerAddr.IsValid() &&
+			target.PeerAddr == zeroPeer &&
+			target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
+			target.Authority == uxsvocab.AuthorityCompanionTeleop &&
+			target.TeleopUncertainReason != "authority_preempted" &&
+			target.TeleopUncertainReason != "supervisory_link_only" {
+			_ = s.sendZeroVelocity(sysid, zeroFrame, target.PeerAddr, s.nowFn())
+		}
+	}
+}
+
 // SubmitTeleop validates safety gates and forwards an at-most-once #84 velocity setpoint
 // (or explicit zero-velocity release on Stop) to the pinned peer UDP endpoint.
 func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResult, error) {
@@ -1852,7 +1904,9 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 				!target.LinkLost && target.PeerAddr.IsValid() &&
 				target.PeerAddr == releasePeer &&
 				target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
-				target.Authority == uxsvocab.AuthorityCompanionTeleop {
+				target.Authority == uxsvocab.AuthorityCompanionTeleop &&
+				target.TeleopUncertainReason != "authority_preempted" &&
+				target.TeleopUncertainReason != "supervisory_link_only" {
 				_ = s.sendZeroVelocity(req.SysID, releaseFrame, target.PeerAddr, s.nowFn())
 			}
 		}
@@ -1861,6 +1915,9 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 
 	initialTarget, ok := s.targets.ActuationTarget(req.SysID)
 	if err := validateTeleopTarget(req.SysID, initialTarget, ok); err != nil {
+		if ok && initialTarget.TeleopUncertain {
+			s.revokeUncertainLease(req.SysID, session, req.Engage, initialTarget)
+		}
 		return TeleopResult{}, err
 	}
 
@@ -1921,7 +1978,9 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 			!target.LinkLost && target.PeerAddr.IsValid() &&
 			target.PeerAddr == expPeer &&
 			target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
-			target.Authority == uxsvocab.AuthorityCompanionTeleop {
+			target.Authority == uxsvocab.AuthorityCompanionTeleop &&
+			target.TeleopUncertainReason != "authority_preempted" &&
+			target.TeleopUncertainReason != "supervisory_link_only" {
 			_ = s.sendZeroVelocity(req.SysID, expFrame, target.PeerAddr, now)
 		}
 		s.mu.Lock()
@@ -1931,7 +1990,32 @@ func (s *Service) SubmitTeleop(_ context.Context, req TeleopRequest) (TeleopResu
 	expiresAt := now.Add(s.teleopTTL)
 	curTarget, curOK := s.targets.ActuationTarget(req.SysID)
 	if err := validateTeleopTarget(req.SysID, curTarget, curOK); err != nil {
+		var zeroPeer netip.AddrPort
+		var zeroFrame uint8
+		var shouldZero bool
+		if curOK && curTarget.TeleopUncertain {
+			if prev, had := s.leases[req.SysID]; had {
+				zeroPeer = prev.peer
+				zeroFrame = prev.coordFrame
+				s.recordStoppedSessionLocked(req.SysID, prev.session)
+				delete(s.leases, req.SysID)
+				s.authEpoch[req.SysID]++
+				shouldZero = true
+			}
+			if req.Engage && session != "" {
+				s.recordStoppedSessionLocked(req.SysID, session)
+			}
+		}
 		s.mu.Unlock()
+		if shouldZero &&
+			!curTarget.LinkLost && curTarget.PeerAddr.IsValid() &&
+			curTarget.PeerAddr == zeroPeer &&
+			curTarget.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
+			curTarget.Authority == uxsvocab.AuthorityCompanionTeleop &&
+			curTarget.TeleopUncertainReason != "authority_preempted" &&
+			curTarget.TeleopUncertainReason != "supervisory_link_only" {
+			_ = s.sendZeroVelocity(req.SysID, zeroFrame, curTarget.PeerAddr, now)
+		}
 		s.egressMu[req.SysID].Unlock()
 		return TeleopResult{}, err
 	}
@@ -2365,7 +2449,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(other.ackAccounted),
-				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], other.ackAccounted, wasWrapHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    dispatchNow.UnixMilli(),
 			})
@@ -2626,9 +2710,15 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 		if s.recovered.Load() {
 			if priorUnacked > 0 {
 				s.unackedCount[key] = priorUnacked - 1
+				if couldBeAccountedDuplicate {
+					s.wrapAckCredit[key]++
+				}
 				if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
 					detachedID := ids[0]
 					s.unackedDetachedIDs[key] = ids[1:]
+					if couldBeAccountedDuplicate {
+						s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], detachedID)
+					}
 					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
 				}
 			} else if s.wrapAckCredit[key] > 0 {
@@ -2709,24 +2799,36 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			}
 			markAllAmbiguous = true
 		} else if s.recovered.Load() && priorUnacked > 0 {
-			s.unackedCount[key] = priorUnacked - 1
-			hadDetached := false
-			if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
-				hadDetached = true
-				detachedID := ids[0]
-				s.unackedDetachedIDs[key] = ids[1:]
-				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
-			} else {
-				for _, cmd := range matches {
-					if !cmd.ackAccounted {
-						cmd.ackAccounted = true
-						s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
-						break
+			if !couldBeAccountedDuplicate {
+				s.unackedCount[key] = priorUnacked - 1
+				if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
+					detachedID := ids[0]
+					s.unackedDetachedIDs[key] = ids[1:]
+					s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
+				} else {
+					for _, cmd := range matches {
+						if !cmd.ackAccounted {
+							cmd.ackAccounted = true
+							s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], cmd.entityID)
+							break
+						}
 					}
 				}
-			}
-			if !hadDetached && priorUnacked == 1 && len(matches) == 1 && !holdingWrapReceipt && couldBeAccountedDuplicate {
+			} else if ids := s.unackedDetachedIDs[key]; len(ids) > 0 {
+				s.unackedCount[key] = priorUnacked - 1
+				s.wrapAckCredit[key]++
+				detachedID := ids[0]
+				s.unackedDetachedIDs[key] = ids[1:]
+				s.wrapCreditIDs[key] = append(s.wrapCreditIDs[key], detachedID)
+				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], detachedID)
+				markAllAmbiguous = true
+			} else if priorUnacked == 1 && len(matches) == 1 && !holdingWrapReceipt && !matches[0].ackAccounted {
+				s.unackedCount[key] = 0
+				matches[0].ackAccounted = true
 				matches[0].wrapReceiptHeld = true
+				s.ambiguousSlotIDs[key] = appendBoundedIDs(s.ambiguousSlotIDs[key], matches[0].entityID)
+			} else {
+				markAllAmbiguous = true
 			}
 		} else if s.recovered.Load() && priorUnacked == 0 {
 			if holdingWrapReceipt {
@@ -2767,10 +2869,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			if cmd.phase == PhasePending {
 				cmd.phase = PhaseCommitUnknown
 				cmd.detail = CommitUnknownDetail
-				cmdMask := poolMask
-				if cmd.wrapReceiptHeld {
-					cmdMask |= ackPoolWrapHeldBit
-				}
+				cmdMask := poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld)
 				s.enqueueWriteLocked(pendingCommandWrite{
 					entityID:     cmd.entityID,
 					phase:        PhaseCommitUnknown,
@@ -2966,7 +3065,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 					detail:       preemptDetail,
 					updatedMs:    updatedMs,
 				})
@@ -3064,7 +3163,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 					detail:       cmd.detail,
 					updatedMs:    updatedMs,
 				})
@@ -3113,7 +3212,9 @@ func (s *Service) expireVehicleLease(sysid uint8, now time.Time) {
 			!target.LinkLost && target.PeerAddr.IsValid() &&
 			target.PeerAddr == expPeer &&
 			target.LinkTier != uxsvocab.LinkTierMeshSupervisory &&
-			target.Authority == uxsvocab.AuthorityCompanionTeleop {
+			target.Authority == uxsvocab.AuthorityCompanionTeleop &&
+			target.TeleopUncertainReason != "authority_preempted" &&
+			target.TeleopUncertainReason != "supervisory_link_only" {
 			_ = s.sendZeroVelocity(sysid, expFrame, target.PeerAddr, now)
 		}
 	}
@@ -3247,7 +3348,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				source:       lifecycle.TransitionSourceComponent,
 				ackResult:    UnacknowledgedResult,
 				ackAccounted: boolToInt(cmd.ackAccounted),
-				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.wrapReceiptHeld),
+				ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, cmd.wrapReceiptHeld),
 				detail:       CommitUnknownDetail,
 				updatedMs:    updatedMs,
 			})
@@ -3278,7 +3379,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 					source:       lifecycle.TransitionSourceComponent,
 					ackResult:    UnacknowledgedResult,
 					ackAccounted: boolToInt(cmd.ackAccounted),
-					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], wasWrapHeld),
+					ackPoolMask:  poolMaskForCmd(s.seenAckResultMask[key], cmd.ackAccounted, wasWrapHeld),
 					detail:       cmd.detail,
 					updatedMs:    updatedMs,
 				})
