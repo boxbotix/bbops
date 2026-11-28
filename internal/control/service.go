@@ -66,15 +66,20 @@ type CommandStore interface {
 }
 
 // RecoverableCommandStore extends CommandStore with authoritative reads, owner-neutral
-// consumed-ACK and target-displacement updates, and full-history enumeration for restart recovery.
+// consumed-ACK pool updates, and full-history enumeration for restart recovery and ambiguity preservation.
 type RecoverableCommandStore interface {
 	CommandStore
-	TransitionDisplaced(ctx context.Context, entityID, newPhase, note string, source lifecycle.TransitionSource, ackResult int, detail string, updatedMs int64) error
-	RecordDisplaced(ctx context.Context, entityID string) error
 	RecordConsumedAck(ctx context.Context, entityID string, ackAccounted, ackPoolMask int) error
 	Get(ctx context.Context, entityID string) (*CommandEntity, error)
 	ListCommands(ctx context.Context) ([]CommandEntity, error)
 	ListNonTerminal(ctx context.Context) ([]CommandEntity, error)
+}
+
+// DisplacedCommandStore is implemented by RecoverableCommandStore backends (including LifecycleStore)
+// that persist uxs.command.displaced atomically with phase transitions and operator updates.
+type DisplacedCommandStore interface {
+	TransitionDisplaced(ctx context.Context, entityID, newPhase, note string, source lifecycle.TransitionSource, ackResult int, detail string, updatedMs int64) error
+	RecordDisplaced(ctx context.Context, entityID string) error
 }
 
 // LifecycleStore adapts semengine/pkg/lifecycle.Manager to RecoverableCommandStore (`OQ2 Option A`).
@@ -82,7 +87,10 @@ type LifecycleStore struct {
 	mgr *lifecycle.Manager
 }
 
-var _ RecoverableCommandStore = (*LifecycleStore)(nil)
+var (
+	_ RecoverableCommandStore = (*LifecycleStore)(nil)
+	_ DisplacedCommandStore   = (*LifecycleStore)(nil)
+)
 
 // NewLifecycleStore registers the uxs-command workflow on mgr and returns a CAS-backed LifecycleStore.
 func NewLifecycleStore(mgr *lifecycle.Manager) (*LifecycleStore, error) {
@@ -149,7 +157,7 @@ func (s *LifecycleStore) transition(
 			}
 		}
 		if displaced {
-			ce.Displaced = 1
+			ce.Displaced = DisplacedBroken
 		}
 		ce.Detail = detail
 		ce.UpdatedMs = updatedMs
@@ -161,7 +169,7 @@ func (s *LifecycleStore) transition(
 // on an already-created CommandEntity without mutating its PhaseState or UpdatedMs transition timestamp.
 func (s *LifecycleStore) RecordDisplaced(ctx context.Context, entityID string) error {
 	return s.mgr.UpdateFromOperator(ctx, WorkflowName, entityID, map[string]any{
-		"displaced": 1,
+		"displaced": DisplacedBroken,
 	})
 }
 
@@ -502,10 +510,12 @@ type commandInvokeSpec struct {
 }
 
 const (
-	ackPoolWrapHeldBit    = 1 << 28
-	ackPoolWrapSettledBit = 1 << 29
-	ackPoolFormatV2Bit    = 1 << 30
-	ackPoolResultMask     = (1 << 28) - 1
+	legacyAckPoolDisplacedBit = 1 << 27
+	legacyAckPoolResultMask   = (1 << 27) - 1
+	ackPoolWrapHeldBit        = 1 << 28
+	ackPoolWrapSettledBit     = 1 << 29
+	ackPoolFormatV2Bit        = 1 << 30
+	ackPoolResultMask         = (1 << 28) - 1
 )
 
 func poolMaskForCmd(mask uint64, accounted, wrapHeld bool) int {
@@ -767,7 +777,13 @@ func NewService(opts Options) (*Service, error) {
 		leaseWake:               make(chan struct{}, 1),
 		persistWake:             make(chan struct{}, 1),
 	}
+	type listCommandsProbe interface {
+		ListCommands(ctx context.Context) ([]CommandEntity, error)
+	}
 	if _, ok := opts.Store.(RecoverableCommandStore); !ok {
+		if _, partial := opts.Store.(listCommandsProbe); partial {
+			return nil, fmt.Errorf("control: store %T implements ListCommands without full RecoverableCommandStore", opts.Store)
+		}
 		svc.recovered.Store(true)
 	}
 	return svc, nil
@@ -1148,12 +1164,34 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 	})
 
 	concreteResultMask := make(map[cmdKey]uint64)
+	allConcreteMask := make(map[cmdKey]uint64)
+	for _, ce := range preRestartSent {
+		if ce.AckResult >= 0 && ce.AckResult < 64 && commandTransitions.IsTerminal(ce.PhaseState) {
+			recPeer := parseEntityPeer(ce.Peer)
+			key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID), peer: recPeer}
+			allConcreteMask[key] |= uint64(1) << uint(ce.AckResult)
+		}
+	}
 
 	s.mu.Lock()
 	for _, ce := range preRestartSent {
 		recPeer := parseEntityPeer(ce.Peer)
 		key := cmdKey{sysid: uint8(ce.SysID), cmdID: uint16(ce.CmdID), peer: recPeer}
 		priorConcreteMask := concreteResultMask[key]
+		hasV2LegacyBit27 := (ce.AckPoolMask & (ackPoolFormatV2Bit | legacyAckPoolDisplacedBit)) ==
+			(ackPoolFormatV2Bit | legacyAckPoolDisplacedBit)
+		knownParent5caDisplaced := ce.AckResult < 0 &&
+			ce.AckAccounted == 0 &&
+			(ce.AckPoolMask&(ackPoolWrapHeldBit|ackPoolWrapSettledBit)) == 0 &&
+			hasV2LegacyBit27
+		indistinguishableLegacyV2Bit27 := ce.Displaced == 0 &&
+			ce.AckResult < 0 &&
+			!knownParent5caDisplaced &&
+			hasV2LegacyBit27
+		rowResultMask := ackPoolResultMask
+		if knownParent5caDisplaced {
+			rowResultMask = legacyAckPoolResultMask
+		}
 		var mask uint64
 		if ce.AckResult >= 0 && ce.AckResult < 64 {
 			bit := uint64(1) << uint(ce.AckResult)
@@ -1161,14 +1199,14 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			concreteResultMask[key] |= bit
 		}
 		if ce.AckPoolMask > 0 {
-			mask |= uint64(ce.AckPoolMask & ackPoolResultMask)
+			mask |= uint64(ce.AckPoolMask & rowResultMask)
 		}
 		if mask != 0 {
 			s.seenAckResultMask[key] |= mask
 			s.preResetAckResultMask[key] |= mask
 		}
 		isCurrentFormat := (ce.AckPoolMask & (ackPoolFormatV2Bit | ackPoolWrapHeldBit | ackPoolWrapSettledBit)) != 0
-		wasDisplaced := ce.Displaced > 0
+		wasDisplaced := ce.Displaced > 0 || knownParent5caDisplaced || indistinguishableLegacyV2Bit27
 		legacyWrapHeld := !isCurrentFormat &&
 			ce.AckResult < 0 &&
 			ce.AckAccounted > 0 &&
@@ -1178,13 +1216,16 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			(ce.AckPoolMask&ackPoolWrapSettledBit) == 0 &&
 			((ce.AckPoolMask&ackPoolWrapHeldBit) != 0 || legacyWrapHeld)
 		accounted := ce.AckAccounted > 0 || ce.AckResult >= 0
-		persistedMask := ce.AckPoolMask | (int(mask) & ackPoolResultMask)
+		persistedMask := ce.AckPoolMask | (int(mask) & rowResultMask)
 		s.persistedAckMeta[ce.ID] = ackMetaState{
 			ackAccounted: max(ce.AckAccounted, boolToInt(accounted)),
 			ackPoolMask:  persistedMask,
-			displaced:    boolToInt(wasDisplaced),
+			displaced:    ce.Displaced,
 		}
-		if !recPeer.IsValid() && (ce.AckResult < 0 || isSITLOnlyAction(ce.Action)) {
+		if wasDisplaced && ce.Displaced <= 0 && ce.PhaseState != PhasePending {
+			_ = s.enqueueDisplacedLocked(ce.ID)
+		}
+		if !recPeer.IsValid() && (ce.AckResult < 0 || !commandTransitions.IsTerminal(ce.PhaseState) || (mask&^allConcreteMask[key]) != 0) {
 			s.surplusAckTainted[key] = true
 			for _, curCmd := range s.inFlight {
 				if curCmd.sysid == key.sysid && curCmd.cmdID == key.cmdID {
@@ -1433,6 +1474,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 	defer s.persistMu.Unlock()
 
 	recStore, hasReader := s.store.(RecoverableCommandStore)
+	dispStore, hasDisplacedStore := s.store.(DisplacedCommandStore)
 	for pass := 0; pass < 2; pass++ {
 		s.mu.Lock()
 		if len(s.pendingWrites) == 0 {
@@ -1465,27 +1507,33 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				curMeta := s.persistedAckMeta[w.entityID]
 				s.mu.Unlock()
 
-				if w.displaced && curMeta.displaced == 0 {
-					dispErr := recStore.RecordDisplaced(ctx, w.entityID)
-					dispVerified := dispErr == nil
-					if !dispVerified && ctx.Err() == nil {
-						if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil && got.Displaced > 0 {
-							dispVerified = true
+				fallbackMaskDisplaced := false
+				if w.displaced && curMeta.displaced <= 0 {
+					if hasDisplacedStore {
+						dispErr := dispStore.RecordDisplaced(ctx, w.entityID)
+						dispVerified := dispErr == nil
+						if !dispVerified && ctx.Err() == nil {
+							if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil && got.Displaced > 0 {
+								dispVerified = true
+							}
 						}
+						if !dispVerified {
+							s.logger.Warn("control: transient command displacement write failed; retaining for retry",
+								slog.String("command_id", w.entityID),
+								slog.Any("error", dispErr),
+							)
+							continue
+						}
+						s.mu.Lock()
+						meta := s.persistedAckMeta[w.entityID]
+						meta.displaced = DisplacedBroken
+						s.persistedAckMeta[w.entityID] = meta
+						curMeta = meta
+						s.mu.Unlock()
+					} else {
+						w.ackPoolMask |= ackPoolFormatV2Bit | legacyAckPoolDisplacedBit
+						fallbackMaskDisplaced = true
 					}
-					if !dispVerified {
-						s.logger.Warn("control: transient command displacement write failed; retaining for retry",
-							slog.String("command_id", w.entityID),
-							slog.Any("error", dispErr),
-						)
-						continue
-					}
-					s.mu.Lock()
-					meta := s.persistedAckMeta[w.entityID]
-					meta.displaced = 1
-					s.persistedAckMeta[w.entityID] = meta
-					curMeta = meta
-					s.mu.Unlock()
 				}
 
 				needAckPatch := w.ackAccounted > curMeta.ackAccounted || (w.ackPoolMask&^curMeta.ackPoolMask) != 0
@@ -1511,6 +1559,15 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 						meta.ackAccounted = w.ackAccounted
 					}
 					meta.ackPoolMask |= w.ackPoolMask
+					if fallbackMaskDisplaced {
+						meta.displaced = DisplacedBroken
+					}
+					s.persistedAckMeta[w.entityID] = meta
+					s.mu.Unlock()
+				} else if fallbackMaskDisplaced {
+					s.mu.Lock()
+					meta := s.persistedAckMeta[w.entityID]
+					meta.displaced = DisplacedBroken
 					s.persistedAckMeta[w.entityID] = meta
 					s.mu.Unlock()
 				}
@@ -1527,8 +1584,8 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 			}
 
 			var err error
-			if w.displaced && hasReader {
-				err = recStore.TransitionDisplaced(
+			if w.displaced && hasDisplacedStore {
+				err = dispStore.TransitionDisplaced(
 					ctx,
 					w.entityID,
 					w.phase,
@@ -1551,7 +1608,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				)
 			}
 			verified := err == nil
-			displacedVerified := verified && w.displaced && hasReader
+			displacedVerified := verified && w.displaced && hasDisplacedStore
 			if !verified && hasReader && ctx.Err() == nil {
 				if got, getErr := recStore.Get(ctx, w.entityID); getErr == nil && got != nil {
 					if got.PhaseState == w.phase || commandTransitions.IsTerminal(got.PhaseState) {
@@ -1564,7 +1621,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				s.mu.Lock()
 				meta := s.persistedAckMeta[w.entityID]
 				if displacedVerified {
-					meta.displaced = 1
+					meta.displaced = DisplacedBroken
 				}
 				if w.ackResult >= 0 {
 					meta.ackAccounted = 1
@@ -1576,7 +1633,7 @@ func (s *Service) flushPendingWrites(ctx context.Context) {
 				s.persistedAckMeta[w.entityID] = meta
 				if cur, exists := s.pendingWrites[w.entityID]; exists && !cur.ackOnly && cur.phase == w.phase {
 					curMeta := s.persistedAckMeta[w.entityID]
-					needDisplacedPatch := hasReader && cur.displaced && curMeta.displaced == 0
+					needDisplacedPatch := hasReader && cur.displaced && curMeta.displaced <= 0
 					needPoolPatch := hasReader && cur.ackResult < 0 &&
 						(cur.ackAccounted > curMeta.ackAccounted || (cur.ackPoolMask&^curMeta.ackPoolMask) != 0)
 					if !needDisplacedPatch && !needPoolPatch {
@@ -2553,6 +2610,7 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		Domain:     curTarget.Domain,
 		LinkTier:   curTarget.LinkTier,
 		AckResult:  UnacknowledgedResult,
+		Displaced:  DisplacedIntact,
 		Detail:     "Awaiting COMMAND_ACK",
 		IssuedMs:   now.UnixMilli(),
 		UpdatedMs:  now.UnixMilli(),
@@ -2572,6 +2630,10 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 
 	postCreateMs := s.nowFn().UTC().UnixMilli()
 	s.mu.Lock()
+	if curMeta, ok := s.persistedAckMeta[entityID]; !ok || curMeta.displaced == 0 {
+		curMeta.displaced = DisplacedIntact
+		s.persistedAckMeta[entityID] = curMeta
+	}
 	sendTarget, sendOK := s.targets.ActuationTarget(req.SysID)
 	targetErr := validateCommandTarget(req.SysID, actionSlug, spec.sitlOnly, sendTarget, sendOK)
 	peerChanged := targetErr == nil && (normalizeControlPeer(sendTarget.PeerAddr) != normPeer ||

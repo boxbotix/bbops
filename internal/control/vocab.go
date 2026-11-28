@@ -49,7 +49,7 @@ const (
 	PredicateCommandAckAccounted = "uxs.command.ackaccounted"
 	// PredicateCommandAckPoolMask records the cumulative bitmask of #77 COMMAND_ACK MAV_RESULT codes observed on `(sysid, cmd_id)`.
 	PredicateCommandAckPoolMask = "uxs.command.ackpoolmask"
-	// PredicateCommandDisplaced records (`1` vs `0`) whether target continuity broke across peer, domain, entity, incarnation, or SITL LinkTier.
+	// PredicateCommandDisplaced records (`-1` intact on current writers, `1` displaced, `0` pre-migration absent) target continuity state.
 	PredicateCommandDisplaced = "uxs.command.displaced"
 	// PredicateCommandDetail records operator-facing status or refusal detail text.
 	PredicateCommandDetail = "uxs.command.detail"
@@ -73,6 +73,15 @@ const (
 	// UnsentAckResult marks a CommandEntity that was aborted or rejected prior to transmitting
 	// a #76 COMMAND_LONG datagram on UDP so restart recovery does not count an unreceived #77 ACK.
 	UnsentAckResult = -2
+
+	// DisplacedIntact (-1) is stamped into uxs.command.displaced on creation by current writers so
+	// ENTITY_STATES carries explicit non-zero writer provenance distinguishing intact commands from
+	// pre-migration records where uxs.command.displaced was absent (0).
+	DisplacedIntact = -1
+
+	// DisplacedBroken (1) marks uxs.command.displaced once target continuity breaks across peer,
+	// domain, target entity ID, authority incarnation, or SITL LinkTier.
+	DisplacedBroken = 1
 
 	// CommitUnknownDetail is the canonical indeterminate status message surfaced when #77 COMMAND_ACK
 	// does not arrive within the command timeout (`ADR-111 Decision 3`, zero blind retries).
@@ -227,7 +236,7 @@ func ControlPackSpec() vocabulary.PackSpec {
 			},
 			{
 				Name:        PredicateCommandDisplaced,
-				Description: "Durable target-continuity displacement marker (1 once pinned peer, target entity, domain, authority incarnation, or SITL LinkTier continuity broke)",
+				Description: "Durable target-continuity marker (-1 while continuity intact on current writers, 1 once pinned peer, target entity, domain, authority incarnation, or SITL LinkTier continuity broke, 0/absent on pre-migration records)",
 				DataType:    "int",
 			},
 			{
