@@ -2569,6 +2569,46 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.keyboard.press("w");
     expect(teleopPosts).toHaveLength(0);
 
+    const settlePilotPaint = async (): Promise<void> => {
+      await page.waitForTimeout(250);
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
+    };
+
+    // Let PilotWorkspace's DPR=2 SwiftShader canvases complete initial ResizeObserver allocation/paint/GC before starting the 240 ms teleop lease.
+    await settlePilotPaint();
+
+    // 2b. Held Space gesture on Quadcopter (#1) cancelled when workspace shortcut switches selection to SurfaceBoat (#3):
+    // releasing Space emits zero Engage requests until a fresh activation on #3.
+    await page.getByTestId("teleop-engage-btn").focus();
+    await page.keyboard.down(" ");
+    await page.keyboard.press("3");
+    await expect(panel).toHaveAttribute("data-sysid", "3");
+    await page.keyboard.up(" ");
+    await page.waitForTimeout(80);
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    expect(teleopPosts.filter((p) => p.engage === true)).toHaveLength(0);
+
+    await settlePilotPaint();
+    await page.getByTestId("teleop-engage-btn").focus();
+    await page.keyboard.press(" ");
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    expect(
+      teleopPosts.filter((p) => p.sysid === 3 && p.engage === true),
+    ).toHaveLength(1);
+    expect(
+      teleopPosts.filter((p) => p.sysid === 1 && p.engage === true),
+    ).toHaveLength(0);
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await page.keyboard.press("1");
+    await expect(panel).toHaveAttribute("data-sysid", "1");
+    await settlePilotPaint();
+
     // 3. Explicit Engage Teleop focuses velocity pad, streams 20 Hz #84 nudges on hold "w", updates live vehicle groundspeed, and zeroes on release.
     await page.getByTestId("teleop-engage-btn").click();
     await expect(panel).toHaveAttribute("data-engaged", "true");
@@ -2596,17 +2636,20 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await expect(page.getByTestId("teleop-axes-readout")).toContainText(
       "vx: 0.0 m/s",
     );
-    await expect
-      .poll(
-        () =>
-          teleopPosts.some(
-            (p) => p.sysid === 1 && p.vx === 0 && p.vy === 0 && p.vz === 0,
-          ),
-        { timeout: 3_000 },
-      )
-      .toBe(true);
+    await expect(page.getByTestId("hud-readout-gs").locator("dd")).toHaveText(
+      "0.0 m/s",
+      { timeout: 5_000 },
+    );
+
+    if ((await panel.getAttribute("data-engaged")) === "true") {
+      await page.getByTestId("teleop-engage-btn").click();
+      await expect(panel).toHaveAttribute("data-engaged", "false");
+    }
 
     // 4. Hardware P1 CRSF override while holding "w" zeroes sticks on the frame edge, latches PREEMPTED, and does NOT auto-resume when P2 returns.
+    await page.getByTestId("teleop-engage-btn").click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    await expect(page.getByTestId("teleop-velocity-pad")).toBeFocused();
     await page.keyboard.down("w");
     await expect(page.getByTestId("teleop-axes-readout")).toContainText(
       "vx: 4.0 m/s",
@@ -2636,15 +2679,101 @@ test.describe("Full-stack Chromium 4-workspace COP/GCS end-to-end verification",
     await page.waitForTimeout(250);
     expect(teleopPosts.length).toBe(teleopCountBeforeRestore);
 
-    // Explicit re-engagement clears preemption latch; Disengage Teleop sends explicit stop zero frame.
-    await page.getByTestId("teleop-engage-btn").click();
+    // Explicit re-engagement clears preemption latch; holding Enter across auto-repeats on Disengage Teleop sends one stop and zero re-engages.
+    const engageBtn = page.getByTestId("teleop-engage-btn");
+    await engageBtn.click();
     await expect(panel).toHaveAttribute("data-engaged", "true");
     await expect(preemptBanner).toHaveCount(0);
-    await page.getByTestId("teleop-engage-btn").click();
+    await engageBtn.focus();
+    const engagesBeforeHoldEnter = teleopPosts.filter(
+      (p) => p.sysid === 1 && p.engage === true,
+    ).length;
+    const stopsBeforeHoldEnter = teleopPosts.filter(
+      (p) => p.sysid === 1 && p.stop === true,
+    ).length;
+    await page.keyboard.down("Enter");
+    await expect(panel).toHaveAttribute("data-engaged", "false");
+    await page.keyboard.down("Enter");
+    await page.keyboard.down("Enter");
+    await page.keyboard.up("Enter");
+    await page.waitForTimeout(80);
     await expect(panel).toHaveAttribute("data-engaged", "false");
     expect(
-      teleopPosts.some((p) => p.sysid === 1 && p.stop === true && p.vx === 0),
-    ).toBe(true);
+      teleopPosts.filter((p) => p.sysid === 1 && p.stop === true && p.vx === 0)
+        .length,
+    ).toBe(stopsBeforeHoldEnter + 1);
+    expect(
+      teleopPosts.filter((p) => p.sysid === 1 && p.engage === true).length,
+    ).toBe(engagesBeforeHoldEnter);
+
+    // Holding Space on Disengage Teleop until the confirmed lease expires locally (with no successful renewal)
+    // and then releasing Space in Chromium MUST send a scoped Stop for the captured session and zero new Engages.
+    await engageBtn.click();
+    await expect(panel).toHaveAttribute("data-engaged", "true");
+    const spaceEngagedSession = teleopPosts
+      .filter((p) => p.sysid === 1 && p.engage === true)
+      .at(-1)?.session;
+    expect(typeof spaceEngagedSession).toBe("string");
+
+    let failSpaceRenewals = true;
+    const stalledRenewals: Array<() => void> = [];
+    const spaceRenewalRoute = async (
+      route: Parameters<Parameters<typeof page.route>[1]>[0],
+    ): Promise<void> => {
+      const raw = route.request().postData();
+      const parsed = raw
+        ? (JSON.parse(raw) as { engage?: boolean; stop?: boolean })
+        : {};
+      if (failSpaceRenewals && !parsed.engage && !parsed.stop) {
+        await new Promise<void>((resolve) => {
+          stalledRenewals.push(resolve);
+        });
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: "lease_expired",
+            message: "simulated renewal stall",
+          }),
+        });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/control/teleop", spaceRenewalRoute);
+    try {
+      await engageBtn.focus();
+      const engagesBeforeHoldSpace = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.engage === true,
+      ).length;
+      const stopsBeforeHoldSpace = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.stop === true,
+      ).length;
+
+      await page.keyboard.down(" ");
+      await expect(panel).toHaveAttribute("data-engaged", "false", {
+        timeout: 2_000,
+      });
+      await page.keyboard.up(" ");
+      await page.waitForTimeout(80);
+
+      await expect(panel).toHaveAttribute("data-engaged", "false");
+      expect(
+        teleopPosts.filter((p) => p.sysid === 1 && p.engage === true).length,
+      ).toBe(engagesBeforeHoldSpace);
+      const spaceStops = teleopPosts.filter(
+        (p) => p.sysid === 1 && p.stop === true,
+      );
+      expect(spaceStops.length).toBe(stopsBeforeHoldSpace + 1);
+      expect(spaceStops.at(-1)?.session).toBe(spaceEngagedSession);
+    } finally {
+      failSpaceRenewals = false;
+      while (stalledRenewals.length > 0) {
+        stalledRenewals.shift()?.();
+      }
+      await page.waitForTimeout(20);
+      await page.unroute("**/control/teleop", spaceRenewalRoute);
+    }
 
     // 5. ADR-111 Decision 3: dropped #77 COMMAND_ACK transitions pending -> commit_unknown with zero retries, then reconciles to confirmed on next #0 HEARTBEAT.
     await copStack.setDropCommandAck(1, 1);

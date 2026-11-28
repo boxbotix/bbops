@@ -94,6 +94,10 @@
     isExternalContactEntity(selectedEntity) ? selectedEntity : null,
   );
   const commandableVehicle = $derived(viewportStore.selectedCommandableVehicle);
+
+  $effect(() => {
+    actuationController.reconcileVehicle(commandableVehicle, freshnessContext);
+  });
   const poisonedOwnshipId = $derived(
     selectedEntity?.poisoned && !selectedVehicle
       ? parseVehicleEntityId(selectedEntity.id)

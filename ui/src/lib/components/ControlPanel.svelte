@@ -59,10 +59,24 @@
       telemetryStore,
       skgStore,
       freshnessContext,
+      now?.(),
     ),
   );
 
+  let trackedVehicleSysId: number | null = null;
   $effect(() => {
+    const nextSysId = vehicle.sysid;
+    if (trackedVehicleSysId !== null && trackedVehicleSysId !== nextSysId) {
+      if (pendingToggleIntent?.kind === "engage") {
+        pendingToggleIntent = {
+          kind: "cancelled",
+          sysid: pendingToggleIntent.sysid,
+          session: null,
+        };
+        suppressPadBlur = false;
+      }
+    }
+    trackedVehicleSysId = nextSysId;
     controller.reconcileVehicle(vehicle, freshnessContext);
   });
 
@@ -74,6 +88,14 @@
   let currentEastMps = $state("1.2");
   let activePointerId: number | null = null;
   let suppressPadBlur = false;
+  let activeButtonKey: string | null = null;
+  let buttonKeyConsumed = false;
+  let buttonKeyReleased = false;
+  let pendingToggleIntent: {
+    readonly kind: "disengage" | "engage" | "cancelled";
+    readonly sysid: number;
+    readonly session: string | null;
+  } | null = null;
 
   $effect(() => {
     if (!safety.isSitlLocal && sitlLabOpen) {
@@ -85,6 +107,25 @@
     const onWindowBlur = (): void => {
       controller.handleFocusLoss();
     };
+    const onWindowKeyUp = (ev: KeyboardEvent): void => {
+      if (
+        activeButtonKey !== null &&
+        !buttonKeyReleased &&
+        !buttonKeyConsumed &&
+        isSameEngageButtonKey(ev.key, activeButtonKey)
+      ) {
+        onEngageButtonKeyUp(ev);
+      }
+      controller.handlePadKeyUp(ev);
+    };
+    const clearReleasedPointerIntent = (): void => {
+      setTimeout(() => {
+        if (activeButtonKey === null) {
+          pendingToggleIntent = null;
+          suppressPadBlur = false;
+        }
+      }, 0);
+    };
     const onVisibilityChange = (): void => {
       if (
         typeof document !== "undefined" &&
@@ -94,9 +135,15 @@
       }
     };
     window.addEventListener("blur", onWindowBlur);
+    window.addEventListener("keyup", onWindowKeyUp);
+    window.addEventListener("pointerup", clearReleasedPointerIntent);
+    window.addEventListener("mouseup", clearReleasedPointerIntent);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.removeEventListener("blur", onWindowBlur);
+      window.removeEventListener("keyup", onWindowKeyUp);
+      window.removeEventListener("pointerup", clearReleasedPointerIntent);
+      window.removeEventListener("mouseup", clearReleasedPointerIntent);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (!externalController && ownedController) {
         ownedController.dispose();
@@ -125,8 +172,132 @@
     }
   }
 
+  function isEngageButtonKey(key: string): boolean {
+    return key === " " || key === "Spacebar" || key === "Enter";
+  }
+
+  function isSameEngageButtonKey(a: string, b: string): boolean {
+    if (a === b) {
+      return true;
+    }
+    return (a === " " || a === "Spacebar") && (b === " " || b === "Spacebar");
+  }
+
+  function captureEngageToggleIntent(): void {
+    if (controller.engaged || controller.leaseRenewalPending) {
+      suppressPadBlur = true;
+    }
+    pendingToggleIntent = {
+      kind: controller.engaged ? "disengage" : "engage",
+      sysid: controller.engagedSysId ?? vehicle.sysid,
+      session: controller.engagedSession,
+    };
+  }
+
+  function onEngageButtonKeyDown(ev: KeyboardEvent): void {
+    if (!isEngageButtonKey(ev.key)) {
+      return;
+    }
+    if (!ev.repeat && buttonKeyReleased) {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      pendingToggleIntent = null;
+    }
+    if (ev.repeat || activeButtonKey !== null) {
+      ev.preventDefault();
+      return;
+    }
+    activeButtonKey = ev.key;
+    buttonKeyConsumed = false;
+    buttonKeyReleased = false;
+    captureEngageToggleIntent();
+  }
+
+  function onEngageButtonKeyUp(ev: KeyboardEvent): void {
+    if (
+      activeButtonKey === null ||
+      !isSameEngageButtonKey(ev.key, activeButtonKey)
+    ) {
+      return;
+    }
+    if (buttonKeyConsumed || ev.key === "Enter") {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      pendingToggleIntent = null;
+      suppressPadBlur = false;
+      return;
+    }
+    ev.preventDefault();
+    void toggleTeleopEngagement();
+    buttonKeyReleased = true;
+    setTimeout(() => {
+      if (buttonKeyReleased) {
+        activeButtonKey = null;
+        buttonKeyConsumed = false;
+        buttonKeyReleased = false;
+        pendingToggleIntent = null;
+        suppressPadBlur = false;
+      }
+    }, 0);
+  }
+
+  function onEngageButtonBlur(): void {
+    if (activeButtonKey !== null) {
+      activeButtonKey = null;
+      buttonKeyConsumed = false;
+      buttonKeyReleased = false;
+      pendingToggleIntent = null;
+      suppressPadBlur = false;
+    }
+  }
+
   async function toggleTeleopEngagement(): Promise<void> {
+    if (activeButtonKey !== null) {
+      if (buttonKeyConsumed) {
+        return;
+      }
+      if (buttonKeyReleased) {
+        activeButtonKey = null;
+        buttonKeyConsumed = false;
+        buttonKeyReleased = false;
+      } else {
+        buttonKeyConsumed = true;
+      }
+    }
     suppressPadBlur = false;
+    const intent = pendingToggleIntent;
+    pendingToggleIntent = null;
+    if (
+      intent?.kind === "cancelled" ||
+      (intent?.kind === "engage" && intent.sysid !== vehicle.sysid)
+    ) {
+      return;
+    }
+    if (intent?.kind === "disengage") {
+      if (intent.session !== null) {
+        await controller.disengageTeleop({
+          sendZero: true,
+          sysid: intent.sysid,
+          session: intent.session,
+        });
+      }
+      return;
+    }
+    if (intent?.kind === "engage") {
+      if (controller.engaged) {
+        await tick();
+        padEl?.focus({ preventScroll: true });
+        return;
+      }
+      const ok = await controller.engageTeleop(vehicle, freshnessContext);
+      if (ok) {
+        await tick();
+        padEl?.focus({ preventScroll: true });
+      }
+      return;
+    }
     if (controller.engaged) {
       await controller.disengageTeleop({ sendZero: true });
       return;
@@ -219,6 +390,7 @@
         engageBtnEl.contains(ev.relatedTarget))
     ) {
       suppressPadBlur = false;
+      controller.clearHeldMovement();
       return;
     }
     controller.handleFocusLoss();
@@ -423,10 +595,28 @@
           data-testid="teleop-engage-btn"
           aria-pressed={controller.engaged}
           disabled={!controller.engaged && !safety.canEngageTeleop}
-          onpointerdown={() => {
-            if (controller.engaged) {
-              suppressPadBlur = true;
+          onpointerdown={(ev) => {
+            if (ev.button === 0) {
+              activeButtonKey = null;
+              buttonKeyConsumed = false;
+              buttonKeyReleased = false;
+              captureEngageToggleIntent();
             }
+          }}
+          onmousedown={(ev) => {
+            if (ev.button === 0 && pendingToggleIntent === null) {
+              activeButtonKey = null;
+              buttonKeyConsumed = false;
+              buttonKeyReleased = false;
+              captureEngageToggleIntent();
+            }
+          }}
+          onkeydown={onEngageButtonKeyDown}
+          onkeyup={onEngageButtonKeyUp}
+          onblur={onEngageButtonBlur}
+          onpointercancel={() => {
+            pendingToggleIntent = null;
+            suppressPadBlur = false;
           }}
           onclick={() => void toggleTeleopEngagement()}
         >
@@ -441,7 +631,7 @@
         class:engaged={controller.engaged}
         data-testid="teleop-velocity-pad"
         data-actuation-pad="true"
-        tabindex={controller.engaged ? 0 : -1}
+        tabindex={controller.engaged || controller.leaseRenewalPending ? 0 : -1}
         role="application"
         aria-label="Spring-return 2D velocity teleop pad. Drag pointer or hold WASD/Arrows while engaged; Space or Escape disengages."
         onpointerdown={onPadPointerDown}
@@ -462,11 +652,13 @@
         ></div>
         {#if !controller.engaged}
           <span class="pad-overlay-hint">
-            {safety.canEngageTeleop
-              ? "Click Engage Teleop to unlock velocity pad"
-              : !safety.armed
-                ? "Arm vehicle to enable velocity teleop"
-                : `Teleop locked (${safety.authority})`}
+            {controller.leaseRenewalPending
+              ? "Awaiting teleop lease renewal confirmation…"
+              : safety.canEngageTeleop
+                ? "Click Engage Teleop to unlock velocity pad"
+                : !safety.armed
+                  ? "Arm vehicle to enable velocity teleop"
+                  : `Teleop locked (${safety.authority})`}
           </span>
         {/if}
       </div>

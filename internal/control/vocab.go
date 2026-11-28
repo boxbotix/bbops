@@ -37,8 +37,20 @@ const (
 	PredicateCommandCmdID = "uxs.command.cmdid"
 	// PredicateCommandAction records the canonical bbops discrete command action slug.
 	PredicateCommandAction = "uxs.command.action"
-	// PredicateCommandAckResult records the #77 COMMAND_ACK MAV_RESULT (`-1` while unacknowledged).
+	// PredicateCommandPeer records the normalized UDP peer endpoint (`ip:port`) to which #76 COMMAND_LONG was dispatched.
+	PredicateCommandPeer = "uxs.command.peer"
+	// PredicateCommandDomain records the admitted UXS vehicle domain at dispatch (`quadcopter`, `rover`, `surface-boat`).
+	PredicateCommandDomain = "uxs.command.domain"
+	// PredicateCommandLinkTier records the admitted UXS LinkTier at dispatch (`sitl-local`, `direct-bench`, `mesh-supervisory`).
+	PredicateCommandLinkTier = "uxs.command.linktier"
+	// PredicateCommandAckResult records the #77 COMMAND_ACK MAV_RESULT (`-1` while unacknowledged or ambiguous).
 	PredicateCommandAckResult = "uxs.command.ackresult"
+	// PredicateCommandAckAccounted records (`1` vs `0`) whether an unattributed/ambiguous or idle #77 COMMAND_ACK slot was accounted for.
+	PredicateCommandAckAccounted = "uxs.command.ackaccounted"
+	// PredicateCommandAckPoolMask records the cumulative bitmask of #77 COMMAND_ACK MAV_RESULT codes observed on `(sysid, cmd_id)`.
+	PredicateCommandAckPoolMask = "uxs.command.ackpoolmask"
+	// PredicateCommandDisplaced records (`-1` intact on current writers, `1` displaced, `0` pre-migration absent) target continuity state.
+	PredicateCommandDisplaced = "uxs.command.displaced"
 	// PredicateCommandDetail records operator-facing status or refusal detail text.
 	PredicateCommandDetail = "uxs.command.detail"
 	// PredicateCommandIssuedMs records the UTC Unix-millisecond dispatch timestamp.
@@ -53,9 +65,23 @@ const (
 	PhaseCommitUnknown = "commit_unknown"
 	PhasePreempted     = "preempted"
 
-	// UnacknowledgedResult is stamped into uxs.command.ackresult while awaiting #77 COMMAND_ACK
-	// so TransitionWith emits an explicit triple delta when MAV_RESULT_ACCEPTED (0) arrives.
+	// UnacknowledgedResult is stamped into uxs.command.ackresult once a #76 COMMAND_LONG is
+	// persisted/sent without an unambiguously attributed #77 COMMAND_ACK so TransitionWith emits
+	// an explicit triple delta when an unambiguous MAV_RESULT_ACCEPTED (0) arrives.
 	UnacknowledgedResult = -1
+
+	// UnsentAckResult marks a CommandEntity that was aborted or rejected prior to transmitting
+	// a #76 COMMAND_LONG datagram on UDP so restart recovery does not count an unreceived #77 ACK.
+	UnsentAckResult = -2
+
+	// DisplacedIntact (-1) is stamped into uxs.command.displaced on creation by current writers so
+	// ENTITY_STATES carries explicit non-zero writer provenance distinguishing intact commands from
+	// pre-migration records where uxs.command.displaced was absent (0).
+	DisplacedIntact = -1
+
+	// DisplacedBroken (1) marks uxs.command.displaced once target continuity breaks across peer,
+	// domain, target entity ID, authority incarnation, or SITL LinkTier.
+	DisplacedBroken = 1
 
 	// CommitUnknownDetail is the canonical indeterminate status message surfaced when #77 COMMAND_ACK
 	// does not arrive within the command timeout (`ADR-111 Decision 3`, zero blind retries).
@@ -83,16 +109,22 @@ const (
 // CommandEntity projects a discrete #76 COMMAND_LONG execution into SemEngine ENTITY_STATES
 // via semengine/pkg/lifecycle.Manager revision-fenced CAS transitions (`OQ2 Option A`).
 type CommandEntity struct {
-	ID         string `lifecycle:"id"`
-	PhaseState string `lifecycle:"phase,predicate=uxs.command.phase"`
-	Target     string `lifecycle:"predicate=uxs.command.target"`
-	SysID      int    `lifecycle:"predicate=uxs.command.sysid"`
-	CmdID      int    `lifecycle:"predicate=uxs.command.cmdid"`
-	Action     string `lifecycle:"predicate=uxs.command.action"`
-	AckResult  int    `lifecycle:"predicate=uxs.command.ackresult"`
-	Detail     string `lifecycle:"predicate=uxs.command.detail"`
-	IssuedMs   int64  `lifecycle:"predicate=uxs.command.issuedms"`
-	UpdatedMs  int64  `lifecycle:"predicate=uxs.command.updatedms"`
+	ID           string `lifecycle:"id"`
+	PhaseState   string `lifecycle:"phase,predicate=uxs.command.phase"`
+	Target       string `lifecycle:"predicate=uxs.command.target"`
+	SysID        int    `lifecycle:"predicate=uxs.command.sysid"`
+	CmdID        int    `lifecycle:"predicate=uxs.command.cmdid"`
+	Action       string `lifecycle:"predicate=uxs.command.action"`
+	Peer         string `json:"peer,omitempty" lifecycle:"predicate=uxs.command.peer"`
+	Domain       string `json:"domain,omitempty" lifecycle:"predicate=uxs.command.domain"`
+	LinkTier     string `json:"link_tier,omitempty" lifecycle:"predicate=uxs.command.linktier"`
+	AckResult    int    `lifecycle:"predicate=uxs.command.ackresult"`
+	AckAccounted int    `json:"ack_accounted,omitempty" lifecycle:"predicate=uxs.command.ackaccounted,operator_writable"`
+	AckPoolMask  int    `json:"ack_pool_mask,omitempty" lifecycle:"predicate=uxs.command.ackpoolmask,operator_writable"`
+	Displaced    int    `json:"displaced,omitempty" lifecycle:"predicate=uxs.command.displaced,operator_writable"`
+	Detail       string `lifecycle:"predicate=uxs.command.detail"`
+	IssuedMs     int64  `lifecycle:"predicate=uxs.command.issuedms"`
+	UpdatedMs    int64  `lifecycle:"predicate=uxs.command.updatedms"`
 }
 
 var _ lifecycle.Participant = (*CommandEntity)(nil)
@@ -173,8 +205,38 @@ func ControlPackSpec() vocabulary.PackSpec {
 				DataType:    "string",
 			},
 			{
+				Name:        PredicateCommandPeer,
+				Description: "Normalized UDP peer endpoint (ip:port) to which COMMAND_LONG was dispatched",
+				DataType:    "string",
+			},
+			{
+				Name:        PredicateCommandDomain,
+				Description: "Admitted UXS vehicle domain at command dispatch",
+				DataType:    "string",
+			},
+			{
+				Name:        PredicateCommandLinkTier,
+				Description: "Admitted UXS LinkTier at command dispatch",
+				DataType:    "string",
+			},
+			{
 				Name:        PredicateCommandAckResult,
-				Description: "Inbound #77 COMMAND_ACK MAV_RESULT code (-1 while unacknowledged)",
+				Description: "Unambiguously attributed inbound #77 COMMAND_ACK MAV_RESULT code (-1 while unacknowledged or ambiguous)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandAckAccounted,
+				Description: "Owner-neutral slot accounting marker (1 when a #77 COMMAND_ACK slot for the command pool was consumed)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandAckPoolMask,
+				Description: "Owner-neutral bitmask for the (sysid, cmd_id) pool: bits 0..27 record observed #77 COMMAND_ACK MAV_RESULT codes; bits 28..30 carry reserved accounting flags (bit 28 wrap-held receipt credit, bit 29 settled wrap credit, bit 30 v2 format marker)",
+				DataType:    "int",
+			},
+			{
+				Name:        PredicateCommandDisplaced,
+				Description: "Durable target-continuity marker (-1 while continuity intact on current writers, 1 once pinned peer, target entity, domain, authority incarnation, or SITL LinkTier continuity broke, 0/absent on pre-migration records)",
 				DataType:    "int",
 			},
 			{
@@ -210,7 +272,8 @@ var registerVocabMu sync.Mutex
 func RegisterVocab() error {
 	registerVocabMu.Lock()
 	defer registerVocabMu.Unlock()
-	if vocabulary.RequireDeclaredPredicate(PredicateCommandPhase) == nil {
+	if vocabulary.RequireDeclaredPredicate(PredicateCommandPhase) == nil &&
+		vocabulary.RequireDeclaredPredicate(PredicateCommandDisplaced) == nil {
 		return nil
 	}
 	pack := ControlPackSpec()
@@ -232,6 +295,11 @@ func Workflow() lifecycle.Workflow {
 		PhasePredicate:  PredicateCommandPhase,
 		Schema:          reflect.TypeOf(CommandEntity{}),
 		Transitions:     commandTransitions,
+		OperatorWritablePredicates: []string{
+			PredicateCommandAckAccounted,
+			PredicateCommandAckPoolMask,
+			PredicateCommandDisplaced,
+		},
 	}
 }
 
