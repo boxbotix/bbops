@@ -491,9 +491,15 @@ type inFlightCommand struct {
 	cmdID               uint16
 	action              string
 	invokeSpec          commandInvokeSpec
+	issuedPeer          netip.AddrPort
+	issuedTargetID      string
+	issuedDomain        string
+	issuedIncarnation   string
+	issuedLinkTier      string
 	issuedAuthority     string
 	priorUnackedAtIssue bool
 	sitlOnly            bool
+	targetDisplaced     bool
 	dispatch            cmdDispatchState
 	abortedNote         string
 	abortedDetail       string
@@ -1169,23 +1175,35 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			unknownNs = ceUpdatedNs
 		}
 		var unknownHbSeq, unknownHbReceiptRev, unknownLinkEpoch, unknownPacketOrder uint64
-		if target, ok := s.targets.ActuationTarget(uint8(ce.SysID)); ok {
-			if target.HeartbeatObservedUnixNs > unknownNs {
-				unknownNs = target.HeartbeatObservedUnixNs
+		var recPeer netip.AddrPort
+		var recDomain, recIncarnation, recLinkTier string
+		recTarget, recOK := s.targets.ActuationTarget(uint8(ce.SysID))
+		if recOK {
+			if recTarget.HeartbeatObservedUnixNs > unknownNs {
+				unknownNs = recTarget.HeartbeatObservedUnixNs
 			}
-			unknownHbSeq = target.HeartbeatSeq
-			unknownHbReceiptRev = latestTargetHbReceiptRev(target)
-			unknownLinkEpoch = target.LinkEpoch
-			unknownPacketOrder = target.PacketOrder
+			unknownHbSeq = recTarget.HeartbeatSeq
+			unknownHbReceiptRev = latestTargetHbReceiptRev(recTarget)
+			unknownLinkEpoch = recTarget.LinkEpoch
+			unknownPacketOrder = recTarget.PacketOrder
+			recPeer = normalizeControlPeer(recTarget.PeerAddr)
+			recDomain = recTarget.Domain
+			recIncarnation = recTarget.AuthorityIncarnation
+			recLinkTier = recTarget.LinkTier
 		}
 		seq := s.cmdCounter.Add(1)
-		s.inFlight[ce.ID] = &inFlightCommand{
+		recCmd := &inFlightCommand{
 			entityID:            ce.ID,
 			orderSeq:            seq,
 			sysid:               uint8(ce.SysID),
 			cmdID:               uint16(ce.CmdID),
 			action:              ce.Action,
 			invokeSpec:          commandInvokeSpec{action: ce.Action},
+			issuedPeer:          recPeer,
+			issuedTargetID:      ce.Target,
+			issuedDomain:        recDomain,
+			issuedIncarnation:   recIncarnation,
+			issuedLinkTier:      recLinkTier,
 			priorUnackedAtIssue: true,
 			sitlOnly:            isSITLOnlyAction(ce.Action),
 			dispatch:            dispatchSent,
@@ -1201,6 +1219,10 @@ func (s *Service) ensureRecovered(ctx context.Context) {
 			unknownLinkEpoch:    unknownLinkEpoch,
 			unknownPacketOrder:  unknownPacketOrder,
 		}
+		if recOK {
+			_ = observeCommandTargetContinuity(recCmd, recTarget, true)
+		}
+		s.inFlight[ce.ID] = recCmd
 	}
 	hasWrites := len(s.pendingWrites) > 0
 	s.recovered.Store(true)
@@ -2316,10 +2338,15 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 			param2Bits: math.Float32bits(spec.msg.Param2),
 			param3Bits: math.Float32bits(spec.msg.Param3),
 		},
-		sitlOnly: spec.sitlOnly,
-		dispatch: dispatchReserved,
-		phase:    PhasePending,
-		detail:   "Awaiting COMMAND_ACK",
+		issuedPeer:        normalizeControlPeer(pinnedPeer),
+		issuedTargetID:    curTarget.EntityID,
+		issuedDomain:      curTarget.Domain,
+		issuedIncarnation: curTarget.AuthorityIncarnation,
+		issuedLinkTier:    curTarget.LinkTier,
+		sitlOnly:          spec.sitlOnly,
+		dispatch:          dispatchReserved,
+		phase:             PhasePending,
+		detail:            "Awaiting COMMAND_ACK",
 	}
 	s.inFlight[entityID] = inflight
 	s.mu.Unlock()
@@ -2436,6 +2463,11 @@ func (s *Service) SubmitCommand(ctx context.Context, req CommandRequest) (Comman
 		return CommandResult{}, retErr
 	}
 	preSendHbReceiptRev := latestTargetHbReceiptRev(sendTarget)
+	inflight.issuedPeer = normalizeControlPeer(pinnedPeer)
+	inflight.issuedTargetID = sendTarget.EntityID
+	inflight.issuedDomain = sendTarget.Domain
+	inflight.issuedIncarnation = sendTarget.AuthorityIncarnation
+	inflight.issuedLinkTier = sendTarget.LinkTier
 	inflight.issuedAuthority = sendTarget.Authority
 	inflight.dispatch = dispatchSending
 	s.mu.Unlock()
@@ -2853,11 +2885,20 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	}
 
 	target, targetOK := s.targets.ActuationTarget(sysid)
+	anyTargetDisplaced := false
+	for _, cmd := range matches {
+		if targetOK && !canReconcileCommandOnTarget(cmd, target, true) {
+			anyTargetDisplaced = true
+		} else if cmd.targetDisplaced {
+			anyTargetDisplaced = true
+		}
+	}
 	wrapAmbiguous := false
 	if len(matches) == 1 && hasSeq {
 		hasPostDispatchMatchingHB := targetOK &&
 			!target.LinkLost &&
 			!ackOrderUncertain &&
+			canReconcileCommandOnTarget(matches[0], target, targetOK) &&
 			hasFreshHeartbeatSince(target, matches[0].issuedHbObsNs, matches[0].issuedHbSeq, matches[0].issuedHbReceiptRev, matches[0].issuedLinkEpoch, matches[0].issuedPacketOrder) &&
 			matchesExpectedCommandState(matches[0], target)
 		if ackOrderUncertain {
@@ -2875,6 +2916,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 
 	holdingWrapReceipt := len(matches) == 1 && matches[0].wrapReceiptHeld
 	nonWrapAmbiguous := !s.recovered.Load() ||
+		anyTargetDisplaced ||
 		priorUnacked > 1 ||
 		s.wrapAckCredit[key] > 0 ||
 		len(matches) > 1 ||
@@ -2887,7 +2929,9 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 	if ambiguous {
 		wroteAny := false
 		markAllAmbiguous := nonWrapAmbiguous
-		if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
+		if anyTargetDisplaced {
+			markAllAmbiguous = true
+		} else if s.recovered.Load() && s.wrapAckCredit[key] > 0 && !holdingWrapReceipt {
 			if !couldBeAccountedDuplicate {
 				s.wrapAckCredit[key]--
 				if ids := s.wrapCreditIDs[key]; len(ids) > 0 {
@@ -2960,6 +3004,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			if markAllAmbiguous {
 				cmd.ackAmbiguous = true
 			}
+			targetApplicable := observeCommandTargetContinuity(cmd, target, targetOK)
 			if hbFloor > cmd.unknownAtUnixNs {
 				cmd.unknownAtUnixNs = hbFloor
 			}
@@ -2969,7 +3014,7 @@ func (s *Service) processDedupedCommandAck(sysid, seq uint8, hasSeq, ackOrderUnc
 			if hbFloorReceiptRev > cmd.unknownHbReceiptRev {
 				cmd.unknownHbReceiptRev = hbFloorReceiptRev
 			}
-			if linkEpochFloor > cmd.unknownLinkEpoch {
+			if targetApplicable && linkEpochFloor > cmd.unknownLinkEpoch {
 				cmd.unknownLinkEpoch = linkEpochFloor
 				cmd.unknownPacketOrder = packetOrderFloor
 			} else if linkEpochFloor == cmd.unknownLinkEpoch && packetOrderFloor > cmd.unknownPacketOrder {
@@ -3084,6 +3129,13 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 		evObsRev = targetForObs.ObservationRev
 	}
 	useObsRev := hasResolver && evObsRev > 0
+	if targetForObsOK {
+		for _, cmd := range s.inFlight {
+			if cmd.sysid == ev.SysID && cmd.dispatch == dispatchSent {
+				_ = observeCommandTargetContinuity(cmd, targetForObs, true)
+			}
+		}
+	}
 
 	if ev.Kind == mavlink.EventKindLinkLost || ev.Kind == mavlink.EventKindLinkRestored {
 		alreadySnapshotted := ev.Kind == mavlink.EventKindLinkRestored && targetForObsOK &&
@@ -3249,6 +3301,7 @@ func (s *Service) OnTransitionEvent(ev mavlink.TransitionEvent) {
 			if cmd.dispatch == dispatchSent &&
 				cmd.sysid == ev.SysID &&
 				cmd.phase == PhaseCommitUnknown &&
+				observeCommandTargetContinuity(cmd, targetForObs, targetForObsOK) &&
 				hasFreshHeartbeatSince(targetForObs, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownHbReceiptRev, cmd.unknownLinkEpoch, cmd.unknownPacketOrder) &&
 				matchesExpectedCommandState(cmd, targetForObs) {
 				cmd.phase = PhaseConfirmed
@@ -3438,6 +3491,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 			cmd.detail = CommitUnknownDetail
 			hbFloor := nowNs
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok {
+				targetApplicable := observeCommandTargetContinuity(cmd, target, true)
 				if target.HeartbeatObservedUnixNs > hbFloor {
 					hbFloor = target.HeartbeatObservedUnixNs
 				}
@@ -3447,7 +3501,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 				if curRev := latestTargetHbReceiptRev(target); curRev > cmd.unknownHbReceiptRev {
 					cmd.unknownHbReceiptRev = curRev
 				}
-				if target.LinkEpoch > cmd.unknownLinkEpoch {
+				if targetApplicable && target.LinkEpoch > cmd.unknownLinkEpoch {
 					cmd.unknownLinkEpoch = target.LinkEpoch
 					cmd.unknownPacketOrder = target.PacketOrder
 				} else if target.LinkEpoch == cmd.unknownLinkEpoch && target.PacketOrder > cmd.unknownPacketOrder {
@@ -3472,6 +3526,7 @@ func (s *Service) advanceCommands(ctx context.Context, now time.Time) {
 		}
 		if cmd.phase == PhaseCommitUnknown {
 			if target, ok := s.targets.ActuationTarget(cmd.sysid); ok && !target.LinkLost &&
+				observeCommandTargetContinuity(cmd, target, true) &&
 				hasFreshHeartbeatSince(target, cmd.unknownAtUnixNs, cmd.unknownHbSeq, cmd.unknownHbReceiptRev, cmd.unknownLinkEpoch, cmd.unknownPacketOrder) &&
 				matchesExpectedCommandState(cmd, target) {
 				cmd.phase = PhaseConfirmed
@@ -3561,8 +3616,70 @@ func (s *Service) bootMillis(now time.Time) uint32 {
 	return uint32(ms)
 }
 
+func normalizeControlPeer(peer netip.AddrPort) netip.AddrPort {
+	if !peer.IsValid() {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+}
+
+func isApplicableCommandLinkTier(cmd *inFlightCommand, target mavlink.ActuationTarget) bool {
+	if cmd == nil || !uxsvocab.IsValidLinkTier(target.LinkTier) {
+		return false
+	}
+	if cmd.sitlOnly {
+		if target.LinkTier != uxsvocab.LinkTierSITLLocal || target.CurrentLinkHbUnconfirmed {
+			return false
+		}
+		if (target.UncertainLinkTier != "" && target.UncertainLinkTier != uxsvocab.LinkTierSITLLocal) ||
+			(target.TeleopUncertain &&
+				(target.TeleopUncertainReason == "supervisory_link_only" ||
+					target.TeleopUncertainReason == "supervisory_link_tier")) {
+			return false
+		}
+	}
+	return true
+}
+
+func observeCommandTargetContinuity(cmd *inFlightCommand, target mavlink.ActuationTarget, ok bool) bool {
+	if cmd == nil || !ok || !target.PeerAddr.IsValid() {
+		return false
+	}
+	curPeer := normalizeControlPeer(target.PeerAddr)
+	if !cmd.issuedPeer.IsValid() {
+		cmd.issuedPeer = curPeer
+	} else if curPeer != cmd.issuedPeer {
+		cmd.targetDisplaced = true
+	}
+	if cmd.issuedTargetID != "" && target.EntityID != "" && target.EntityID != cmd.issuedTargetID {
+		cmd.targetDisplaced = true
+	}
+	if cmd.issuedDomain != "" && target.Domain != "" && target.Domain != cmd.issuedDomain {
+		cmd.targetDisplaced = true
+	} else if cmd.issuedDomain == "" && target.Domain != "" {
+		cmd.issuedDomain = target.Domain
+	}
+	if cmd.issuedIncarnation != "" && target.AuthorityIncarnation != "" && target.AuthorityIncarnation != cmd.issuedIncarnation {
+		cmd.targetDisplaced = true
+	} else if cmd.issuedIncarnation == "" && target.AuthorityIncarnation != "" {
+		cmd.issuedIncarnation = target.AuthorityIncarnation
+	}
+	if cmd.sitlOnly && !target.LinkLost && !target.CurrentLinkHbUnconfirmed &&
+		target.LinkTier != "" && target.LinkTier != uxsvocab.LinkTierSITLLocal {
+		cmd.targetDisplaced = true
+	}
+	return !cmd.targetDisplaced
+}
+
+func canReconcileCommandOnTarget(cmd *inFlightCommand, target mavlink.ActuationTarget, ok bool) bool {
+	if !observeCommandTargetContinuity(cmd, target, ok) {
+		return false
+	}
+	return isApplicableCommandLinkTier(cmd, target)
+}
+
 func matchesExpectedCommandState(cmd *inFlightCommand, target mavlink.ActuationTarget) bool {
-	if cmd == nil {
+	if cmd == nil || !canReconcileCommandOnTarget(cmd, target, true) {
 		return false
 	}
 	if cmd.action == ActionSITLCRSFOverride {

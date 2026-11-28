@@ -10378,4 +10378,330 @@ func TestServiceMotionSuspensionPersistenceCadenceRecoveryDiscreteRestrictionsAn
 			t.Fatalf("after seq=11 direct-crsf-override at PacketOrder=11 on new link epoch = %+v, want PhaseConfirmed", ent)
 		}
 	})
+
+	t.Run("window_crossing_sitl_heartbeat_after_packet_loss_blocks_sitl_command_for_stale_and_uncorroborated_histories", func(t *testing.T) {
+		for idx, mode := range []string{"uncorroborated_after_bench_12", "stale_mono_after_bench_12", "one_pos_late_after_bench_11"} {
+			tracker, err := mavlink.NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker (%s): %v", mode, err)
+			}
+			sender := &fakeFrameSender{}
+			now := time.Date(2026, 11, 28, 8, idx, 0, 0, time.UTC)
+			svc, err := NewService(Options{
+				Org:      "boxbotix",
+				Platform: "bbops",
+				Targets:  tracker,
+				Sender:   sender,
+				Store:    newFakeCommandStore(),
+				Now:      func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("NewService (%s): %v", mode, err)
+			}
+			peer := netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", 20600+idx))
+
+			// Initial (seq=10, sitl-local) at pos=1.
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			curSeq := uint8(10)
+			// Wrap 1: 256 sequence steps back to seq=10, dropping 2 packets (seq=50, 51) -> lifetimePacketPos = 255.
+			for step := 1; step <= 256; step++ {
+				curSeq++
+				if curSeq == 50 || curSeq == 51 {
+					continue
+				}
+				now = now.Add(5 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+			}
+			// Wrap 2 up to seq=9: 255 sequence steps, dropping 2 packets (seq=200, 201) -> lifetimePacketPos = 508.
+			for step := 1; step <= 255; step++ {
+				curSeq++
+				if curSeq == 200 || curSeq == 201 {
+					continue
+				}
+				now = now.Add(5 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+			}
+
+			// Cycle 3: skip seq=10 initially so candPos <= 513 (older cycle-1 entry still inside 512-packet window!).
+			var benchTs time.Time
+			if mode == "one_pos_late_after_bench_11" {
+				now = now.Add(5 * time.Millisecond)
+				benchTs = now
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 11, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, benchTs), benchTs)
+				curSeq = 11
+			} else {
+				now = now.Add(5 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+				now = now.Add(5 * time.Millisecond)
+				benchTs = now
+				deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 12, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierDirectBench), peer, benchTs), benchTs)
+				curSeq = 12
+			}
+
+			obsTs := now.Add(5 * time.Millisecond)
+			if mode == "stale_mono_after_bench_12" {
+				obsTs = benchTs.Add(-2 * time.Millisecond)
+			} else {
+				now = obsTs
+			}
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, obsTs), obsTs)
+
+			// 10 ordinary telemetry packets age out the cycle-1 pos=1 entry (lifetimePacketPos > 513).
+			for i := 0; i < 10; i++ {
+				curSeq++
+				now = now.Add(5 * time.Millisecond)
+				deliverTrackerOutcome(svc, tracker.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, now), now)
+			}
+
+			now = now.Add(3100 * time.Millisecond)
+			for _, ev := range tracker.EvaluateSilence(now) {
+				svc.OnTransitionEvent(ev)
+			}
+
+			// Reconnect copy of (seq=10, sitl-local) MUST NOT confirm sitl-local or allow ActionSITLCRSFOverride!
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 10, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+
+			var ce *ControlError
+			if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride}); !errors.As(err, &ce) || ce.Status != 403 || ce.Code != "sitl_only_action" {
+				t.Fatalf("%s: ActionSITLCRSFOverride after window-crossing seq=10 sitl-local replay = %v, want 403 sitl_only_action", mode, err)
+			}
+			if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 0 {
+				t.Fatalf("%s: emitted %d #76 frames on stale replay, want 0", mode, got)
+			}
+
+			// Positive control: fresh unseen (seq=25, sitl-local) confirms sitl-local and dispatches ActionSITLCRSFOverride.
+			now = now.Add(20 * time.Millisecond)
+			deliverTrackerOutcome(svc, tracker.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 25, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peer, now), now)
+			if _, err := svc.SubmitCommand(context.Background(), CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride}); err != nil {
+				t.Fatalf("%s: ActionSITLCRSFOverride after fresh seq=25 sitl-local: %v", mode, err)
+			}
+			if got := sender.countByMsgID(mavcodec.MsgIDCommandLong); got != 1 {
+				t.Fatalf("%s: fresh seq=25 #76 count = %d, want 1", mode, got)
+			}
+		}
+	})
+
+	t.Run("replacement_peer_or_non_sitl_tier_never_confirms_prior_simulator_command_across_reconnect", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Subcase A: Simulator A (peerA, sitl-local) dispatches ActionSITLCRSFOverride -> times out -> link_lost ->
+		// direct-bench peer B (peerB != peerA) admitted under sysid=1 with hardware override (direct-crsf-override).
+		trackerA, err := mavlink.NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker A: %v", err)
+		}
+		storeA := newFakeCommandStore()
+		nowA := time.Date(2026, 11, 28, 8, 30, 0, 0, time.UTC)
+		svcA, err := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerA,
+			Sender:   &fakeFrameSender{},
+			Store:    storeA,
+			Now:      func() time.Time { return nowA },
+		})
+		if err != nil {
+			t.Fatalf("NewService A: %v", err)
+		}
+		peerSimA := netip.MustParseAddrPort("127.0.0.1:20611")
+		peerBenchB := netip.MustParseAddrPort("127.0.0.1:20612")
+
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSimA, nowA), nowA)
+		for seq := uint8(2); seq <= 150; seq++ {
+			nowA = nowA.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcA, trackerA.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peerSimA, nowA), nowA)
+		}
+		nowA = nowA.Add(10 * time.Millisecond)
+		cmdSimA, err := svcA.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride})
+		if err != nil {
+			t.Fatalf("SubmitCommand SimA: %v", err)
+		}
+		nowA = nowA.Add(2 * time.Second)
+		svcA.Advance(ctx, nowA)
+		if ent, _ := storeA.get(cmdSimA.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("after timeout SimA = %+v, want PhaseCommitUnknown", ent)
+		}
+
+		// Link loss on Simulator A, then replacement direct-bench peer B admitted with direct-crsf-override!
+		nowA = nowA.Add(3100 * time.Millisecond)
+		for _, ev := range trackerA.EvaluateSilence(nowA) {
+			svcA.OnTransitionEvent(ev)
+		}
+		nowA = nowA.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierDirectBench), peerBenchB, nowA), nowA)
+		svcA.Advance(ctx, nowA)
+		if ent, _ := storeA.get(cmdSimA.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("direct-bench replacement peer B at PacketOrder=1 falsely confirmed Simulator A command: %+v", ent)
+		}
+		// Even past PacketOrder > 150 AND with #77 COMMAND_ACK from peer B, Simulator A's command MUST stay PhaseCommitUnknown!
+		for seq := uint8(2); seq <= 160; seq++ {
+			nowA = nowA.Add(10 * time.Millisecond)
+			deliverTrackerOutcome(svcA, trackerA.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, seq, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierDirectBench), peerBenchB, nowA), nowA)
+		}
+		nowA = nowA.Add(10 * time.Millisecond)
+		deliverTrackerOutcome(svcA, trackerA.IngestFrame(mavcodec.Frame{
+			SystemID:    1,
+			ComponentID: mavcodec.CompIDAutopilot1,
+			Sequence:    161,
+			Message: mavcodec.CommandAck{
+				Command: cmdSimA.CmdID,
+				Result:  mavcodec.MAVResultAccepted,
+			},
+		}, peerBenchB, nowA), nowA)
+		svcA.Advance(ctx, nowA)
+		if ent, _ := storeA.get(cmdSimA.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("direct-bench replacement peer B past PacketOrder=160 / COMMAND_ACK falsely confirmed Simulator A command: %+v", ent)
+		}
+
+		// Subcase B: Replacement sitl-local Simulator B at peerSimB != peerSimA (including peerSimA -> peerSimB -> peerSimA)
+		// NEVER confirms Simulator A's prior command.
+		trackerB, err := mavlink.NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker B: %v", err)
+		}
+		storeB := newFakeCommandStore()
+		nowB := time.Date(2026, 11, 28, 8, 40, 0, 0, time.UTC)
+		svcB, err := NewService(Options{
+			Org:               "boxbotix",
+			Platform:          "bbops",
+			Targets:           trackerB,
+			Sender:            &fakeFrameSender{},
+			Store:             storeB,
+			CommandAckTimeout: 5 * time.Second,
+			Now:               func() time.Time { return nowB },
+		})
+		if err != nil {
+			t.Fatalf("NewService B: %v", err)
+		}
+		peerSimB := netip.MustParseAddrPort("127.0.0.1:20613")
+
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSimA, nowB), nowB)
+		nowB = nowB.Add(10 * time.Millisecond)
+		cmdSimB, err := svcB.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride})
+		if err != nil {
+			t.Fatalf("SubmitCommand SimB: %v", err)
+		}
+		// Link loss BEFORE timeout, then replacement sitl-local peerSimB admitted with Authority=direct-crsf-override.
+		nowB = nowB.Add(3100 * time.Millisecond)
+		for _, ev := range trackerB.EvaluateSilence(nowB) {
+			svcB.OnTransitionEvent(ev)
+		}
+		nowB = nowB.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSimB, nowB), nowB)
+		nowB = nowB.Add(2 * time.Second)
+		svcB.Advance(ctx, nowB)
+		nowB = nowB.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 2, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSimB, nowB), nowB)
+		svcB.Advance(ctx, nowB)
+		if ent, _ := storeB.get(cmdSimB.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("replacement sitl-local peerSimB falsely confirmed peerSimA command: %+v", ent)
+		}
+		// Even if peerSimB later goes silent and peerSimA is re-admitted, targetDisplaced stays latched!
+		nowB = nowB.Add(3100 * time.Millisecond)
+		for _, ev := range trackerB.EvaluateSilence(nowB) {
+			svcB.OnTransitionEvent(ev)
+		}
+		nowB = nowB.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcB, trackerB.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 25, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSimA, nowB), nowB)
+		svcB.Advance(ctx, nowB)
+		if ent, _ := storeB.get(cmdSimB.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("re-admitted peerSimA after peerSimB displacement falsely confirmed displaced command: %+v", ent)
+		}
+
+		// Subcase C: Same UDP peer reused by direct-bench hardware after link_lost NEVER confirms ActionSITLCRSFOverride.
+		trackerC, err := mavlink.NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker C: %v", err)
+		}
+		storeC := newFakeCommandStore()
+		nowC := time.Date(2026, 11, 28, 8, 50, 0, 0, time.UTC)
+		svcC, err := NewService(Options{
+			Org:      "boxbotix",
+			Platform: "bbops",
+			Targets:  trackerC,
+			Sender:   &fakeFrameSender{},
+			Store:    storeC,
+			Now:      func() time.Time { return nowC },
+		})
+		if err != nil {
+			t.Fatalf("NewService C: %v", err)
+		}
+		peerSame := netip.MustParseAddrPort("127.0.0.1:20614")
+
+		deliverTrackerOutcome(svcC, trackerC.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSame, nowC), nowC)
+		nowC = nowC.Add(10 * time.Millisecond)
+		cmdSame, err := svcC.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride})
+		if err != nil {
+			t.Fatalf("SubmitCommand SamePeer: %v", err)
+		}
+		nowC = nowC.Add(2 * time.Second)
+		svcC.Advance(ctx, nowC)
+		nowC = nowC.Add(3100 * time.Millisecond)
+		for _, ev := range trackerC.EvaluateSilence(nowC) {
+			svcC.OnTransitionEvent(ev)
+		}
+		nowC = nowC.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcC, trackerC.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 25, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierDirectBench), peerSame, nowC), nowC)
+		nowC = nowC.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcC, trackerC.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 26, true, mavcodec.ModeHoldPosition, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierDirectBench), peerSame, nowC), nowC)
+		svcC.Advance(ctx, nowC)
+		if ent, _ := storeC.get(cmdSame.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("same-peer direct-bench hardware falsely confirmed ActionSITLCRSFOverride: %+v", ent)
+		}
+		// Even if peerSame later emits sitl-local after confirmed direct-bench takeover, targetDisplaced remains latched!
+		nowC = nowC.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcC, trackerC.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 27, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSame, nowC), nowC)
+		svcC.Advance(ctx, nowC)
+		if ent, _ := storeC.get(cmdSame.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("post-bench-takeover sitl-local frame falsely confirmed displaced ActionSITLCRSFOverride: %+v", ent)
+		}
+
+		// Subcase D: Brief replacement peerSimB takeover with companion-teleop WHILE still PhasePending (< timeout),
+		// followed by peerSimB silence and peerSimA reconnect with direct-crsf-override -> OnTransitionEvent latched targetDisplaced!
+		trackerD, err := mavlink.NewTracker("boxbotix", "bbops")
+		if err != nil {
+			t.Fatalf("NewTracker D: %v", err)
+		}
+		storeD := newFakeCommandStore()
+		nowD := time.Date(2026, 11, 28, 8, 55, 0, 0, time.UTC)
+		svcD, err := NewService(Options{
+			Org:               "boxbotix",
+			Platform:          "bbops",
+			Targets:           trackerD,
+			Sender:            &fakeFrameSender{},
+			Store:             storeD,
+			CommandAckTimeout: 10 * time.Second,
+			Now:               func() time.Time { return nowD },
+		})
+		if err != nil {
+			t.Fatalf("NewService D: %v", err)
+		}
+		deliverTrackerOutcome(svcD, trackerD.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSimA, nowD), nowD)
+		nowD = nowD.Add(10 * time.Millisecond)
+		cmdD, err := svcD.SubmitCommand(ctx, CommandRequest{SysID: 1, Action: ActionSITLCRSFOverride})
+		if err != nil {
+			t.Fatalf("SubmitCommand D: %v", err)
+		}
+		nowD = nowD.Add(3100 * time.Millisecond)
+		for _, ev := range trackerD.EvaluateSilence(nowD) {
+			svcD.OnTransitionEvent(ev)
+		}
+		nowD = nowD.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcD, trackerD.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 1, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityCompanionTeleop, mavcodec.LinkTierSITLLocal), peerSimB, nowD), nowD)
+		nowD = nowD.Add(3100 * time.Millisecond)
+		for _, ev := range trackerD.EvaluateSilence(nowD) {
+			svcD.OnTransitionEvent(ev)
+		}
+		nowD = nowD.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcD, trackerD.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 30, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSimA, nowD), nowD)
+		nowD = nowD.Add(5 * time.Second)
+		svcD.Advance(ctx, nowD)
+		nowD = nowD.Add(20 * time.Millisecond)
+		deliverTrackerOutcome(svcD, trackerD.IngestFrame(makeTestVehicleHeartbeatFrameWithTier(t, 1, 31, true, mavcodec.ModeTeleopVelocity, mavcodec.AuthorityDirectCRSFOverride, mavcodec.LinkTierSITLLocal), peerSimA, nowD), nowD)
+		svcD.Advance(ctx, nowD)
+		if ent, _ := storeD.get(cmdD.CommandID); ent.PhaseState != PhaseCommitUnknown {
+			t.Fatalf("transient pre-timeout peerSimB takeover failed to latch targetDisplaced: %+v", ent)
+		}
+	})
 }

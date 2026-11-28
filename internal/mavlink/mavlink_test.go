@@ -4670,4 +4670,137 @@ func TestTrackerGapAndWrapSuspensionPersistenceAndRegularCadenceRecovery(t *test
 			}
 		}
 	})
+
+	t.Run("window_crossing_sitl_heartbeat_after_dropped_packets_refreshes_history_for_stale_and_uncorroborated_observations", func(t *testing.T) {
+		hbBench := makeVehicleHB(
+			mavcodec.DomainQuadcopter,
+			true,
+			mavcodec.AuthorityCompanionTeleop,
+			mavcodec.ModeTeleopVelocity,
+			mavcodec.LinkTierDirectBench,
+			uxsvocab.HealthFlags{CompanionTrunkHealthy: true},
+		)
+
+		// Subcase A: Initial (seq=10, sitl-local) at pos=1; across 2 sequence wraps with 4 dropped telemetry packets,
+		// cycle-3 (seq=10, sitl-local) arrives at candPos <= 513 (while the cycle-1 entry is still unexpired!), followed by
+		// 10 ordinary telemetry packets (pos > 513) that age out the cycle-1 entry before link_lost.
+		for _, mode := range []string{"uncorroborated_after_bench_12", "stale_mono_after_bench_12", "one_pos_late_after_bench_11"} {
+			trWin, err := NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker (%s): %v", mode, err)
+			}
+			nowW := t0
+			_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowW)
+
+			curSeq := uint8(10)
+			// Wrap 1: 256 sequence steps back to seq=10, dropping 2 telemetry packets (seq=50, 51) -> lifetimePacketPos = 255.
+			for step := 1; step <= 256; step++ {
+				curSeq++
+				if curSeq == 50 || curSeq == 51 {
+					continue
+				}
+				nowW = nowW.Add(5 * time.Millisecond)
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowW)
+			}
+			// Wrap 2 up to seq=9: 255 sequence steps, dropping 2 telemetry packets (seq=200, 201) -> lifetimePacketPos = 508.
+			for step := 1; step <= 255; step++ {
+				curSeq++
+				if curSeq == 200 || curSeq == 201 {
+					continue
+				}
+				nowW = nowW.Add(5 * time.Millisecond)
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowW)
+			}
+
+			// Cycle 3: skip seq=10 initially so candPos <= 513 when seq=10 arrives out of order.
+			var benchTs time.Time
+			if mode == "one_pos_late_after_bench_11" {
+				nowW = nowW.Add(5 * time.Millisecond)
+				benchTs = nowW
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: hbBench}, peer, benchTs)
+				curSeq = 11
+			} else {
+				nowW = nowW.Add(5 * time.Millisecond)
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowW)
+				nowW = nowW.Add(5 * time.Millisecond)
+				benchTs = nowW
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 12, Message: hbBench}, peer, benchTs)
+				curSeq = 12
+			}
+
+			obsTs := nowW.Add(5 * time.Millisecond)
+			if mode == "stale_mono_after_bench_12" {
+				obsTs = benchTs.Add(-2 * time.Millisecond)
+			} else {
+				nowW = obsTs
+			}
+			_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, obsTs)
+			if tgtPre, ok := trWin.ActuationTarget(1); !ok || tgtPre.LinkTier != uxsvocab.LinkTierDirectBench || tgtPre.CurrentLinkHbUnconfirmed {
+				t.Fatalf("%s: pre-loss target = %+v (ok=%v), want confirmed direct-bench", mode, tgtPre, ok)
+			}
+
+			// Advance 10 ordinary telemetry packets so lifetimePacketPos > 513 (aging out the cycle-1 pos=1 entry).
+			for i := 0; i < 10; i++ {
+				curSeq++
+				nowW = nowW.Add(5 * time.Millisecond)
+				_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: curSeq, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowW)
+			}
+
+			nowW = nowW.Add(3100 * time.Millisecond)
+			if lost := trWin.EvaluateSilence(nowW); len(lost) != 1 || lost[0].Kind != EventKindLinkLost {
+				t.Fatalf("%s: EvaluateSilence = %+v, want single link_lost", mode, lost)
+			}
+
+			// Reconnect copy of (seq=10, sitl-local) MUST remain held and keep direct-bench!
+			nowW = nowW.Add(20 * time.Millisecond)
+			_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowW)
+			if tgtPost, ok := trWin.ActuationTarget(1); !ok || !tgtPost.CurrentLinkHbUnconfirmed || tgtPost.LinkTier != uxsvocab.LinkTierDirectBench {
+				t.Fatalf("%s: post-reconnect target after replaying recent seq=10 sitl-local = %+v (ok=%v), want CurrentLinkHbUnconfirmed=true LinkTier=direct-bench", mode, tgtPost, ok)
+			}
+
+			// Positive control: fresh unseen (seq=25, sitl-local) confirms sitl-local cleanly.
+			nowW = nowW.Add(20 * time.Millisecond)
+			_ = trWin.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 25, Message: hbTeleopArmed}, peer, nowW)
+			if tgtFresh, _ := trWin.ActuationTarget(1); tgtFresh.CurrentLinkHbUnconfirmed || tgtFresh.LinkTier != uxsvocab.LinkTierSITLLocal {
+				t.Fatalf("%s: target after fresh seq=25 sitl-local = %+v, want confirmed sitl-local", mode, tgtFresh)
+			}
+		}
+
+		// Subcase B: 140-packet-late same-cycle duplicate (back=140 > 128 > 64) does NOT advance curLinkLife past pos=1.
+		for _, olderMono := range []bool{false, true} {
+			trLateDup, err := NewTracker("boxbotix", "bbops")
+			if err != nil {
+				t.Fatalf("NewTracker lateDup (olderMono=%v): %v", olderMono, err)
+			}
+			nowLD := t0
+			_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowLD)
+			nowLD = nowLD.Add(5 * time.Millisecond)
+			_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 11, Message: hbBench}, peer, nowLD)
+			for s := uint8(12); s <= 150; s++ {
+				nowLD = nowLD.Add(5 * time.Millisecond)
+				_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: s, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowLD)
+			}
+			dupTs := nowLD.Add(5 * time.Millisecond)
+			if olderMono {
+				dupTs = t0.Add(2 * time.Millisecond)
+			} else {
+				nowLD = dupTs
+			}
+			_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, dupTs)
+
+			seqLD := uint8(150)
+			for i := 0; i < 373; i++ {
+				seqLD++
+				nowLD = nowLD.Add(5 * time.Millisecond)
+				_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: seqLD, Message: mavcodec.AttitudeQuaternion{Q1: 1}}, peer, nowLD)
+			}
+			nowLD = nowLD.Add(3100 * time.Millisecond)
+			_ = trLateDup.EvaluateSilence(nowLD)
+			nowLD = nowLD.Add(20 * time.Millisecond)
+			_ = trLateDup.IngestFrame(mavcodec.Frame{SystemID: 1, ComponentID: mavcodec.CompIDAutopilot1, Sequence: 10, Message: hbTeleopArmed}, peer, nowLD)
+			if tgtAged, _ := trLateDup.ActuationTarget(1); tgtAged.CurrentLinkHbUnconfirmed || tgtAged.LinkTier != uxsvocab.LinkTierSITLLocal {
+				t.Fatalf("olderMono=%v: 140-packet-late same-cycle duplicate falsely advanced history position: %+v", olderMono, tgtAged)
+			}
+		}
+	})
 }
